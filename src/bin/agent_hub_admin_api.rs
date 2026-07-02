@@ -15202,12 +15202,12 @@ struct HlsLiveSessionProjection {
 }
 
 const HLS_LIVE_CODEC: &str = "h264_low_latency";
-const HLS_LIVE_TARGET_FPS: &str = "12";
+const HLS_LIVE_TARGET_FPS: &str = "20";
 const HLS_LIVE_SEGMENT_SECONDS: &str = "1";
 const HLS_LIVE_WINDOW_SEGMENTS: &str = "4";
-const HLS_LIVE_VIDEO_BITRATE: &str = "900k";
-const HLS_LIVE_VIDEO_MAXRATE: &str = "1100k";
-const HLS_LIVE_VIDEO_BUFSIZE: &str = "1800k";
+const HLS_LIVE_VIDEO_BITRATE: &str = "1200k";
+const HLS_LIVE_VIDEO_MAXRATE: &str = "1500k";
+const HLS_LIVE_VIDEO_BUFSIZE: &str = "2400k";
 
 impl HlsLiveSessionProjection {
     fn stopped(device_id: &str, message: impl Into<String>) -> Self {
@@ -16307,8 +16307,8 @@ mod tests {
         };
 
         assert!(has_pair("-c:v", "libx264"));
-        assert!(has_pair("-vf", "fps=12"));
-        assert!(has_pair("-g", "12"));
+        assert!(has_pair("-vf", "fps=20"));
+        assert!(has_pair("-g", "20"));
         assert!(has_pair("-hls_time", "1"));
         assert!(has_pair("-hls_list_size", "4"));
         assert!(has_pair(
