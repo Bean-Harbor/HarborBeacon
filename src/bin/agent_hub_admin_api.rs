@@ -1680,8 +1680,14 @@ impl AdminApi {
                 .handle_live_view_page(&raw_url, &path, remote_addr, &headers, &identity_hints)
                 .boxed(),
             Method::Post if path.starts_with("/api/cameras/") && path.ends_with("/live/start") => {
-                self.handle_camera_hls_live_start(&path, remote_addr, &headers, &identity_hints)
-                    .boxed()
+                self.handle_camera_hls_live_start(
+                    &path,
+                    &mut request,
+                    remote_addr,
+                    &headers,
+                    &identity_hints,
+                )
+                .boxed()
             }
             Method::Post if path.starts_with("/api/cameras/") && path.ends_with("/live/stop") => {
                 self.handle_camera_hls_live_stop(
@@ -4909,6 +4915,7 @@ impl AdminApi {
     fn handle_camera_hls_live_start(
         &self,
         path: &str,
+        request: &mut Request,
         remote_addr: Option<SocketAddr>,
         headers: &[Header],
         hints: &AccessIdentityHints,
@@ -4935,9 +4942,27 @@ impl AdminApi {
             Err(error) => return error_json(StatusCode(422), &error),
         };
 
+        let body: LiveStartRequest = match read_json_body_or_default(request) {
+            Ok(body) => body,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let stream_profile = match LiveStreamProfile::parse(body.stream_profile.as_deref()) {
+            Ok(profile) => profile,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let state = match self.admin_store.load_or_create_state() {
+            Ok(state) => state,
+            Err(error) => return error_json(StatusCode(422), &error),
+        };
+        let stream_url =
+            match camera_stream_url_with_credentials_for_profile(&device, &state, stream_profile) {
+                Some(url) => url,
+                None => device.primary_stream.url.clone(),
+            };
+
         match self
             .hls_live_runtime
-            .start_session(&device.device_id, &device.primary_stream.url)
+            .start_session(&device.device_id, &stream_url, stream_profile)
         {
             Ok(session) => ok_json(&session.to_response(&self.public_origin)),
             Err(error) => error_json(StatusCode(422), &error),
@@ -13131,6 +13156,14 @@ fn camera_stream_url_with_credentials(
     device: &CameraDevice,
     state: &AdminConsoleState,
 ) -> Option<String> {
+    camera_stream_url_with_credentials_for_profile(device, state, LiveStreamProfile::Sub)
+}
+
+fn camera_stream_url_with_credentials_for_profile(
+    device: &CameraDevice,
+    state: &AdminConsoleState,
+    stream_profile: LiveStreamProfile,
+) -> Option<String> {
     let credential = state
         .device_credentials
         .iter()
@@ -13153,21 +13186,14 @@ fn camera_stream_url_with_credentials(
         .and_then(|credential| credential.rtsp_port)
         .or_else(|| rtsp_port_from_url(&device.primary_stream.url))
         .unwrap_or(state.defaults.rtsp_port);
-    let path = credential
-        .and_then(|credential| {
-            credential
-                .rtsp_paths
-                .iter()
-                .find_map(|path| non_empty_string(path))
-        })
-        .or_else(|| rtsp_path_from_url(&device.primary_stream.url))
-        .or_else(|| {
-            state
-                .defaults
-                .rtsp_paths
-                .iter()
-                .find_map(|path| non_empty_string(path))
-        })
+    let mut path_candidates = credential
+        .map(|credential| credential.rtsp_paths.clone())
+        .filter(|paths| !paths.is_empty())
+        .unwrap_or_else(|| state.defaults.rtsp_paths.clone());
+    if let Some(path) = rtsp_path_from_url(&device.primary_stream.url) {
+        path_candidates.push(path);
+    }
+    let path = preferred_rtsp_path_for_live_profile(&path_candidates, stream_profile)
         .unwrap_or_else(|| "/stream1".to_string());
     let path = if path.starts_with('/') {
         path
@@ -13183,6 +13209,49 @@ fn camera_stream_url_with_credentials(
         let _ = url.set_password(Some(&password));
     }
     Some(url.to_string())
+}
+
+fn preferred_rtsp_path_for_live_profile(
+    paths: &[String],
+    stream_profile: LiveStreamProfile,
+) -> Option<String> {
+    let candidates = paths
+        .iter()
+        .filter_map(|path| non_empty_string(path))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return None;
+    }
+    let selected = match stream_profile {
+        LiveStreamProfile::Sub => candidates
+            .iter()
+            .find(|path| rtsp_path_is_substream(path))
+            .or_else(|| candidates.first()),
+        LiveStreamProfile::Main => candidates
+            .iter()
+            .find(|path| rtsp_path_is_mainstream(path))
+            .or_else(|| candidates.iter().find(|path| !rtsp_path_is_substream(path)))
+            .or_else(|| candidates.first()),
+    };
+    selected.cloned()
+}
+
+fn rtsp_path_is_substream(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("sub")
+        || lower.contains("stream2")
+        || lower.contains("minor")
+        || lower.contains("low")
+        || lower.contains("secondary")
+}
+
+fn rtsp_path_is_mainstream(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("main")
+        || lower.contains("stream1")
+        || lower.contains("ch01.264")
+        || lower.contains("primary")
+        || lower.contains("high")
 }
 
 fn redact_secret_json_value(mut value: Value) -> Value {
@@ -15187,6 +15256,37 @@ struct LiveStopRequest {
     session_id: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct LiveStartRequest {
+    stream_profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveStreamProfile {
+    Sub,
+    Main,
+}
+
+impl LiveStreamProfile {
+    fn parse(value: Option<&str>) -> Result<Self, String> {
+        let Some(value) = value.and_then(non_empty_string) else {
+            return Ok(Self::Sub);
+        };
+        match value.to_ascii_lowercase().as_str() {
+            "sub" | "low" | "secondary" | "continuous" | "preview" => Ok(Self::Sub),
+            "main" | "high" | "primary" | "hd" => Ok(Self::Main),
+            _ => Err(format!("unsupported live stream profile: {value}")),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sub => "sub",
+            Self::Main => "main",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct HlsLiveSessionProjection {
     device_id: String,
@@ -15196,6 +15296,7 @@ struct HlsLiveSessionProjection {
     playlist_ready: bool,
     mode: String,
     codec: String,
+    stream_profile: String,
     started_at: Option<String>,
     updated_at: String,
     message: String,
@@ -15219,6 +15320,7 @@ impl HlsLiveSessionProjection {
             playlist_ready: false,
             mode: "hls_fmp4".to_string(),
             codec: HLS_LIVE_CODEC.to_string(),
+            stream_profile: LiveStreamProfile::Sub.as_str().to_string(),
             started_at: None,
             updated_at: current_unix_secs().to_string(),
             message: message.into(),
@@ -15233,6 +15335,7 @@ impl HlsLiveSessionProjection {
 struct HlsLiveSession {
     device_id: String,
     session_id: String,
+    stream_profile: LiveStreamProfile,
     root: PathBuf,
     started_at: String,
     child: Child,
@@ -15254,6 +15357,7 @@ impl HlsLiveRuntime {
         &self,
         device_id: &str,
         stream_url: &str,
+        stream_profile: LiveStreamProfile,
     ) -> Result<HlsLiveSessionProjection, String> {
         if stream_url.trim().is_empty() {
             return Err("camera RTSP stream is not configured".to_string());
@@ -15303,6 +15407,7 @@ impl HlsLiveRuntime {
         let session = HlsLiveSession {
             device_id: device_id.to_string(),
             session_id: session_id.clone(),
+            stream_profile,
             root,
             started_at: current_unix_secs().to_string(),
             child,
@@ -15364,6 +15469,7 @@ impl HlsLiveRuntime {
             playlist_ready: false,
             mode: "hls_fmp4".to_string(),
             codec: HLS_LIVE_CODEC.to_string(),
+            stream_profile: session.stream_profile.as_str().to_string(),
             started_at: Some(session.started_at),
             updated_at: current_unix_secs().to_string(),
             message: "live session stopped".to_string(),
@@ -15436,6 +15542,7 @@ impl HlsLiveRuntime {
                     playlist_ready: false,
                     mode: "hls_fmp4".to_string(),
                     codec: HLS_LIVE_CODEC.to_string(),
+                    stream_profile: session.stream_profile.as_str().to_string(),
                     started_at: Some(session.started_at),
                     updated_at: current_unix_secs().to_string(),
                     message: format!("live ffmpeg process exited: {status}"),
@@ -15451,6 +15558,7 @@ impl HlsLiveRuntime {
                     playlist_ready: false,
                     mode: "hls_fmp4".to_string(),
                     codec: HLS_LIVE_CODEC.to_string(),
+                    stream_profile: session.stream_profile.as_str().to_string(),
                     started_at: Some(session.started_at.clone()),
                     updated_at: current_unix_secs().to_string(),
                     message: format!("failed to inspect live ffmpeg process: {error}"),
@@ -15476,6 +15584,7 @@ impl HlsLiveRuntime {
             playlist_ready,
             mode: "hls_fmp4".to_string(),
             codec: HLS_LIVE_CODEC.to_string(),
+            stream_profile: session.stream_profile.as_str().to_string(),
             started_at: Some(session.started_at.clone()),
             updated_at: current_unix_secs().to_string(),
             message: if playlist_ready {
@@ -15694,8 +15803,9 @@ mod tests {
         build_local_model_catalog, build_model_capabilities_response, build_rag_readiness_response,
         build_redacted_diagnostics_bundle, build_release_readiness_response,
         build_rtsp_url_from_patch, camera_stream_url_with_credentials,
-        default_model_download_target_path, default_model_download_target_path_in_root,
-        default_model_endpoints, ensure_local_admin_access, ensure_local_camera_access,
+        camera_stream_url_with_credentials_for_profile, default_model_download_target_path,
+        default_model_download_target_path_in_root, default_model_endpoints,
+        ensure_local_admin_access, ensure_local_camera_access,
         harbor_assistant_build_missing_response, hardware_class_for_probe, has_forwarding_headers,
         hls_live_ffmpeg_args, huggingface_download_should_fallback_to_plain_http,
         huggingface_resolve_url, identity_query_suffix, is_admin_surface_path,
@@ -15729,9 +15839,9 @@ mod tests {
         resolve_knowledge_preview_path, run_knowledge_index_jobs, run_model_download_job,
         run_model_download_transfer, scan_request_task_args, url_encode_path_segment,
         validate_home_assistant_service_fields, validate_home_assistant_service_smoke, AdminApi,
-        HomeAssistantServiceSmokeRequest, KnowledgeSearchApiRequest, LocalModelRuntimeProjection,
-        ManualAddRequest, ModelRuntimeActivationRequest, ModelRuntimeActivationResult,
-        DEFAULT_HF_ENDPOINT,
+        HomeAssistantServiceSmokeRequest, KnowledgeSearchApiRequest, LiveStreamProfile,
+        LocalModelRuntimeProjection, ManualAddRequest, ModelRuntimeActivationRequest,
+        ModelRuntimeActivationResult, DEFAULT_HF_ENDPOINT,
     };
     use harborbeacon_local_agent::control_plane::events::EventRecord;
     use harborbeacon_local_agent::control_plane::media::{
@@ -16399,6 +16509,39 @@ mod tests {
         let url = camera_stream_url_with_credentials(&device, &state).expect("stream url");
 
         assert_eq!(url, "rtsp://admin:secret@192.168.3.73:8554/stream2");
+    }
+
+    #[test]
+    fn camera_stream_url_selects_requested_live_profile_path() {
+        let mut state = AdminConsoleState::default();
+        state.device_credentials.push(DeviceCredentialSecret {
+            device_id: "cam-1".to_string(),
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+            rtsp_port: Some(554),
+            rtsp_paths: vec!["/ch01_sub.264".to_string(), "/ch01.264".to_string()],
+            updated_at: Some("123".to_string()),
+            last_verified_at: None,
+        });
+        let mut device =
+            CameraDevice::new("cam-1", "Living Room", "rtsp://192.168.3.252/ch01_sub.264");
+        device.ip_address = Some("192.168.3.252".to_string());
+
+        let sub_url =
+            camera_stream_url_with_credentials_for_profile(&device, &state, LiveStreamProfile::Sub)
+                .expect("sub stream url");
+        let main_url = camera_stream_url_with_credentials_for_profile(
+            &device,
+            &state,
+            LiveStreamProfile::Main,
+        )
+        .expect("main stream url");
+
+        assert_eq!(
+            sub_url,
+            "rtsp://admin:secret@192.168.3.252:554/ch01_sub.264"
+        );
+        assert_eq!(main_url, "rtsp://admin:secret@192.168.3.252:554/ch01.264");
     }
 
     #[test]
