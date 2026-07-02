@@ -5061,6 +5061,13 @@ impl AdminApi {
                 live_asset_mime_type(&asset_name).as_bytes(),
             )
             .expect("header"),
+            Header::from_bytes(
+                b"Cache-Control".as_slice(),
+                b"no-store, no-cache, must-revalidate, max-age=0".as_slice(),
+            )
+            .expect("header"),
+            Header::from_bytes(b"Pragma".as_slice(), b"no-cache".as_slice()).expect("header"),
+            Header::from_bytes(b"Expires".as_slice(), b"0".as_slice()).expect("header"),
             Header::from_bytes(b"X-Accel-Buffering".as_slice(), b"no".as_slice()).expect("header"),
         ];
         let mut response = Response::new(
@@ -15194,6 +15201,14 @@ struct HlsLiveSessionProjection {
     message: String,
 }
 
+const HLS_LIVE_CODEC: &str = "h264_low_latency";
+const HLS_LIVE_TARGET_FPS: &str = "12";
+const HLS_LIVE_SEGMENT_SECONDS: &str = "1";
+const HLS_LIVE_WINDOW_SEGMENTS: &str = "4";
+const HLS_LIVE_VIDEO_BITRATE: &str = "900k";
+const HLS_LIVE_VIDEO_MAXRATE: &str = "1100k";
+const HLS_LIVE_VIDEO_BUFSIZE: &str = "1800k";
+
 impl HlsLiveSessionProjection {
     fn stopped(device_id: &str, message: impl Into<String>) -> Self {
         Self {
@@ -15203,7 +15218,7 @@ impl HlsLiveSessionProjection {
             playlist_url: None,
             playlist_ready: false,
             mode: "hls_fmp4".to_string(),
-            codec: "h264_copy".to_string(),
+            codec: HLS_LIVE_CODEC.to_string(),
             started_at: None,
             updated_at: current_unix_secs().to_string(),
             message: message.into(),
@@ -15259,45 +15274,12 @@ impl HlsLiveRuntime {
         let playlist_path = root.join("index.m3u8");
         let mut child = Command::new(&ffmpeg_bin)
             .current_dir(&root)
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-nostdin",
-                "-rtsp_transport",
-                "tcp",
-                "-fflags",
-                "nobuffer",
-                "-flags",
-                "low_delay",
-                "-i",
-                stream_url,
-                "-map",
-                "0:v:0",
-                "-an",
-                "-c:v",
-                "copy",
-                "-f",
-                "hls",
-                "-hls_time",
-                "1",
-                "-hls_list_size",
-                "6",
-                "-hls_flags",
-                "delete_segments+omit_endlist+independent_segments",
-                "-hls_segment_type",
-                "fmp4",
-                "-hls_fmp4_init_filename",
-                "init.mp4",
-                "-hls_segment_filename",
-                "segment_%05d.m4s",
-                "index.m3u8",
-            ])
+            .args(hls_live_ffmpeg_args(stream_url))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|error| format!("启动 H.264 live remux ffmpeg 失败: {error}"))?;
+            .map_err(|error| format!("failed to start low-latency H.264 live ffmpeg: {error}"))?;
 
         for _ in 0..20 {
             if playlist_path.exists() {
@@ -15381,7 +15363,7 @@ impl HlsLiveRuntime {
             playlist_url: None,
             playlist_ready: false,
             mode: "hls_fmp4".to_string(),
-            codec: "h264_copy".to_string(),
+            codec: HLS_LIVE_CODEC.to_string(),
             started_at: Some(session.started_at),
             updated_at: current_unix_secs().to_string(),
             message: "live session stopped".to_string(),
@@ -15453,10 +15435,10 @@ impl HlsLiveRuntime {
                     playlist_url: None,
                     playlist_ready: false,
                     mode: "hls_fmp4".to_string(),
-                    codec: "h264_copy".to_string(),
+                    codec: HLS_LIVE_CODEC.to_string(),
                     started_at: Some(session.started_at),
                     updated_at: current_unix_secs().to_string(),
-                    message: format!("live remux process exited: {status}"),
+                    message: format!("live ffmpeg process exited: {status}"),
                 };
             }
             Ok(None) => {}
@@ -15468,10 +15450,10 @@ impl HlsLiveRuntime {
                     playlist_url: None,
                     playlist_ready: false,
                     mode: "hls_fmp4".to_string(),
-                    codec: "h264_copy".to_string(),
+                    codec: HLS_LIVE_CODEC.to_string(),
                     started_at: Some(session.started_at.clone()),
                     updated_at: current_unix_secs().to_string(),
-                    message: format!("failed to inspect live remux process: {error}"),
+                    message: format!("failed to inspect live ffmpeg process: {error}"),
                 };
             }
         }
@@ -15493,17 +15475,91 @@ impl HlsLiveRuntime {
             )),
             playlist_ready,
             mode: "hls_fmp4".to_string(),
-            codec: "h264_copy".to_string(),
+            codec: HLS_LIVE_CODEC.to_string(),
             started_at: Some(session.started_at.clone()),
             updated_at: current_unix_secs().to_string(),
             message: if playlist_ready {
-                "H.264 live remux is running"
+                "low-latency H.264 live stream is running"
             } else {
-                "H.264 live remux is starting"
+                "low-latency H.264 live stream is starting"
             }
             .to_string(),
         }
     }
+}
+
+fn hls_live_ffmpeg_args(stream_url: &str) -> Vec<String> {
+    let mut args = vec![
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-rtsp_transport",
+        "tcp",
+        "-fflags",
+        "nobuffer",
+        "-flags",
+        "low_delay",
+        "-i",
+        stream_url,
+        "-map",
+        "0:v:0",
+        "-an",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+
+    args.push("-vf".to_string());
+    args.push(format!("fps={HLS_LIVE_TARGET_FPS}"));
+    args.extend(
+        [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+            "-profile:v",
+            "baseline",
+            "-level",
+            "3.1",
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            HLS_LIVE_TARGET_FPS,
+            "-keyint_min",
+            HLS_LIVE_TARGET_FPS,
+            "-sc_threshold",
+            "0",
+            "-bf",
+            "0",
+            "-b:v",
+            HLS_LIVE_VIDEO_BITRATE,
+            "-maxrate",
+            HLS_LIVE_VIDEO_MAXRATE,
+            "-bufsize",
+            HLS_LIVE_VIDEO_BUFSIZE,
+            "-f",
+            "hls",
+            "-hls_time",
+            HLS_LIVE_SEGMENT_SECONDS,
+            "-hls_list_size",
+            HLS_LIVE_WINDOW_SEGMENTS,
+            "-hls_flags",
+            "delete_segments+omit_endlist+independent_segments",
+            "-hls_segment_type",
+            "fmp4",
+            "-hls_fmp4_init_filename",
+            "init.mp4",
+            "-hls_segment_filename",
+            "segment_%05d.m4s",
+            "index.m3u8",
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
+    args
 }
 
 fn stop_hls_live_session(session: &mut HlsLiveSession) {
@@ -15641,10 +15697,10 @@ mod tests {
         default_model_download_target_path, default_model_download_target_path_in_root,
         default_model_endpoints, ensure_local_admin_access, ensure_local_camera_access,
         harbor_assistant_build_missing_response, hardware_class_for_probe, has_forwarding_headers,
-        huggingface_download_should_fallback_to_plain_http, huggingface_resolve_url,
-        identity_query_suffix, is_admin_surface_path, is_harbor_assistant_client_route,
-        is_harbor_assistant_surface_path, is_safe_live_asset_name,
-        knowledge_preview_mime_supported, latest_model_download_jobs,
+        hls_live_ffmpeg_args, huggingface_download_should_fallback_to_plain_http,
+        huggingface_resolve_url, identity_query_suffix, is_admin_surface_path,
+        is_harbor_assistant_client_route, is_harbor_assistant_surface_path,
+        is_safe_live_asset_name, knowledge_preview_mime_supported, latest_model_download_jobs,
         live_bridge_provider_from_setup_status, local_model_catalog_item,
         local_model_catalog_specs, mime_type_for_path, model_download_huggingface_endpoint,
         model_download_huggingface_endpoints, model_download_jobs_status,
@@ -16240,6 +16296,26 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn hls_live_ffmpeg_args_use_low_latency_h264_segments() {
+        let args = hls_live_ffmpeg_args("rtsp://camera.local/ch01_sub.264");
+        let has_pair = |left: &str, right: &str| {
+            args.windows(2)
+                .any(|pair| pair[0] == left && pair[1] == right)
+        };
+
+        assert!(has_pair("-c:v", "libx264"));
+        assert!(has_pair("-vf", "fps=12"));
+        assert!(has_pair("-g", "12"));
+        assert!(has_pair("-hls_time", "1"));
+        assert!(has_pair("-hls_list_size", "4"));
+        assert!(has_pair(
+            "-hls_flags",
+            "delete_segments+omit_endlist+independent_segments"
+        ));
+        assert!(!has_pair("-c:v", "copy"));
     }
 
     #[test]
