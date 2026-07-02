@@ -318,6 +318,8 @@ fn can_promote_probe_result(result: &RtspProbeResult, request: &DiscoveryRequest
 
 pub fn default_rtsp_paths() -> Vec<String> {
     vec![
+        "/ch01_sub.264".to_string(),
+        "/ch01.264".to_string(),
         "/stream1".to_string(),
         "/stream2".to_string(),
         "/h264/ch1/main/av_stream".to_string(),
@@ -847,6 +849,8 @@ mod tests {
         assert_eq!(paths[0], "/stream1");
         assert_eq!(paths[1], "/stream2");
         assert!(paths.contains(&"/h264/ch1/main/av_stream".to_string()));
+        assert!(paths.contains(&"/ch01_sub.264".to_string()));
+        assert!(paths.contains(&"/ch01.264".to_string()));
     }
 
     struct EmptyOnvifAdapter;

@@ -1057,6 +1057,8 @@ mod tests {
         assert_eq!(paths[0], "/Streaming/Channels/101");
         assert!(paths.contains(&"/stream1".to_string()));
         assert!(paths.contains(&"/stream2".to_string()));
+        assert!(paths.contains(&"/ch01_sub.264".to_string()));
+        assert!(paths.contains(&"/ch01.264".to_string()));
         assert!(paths.contains(&"/live".to_string()));
         assert_eq!(
             paths

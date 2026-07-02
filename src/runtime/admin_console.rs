@@ -5495,8 +5495,10 @@ mod tests {
     }
 
     #[test]
-    fn default_rtsp_paths_include_tp_link_stream_candidates() {
+    fn default_rtsp_paths_include_common_camera_stream_candidates() {
         let paths = default_rtsp_paths();
+        assert_eq!(paths[0], "/ch01_sub.264");
+        assert_eq!(paths[1], "/ch01.264");
         assert!(paths.contains(&"/stream1".to_string()));
         assert!(paths.contains(&"/stream2".to_string()));
     }
