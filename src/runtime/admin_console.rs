@@ -16,6 +16,10 @@ use crate::connectors::home_assistant::{
     redact_home_assistant_token, token_is_redacted, HOME_ASSISTANT_TOKEN_REDACTION,
 };
 use crate::control_plane::access::{PermissionBinding, PermissionEffect, ScopeKind};
+use crate::control_plane::apps::{
+    sanitize_harbor_app_registry, HarborAppExecutionPlanSnapshot, HarborAppExposure,
+    HarborAppPathRoots, HarborAppRegistryEntry, HarborAppRuntimeStatus,
+};
 use crate::control_plane::audit::{
     append_bounded_audit_record, sanitize_audit_stream, AuditRecord,
 };
@@ -633,6 +637,8 @@ pub struct AdminConsoleState {
     #[serde(default)]
     pub home_assistant: HomeAssistantAdminState,
     #[serde(default)]
+    pub harbor_apps: Vec<HarborAppRegistryEntry>,
+    #[serde(default)]
     pub audit_records: Vec<AuditRecord>,
 }
 
@@ -821,6 +827,7 @@ pub struct AdminConsoleStateStats {
     pub platform_credential_duplicate_count: usize,
     pub knowledge_index_job_count: usize,
     pub model_download_job_count: usize,
+    pub harbor_app_count: usize,
     pub top_level_section_sizes: Value,
     pub section_size_scan_skipped: bool,
     pub metadata_only: bool,
@@ -913,6 +920,7 @@ impl AdminConsoleStore {
             platform_credential_duplicate_count: 0,
             knowledge_index_job_count: 0,
             model_download_job_count: 0,
+            harbor_app_count: 0,
             top_level_section_sizes: json!({
                 "status": "skipped",
                 "reason": "section byte sizing is skipped for large admin state files",
@@ -935,6 +943,7 @@ impl AdminConsoleStore {
                 .count();
             stats.knowledge_index_job_count = state.knowledge_index_jobs.len();
             stats.model_download_job_count = state.model_download_jobs.len();
+            stats.harbor_app_count = state.harbor_apps.len();
             if file_bytes <= 4 * 1024 * 1024 {
                 if let Ok(value) = serde_json::to_value(state) {
                     if let Some(object) = value.as_object() {
@@ -2154,6 +2163,108 @@ impl AdminConsoleStore {
         };
         state.models.route_policies = sanitized;
         self.save_projected_state(state)
+    }
+
+    pub fn harbor_apps(&self) -> Result<Vec<HarborAppRegistryEntry>, String> {
+        Ok(self.load_or_create_state()?.harbor_apps)
+    }
+
+    pub fn harbor_app(&self, app_id: &str) -> Result<Option<HarborAppRegistryEntry>, String> {
+        Ok(self
+            .load_or_create_state()?
+            .harbor_apps
+            .into_iter()
+            .find(|entry| entry.app_id == app_id))
+    }
+
+    pub fn upsert_harbor_app(
+        &self,
+        mut entry: HarborAppRegistryEntry,
+    ) -> Result<HarborAppRegistryEntry, String> {
+        let mut state = self.load_or_create_state()?;
+        if let Some(existing) = state
+            .harbor_apps
+            .iter()
+            .find(|existing| existing.app_id == entry.app_id)
+        {
+            entry.registered_at = existing.registered_at.clone();
+        }
+        if let Some(existing) = state
+            .harbor_apps
+            .iter_mut()
+            .find(|existing| existing.app_id == entry.app_id)
+        {
+            *existing = entry.clone();
+        } else {
+            state.harbor_apps.push(entry.clone());
+        }
+        self.save_projected_state(state)?;
+        Ok(entry)
+    }
+
+    pub fn record_harbor_app_plan(
+        &self,
+        app_id: &str,
+        status: HarborAppRuntimeStatus,
+        requested_action: impl Into<String>,
+        plan: HarborAppExecutionPlanSnapshot,
+        audit_id: Option<String>,
+        updated_at: impl Into<String>,
+    ) -> Result<HarborAppRegistryEntry, String> {
+        let mut state = self.load_or_create_state()?;
+        let updated_at = updated_at.into();
+        let requested_action = requested_action.into();
+        let plan = Some(plan);
+        let mut updated = None;
+        for entry in &mut state.harbor_apps {
+            if entry.app_id == app_id {
+                entry.status = status;
+                entry.last_requested_action = Some(requested_action.clone());
+                entry.last_execution_plan = plan.clone();
+                entry.last_audit_id = audit_id.clone();
+                entry.updated_at = updated_at.clone();
+                updated = Some(entry.clone());
+                break;
+            }
+        }
+        let Some(entry) = updated else {
+            return Err(format!("Harbor app {app_id} is not registered"));
+        };
+        self.save_projected_state(state)?;
+        Ok(entry)
+    }
+
+    pub fn update_harbor_app_exposure(
+        &self,
+        app_id: &str,
+        exposure: HarborAppExposure,
+        status: HarborAppRuntimeStatus,
+        plan: HarborAppExecutionPlanSnapshot,
+        audit_id: Option<String>,
+        updated_at: impl Into<String>,
+    ) -> Result<HarborAppRegistryEntry, String> {
+        let mut state = self.load_or_create_state()?;
+        let updated_at = updated_at.into();
+        let plan = Some(plan);
+        let mut updated = None;
+        for entry in &mut state.harbor_apps {
+            if entry.app_id == app_id {
+                entry.exposure = exposure;
+                entry.manifest.exposure = exposure;
+                entry.status = status;
+                entry.last_requested_action = Some("exposure".to_string());
+                entry.last_execution_plan = plan.clone();
+                entry.last_audit_id = audit_id.clone();
+                entry.updated_at = updated_at.clone();
+                updated = Some(entry.clone());
+                break;
+            }
+        }
+        let Some(entry) = updated else {
+            return Err(format!("Harbor app {app_id} is not registered"));
+        };
+        self.save_projected_state(state)?;
+        Ok(entry)
     }
 
     pub fn append_audit_record(&self, record: AuditRecord) -> Result<AuditRecord, String> {
@@ -3850,6 +3961,8 @@ fn sanitize_legacy_admin_fields(state: &mut AdminConsoleState) {
     state.knowledge = sanitize_knowledge_settings(state.knowledge.clone());
     state.knowledge_index_jobs = sanitize_knowledge_index_jobs(state.knowledge_index_jobs.clone());
     state.home_assistant = sanitize_home_assistant_state(state.home_assistant.clone());
+    state.harbor_apps =
+        sanitize_harbor_app_registry(state.harbor_apps.clone(), &HarborAppPathRoots::default());
     state.audit_records = sanitize_audit_stream(state.audit_records.clone());
 }
 
@@ -5758,8 +5871,15 @@ fn model_download_job_record_is_active(job: &ModelDownloadJobRecord) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use crate::control_plane::apps::{
+        build_harbor_app_registry_entry, HarborAppExecutionPlanSnapshot, HarborAppExposure,
+        HarborAppHealth, HarborAppManifest, HarborAppPathRoots, HarborAppPermission, HarborAppRisk,
+        HarborAppRoute, HarborAppRuntimeStatus, HarborAppVolume, HarborAppVolumeKind,
+        HARBOR_APP_CONTRACT_VERSION,
+    };
     use crate::control_plane::auth::{AuthSource, IdentityBinding};
     use crate::control_plane::credentials::{
         CredentialKind, CredentialRecord, CredentialRotationState,
@@ -5796,6 +5916,54 @@ mod tests {
             .expect("clock")
             .as_nanos();
         std::env::temp_dir().join(format!("harborbeacon-{name}-{unique}.json"))
+    }
+
+    fn test_harbor_app_manifest() -> HarborAppManifest {
+        HarborAppManifest {
+            contract: HARBOR_APP_CONTRACT_VERSION.to_string(),
+            id: "finance-audit".to_string(),
+            name: "Finance Audit".to_string(),
+            version: "0.1.0".to_string(),
+            image: Some("harbor.local/finance-audit:0.1.0".to_string()),
+            build: None,
+            routes: vec![HarborAppRoute {
+                path_prefix: "/apps/finance-audit/".to_string(),
+                service_port: 4190,
+                strip_prefix: false,
+            }],
+            health: HarborAppHealth {
+                path: "/healthz".to_string(),
+                port: 4190,
+                interval_seconds: 30,
+            },
+            permissions: vec![HarborAppPermission {
+                capability: "platform.models.infer".to_string(),
+                actions: vec!["call".to_string()],
+                risk: HarborAppRisk::Medium,
+            }],
+            volumes: vec![HarborAppVolume {
+                name: "data".to_string(),
+                mount_path: "/data".to_string(),
+                kind: HarborAppVolumeKind::Data,
+            }],
+            platform_capabilities: vec!["platform.models.infer".to_string()],
+            exposure: HarborAppExposure::Lan,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    fn test_harbor_app_plan(action: &str) -> HarborAppExecutionPlanSnapshot {
+        HarborAppExecutionPlanSnapshot {
+            app_id: "finance-audit".to_string(),
+            action: action.to_string(),
+            compose_project: "harbor-finance-audit".to_string(),
+            route_prefixes: vec!["/apps/finance-audit/".to_string()],
+            exposure: HarborAppExposure::Lan,
+            audit_action: format!("harbor_app.{action}.plan"),
+            commands: Vec::new(),
+            command_count: 0,
+            requires_approval: false,
+        }
     }
 
     #[test]
@@ -5839,6 +6007,61 @@ mod tests {
             .fallback_order
             .iter()
             .any(|kind| kind.eq_ignore_ascii_case("cloud")));
+    }
+
+    #[test]
+    fn harbor_app_registry_upsert_and_plan_preserve_admin_defaults() {
+        let registry_path = temp_path("registry-harbor-apps");
+        let admin_path = temp_path("admin-harbor-apps");
+        let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
+        let store = AdminConsoleStore::new(admin_path.clone(), registry);
+        let (mut entry, report) = build_harbor_app_registry_entry(
+            test_harbor_app_manifest(),
+            &HarborAppPathRoots::default(),
+            "100",
+            "100",
+        )
+        .expect("entry");
+        entry.last_execution_plan = Some(test_harbor_app_plan("install"));
+
+        let saved = store.upsert_harbor_app(entry).expect("upsert app");
+        assert!(report.ok);
+        assert_eq!(saved.app_id, "finance-audit");
+        assert_eq!(store.harbor_apps().expect("apps").len(), 1);
+
+        let updated = store
+            .record_harbor_app_plan(
+                "finance-audit",
+                HarborAppRuntimeStatus::PlanReady,
+                "start",
+                test_harbor_app_plan("start"),
+                Some("audit-1".to_string()),
+                "101",
+            )
+            .expect("record plan");
+        assert_eq!(updated.last_requested_action.as_deref(), Some("start"));
+        assert_eq!(updated.last_audit_id.as_deref(), Some("audit-1"));
+
+        let exposure = store
+            .update_harbor_app_exposure(
+                "finance-audit",
+                HarborAppExposure::None,
+                HarborAppRuntimeStatus::PlanReady,
+                test_harbor_app_plan("disable_exposure"),
+                Some("audit-2".to_string()),
+                "102",
+            )
+            .expect("exposure");
+        assert_eq!(exposure.exposure, HarborAppExposure::None);
+        assert_eq!(exposure.manifest.exposure, HarborAppExposure::None);
+
+        let state = store.load_state().expect("state");
+        assert_eq!(state.harbor_apps.len(), 1);
+        assert_eq!(state.platform.workspaces.len(), 1);
+        assert_eq!(store.state_stats(Some(&state)).harbor_app_count, 1);
+
+        let _ = std::fs::remove_file(admin_path);
+        let _ = std::fs::remove_file(registry_path);
     }
 
     #[test]
