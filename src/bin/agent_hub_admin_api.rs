@@ -21,6 +21,7 @@ use reqwest::blocking::Client;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tiny_http::{Header, Method, Request, Response, ResponseBox, Server, StatusCode};
 use uuid::Uuid;
 
@@ -35,7 +36,10 @@ use harborbeacon_local_agent::connectors::home_assistant::{
 };
 use harborbeacon_local_agent::connectors::im_gateway::GatewayPlatformStatus;
 use harborbeacon_local_agent::connectors::notifications::{
-    NotificationDeliveryError, NotificationDeliveryRecord, NotificationDeliveryService,
+    NotificationContent, NotificationDelivery, NotificationDeliveryError, NotificationDeliveryMode,
+    NotificationDeliveryRecord, NotificationDeliveryService, NotificationDeliveryStatus,
+    NotificationDestination, NotificationDestinationKind, NotificationMetadata,
+    NotificationPayloadFormat, NotificationRequest, NotificationSource,
 };
 use harborbeacon_local_agent::connectors::storage::StorageTarget;
 use harborbeacon_local_agent::control_plane::apps::{
@@ -807,6 +811,63 @@ struct NotificationTargetDefaultRequest {
 #[derive(Debug, Serialize)]
 struct NotificationTargetsResponse {
     targets: Vec<harborbeacon_local_agent::runtime::admin_console::NotificationTargetRecord>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OutreachDeliveryRecipientRequest {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    handle: String,
+    #[serde(default)]
+    platform: String,
+    #[serde(default)]
+    contact_email: String,
+    #[serde(default)]
+    evidence_type: String,
+    #[serde(default)]
+    evidence_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OutreachDeliveryRequest {
+    product_id: String,
+    project_id: String,
+    #[serde(default)]
+    batch_id: Option<String>,
+    draft_id: String,
+    candidate_id: String,
+    channel: String,
+    subject: String,
+    body_hash: String,
+    body: String,
+    idempotency_key: String,
+    #[serde(default)]
+    recipient: OutreachDeliveryRecipientRequest,
+}
+
+#[derive(Debug, Serialize)]
+struct HarborAppDeliveryHandoffResponse {
+    ok: bool,
+    app_id: String,
+    status: String,
+    delivery_id: String,
+    notification_id: String,
+    trace_id: String,
+    platform: String,
+    #[serde(default)]
+    provider_message_id: Option<String>,
+    retryable: bool,
+    #[serde(default)]
+    error: Option<HarborAppDeliveryErrorDetail>,
+    #[serde(default)]
+    audit_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct HarborAppDeliveryErrorDetail {
+    code: String,
+    message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2280,6 +2341,12 @@ impl AdminApi {
                 .handle_harbor_app_install(&mut request, &identity_hints)
                 .boxed(),
             Method::Post
+                if path.starts_with("/api/apps/") && path.ends_with("/delivery-requests") =>
+            {
+                self.handle_harbor_app_delivery_request(&path, &mut request, &identity_hints)
+                    .boxed()
+            }
+            Method::Post
                 if path.starts_with("/api/apps/")
                     && (path.ends_with("/start")
                         || path.ends_with("/stop")
@@ -3635,6 +3702,155 @@ impl AdminApi {
             audit_id,
             metadata_only: true,
         })
+    }
+
+    fn handle_harbor_app_delivery_request(
+        &self,
+        path: &str,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
+        let Some(app_id) = parse_harbor_app_path(path, "/delivery-requests") else {
+            return error_json(StatusCode(404), "Harbor app delivery route not found");
+        };
+        if app_id != "outreach" {
+            return harbor_app_delivery_error_json(
+                StatusCode(404),
+                "APP_DELIVERY_NOT_SUPPORTED",
+                "Delivery handoff is only enabled for outreach in this release.",
+                None,
+            );
+        }
+        let body: OutreachDeliveryRequest = match read_json_body(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        if let Err(error) = validate_outreach_delivery_request(&body) {
+            return harbor_app_delivery_error_json(
+                StatusCode(400),
+                "VALIDATION_ERROR",
+                &error,
+                None,
+            );
+        }
+        let entry = match self.admin_store.harbor_app(&app_id) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => {
+                return harbor_app_delivery_error_json(
+                    StatusCode(404),
+                    "APP_NOT_REGISTERED",
+                    "Harbor app is not registered.",
+                    None,
+                )
+            }
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let state = match self.admin_store.load_state() {
+            Ok(state) => state,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let Some(target) = default_notification_target_record(&state.notification_targets).cloned()
+        else {
+            let audit_id = match self.append_harbor_app_audit(
+                &principal,
+                &entry.app_id,
+                "harbor_app.outreach.delivery_request.blocked",
+                sanitized_outreach_delivery_request_audit(&body),
+                json!({
+                    "status": "blocked",
+                    "reason": "DELIVERY_TARGET_NOT_CONFIGURED",
+                    "metadata_only": false,
+                }),
+            ) {
+                Ok(audit_id) => audit_id,
+                Err(error) => return error_json(StatusCode(500), &error),
+            };
+            return harbor_app_delivery_error_json(
+                StatusCode(409),
+                "DELIVERY_TARGET_NOT_CONFIGURED",
+                "No default notification target is configured.",
+                audit_id,
+            );
+        };
+        let notification_request =
+            build_outreach_delivery_notification_request(&body, &target.route_key);
+        let service = match NotificationDeliveryService::new() {
+            Ok(service) => service,
+            Err(error) => {
+                let audit_id = match self.append_harbor_app_audit(
+                    &principal,
+                    &entry.app_id,
+                    "harbor_app.outreach.delivery_request.blocked",
+                    sanitized_outreach_delivery_request_audit(&body),
+                    json!({
+                        "status": "blocked",
+                        "reason": "DELIVERY_BACKEND_NOT_CONNECTED",
+                        "message": redact_admin_string(&error),
+                        "metadata_only": false,
+                    }),
+                ) {
+                    Ok(audit_id) => audit_id,
+                    Err(error) => return error_json(StatusCode(500), &error),
+                };
+                return harbor_app_delivery_error_json(
+                    StatusCode(503),
+                    "DELIVERY_BACKEND_NOT_CONNECTED",
+                    "Notification delivery backend is not configured.",
+                    audit_id,
+                );
+            }
+        };
+        match service.deliver(&notification_request) {
+            Ok(record) => {
+                let status = outreach_delivery_status_from_record(&record);
+                let audit_id = match self.append_harbor_app_audit(
+                    &principal,
+                    &entry.app_id,
+                    "harbor_app.outreach.delivery_request.submitted",
+                    sanitized_outreach_delivery_request_audit(&body),
+                    json!({
+                        "status": status,
+                        "notification_id": &record.notification_id,
+                        "delivery_id": &record.delivery_id,
+                        "platform": &record.platform,
+                        "provider_message_id_present": record.provider_message_id.is_some(),
+                        "retryable": record.retryable,
+                        "error_code": record.error.as_ref().map(|error| error.code.clone()),
+                        "metadata_only": false,
+                    }),
+                ) {
+                    Ok(audit_id) => audit_id,
+                    Err(error) => return error_json(StatusCode(500), &error),
+                };
+                ok_json(&harbor_app_delivery_response(
+                    &app_id, status, record, audit_id,
+                ))
+            }
+            Err(error) => {
+                let (status_code, code, message) =
+                    notification_delivery_error_to_harbor_app_error(&error);
+                let audit_id = match self.append_harbor_app_audit(
+                    &principal,
+                    &entry.app_id,
+                    "harbor_app.outreach.delivery_request.rejected",
+                    sanitized_outreach_delivery_request_audit(&body),
+                    json!({
+                        "status": "rejected",
+                        "error_code": &code,
+                        "message": redact_admin_string(&message),
+                        "metadata_only": false,
+                    }),
+                ) {
+                    Ok(audit_id) => audit_id,
+                    Err(error) => return error_json(StatusCode(500), &error),
+                };
+                harbor_app_delivery_error_json(status_code, &code, &message, audit_id)
+            }
+        }
     }
 
     fn append_harbor_app_audit(
@@ -13344,6 +13560,248 @@ fn default_notification_target_record(
         })
 }
 
+fn validate_outreach_delivery_request(request: &OutreachDeliveryRequest) -> Result<(), String> {
+    for (label, value) in [
+        ("product_id", request.product_id.as_str()),
+        ("project_id", request.project_id.as_str()),
+        ("draft_id", request.draft_id.as_str()),
+        ("candidate_id", request.candidate_id.as_str()),
+        ("channel", request.channel.as_str()),
+        ("subject", request.subject.as_str()),
+        ("body_hash", request.body_hash.as_str()),
+        ("body", request.body.as_str()),
+        ("idempotency_key", request.idempotency_key.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(format!("{label} is required"));
+        }
+    }
+    if request.channel.trim() != "feishu_mail" {
+        return Err("unsupported delivery channel".to_string());
+    }
+    Ok(())
+}
+
+fn build_outreach_delivery_notification_request(
+    request: &OutreachDeliveryRequest,
+    route_key: &str,
+) -> NotificationRequest {
+    let notification_id = stable_outreach_notification_id(request);
+    let trace_id = format!("trace_{notification_id}");
+    NotificationRequest {
+        notification_id: notification_id.clone(),
+        trace_id: trace_id.clone(),
+        source: NotificationSource {
+            service: "harborbeacon".to_string(),
+            module: "harbor_app.outreach".to_string(),
+            event_type: "outreach.delivery_request".to_string(),
+        },
+        destination: NotificationDestination {
+            kind: NotificationDestinationKind::Conversation,
+            route_key: route_key.to_string(),
+            id: String::new(),
+            platform: String::new(),
+            recipient: None,
+        },
+        content: NotificationContent {
+            title: request.subject.trim().to_string(),
+            body: outreach_delivery_notification_body(request),
+            payload_format: NotificationPayloadFormat::PlainText,
+            structured_payload: json!({
+                "app_id": "outreach",
+                "product_id": request.product_id,
+                "project_id": request.project_id,
+                "batch_id": request.batch_id,
+                "draft_id": request.draft_id,
+                "candidate_id": request.candidate_id,
+                "channel": request.channel,
+                "body_hash": request.body_hash,
+                "recipient": {
+                    "name": request.recipient.name,
+                    "handle": request.recipient.handle,
+                    "platform": request.recipient.platform,
+                    "contact_email_configured": !request.recipient.contact_email.trim().is_empty(),
+                    "evidence_type": request.recipient.evidence_type,
+                    "evidence_url_hash": short_sha256(&request.recipient.evidence_url),
+                },
+                "secret_scan": "clean",
+            }),
+            attachments: Vec::new(),
+        },
+        delivery: NotificationDelivery {
+            mode: NotificationDeliveryMode::Send,
+            reply_to_message_id: String::new(),
+            update_message_id: String::new(),
+            idempotency_key: request.idempotency_key.trim().to_string(),
+        },
+        metadata: NotificationMetadata {
+            correlation_id: trace_id,
+        },
+    }
+}
+
+fn outreach_delivery_notification_body(request: &OutreachDeliveryRequest) -> String {
+    let mut lines = vec![
+        "Harbor Creator Outreach delivery request".to_string(),
+        format!("Subject: {}", request.subject.trim()),
+        String::new(),
+        request.body.trim().to_string(),
+        String::new(),
+        format!(
+            "Creator: {} {}",
+            request.recipient.name.trim(),
+            request.recipient.handle.trim()
+        )
+        .trim()
+        .to_string(),
+        format!("Platform: {}", request.recipient.platform.trim()),
+        format!("Evidence: {}", request.recipient.evidence_type.trim()),
+        format!("Draft: {}", request.draft_id.trim()),
+        format!("Idempotency: {}", request.idempotency_key.trim()),
+    ];
+    if !request.recipient.contact_email.trim().is_empty() {
+        lines.push("Contact email: configured in outreach envelope".to_string());
+    }
+    lines.join("\n")
+}
+
+fn sanitized_outreach_delivery_request_audit(request: &OutreachDeliveryRequest) -> Value {
+    json!({
+        "app_id": "outreach",
+        "product_id": request.product_id,
+        "project_id": request.project_id,
+        "batch_id": request.batch_id,
+        "draft_id": request.draft_id,
+        "candidate_id": request.candidate_id,
+        "channel": request.channel,
+        "subject_hash": short_sha256(&request.subject),
+        "body_hash": request.body_hash,
+        "idempotency_key": request.idempotency_key,
+        "recipient": {
+            "name": request.recipient.name,
+            "handle": request.recipient.handle,
+            "platform": request.recipient.platform,
+            "contact_email_configured": !request.recipient.contact_email.trim().is_empty(),
+            "evidence_type": request.recipient.evidence_type,
+            "evidence_url_hash": short_sha256(&request.recipient.evidence_url),
+        },
+        "route_key_included": false,
+        "platform_credentials_included": false,
+        "metadata_only": false,
+    })
+}
+
+fn harbor_app_delivery_response(
+    app_id: &str,
+    status: &str,
+    record: NotificationDeliveryRecord,
+    audit_id: Option<String>,
+) -> HarborAppDeliveryHandoffResponse {
+    HarborAppDeliveryHandoffResponse {
+        ok: record.ok,
+        app_id: app_id.to_string(),
+        status: status.to_string(),
+        delivery_id: record.delivery_id,
+        notification_id: record.notification_id,
+        trace_id: record.trace_id,
+        platform: record.platform,
+        provider_message_id: record.provider_message_id,
+        retryable: record.retryable,
+        error: record.error.map(|error| HarborAppDeliveryErrorDetail {
+            code: error.code,
+            message: redact_admin_string(&error.message),
+        }),
+        audit_id,
+    }
+}
+
+fn outreach_delivery_status_from_record(record: &NotificationDeliveryRecord) -> &'static str {
+    if !record.ok {
+        return "failed";
+    }
+    match record.status {
+        NotificationDeliveryStatus::Sent => "sent",
+        NotificationDeliveryStatus::Skipped => "accepted_by_gate",
+        NotificationDeliveryStatus::Failed => "failed",
+    }
+}
+
+fn notification_delivery_error_to_harbor_app_error(
+    error: &NotificationDeliveryError,
+) -> (StatusCode, String, String) {
+    match error {
+        NotificationDeliveryError::MissingConfiguration(message) => (
+            StatusCode(503),
+            "DELIVERY_BACKEND_NOT_CONNECTED".to_string(),
+            redact_admin_string(message),
+        ),
+        NotificationDeliveryError::Transport(message)
+        | NotificationDeliveryError::InvalidResponse(message) => (
+            StatusCode(503),
+            "DELIVERY_BACKEND_NOT_CONNECTED".to_string(),
+            redact_admin_string(message),
+        ),
+        NotificationDeliveryError::RequestRejected {
+            status_code,
+            envelope,
+        } => (
+            StatusCode(*status_code),
+            envelope.error.code.clone(),
+            redact_admin_string(&envelope.error.message),
+        ),
+    }
+}
+
+fn harbor_app_delivery_error_json(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    audit_id: Option<String>,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    json_response(
+        status,
+        &json!({
+            "ok": false,
+            "error": {
+                "code": code,
+                "message": redact_admin_string(message),
+            },
+            "audit_id": audit_id,
+            "metadata_only": false,
+        }),
+    )
+}
+
+fn stable_outreach_notification_id(request: &OutreachDeliveryRequest) -> String {
+    format!(
+        "notif_outreach_{}_{}",
+        delivery_id_segment(&request.draft_id),
+        delivery_id_segment(&request.body_hash)
+    )
+}
+
+fn delivery_id_segment(value: &str) -> String {
+    let segment = value
+        .chars()
+        .filter_map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' => Some(ch.to_ascii_lowercase()),
+            '_' | '-' => Some(ch),
+            _ => None,
+        })
+        .take(40)
+        .collect::<String>();
+    if segment.is_empty() {
+        short_sha256(value)
+    } else {
+        segment
+    }
+}
+
+fn short_sha256(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    format!("{digest:x}").chars().take(16).collect()
+}
+
 fn build_local_vision_event_notification_blocked_response(
     stored: &StoredLocalVisionEvent,
     target: Option<&NotificationTargetRecord>,
@@ -19020,13 +19478,13 @@ mod tests {
         build_home_assistant_operator_audit, build_inference_health_alias_response,
         build_knowledge_index_job, build_knowledge_index_status_response,
         build_local_model_catalog, build_local_vision_event_notification_blocked_response,
-        build_model_capabilities_response, build_rag_readiness_response,
-        build_redacted_diagnostics_bundle, build_release_readiness_response,
-        build_rtsp_url_from_patch, camera_stream_url_with_credentials, current_epoch_secs,
-        default_model_download_target_path, default_model_download_target_path_in_root,
-        default_model_endpoints, embedding_warmup_timeout_stats, ensure_local_admin_access,
-        ensure_local_camera_access, harbor_assistant_build_missing_response,
-        hardware_class_for_probe, has_forwarding_headers,
+        build_model_capabilities_response, build_outreach_delivery_notification_request,
+        build_rag_readiness_response, build_redacted_diagnostics_bundle,
+        build_release_readiness_response, build_rtsp_url_from_patch,
+        camera_stream_url_with_credentials, current_epoch_secs, default_model_download_target_path,
+        default_model_download_target_path_in_root, default_model_endpoints,
+        embedding_warmup_timeout_stats, ensure_local_admin_access, ensure_local_camera_access,
+        harbor_assistant_build_missing_response, hardware_class_for_probe, has_forwarding_headers,
         huggingface_download_should_fallback_to_plain_http, huggingface_resolve_url,
         identity_query_suffix, is_admin_surface_path, is_harbor_assistant_client_route,
         is_harbor_assistant_surface_path, is_safe_live_asset_name,
@@ -19035,6 +19493,7 @@ mod tests {
         local_model_catalog_specs, mime_type_for_path, model_download_huggingface_endpoint,
         model_download_huggingface_endpoints, model_download_jobs_status,
         model_hardware_recommendation, model_snapshot_file_allowed, normalize_unified_admin_path,
+        notification_delivery_error_to_harbor_app_error,
         overlay_model_endpoints_with_runtime_truth, parse_approval_decision_path,
         parse_camera_analyze_path, parse_camera_hls_live_asset_path,
         parse_camera_hls_live_start_path, parse_camera_hls_live_status_path,
@@ -19059,13 +19518,19 @@ mod tests {
         redacted_home_assistant_task_api_event_summary, release_item, request_identity_hints,
         resolve_harbor_assistant_asset_path, resolve_knowledge_preview_path,
         run_knowledge_index_jobs, run_model_download_job, run_model_download_transfer,
-        scan_request_task_args, service_overloaded_response, url_encode_path_segment,
-        validate_home_assistant_service_fields, validate_home_assistant_service_smoke, AdminApi,
-        HomeAssistantServiceSmokeRequest, HomeGuardianEvaluationQueue, KnowledgeSearchApiRequest,
-        LocalModelRuntimeProjection, ManualAddRequest, ModelRuntimeActivationRequest,
-        ModelRuntimeActivationResult, VisionIngestLimiter, DEFAULT_HF_ENDPOINT,
-        HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS, HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS,
-        MAX_VISION_EVENT_INGEST_INFLIGHT, PRIVACY_GATEWAY_AUDIT_ACTION,
+        sanitized_outreach_delivery_request_audit, scan_request_task_args,
+        service_overloaded_response, url_encode_path_segment,
+        validate_home_assistant_service_fields, validate_home_assistant_service_smoke,
+        validate_outreach_delivery_request, AdminApi, HomeAssistantServiceSmokeRequest,
+        HomeGuardianEvaluationQueue, KnowledgeSearchApiRequest, LocalModelRuntimeProjection,
+        ManualAddRequest, ModelRuntimeActivationRequest, ModelRuntimeActivationResult,
+        OutreachDeliveryRecipientRequest, OutreachDeliveryRequest, VisionIngestLimiter,
+        DEFAULT_HF_ENDPOINT, HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS,
+        HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS, MAX_VISION_EVENT_INGEST_INFLIGHT,
+        PRIVACY_GATEWAY_AUDIT_ACTION,
+    };
+    use harborbeacon_local_agent::connectors::notifications::{
+        NotificationDeliveryError, SharedHttpErrorDetail, SharedHttpErrorEnvelope,
     };
     use harborbeacon_local_agent::control_plane::audit::{
         build_metadata_audit_record, AuditActorKind,
@@ -19172,6 +19637,94 @@ mod tests {
         reader.read_to_string(&mut text).expect("read response");
         let value = serde_json::from_str(&text).expect("json response");
         (status, value)
+    }
+
+    fn sample_outreach_delivery_request() -> OutreachDeliveryRequest {
+        OutreachDeliveryRequest {
+            product_id: "prod_paper7".to_string(),
+            project_id: "camp_harbornavi_us".to_string(),
+            batch_id: Some("batch_paper7_seed".to_string()),
+            draft_id: "draft_123".to_string(),
+            candidate_id: "cand_yt_home_ai_01".to_string(),
+            channel: "feishu_mail".to_string(),
+            subject: "Paper7 collaboration idea".to_string(),
+            body_hash: "abcdef1234567890".to_string(),
+            body: "Hi Creator,\nWould you be open to a short demo?".to_string(),
+            idempotency_key: "outreach:draft_123:abcdef1234567890".to_string(),
+            recipient: OutreachDeliveryRecipientRequest {
+                name: "Home AI Field Notes".to_string(),
+                handle: "@example-home-ai".to_string(),
+                platform: "youtube".to_string(),
+                contact_email: "creator@example.com".to_string(),
+                evidence_type: "website_contact_page".to_string(),
+                evidence_url: "https://example.com/contact".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn outreach_delivery_request_builds_gate_notification_without_route_leak() {
+        let request = sample_outreach_delivery_request();
+
+        validate_outreach_delivery_request(&request).expect("valid request");
+        let notification =
+            build_outreach_delivery_notification_request(&request, "gw_route_feishu_default");
+        let payload = serde_json::to_value(&notification).expect("notification json");
+        let encoded = serde_json::to_string(&payload).expect("encoded notification");
+
+        assert_eq!(notification.source.module, "harbor_app.outreach");
+        assert_eq!(notification.source.event_type, "outreach.delivery_request");
+        assert_eq!(
+            notification.destination.route_key,
+            "gw_route_feishu_default"
+        );
+        assert_eq!(
+            notification.delivery.idempotency_key,
+            "outreach:draft_123:abcdef1234567890"
+        );
+        assert_eq!(
+            payload["content"]["structured_payload"]["recipient"]["contact_email_configured"],
+            json!(true)
+        );
+        assert!(encoded.contains("gw_route_feishu_default"));
+        assert!(!encoded.contains("creator@example.com"));
+    }
+
+    #[test]
+    fn outreach_delivery_audit_snapshot_is_sanitized() {
+        let request = sample_outreach_delivery_request();
+        let audit = sanitized_outreach_delivery_request_audit(&request);
+        let encoded = serde_json::to_string(&audit).expect("audit json");
+
+        assert_eq!(audit["route_key_included"], json!(false));
+        assert_eq!(audit["platform_credentials_included"], json!(false));
+        assert_eq!(audit["recipient"]["contact_email_configured"], json!(true));
+        assert_eq!(audit["body_hash"], json!("abcdef1234567890"));
+        assert!(!encoded.contains("Paper7 collaboration idea"));
+        assert!(!encoded.contains("Would you be open"));
+        assert!(!encoded.contains("creator@example.com"));
+        assert!(!encoded.contains("https://example.com/contact"));
+    }
+
+    #[test]
+    fn outreach_delivery_error_mapping_preserves_gate_machine_code() {
+        let error = NotificationDeliveryError::RequestRejected {
+            status_code: 404,
+            envelope: SharedHttpErrorEnvelope {
+                ok: false,
+                error: SharedHttpErrorDetail {
+                    code: "ROUTE_NOT_FOUND".to_string(),
+                    message: "route key not found".to_string(),
+                },
+                trace_id: Some("trace_outreach".to_string()),
+            },
+        };
+
+        let (status, code, message) = notification_delivery_error_to_harbor_app_error(&error);
+
+        assert_eq!(status, StatusCode(404));
+        assert_eq!(code, "ROUTE_NOT_FOUND");
+        assert_eq!(message, "route key not found");
     }
 
     fn sample_home_guardian_review(status: &str) -> AutomationRuleReview {

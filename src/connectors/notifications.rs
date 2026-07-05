@@ -13,6 +13,8 @@ const IM_GATEWAY_BASE_URL_ENV: &str = "HARBORGATE_BASE_URL";
 const IM_GATEWAY_BEARER_TOKEN_ENV: &str = "HARBORGATE_BEARER_TOKEN";
 const LEGACY_IM_GATEWAY_BASE_URL_ENV: &str = "HARBOR_IM_GATEWAY_BASE_URL";
 const LEGACY_IM_GATEWAY_BEARER_TOKEN_ENV: &str = "HARBOR_IM_GATEWAY_BEARER_TOKEN";
+const SHARED_IM_AGENT_SERVICE_TOKEN_ENV: &str = "IM_AGENT_SERVICE_TOKEN";
+const DEFAULT_LOCAL_IM_GATEWAY_BASE_URL: &str = "http://127.0.0.1:8787";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -190,11 +192,12 @@ impl NotificationGatewayConfig {
     pub fn from_env() -> Result<Self, String> {
         let base_url =
             env_var_with_legacy_alias(IM_GATEWAY_BASE_URL_ENV, LEGACY_IM_GATEWAY_BASE_URL_ENV)
-                .ok_or_else(|| format!("missing required env var {IM_GATEWAY_BASE_URL_ENV}"))?;
+                .unwrap_or_else(|| DEFAULT_LOCAL_IM_GATEWAY_BASE_URL.to_string());
         let bearer_token = env_var_with_legacy_alias(
             IM_GATEWAY_BEARER_TOKEN_ENV,
             LEGACY_IM_GATEWAY_BEARER_TOKEN_ENV,
         )
+        .or_else(|| env_var(SHARED_IM_AGENT_SERVICE_TOKEN_ENV))
         .ok_or_else(|| format!("missing required env var {IM_GATEWAY_BEARER_TOKEN_ENV}"))?;
         Self::new(base_url, bearer_token)
     }
@@ -219,21 +222,20 @@ impl NotificationGatewayConfig {
 }
 
 fn env_var_with_legacy_alias(primary: &str, legacy: &str) -> Option<String> {
-    if let Some(value) = env::var(primary)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
+    if let Some(value) = env_var(primary) {
         return Some(value);
     }
 
-    env::var(legacy)
+    env_var(legacy).inspect(|_| {
+        eprintln!("warning: {legacy} is deprecated; prefer {primary}");
+    })
+}
+
+fn env_var(name: &str) -> Option<String> {
+    env::var(name)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .inspect(|_| {
-            eprintln!("warning: {legacy} is deprecated; prefer {primary}");
-        })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -369,8 +371,10 @@ fn new_delivery_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::{Mutex, MutexGuard};
     use std::thread;
 
     use serde_json::{json, Value};
@@ -382,7 +386,52 @@ mod tests {
         NotificationDestinationKind, NotificationErrorDetail, NotificationGatewayConfig,
         NotificationMetadata, NotificationPayloadFormat, NotificationRequest, NotificationSource,
         SharedHttpErrorDetail, SharedHttpErrorEnvelope, CONTRACT_VERSION,
+        DEFAULT_LOCAL_IM_GATEWAY_BASE_URL, IM_GATEWAY_BASE_URL_ENV, IM_GATEWAY_BEARER_TOKEN_ENV,
+        LEGACY_IM_GATEWAY_BASE_URL_ENV, LEGACY_IM_GATEWAY_BEARER_TOKEN_ENV,
+        SHARED_IM_AGENT_SERVICE_TOKEN_ENV,
     };
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        previous: Vec<(&'static str, Option<String>)>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn scoped(values: &[(&'static str, Option<&str>)]) -> Self {
+            let lock = ENV_LOCK.lock().expect("env lock");
+            let previous = values
+                .iter()
+                .map(|(key, _)| (*key, env::var(key).ok()))
+                .collect::<Vec<_>>();
+
+            for (key, value) in values {
+                if let Some(value) = value {
+                    env::set_var(key, value);
+                } else {
+                    env::remove_var(key);
+                }
+            }
+
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, previous) in self.previous.drain(..) {
+                if let Some(value) = previous {
+                    env::set_var(key, value);
+                } else {
+                    env::remove_var(key);
+                }
+            }
+        }
+    }
 
     fn sample_request() -> NotificationRequest {
         NotificationRequest {
@@ -426,6 +475,22 @@ mod tests {
                 correlation_id: "trace_01JABC".to_string(),
             },
         }
+    }
+
+    #[test]
+    fn notification_gateway_config_accepts_shared_gate_defaults() {
+        let _env = EnvGuard::scoped(&[
+            (IM_GATEWAY_BASE_URL_ENV, None),
+            (LEGACY_IM_GATEWAY_BASE_URL_ENV, None),
+            (IM_GATEWAY_BEARER_TOKEN_ENV, None),
+            (LEGACY_IM_GATEWAY_BEARER_TOKEN_ENV, None),
+            (SHARED_IM_AGENT_SERVICE_TOKEN_ENV, Some("shared-gate-token")),
+        ]);
+
+        let config = NotificationGatewayConfig::from_env().expect("config");
+
+        assert_eq!(config.base_url, DEFAULT_LOCAL_IM_GATEWAY_BASE_URL);
+        assert_eq!(config.bearer_token, "shared-gate-token");
     }
 
     #[test]
