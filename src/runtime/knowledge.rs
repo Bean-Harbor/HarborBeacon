@@ -1,28 +1,25 @@
 //! HarborBeacon-local knowledge retrieval over NAS-backed documents and images.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::control_plane::models::{
     ModelEndpointKind, ModelEndpointStatus, ModelKind, PrivacyLevel,
 };
 use crate::runtime::admin_console::{
-    path_is_same_or_inside, AdminModelCenterState, RagResourceProfile,
+    path_is_same_or_inside, AdminModelCenterState, KnowledgeRetrievalSettings, RagResourceProfile,
 };
 use crate::runtime::knowledge_index::{
-    load_embedding_store, save_embedding_store, KnowledgeEmbeddingEntry, KnowledgeEmbeddingStore,
-    KnowledgeIndexChunk, KnowledgeIndexConfig, KnowledgeIndexEntry, KnowledgeIndexService,
-    KnowledgeModality,
+    load_embedding_store, KnowledgeEmbeddingStore, KnowledgeIndexChunk, KnowledgeIndexConfig,
+    KnowledgeIndexEntry, KnowledgeIndexService, KnowledgeModality,
 };
 use crate::runtime::model_center;
 
 const DEFAULT_LIMIT: usize = 5;
-const SEMANTIC_ONLY_MATCH_MIN_SCORE: f32 = 0.55;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct KnowledgeSearchRequest {
     pub query: String,
     pub configured_roots: Vec<String>,
@@ -35,6 +32,7 @@ pub struct KnowledgeSearchRequest {
     pub limit: usize,
     pub privacy_level: PrivacyLevel,
     pub resource_profile: RagResourceProfile,
+    pub retrieval: KnowledgeRetrievalSettings,
     pub require_embeddings: bool,
     pub latency_budget_ms: Option<u64>,
 }
@@ -53,6 +51,7 @@ impl KnowledgeSearchRequest {
             limit: DEFAULT_LIMIT,
             privacy_level: PrivacyLevel::StrictLocal,
             resource_profile: RagResourceProfile::CpuOnly,
+            retrieval: KnowledgeRetrievalSettings::default(),
             require_embeddings: false,
             latency_budget_ms: None,
         }
@@ -71,6 +70,8 @@ pub struct KnowledgeSearchHit {
     pub embedding_score: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hybrid_score: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_score: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -117,6 +118,8 @@ pub struct KnowledgeSearchCitation {
     pub embedding_score: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hybrid_score: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_score: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -230,6 +233,8 @@ struct SearchCandidate {
     hit: KnowledgeSearchHit,
     embedding_text: String,
     semantic_only: bool,
+    rrf_score: f32,
+    final_score: f32,
 }
 
 impl KnowledgeSearchService {
@@ -321,6 +326,7 @@ impl KnowledgeSearchService {
                 blocker,
             ));
         }
+        let retrieval = request.retrieval.clone();
         let query_embedding = model_center::run_embedding_with_state(&query, &model_center_state);
         let query_embedding_vector = (!query_embedding.vector.is_empty()
             && query_embedding.available)
@@ -339,18 +345,18 @@ impl KnowledgeSearchService {
             ));
         }
         let mut warnings = Vec::new();
-        if query_embedding_vector.is_none() {
+        let embedding_model_degraded = query_embedding_vector.is_none();
+        if embedding_model_degraded {
             warnings.push(format!(
                 "Embedding 模型不可用，已降级为本地词法检索：{}",
                 query_embedding.summary
             ));
         }
         let mut seen_hits = HashSet::new();
-
-        let mut documents = Vec::new();
-        let mut images = Vec::new();
-        let mut videos = Vec::new();
+        let mut candidates = Vec::new();
         let mut diagnostics = SearchDiagnostics::default();
+        let mut cached_embedding_total = 0usize;
+        let mut cached_embedding_missing = 0usize;
         for root in &roots {
             let snapshot = match index_service.load_existing(root) {
                 Ok(snapshot) => snapshot,
@@ -366,7 +372,7 @@ impl KnowledgeSearchService {
                 }
             };
             let embedding_store_path = index_service.embedding_store_path_for_root(root);
-            let mut embedding_store = if query_embedding_vector.is_some() {
+            let embedding_store = if query_embedding_vector.is_some() {
                 match load_embedding_store(&embedding_store_path) {
                     Ok(store) => store,
                     Err(error) => {
@@ -379,124 +385,102 @@ impl KnowledgeSearchService {
             } else {
                 KnowledgeEmbeddingStore::default()
             };
-            if embedding_store.schema_version == 0 {
-                embedding_store.schema_version = 1;
+            let mut embedding_vectors = HashMap::new();
+            for entry in embedding_store
+                .entries
+                .iter()
+                .filter(|entry| !entry.vector.is_empty())
+            {
+                embedding_vectors.insert(entry.key.clone(), entry.vector.clone());
+                embedding_vectors.insert(
+                    embedding_key(
+                        &normalize_search_path_text(&entry.path),
+                        entry.chunk_id.as_deref(),
+                    ),
+                    entry.vector.clone(),
+                );
             }
-            embedding_store.root = root.to_string_lossy().into_owned();
-            embedding_store.provider_key = (!query_embedding.provider_key.trim().is_empty())
-                .then_some(query_embedding.provider_key.clone());
-            embedding_store.model_endpoint_id = query_embedding.model_endpoint_id.clone();
-            embedding_store.model_name = query_embedding.model_name.clone();
-            let mut embedding_store_dirty = false;
             for entry in &snapshot.manifest.entries {
                 diagnostics.observe_entry(entry);
                 if !focus_paths.is_empty() && !entry_matches_focus_paths(&entry.path, &focus_paths)
                 {
                     continue;
                 }
-                let modality = entry.modality;
-                match modality {
-                    KnowledgeModality::Document if request.include_documents => {
-                        for mut candidate in
-                            build_hit_candidates_from_index_entry(entry, &query_terms)
-                        {
-                            apply_hybrid_scores(
-                                &mut candidate,
-                                query_embedding_vector.as_deref(),
-                                &model_center_state,
-                                &mut embedding_store,
-                                &mut embedding_store_dirty,
-                            );
-                            if semantic_only_candidate_below_threshold(&candidate) {
-                                continue;
-                            }
-                            let hit = candidate.hit;
-                            let dedupe_key = (
-                                hit.modality.clone(),
-                                hit.path.clone(),
-                                hit.chunk_id.clone().unwrap_or_default(),
-                            );
-                            if seen_hits.insert(dedupe_key) {
-                                documents.push(hit);
-                            }
-                        }
-                    }
-                    KnowledgeModality::Image if request.include_images => {
-                        for mut candidate in
-                            build_hit_candidates_from_index_entry(entry, &query_terms)
-                        {
-                            apply_hybrid_scores(
-                                &mut candidate,
-                                query_embedding_vector.as_deref(),
-                                &model_center_state,
-                                &mut embedding_store,
-                                &mut embedding_store_dirty,
-                            );
-                            if semantic_only_candidate_below_threshold(&candidate) {
-                                continue;
-                            }
-                            let hit = candidate.hit;
-                            let dedupe_key = (
-                                hit.modality.clone(),
-                                hit.path.clone(),
-                                hit.chunk_id.clone().unwrap_or_default(),
-                            );
-                            if seen_hits.insert(dedupe_key) {
-                                images.push(hit);
-                            }
-                        }
-                    }
-                    KnowledgeModality::Video if request.include_videos => {
-                        for mut candidate in
-                            build_hit_candidates_from_index_entry(entry, &query_terms)
-                        {
-                            apply_hybrid_scores(
-                                &mut candidate,
-                                query_embedding_vector.as_deref(),
-                                &model_center_state,
-                                &mut embedding_store,
-                                &mut embedding_store_dirty,
-                            );
-                            if semantic_only_candidate_below_threshold(&candidate) {
-                                continue;
-                            }
-                            let hit = candidate.hit;
-                            let dedupe_key = (
-                                hit.modality.clone(),
-                                hit.path.clone(),
-                                hit.chunk_id.clone().unwrap_or_default(),
-                            );
-                            if seen_hits.insert(dedupe_key) {
-                                videos.push(hit);
-                            }
-                        }
-                    }
-                    _ => {}
+                if !modality_included(entry.modality, &request) {
+                    continue;
                 }
-            }
-            if embedding_store_dirty {
-                if let Err(error) = save_embedding_store(&embedding_store_path, &embedding_store) {
-                    return Ok(KnowledgeSearchResponse::degraded(
-                        query,
-                        root_strings,
-                        request.privacy_level,
-                        request.resource_profile,
-                        "embedding_cache_write_failed",
-                        error,
-                    ));
+                for mut candidate in build_hit_candidates_from_index_entry(entry, &query_terms) {
+                    let embedding_key =
+                        embedding_key(&candidate.hit.path, candidate.hit.chunk_id.as_deref());
+                    let embedding_score =
+                        query_embedding_vector.as_deref().and_then(|query_vector| {
+                            cached_embedding_total += 1;
+                            embedding_vectors.get(&embedding_key).map(|chunk_vector| {
+                                cosine_similarity(query_vector, chunk_vector).clamp(0.0, 1.0)
+                            })
+                        });
+                    if query_embedding_vector.is_some() && embedding_score.is_none() {
+                        cached_embedding_missing += 1;
+                    }
+                    candidate.hit.embedding_score = embedding_score;
+                    if !candidate_has_retrieval_signal(&candidate, &retrieval) {
+                        continue;
+                    }
+                    let dedupe_key = (
+                        candidate.hit.modality.clone(),
+                        candidate.hit.path.clone(),
+                        candidate.hit.chunk_id.clone().unwrap_or_default(),
+                    );
+                    if seen_hits.insert(dedupe_key) {
+                        candidates.push(candidate);
+                    }
                 }
             }
         }
 
-        sort_hits(&mut documents);
-        sort_hits(&mut images);
-        sort_hits(&mut videos);
+        if cached_embedding_total > 0 && cached_embedding_missing > 0 {
+            warnings.push(format!(
+                "Embedding cache 覆盖不足：{} / {} 个候选缺少 cached chunk embedding，已仅用现有缓存参与向量召回。",
+                cached_embedding_missing, cached_embedding_total
+            ));
+        }
 
-        let total_matches = documents.len() + images.len() + videos.len();
+        apply_rrf_scores(&mut candidates, &retrieval);
+        sort_candidates_by_final_score(&mut candidates);
+        let total_matches = candidates.len();
+        candidates.truncate(retrieval.candidate_limit.max(1));
+        if retrieval.rerank_enabled {
+            apply_local_rerank(
+                &mut candidates,
+                &query,
+                &retrieval,
+                &model_center_state,
+                &mut warnings,
+            );
+        }
+        sort_candidates_by_final_score(&mut candidates);
+
         let limit = request.limit.clamp(1, 10);
-        documents.truncate(limit);
-        images.truncate(limit);
-        videos.truncate(limit);
+        let selected_candidates = if retrieval.mmr_enabled {
+            apply_mmr(candidates, limit, retrieval.mmr_lambda)
+        } else {
+            candidates.into_iter().take(limit).collect::<Vec<_>>()
+        };
+        let ordered_hits = selected_candidates
+            .iter()
+            .map(|candidate| candidate.hit.clone())
+            .collect::<Vec<_>>();
+        let mut documents = Vec::new();
+        let mut images = Vec::new();
+        let mut videos = Vec::new();
+        for hit in &ordered_hits {
+            match hit.modality.as_str() {
+                "document" => documents.push(hit.clone()),
+                "image" => images.push(hit.clone()),
+                "video" => videos.push(hit.clone()),
+                _ => {}
+            }
+        }
         let empty_state = build_empty_state(
             &request,
             &roots,
@@ -507,6 +491,7 @@ impl KnowledgeSearchService {
         let reply_pack = build_reply_pack(
             &query,
             total_matches,
+            &ordered_hits,
             &documents,
             &images,
             &videos,
@@ -524,13 +509,13 @@ impl KnowledgeSearchService {
             reply_pack,
             supported_modalities,
             pending_modalities,
-            status: if warnings.is_empty() {
-                "completed".to_string()
-            } else {
+            status: if embedding_model_degraded {
                 "degraded".to_string()
+            } else {
+                "completed".to_string()
             },
-            degraded: !warnings.is_empty(),
-            degraded_reason: (!warnings.is_empty()).then(|| "embedding_unavailable".to_string()),
+            degraded: embedding_model_degraded,
+            degraded_reason: embedding_model_degraded.then(|| "embedding_unavailable".to_string()),
             blockers: Vec::new(),
             warnings,
             source_scope: root_strings,
@@ -923,15 +908,14 @@ fn build_hit_candidates_from_index_entry(
 fn build_reply_pack(
     query: &str,
     total_matches: usize,
+    ordered_hits: &[KnowledgeSearchHit],
     documents: &[KnowledgeSearchHit],
     images: &[KnowledgeSearchHit],
     videos: &[KnowledgeSearchHit],
     empty_state: Option<&KnowledgeEmptyState>,
 ) -> KnowledgeSearchReplyPack {
-    let citations = documents
+    let citations = ordered_hits
         .iter()
-        .chain(images.iter())
-        .chain(videos.iter())
         .map(|hit| KnowledgeSearchCitation {
             title: hit.title.clone(),
             path: hit.path.clone(),
@@ -945,6 +929,7 @@ fn build_reply_pack(
             lexical_score: hit.lexical_score,
             embedding_score: hit.embedding_score,
             hybrid_score: hit.hybrid_score,
+            rerank_score: hit.rerank_score,
             provenance: hit.provenance.clone(),
             source_path: hit.source_path.clone(),
         })
@@ -1072,7 +1057,8 @@ fn build_hit_candidate(
         && content_indexed
         && searchable_text.is_some_and(|text| !text.trim().is_empty());
 
-    if score == 0 && !semantic_only {
+    if score == 0 && !semantic_only && !searchable_text.is_some_and(|text| !text.trim().is_empty())
+    {
         return None;
     }
 
@@ -1081,6 +1067,8 @@ fn build_hit_candidate(
     Some(SearchCandidate {
         embedding_text: searchable_text.unwrap_or_default().to_string(),
         semantic_only,
+        rrf_score: 0.0,
+        final_score: 0.0,
         hit: KnowledgeSearchHit {
             modality: modality.as_str().to_string(),
             path: display_path,
@@ -1089,6 +1077,7 @@ fn build_hit_candidate(
             lexical_score: Some(lexical_score),
             embedding_score: None,
             hybrid_score: Some(lexical_score),
+            rerank_score: None,
             chunk_id: chunk.map(|item| item.chunk_id.clone()),
             line_start: chunk.map(|item| item.line_start),
             line_end: chunk.map(|item| item.line_end),
@@ -1131,102 +1120,8 @@ fn is_content_derived_source(modality: KnowledgeModality, content_source_kinds: 
     }
 }
 
-fn apply_hybrid_scores(
-    candidate: &mut SearchCandidate,
-    query_embedding: Option<&[f32]>,
-    model_center_state: &AdminModelCenterState,
-    embedding_store: &mut KnowledgeEmbeddingStore,
-    embedding_store_dirty: &mut bool,
-) {
-    let lexical_score = candidate.hit.lexical_score.unwrap_or_default();
-    let mut embedding_score = None;
-
-    if let Some(query_vector) = query_embedding {
-        if let Some(chunk_vector) = embedding_vector_for_candidate(
-            candidate,
-            model_center_state,
-            embedding_store,
-            embedding_store_dirty,
-        ) {
-            embedding_score = Some(cosine_similarity(query_vector, &chunk_vector).clamp(0.0, 1.0));
-        }
-    }
-
-    let hybrid_score = match embedding_score {
-        Some(value) => 0.55 * lexical_score + 0.45 * value,
-        None => lexical_score,
-    };
-
-    candidate.hit.embedding_score = embedding_score;
-    candidate.hit.hybrid_score = Some(hybrid_score);
-    candidate.hit.score = (hybrid_score * 1000.0).round() as u32;
-}
-
-fn semantic_only_candidate_below_threshold(candidate: &SearchCandidate) -> bool {
-    candidate.semantic_only
-        && candidate.hit.embedding_score.unwrap_or_default() < SEMANTIC_ONLY_MATCH_MIN_SCORE
-}
-
-fn embedding_vector_for_candidate(
-    candidate: &SearchCandidate,
-    model_center_state: &AdminModelCenterState,
-    embedding_store: &mut KnowledgeEmbeddingStore,
-    embedding_store_dirty: &mut bool,
-) -> Option<Vec<f32>> {
-    let text = candidate.embedding_text.trim();
-    if text.is_empty() {
-        return None;
-    }
-    let key = embedding_key(&candidate.hit.path, candidate.hit.chunk_id.as_deref());
-    let text_hash = text_hash(text);
-    if let Some(entry) = embedding_store
-        .entries
-        .iter()
-        .find(|entry| entry.key == key && entry.text_hash == text_hash && !entry.vector.is_empty())
-    {
-        return Some(entry.vector.clone());
-    }
-
-    let execution = model_center::run_embedding_with_state(text, model_center_state);
-    if !execution.available || execution.vector.is_empty() {
-        return None;
-    }
-
-    let vector = execution.vector.clone();
-    embedding_store.provider_key =
-        (!execution.provider_key.trim().is_empty()).then_some(execution.provider_key.clone());
-    embedding_store.model_endpoint_id = execution.model_endpoint_id.clone();
-    embedding_store.model_name = execution.model_name.clone();
-
-    if let Some(existing) = embedding_store
-        .entries
-        .iter_mut()
-        .find(|entry| entry.key == key)
-    {
-        existing.text_hash = text_hash;
-        existing.vector = vector.clone();
-        existing.path = candidate.hit.path.clone();
-        existing.chunk_id = candidate.hit.chunk_id.clone();
-    } else {
-        embedding_store.entries.push(KnowledgeEmbeddingEntry {
-            key,
-            path: candidate.hit.path.clone(),
-            chunk_id: candidate.hit.chunk_id.clone(),
-            text_hash,
-            vector: vector.clone(),
-        });
-    }
-    *embedding_store_dirty = true;
-    Some(vector)
-}
-
 fn embedding_key(path: &str, chunk_id: Option<&str>) -> String {
     format!("{}::{}", path, chunk_id.unwrap_or("chunk-0001"))
-}
-
-fn text_hash(text: &str) -> String {
-    let digest = Sha256::digest(text.as_bytes());
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
@@ -1249,23 +1144,264 @@ fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
     }
 }
 
-fn sort_hits(hits: &mut [KnowledgeSearchHit]) {
-    hits.sort_by(|left, right| {
-        right
-            .hybrid_score
+fn modality_included(modality: KnowledgeModality, request: &KnowledgeSearchRequest) -> bool {
+    match modality {
+        KnowledgeModality::Document => request.include_documents,
+        KnowledgeModality::Image => request.include_images,
+        KnowledgeModality::Audio => false,
+        KnowledgeModality::Video => request.include_videos,
+    }
+}
+
+fn candidate_has_retrieval_signal(
+    candidate: &SearchCandidate,
+    settings: &KnowledgeRetrievalSettings,
+) -> bool {
+    if candidate.hit.lexical_score.unwrap_or_default() > 0.0 {
+        return true;
+    }
+    let embedding_score = candidate.hit.embedding_score.unwrap_or_default();
+    if candidate.semantic_only {
+        embedding_score >= settings.semantic_only_min_score
+    } else {
+        embedding_score >= settings.vector_min_score
+    }
+}
+
+fn candidate_vector_rank_score(
+    candidate: &SearchCandidate,
+    settings: &KnowledgeRetrievalSettings,
+) -> Option<f32> {
+    let score = candidate.hit.embedding_score?;
+    let threshold = if candidate.semantic_only {
+        settings.semantic_only_min_score
+    } else {
+        settings.vector_min_score
+    };
+    (score >= threshold).then_some(score)
+}
+
+fn apply_rrf_scores(candidates: &mut [SearchCandidate], settings: &KnowledgeRetrievalSettings) {
+    let mut lexical_order = (0..candidates.len())
+        .filter(|index| candidates[*index].hit.lexical_score.unwrap_or_default() > 0.0)
+        .collect::<Vec<_>>();
+    lexical_order.sort_by(|left, right| {
+        candidates[*right]
+            .hit
+            .lexical_score
             .unwrap_or_default()
-            .total_cmp(&left.hybrid_score.unwrap_or_default())
-            .then_with(|| {
-                right
-                    .lexical_score
-                    .unwrap_or_default()
-                    .total_cmp(&left.lexical_score.unwrap_or_default())
-            })
-            .then_with(|| right.score.cmp(&left.score))
-            .then_with(|| left.line_start.cmp(&right.line_start))
-            .then_with(|| left.title.cmp(&right.title))
-            .then_with(|| left.path.cmp(&right.path))
+            .total_cmp(&candidates[*left].hit.lexical_score.unwrap_or_default())
+            .then_with(|| candidate_tie_break(&candidates[*left], &candidates[*right]))
     });
+
+    let mut vector_order = (0..candidates.len())
+        .filter(|index| candidate_vector_rank_score(&candidates[*index], settings).is_some())
+        .collect::<Vec<_>>();
+    vector_order.sort_by(|left, right| {
+        candidate_vector_rank_score(&candidates[*right], settings)
+            .unwrap_or_default()
+            .total_cmp(
+                &candidate_vector_rank_score(&candidates[*left], settings).unwrap_or_default(),
+            )
+            .then_with(|| candidate_tie_break(&candidates[*left], &candidates[*right]))
+    });
+
+    let rrf_k = settings.rrf_k.max(1.0);
+    let mut scores = vec![0.0f32; candidates.len()];
+    for (rank, index) in lexical_order.iter().copied().enumerate() {
+        scores[index] += settings.lexical_weight / (rrf_k + rank as f32 + 1.0);
+    }
+    for (rank, index) in vector_order.iter().copied().enumerate() {
+        scores[index] += settings.vector_weight / (rrf_k + rank as f32 + 1.0);
+    }
+    let active_weight = (if lexical_order.is_empty() {
+        0.0
+    } else {
+        settings.lexical_weight
+    }) + if vector_order.is_empty() {
+        0.0
+    } else {
+        settings.vector_weight
+    };
+    let max_possible = (active_weight / (rrf_k + 1.0)).max(f32::EPSILON);
+    for (index, candidate) in candidates.iter_mut().enumerate() {
+        let normalized = (scores[index] / max_possible).clamp(0.0, 1.0);
+        candidate.rrf_score = normalized;
+        candidate.final_score = normalized;
+        candidate.hit.hybrid_score = Some(normalized);
+        candidate.hit.score = score_to_compat(normalized);
+    }
+}
+
+fn apply_local_rerank(
+    candidates: &mut [SearchCandidate],
+    query: &str,
+    settings: &KnowledgeRetrievalSettings,
+    model_center_state: &AdminModelCenterState,
+    warnings: &mut Vec<String>,
+) {
+    if candidates.is_empty() {
+        return;
+    }
+    let top_k = settings.rerank_top_k.min(candidates.len()).max(1);
+    let documents = candidates
+        .iter()
+        .take(top_k)
+        .map(rerank_passage_for_candidate)
+        .collect::<Vec<_>>();
+    let execution =
+        model_center::run_rerank_with_state(query, &documents, top_k, model_center_state);
+    if !execution.available {
+        warnings.push(format!(
+            "Reranker 不可用，已保留 RRF 排序：{}",
+            execution.summary
+        ));
+        return;
+    }
+
+    for candidate in candidates.iter_mut().take(top_k) {
+        candidate.final_score = (0.25 * candidate.rrf_score).clamp(0.0, 1.0);
+        candidate.hit.score = score_to_compat(candidate.final_score);
+        candidate.hit.rerank_score = None;
+    }
+
+    let mut applied = 0usize;
+    for score in execution.scores {
+        if score.index >= top_k
+            || !score.score.is_finite()
+            || score.score < settings.rerank_min_score
+        {
+            continue;
+        }
+        let rerank_score = score.score.clamp(0.0, 1.0);
+        let candidate = &mut candidates[score.index];
+        candidate.hit.rerank_score = Some(rerank_score);
+        candidate.final_score = (0.75 * rerank_score + 0.25 * candidate.rrf_score).clamp(0.0, 1.0);
+        candidate.hit.score = score_to_compat(candidate.final_score);
+        applied += 1;
+    }
+
+    if applied == 0 {
+        for candidate in candidates.iter_mut().take(top_k) {
+            candidate.final_score = candidate.rrf_score;
+            candidate.hit.score = score_to_compat(candidate.final_score);
+            candidate.hit.rerank_score = None;
+        }
+        warnings.push("Reranker 返回分数低于阈值，已保留 RRF 排序。".to_string());
+    }
+}
+
+fn rerank_passage_for_candidate(candidate: &SearchCandidate) -> String {
+    let mut parts = vec![
+        format!("title: {}", candidate.hit.title),
+        format!("modality: {}", candidate.hit.modality),
+    ];
+    if let Some(preview) = candidate.hit.snippet.as_deref() {
+        if !preview.trim().is_empty() {
+            parts.push(format!("preview: {preview}"));
+        }
+    }
+    if !candidate.embedding_text.trim().is_empty() {
+        parts.push(format!(
+            "text: {}",
+            truncate_chars(&candidate.embedding_text, 1200)
+        ));
+    }
+    parts.join("\n")
+}
+
+fn apply_mmr(
+    mut candidates: Vec<SearchCandidate>,
+    limit: usize,
+    lambda: f32,
+) -> Vec<SearchCandidate> {
+    let lambda = lambda.clamp(0.0, 1.0);
+    let mut selected = Vec::new();
+    while !candidates.is_empty() && selected.len() < limit {
+        let best_index = (0..candidates.len())
+            .max_by(|left, right| {
+                let left_score = mmr_candidate_score(&candidates[*left], &selected, lambda);
+                let right_score = mmr_candidate_score(&candidates[*right], &selected, lambda);
+                left_score
+                    .total_cmp(&right_score)
+                    .then_with(|| candidate_tie_break(&candidates[*right], &candidates[*left]))
+            })
+            .unwrap_or(0);
+        selected.push(candidates.remove(best_index));
+    }
+    selected
+}
+
+fn mmr_candidate_score(
+    candidate: &SearchCandidate,
+    selected: &[SearchCandidate],
+    lambda: f32,
+) -> f32 {
+    let redundancy = selected
+        .iter()
+        .map(|item| candidate_overlap_similarity(candidate, item))
+        .fold(0.0f32, f32::max);
+    lambda * candidate.final_score - (1.0 - lambda) * redundancy
+}
+
+fn candidate_overlap_similarity(left: &SearchCandidate, right: &SearchCandidate) -> f32 {
+    let left_terms = mmr_token_set(left);
+    let right_terms = mmr_token_set(right);
+    if left_terms.is_empty() || right_terms.is_empty() {
+        return 0.0;
+    }
+    let intersection = left_terms.intersection(&right_terms).count() as f32;
+    let union = left_terms.union(&right_terms).count() as f32;
+    if union <= f32::EPSILON {
+        0.0
+    } else {
+        intersection / union
+    }
+}
+
+fn mmr_token_set(candidate: &SearchCandidate) -> HashSet<String> {
+    let text = format!("{} {}", candidate.hit.title, candidate.embedding_text);
+    build_query_terms(&text).into_iter().collect()
+}
+
+fn sort_candidates_by_final_score(candidates: &mut [SearchCandidate]) {
+    candidates.sort_by(|left, right| {
+        right
+            .final_score
+            .total_cmp(&left.final_score)
+            .then_with(|| candidate_tie_break(left, right))
+    });
+}
+
+fn candidate_tie_break(left: &SearchCandidate, right: &SearchCandidate) -> std::cmp::Ordering {
+    right
+        .rrf_score
+        .total_cmp(&left.rrf_score)
+        .then_with(|| {
+            right
+                .hit
+                .lexical_score
+                .unwrap_or_default()
+                .total_cmp(&left.hit.lexical_score.unwrap_or_default())
+        })
+        .then_with(|| left.hit.line_start.cmp(&right.hit.line_start))
+        .then_with(|| left.hit.title.cmp(&right.hit.title))
+        .then_with(|| left.hit.path.cmp(&right.hit.path))
+}
+
+fn score_to_compat(score: f32) -> u32 {
+    (score.clamp(0.0, 1.0) * 1000.0).round() as u32
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    for ch in text.chars().take(max_chars) {
+        output.push(ch);
+    }
+    if text.chars().count() > max_chars {
+        output.push('…');
+    }
+    output
 }
 
 fn build_query_terms(query: &str) -> Vec<String> {
@@ -1436,12 +1572,25 @@ mod tests {
     }
 
     fn build_search_index(root: &Path, index_root: &Path) {
-        KnowledgeIndexService::from_config(
+        let service = KnowledgeIndexService::from_config(
             KnowledgeIndexConfig::new(index_root.to_path_buf()).expect("knowledge index config"),
         )
-        .expect("knowledge index service")
-        .load_or_refresh(root)
-        .expect("build knowledge index");
+        .expect("knowledge index service");
+        let snapshot = service
+            .load_or_refresh(root)
+            .expect("build knowledge index");
+        let model_center_state = crate::runtime::model_center::load_model_center_state();
+        let _ = service.warm_embedding_cache(&snapshot, &model_center_state);
+    }
+
+    fn warm_existing_search_index(root: &Path, index_root: &Path) {
+        let service = KnowledgeIndexService::from_config(
+            KnowledgeIndexConfig::new(index_root.to_path_buf()).expect("knowledge index config"),
+        )
+        .expect("knowledge index service");
+        let snapshot = service.load_existing(root).expect("load knowledge index");
+        let model_center_state = crate::runtime::model_center::load_model_center_state();
+        let _ = service.warm_embedding_cache(&snapshot, &model_center_state);
     }
 
     #[test]
@@ -1590,6 +1739,47 @@ mod tests {
                     fallback_order: vec!["local".to_string(), "cloud".to_string()],
                     status: "active".to_string(),
                     metadata: json!({}),
+                }],
+                ..AdminModelCenterState::default()
+            },
+            ..AdminConsoleState::default()
+        };
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&state).expect("serialize admin state"),
+        )
+        .expect("write admin state");
+    }
+
+    fn write_mock_model_center_state_with_rerank(path: &Path, scores: Value) {
+        let state = AdminConsoleState {
+            models: AdminModelCenterState {
+                endpoints: vec![ModelEndpoint {
+                    model_endpoint_id: "rerank-local".to_string(),
+                    workspace_id: Some("home-1".to_string()),
+                    provider_account_id: None,
+                    model_kind: ModelKind::Reranker,
+                    endpoint_kind: ModelEndpointKind::Local,
+                    provider_key: "rerank_compatible".to_string(),
+                    model_name: "mock-reranker".to_string(),
+                    capability_tags: vec!["rerank".to_string()],
+                    cost_policy: json!({}),
+                    status: ModelEndpointStatus::Active,
+                    metadata: json!({
+                        "mock_rerank_scores": scores,
+                    }),
+                }],
+                route_policies: vec![ModelRoutePolicy {
+                    route_policy_id: "retrieval.rerank".to_string(),
+                    workspace_id: "home-1".to_string(),
+                    domain_scope: "retrieval".to_string(),
+                    modality: "text".to_string(),
+                    privacy_level: PrivacyLevel::StrictLocal,
+                    local_preferred: true,
+                    max_cost_per_run: None,
+                    fallback_order: vec!["local".to_string(), "sidecar".to_string()],
+                    status: "active".to_string(),
+                    metadata: json!({"capability": "rerank"}),
                 }],
                 ..AdminModelCenterState::default()
             },
@@ -1762,8 +1952,8 @@ mod tests {
         assert_eq!(response.images[0].title, "alpha.png");
         assert_eq!(response.reply_pack.citations.len(), 3);
         assert_eq!(response.reply_pack.citations[0].title, "alpha-note.md");
-        assert_eq!(response.reply_pack.citations[1].title, "beta-note.md");
-        assert_eq!(response.reply_pack.citations[2].title, "alpha.png");
+        assert_eq!(response.reply_pack.citations[1].title, "alpha.png");
+        assert_eq!(response.reply_pack.citations[2].title, "beta-note.md");
 
         cleanup_dir(&root);
         cleanup_dir(&index_root);
@@ -1786,7 +1976,6 @@ mod tests {
         .expect("create admin state dir");
         fs::write(root.join("docs").join("a-note.md"), "樱花 会议 纪要").expect("doc a");
         fs::write(root.join("docs").join("b-note.md"), "整理 计划 清单").expect("doc b");
-        build_search_index(&root, &index_root);
 
         write_mock_model_center_state_with_embed(
             &admin_state_path,
@@ -1798,6 +1987,7 @@ mod tests {
         );
 
         std::env::set_var("HARBOR_ADMIN_STATE_PATH", &admin_state_path);
+        build_search_index(&root, &index_root);
         let response = KnowledgeSearchService::search(KnowledgeSearchRequest {
             query: "樱花整理".to_string(),
             configured_roots: vec![root.to_string_lossy().into_owned()],
@@ -1842,6 +2032,92 @@ mod tests {
                 .parent()
                 .expect("admin state path parent directory"),
         );
+    }
+
+    #[test]
+    fn rerank_reorders_reply_pack_citations_after_rrf() {
+        let _guard = INDEX_TEST_LOCK.lock().expect("lock");
+        let root = unique_dir("harborbeacon-knowledge-rerank");
+        let index_root = unique_dir("harborbeacon-knowledge-index-store");
+        let admin_state_path =
+            unique_dir("harborbeacon-admin-model-center-rerank").join("state.json");
+        fs::create_dir_all(root.join("docs")).expect("create docs");
+        fs::create_dir_all(&index_root).expect("create index root");
+        fs::create_dir_all(
+            admin_state_path
+                .parent()
+                .expect("admin state path parent directory"),
+        )
+        .expect("create admin state dir");
+        fs::write(root.join("docs").join("a-note.md"), "春季 整理 alpha").expect("doc a");
+        fs::write(root.join("docs").join("b-note.md"), "春季 整理 beta").expect("doc b");
+        write_mock_model_center_state_with_rerank(&admin_state_path, json!([0.2, 0.95]));
+
+        std::env::set_var("HARBOR_ADMIN_STATE_PATH", &admin_state_path);
+        build_search_index(&root, &index_root);
+        let response = KnowledgeSearchService::search(KnowledgeSearchRequest {
+            query: "春季整理".to_string(),
+            configured_roots: vec![root.to_string_lossy().into_owned()],
+            index_root: Some(index_root.to_string_lossy().into_owned()),
+            roots: vec![root.to_string_lossy().into_owned()],
+            include_documents: true,
+            include_images: false,
+            limit: 5,
+            ..KnowledgeSearchRequest::new("")
+        })
+        .expect("rerank search");
+        std::env::remove_var("HARBOR_ADMIN_STATE_PATH");
+
+        assert_eq!(response.documents[0].title, "b-note.md");
+        assert_eq!(response.reply_pack.citations[0].title, "b-note.md");
+        assert!(
+            response.reply_pack.citations[0]
+                .rerank_score
+                .unwrap_or_default()
+                > 0.9
+        );
+
+        cleanup_dir(&root);
+        cleanup_dir(&index_root);
+        cleanup_dir(
+            admin_state_path
+                .parent()
+                .expect("admin state path parent directory"),
+        );
+    }
+
+    #[test]
+    fn reranker_unavailable_keeps_rrf_results_with_warning() {
+        let _guard = INDEX_TEST_LOCK.lock().expect("lock");
+        let root = unique_dir("harborbeacon-knowledge-rerank-degraded");
+        let index_root = unique_dir("harborbeacon-knowledge-index-store");
+        fs::create_dir_all(root.join("docs")).expect("create docs");
+        fs::create_dir_all(&index_root).expect("create index root");
+        fs::write(root.join("docs").join("a-note.md"), "春季 整理 alpha").expect("doc a");
+        fs::write(root.join("docs").join("b-note.md"), "春季 整理 beta").expect("doc b");
+        build_search_index(&root, &index_root);
+
+        let response = KnowledgeSearchService::search(KnowledgeSearchRequest {
+            query: "春季整理".to_string(),
+            configured_roots: vec![root.to_string_lossy().into_owned()],
+            index_root: Some(index_root.to_string_lossy().into_owned()),
+            roots: vec![root.to_string_lossy().into_owned()],
+            include_documents: true,
+            include_images: false,
+            limit: 5,
+            ..KnowledgeSearchRequest::new("")
+        })
+        .expect("rerank degraded search");
+
+        assert_eq!(response.documents.len(), 2);
+        assert_eq!(response.reply_pack.citations.len(), 2);
+        assert!(response
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Reranker 不可用")));
+
+        cleanup_dir(&root);
+        cleanup_dir(&index_root);
     }
 
     #[test]
@@ -2163,6 +2439,7 @@ mod tests {
         );
 
         std::env::set_var("HARBOR_ADMIN_STATE_PATH", &admin_state_path);
+        warm_existing_search_index(&root, &index_root);
         let response = KnowledgeSearchService::search(KnowledgeSearchRequest {
             query: "春天".to_string(),
             configured_roots: vec![root.to_string_lossy().into_owned()],
@@ -2265,6 +2542,7 @@ mod tests {
         );
 
         std::env::set_var("HARBOR_ADMIN_STATE_PATH", &admin_state_path);
+        warm_existing_search_index(&root, &index_root);
         let response = KnowledgeSearchService::search(KnowledgeSearchRequest {
             query: "春天的照片".to_string(),
             configured_roots: vec![root.to_string_lossy().into_owned()],

@@ -12,6 +12,9 @@ EnvironmentFile=-/etc/default/harboros-beacon
 ExecStart=/usr/bin/harboros-beacon --bind 127.0.0.1:4174 --admin-state /var/lib/harboros-beacon/admin-console.json --device-registry /var/lib/harboros-beacon/device-registry.json --conversations /var/lib/harboros-beacon/task-api-conversations.json --harbor-assistant-dist /usr/share/truenas/webui --public-origin http://127.0.0.1:4174
 Restart=always
 RestartSec=5s
+MemoryAccounting=true
+MemoryHigh=8G
+MemoryMax=12G
 StateDirectory=harboros-beacon
 
 [Install]

@@ -2,7 +2,7 @@
 
 > Superseded note (2026-04-18)  
 > For the current multi-lane collaboration model, use
-> `C:\Users\beanw\OpenSource\HarborBeacon\HarborBeacon-Harbor-Collaboration-Contract-v2.md`
+> `docs/HarborBeacon-Harbor-Collaboration-Contract-v3.md`
 > as the primary coordination contract.  
 > This file remains useful as historical HarborOS-control-specific context.
 

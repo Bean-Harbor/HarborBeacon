@@ -3,7 +3,7 @@
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderType {
@@ -70,6 +70,33 @@ pub struct TextCompletionResponse {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmbeddingResponse {
     pub embedding: Vec<f32>,
+    pub raw_response: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RerankCompatibleConfig {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub rerank_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RerankRequest {
+    pub query: String,
+    pub documents: Vec<String>,
+    pub top_n: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RerankScore {
+    pub index: usize,
+    pub score: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RerankResponse {
+    pub scores: Vec<RerankScore>,
     pub raw_response: serde_json::Value,
 }
 
@@ -171,6 +198,11 @@ pub struct OpenAiCompatibleTextClient {
 pub struct OpenAiCompatibleEmbeddingClient {
     client: Client,
     config: OpenAiCompatibleConfig,
+}
+
+pub struct RerankCompatibleClient {
+    client: Client,
+    config: RerankCompatibleConfig,
 }
 
 impl OpenAiCompatibleVisionClient {
@@ -369,13 +401,68 @@ impl OpenAiCompatibleEmbeddingClient {
     }
 }
 
+impl RerankCompatibleClient {
+    pub fn new(config: RerankCompatibleConfig) -> Result<Self, String> {
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| format!("failed to build rerank-compatible client: {e}"))?;
+        Ok(Self { client, config })
+    }
+
+    pub fn rerank(&self, request: &RerankRequest) -> Result<RerankResponse, String> {
+        if request.query.trim().is_empty() {
+            return Err("rerank query is empty".to_string());
+        }
+        if request.documents.is_empty() {
+            return Err("rerank documents are empty".to_string());
+        }
+        let payload = json!({
+            "model": self.config.model,
+            "query": request.query,
+            "documents": request.documents,
+            "top_n": request.top_n.max(1),
+        });
+
+        let response = self
+            .client
+            .post(rerank_url(&self.config.base_url, &self.config.rerank_path))
+            .headers(openai_compatible_headers(&self.config.api_key)?)
+            .json(&payload)
+            .send()
+            .map_err(|e| format!("rerank-compatible request failed: {e}"))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .unwrap_or_else(|_| "<body unavailable>".to_string());
+            return Err(format!("rerank-compatible API error {status}: {body}"));
+        }
+
+        let raw_response: Value = response
+            .json()
+            .map_err(|e| format!("failed to parse rerank-compatible response: {e}"))?;
+        let scores = extract_rerank_scores(&raw_response);
+        if scores.is_empty() {
+            return Err("rerank-compatible response did not contain scores".to_string());
+        }
+        Ok(RerankResponse {
+            scores,
+            raw_response,
+        })
+    }
+}
+
 fn openai_compatible_headers(api_key: &str) -> Result<HeaderMap, String> {
     let mut headers = HeaderMap::new();
-    headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {api_key}"))
-            .map_err(|e| format!("invalid OpenAI-compatible auth header: {e}"))?,
-    );
+    if !api_key.trim().is_empty() {
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {api_key}"))
+                .map_err(|e| format!("invalid OpenAI-compatible auth header: {e}"))?,
+        );
+    }
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     Ok(headers)
 }
@@ -419,9 +506,45 @@ fn extract_embedding_vector(value: &serde_json::Value) -> Option<Vec<f32>> {
     (!embedding.is_empty()).then_some(embedding)
 }
 
+fn rerank_url(base_url: &str, rerank_path: &str) -> String {
+    let base = base_url.trim().trim_end_matches('/');
+    let path = rerank_path.trim();
+    if path.is_empty() {
+        format!("{base}/rerank")
+    } else if path.starts_with('/') {
+        format!("{base}{path}")
+    } else {
+        format!("{base}/{path}")
+    }
+}
+
+fn extract_rerank_scores(value: &Value) -> Vec<RerankScore> {
+    let Some(results) = value.get("results").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut scores = results
+        .iter()
+        .filter_map(|item| {
+            let index = item.get("index")?.as_u64()? as usize;
+            let score = item
+                .get("relevance_score")
+                .or_else(|| item.get("score"))?
+                .as_f64()? as f32;
+            score.is_finite().then_some(RerankScore { index, score })
+        })
+        .collect::<Vec<_>>();
+    scores.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.index.cmp(&right.index))
+    });
+    scores
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{extract_embedding_vector, extract_message_text};
+    use super::{extract_embedding_vector, extract_message_text, extract_rerank_scores};
     use serde_json::json;
 
     #[test]
@@ -472,5 +595,33 @@ mod tests {
             extract_embedding_vector(&response),
             Some(vec![0.25f32, -0.5f32, 0.75f32])
         );
+    }
+
+    #[test]
+    fn extract_rerank_scores_supports_relevance_score() {
+        let response = json!({
+            "results": [
+                {"index": 1, "relevance_score": 0.82},
+                {"index": 0, "relevance_score": 0.21}
+            ]
+        });
+
+        let scores = extract_rerank_scores(&response);
+        assert_eq!(scores[0].index, 1);
+        assert!((scores[0].score - 0.82).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn extract_rerank_scores_supports_score() {
+        let response = json!({
+            "results": [
+                {"index": 0, "score": 0.4},
+                {"index": 2, "score": 0.7}
+            ]
+        });
+
+        let scores = extract_rerank_scores(&response);
+        assert_eq!(scores[0].index, 2);
+        assert!((scores[0].score - 0.7).abs() < f32::EPSILON);
     }
 }

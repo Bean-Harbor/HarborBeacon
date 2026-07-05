@@ -16,6 +16,9 @@ use crate::connectors::home_assistant::{
     redact_home_assistant_token, token_is_redacted, HOME_ASSISTANT_TOKEN_REDACTION,
 };
 use crate::control_plane::access::{PermissionBinding, PermissionEffect, ScopeKind};
+use crate::control_plane::audit::{
+    append_bounded_audit_record, sanitize_audit_stream, AuditRecord,
+};
 use crate::control_plane::auth::{AuthSource, IdentityBinding};
 use crate::control_plane::credentials::{
     CredentialKind, CredentialRecord, CredentialRotationState, ProviderAccount,
@@ -247,7 +250,94 @@ pub struct KnowledgeSourceRoot {
     pub last_indexed_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KnowledgeRetrievalSettings {
+    #[serde(default = "default_retrieval_fusion_strategy")]
+    pub fusion_strategy: String,
+    #[serde(default = "default_retrieval_rrf_k")]
+    pub rrf_k: f32,
+    #[serde(default = "default_retrieval_lexical_weight")]
+    pub lexical_weight: f32,
+    #[serde(default = "default_retrieval_vector_weight")]
+    pub vector_weight: f32,
+    #[serde(default = "default_retrieval_candidate_limit")]
+    pub candidate_limit: usize,
+    #[serde(default = "default_retrieval_vector_min_score")]
+    pub vector_min_score: f32,
+    #[serde(default = "default_retrieval_semantic_only_min_score")]
+    pub semantic_only_min_score: f32,
+    #[serde(default = "default_true")]
+    pub rerank_enabled: bool,
+    #[serde(default = "default_retrieval_rerank_top_k")]
+    pub rerank_top_k: usize,
+    #[serde(default = "default_retrieval_rerank_min_score")]
+    pub rerank_min_score: f32,
+    #[serde(default = "default_true")]
+    pub mmr_enabled: bool,
+    #[serde(default = "default_retrieval_mmr_lambda")]
+    pub mmr_lambda: f32,
+}
+
+impl Default for KnowledgeRetrievalSettings {
+    fn default() -> Self {
+        Self {
+            fusion_strategy: default_retrieval_fusion_strategy(),
+            rrf_k: default_retrieval_rrf_k(),
+            lexical_weight: default_retrieval_lexical_weight(),
+            vector_weight: default_retrieval_vector_weight(),
+            candidate_limit: default_retrieval_candidate_limit(),
+            vector_min_score: default_retrieval_vector_min_score(),
+            semantic_only_min_score: default_retrieval_semantic_only_min_score(),
+            rerank_enabled: true,
+            rerank_top_k: default_retrieval_rerank_top_k(),
+            rerank_min_score: default_retrieval_rerank_min_score(),
+            mmr_enabled: true,
+            mmr_lambda: default_retrieval_mmr_lambda(),
+        }
+    }
+}
+
+fn default_retrieval_fusion_strategy() -> String {
+    "rrf".to_string()
+}
+
+fn default_retrieval_rrf_k() -> f32 {
+    60.0
+}
+
+fn default_retrieval_lexical_weight() -> f32 {
+    0.35
+}
+
+fn default_retrieval_vector_weight() -> f32 {
+    0.65
+}
+
+fn default_retrieval_candidate_limit() -> usize {
+    80
+}
+
+fn default_retrieval_vector_min_score() -> f32 {
+    0.25
+}
+
+fn default_retrieval_semantic_only_min_score() -> f32 {
+    0.55
+}
+
+fn default_retrieval_rerank_top_k() -> usize {
+    30
+}
+
+fn default_retrieval_rerank_min_score() -> f32 {
+    0.15
+}
+
+fn default_retrieval_mmr_lambda() -> f32 {
+    0.70
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct KnowledgeSettings {
     #[serde(default)]
     pub source_roots: Vec<KnowledgeSourceRoot>,
@@ -257,6 +347,8 @@ pub struct KnowledgeSettings {
     pub privacy_level: PrivacyLevel,
     #[serde(default)]
     pub default_resource_profile: RagResourceProfile,
+    #[serde(default)]
+    pub retrieval: KnowledgeRetrievalSettings,
 }
 
 impl Default for KnowledgeSettings {
@@ -266,6 +358,7 @@ impl Default for KnowledgeSettings {
             index_root: default_knowledge_index_root(),
             privacy_level: PrivacyLevel::StrictLocal,
             default_resource_profile: RagResourceProfile::CpuOnly,
+            retrieval: KnowledgeRetrievalSettings::default(),
         }
     }
 }
@@ -539,6 +632,8 @@ pub struct AdminConsoleState {
     pub knowledge_index_jobs: Vec<KnowledgeIndexJobRecord>,
     #[serde(default)]
     pub home_assistant: HomeAssistantAdminState,
+    #[serde(default)]
+    pub audit_records: Vec<AuditRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -714,6 +809,23 @@ pub struct AdminConsoleStore {
     registry_store: DeviceRegistryStore,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdminConsoleStateStats {
+    pub exists: bool,
+    pub file_bytes: u64,
+    pub automation_review_count: usize,
+    pub audit_record_count: usize,
+    pub notification_target_count: usize,
+    pub device_credential_count: usize,
+    pub platform_credential_count: usize,
+    pub platform_credential_duplicate_count: usize,
+    pub knowledge_index_job_count: usize,
+    pub model_download_job_count: usize,
+    pub top_level_section_sizes: Value,
+    pub section_size_scan_skipped: bool,
+    pub metadata_only: bool,
+}
+
 const DEFAULT_WORKSPACE_ID: &str = "home-1";
 const DEFAULT_WORKSPACE_OWNER_ID: &str = "local-owner";
 const LOCAL_RTSP_PROVIDER_ACCOUNT_ID: &str = "provider-local-rtsp";
@@ -723,6 +835,7 @@ const DEFAULT_RECORDING_POLICY_ID: &str = "recording-policy-default";
 const DEFAULT_MODEL_WORKSPACE_ID: &str = "home-1";
 const DEFAULT_POLICY_RETRIEVAL_OCR: &str = "retrieval.ocr";
 const DEFAULT_POLICY_RETRIEVAL_EMBED: &str = "retrieval.embed";
+const DEFAULT_POLICY_RETRIEVAL_RERANK: &str = "retrieval.rerank";
 const DEFAULT_POLICY_RETRIEVAL_ANSWER: &str = "retrieval.answer";
 const DEFAULT_POLICY_RETRIEVAL_VISION_SUMMARY: &str = "retrieval.vision_summary";
 const DEFAULT_POLICY_SEMANTIC_ROUTER: &str = "semantic.router";
@@ -785,6 +898,62 @@ impl AdminConsoleStore {
         Ok(state)
     }
 
+    pub fn state_stats(&self, state: Option<&AdminConsoleState>) -> AdminConsoleStateStats {
+        let file_bytes = fs::metadata(&self.path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let mut stats = AdminConsoleStateStats {
+            exists: self.path.exists(),
+            file_bytes,
+            automation_review_count: 0,
+            audit_record_count: 0,
+            notification_target_count: 0,
+            device_credential_count: 0,
+            platform_credential_count: 0,
+            platform_credential_duplicate_count: 0,
+            knowledge_index_job_count: 0,
+            model_download_job_count: 0,
+            top_level_section_sizes: json!({
+                "status": "skipped",
+                "reason": "section byte sizing is skipped for large admin state files",
+            }),
+            section_size_scan_skipped: true,
+            metadata_only: true,
+        };
+        if let Some(state) = state {
+            stats.automation_review_count = state.automation_reviews.len();
+            stats.audit_record_count = state.audit_records.len();
+            stats.notification_target_count = state.notification_targets.len();
+            stats.device_credential_count = state.device_credentials.len();
+            stats.platform_credential_count = state.platform.credentials.len();
+            let mut credential_ids = HashSet::new();
+            stats.platform_credential_duplicate_count = state
+                .platform
+                .credentials
+                .iter()
+                .filter(|credential| !credential_ids.insert(credential.credential_id.clone()))
+                .count();
+            stats.knowledge_index_job_count = state.knowledge_index_jobs.len();
+            stats.model_download_job_count = state.model_download_jobs.len();
+            if file_bytes <= 4 * 1024 * 1024 {
+                if let Ok(value) = serde_json::to_value(state) {
+                    if let Some(object) = value.as_object() {
+                        let mut sizes = serde_json::Map::new();
+                        for (key, value) in object {
+                            let bytes = serde_json::to_vec(value)
+                                .map(|bytes| bytes.len())
+                                .unwrap_or(0);
+                            sizes.insert(key.clone(), json!(bytes));
+                        }
+                        stats.top_level_section_sizes = Value::Object(sizes);
+                        stats.section_size_scan_skipped = false;
+                    }
+                }
+            }
+        }
+        stats
+    }
+
     fn save_state(&self, state: &AdminConsoleState) -> Result<(), String> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|e| {
@@ -842,12 +1011,12 @@ impl AdminConsoleStore {
 
     pub fn home_assistant_state(&self) -> Result<HomeAssistantAdminState, String> {
         Ok(redact_home_assistant_state(
-            self.load_or_create_state()?.home_assistant,
+            self.load_state()?.home_assistant,
         ))
     }
 
     pub fn home_assistant_secret_state(&self) -> Result<HomeAssistantAdminState, String> {
-        Ok(self.load_or_create_state()?.home_assistant)
+        Ok(self.load_state()?.home_assistant)
     }
 
     pub fn save_home_assistant_config(
@@ -1987,6 +2156,22 @@ impl AdminConsoleStore {
         self.save_projected_state(state)
     }
 
+    pub fn append_audit_record(&self, record: AuditRecord) -> Result<AuditRecord, String> {
+        let mut state = self.load_or_create_state()?;
+        append_bounded_audit_record(&mut state.audit_records, record);
+        let record = state
+            .audit_records
+            .last()
+            .cloned()
+            .ok_or_else(|| "audit record stream append failed".to_string())?;
+        self.save_projected_state(state)?;
+        Ok(record)
+    }
+
+    pub fn audit_records(&self) -> Result<Vec<AuditRecord>, String> {
+        Ok(self.load_or_create_state()?.audit_records)
+    }
+
     pub fn registry_store(&self) -> &DeviceRegistryStore {
         &self.registry_store
     }
@@ -2112,6 +2297,45 @@ pub fn sanitize_knowledge_settings(settings: KnowledgeSettings) -> KnowledgeSett
             .unwrap_or_else(default_knowledge_index_root),
         privacy_level: settings.privacy_level,
         default_resource_profile: settings.default_resource_profile,
+        retrieval: sanitize_knowledge_retrieval_settings(settings.retrieval),
+    }
+}
+
+fn sanitize_knowledge_retrieval_settings(
+    mut settings: KnowledgeRetrievalSettings,
+) -> KnowledgeRetrievalSettings {
+    if !settings.fusion_strategy.eq_ignore_ascii_case("rrf") {
+        settings.fusion_strategy = default_retrieval_fusion_strategy();
+    } else {
+        settings.fusion_strategy = "rrf".to_string();
+    }
+    settings.rrf_k = sanitize_unit_or_positive_f32(settings.rrf_k, 1.0, 1000.0, 60.0);
+    settings.lexical_weight =
+        sanitize_unit_or_positive_f32(settings.lexical_weight, 0.0, 1.0, 0.35);
+    settings.vector_weight = sanitize_unit_or_positive_f32(settings.vector_weight, 0.0, 1.0, 0.65);
+    if settings.lexical_weight <= f32::EPSILON && settings.vector_weight <= f32::EPSILON {
+        settings.lexical_weight = 0.35;
+        settings.vector_weight = 0.65;
+    }
+    settings.candidate_limit = settings.candidate_limit.clamp(1, 500);
+    settings.vector_min_score =
+        sanitize_unit_or_positive_f32(settings.vector_min_score, 0.0, 1.0, 0.25);
+    settings.semantic_only_min_score =
+        sanitize_unit_or_positive_f32(settings.semantic_only_min_score, 0.0, 1.0, 0.55);
+    settings.rerank_top_k = settings
+        .rerank_top_k
+        .clamp(1, settings.candidate_limit.max(1));
+    settings.rerank_min_score =
+        sanitize_unit_or_positive_f32(settings.rerank_min_score, 0.0, 1.0, 0.15);
+    settings.mmr_lambda = sanitize_unit_or_positive_f32(settings.mmr_lambda, 0.0, 1.0, 0.70);
+    settings
+}
+
+fn sanitize_unit_or_positive_f32(value: f32, min: f32, max: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        fallback
     }
 }
 
@@ -2753,6 +2977,29 @@ pub fn sanitize_model_center_state(state: AdminModelCenterState) -> AdminModelCe
             }
         }
     }
+    for policy in &mut route_policies {
+        if policy.route_policy_id == DEFAULT_POLICY_SEMANTIC_ROUTER {
+            policy.privacy_level = PrivacyLevel::StrictLocal;
+            policy
+                .fallback_order
+                .retain(|kind| !kind.eq_ignore_ascii_case("cloud"));
+            if policy.fallback_order.is_empty() {
+                policy.fallback_order = vec!["local".to_string(), "sidecar".to_string()];
+            }
+            if let Some(metadata) = policy.metadata.as_object_mut() {
+                metadata.remove("cloud_fallback_scope");
+                metadata.remove("redaction_required");
+                metadata.insert("local_only".to_string(), json!(true));
+                metadata.insert("cloud_fallback_allowed".to_string(), json!(false));
+            } else {
+                policy.metadata = json!({
+                    "capability": "router",
+                    "local_only": true,
+                    "cloud_fallback_allowed": false,
+                });
+            }
+        }
+    }
     route_policies.sort_by(|left, right| left.route_policy_id.cmp(&right.route_policy_id));
 
     let model_store_root =
@@ -2927,6 +3174,14 @@ fn normalize_builtin_local_model_api_endpoint(endpoint: &mut ModelEndpoint) {
     {
         return;
     }
+    if endpoint.model_endpoint_id == "llm-local-openai-compatible" {
+        ensure_model_endpoint_tag(endpoint, "assistant_input_parser");
+        ensure_model_endpoint_tag(endpoint, "k3_nsp");
+        ensure_model_endpoint_tag(endpoint, "semantic_router");
+        set_model_endpoint_metadata_bool(endpoint, "semantic_router", true);
+        set_model_endpoint_metadata_bool(endpoint, "local_only", true);
+        set_model_endpoint_metadata_bool(endpoint, "cloud_fallback_allowed", false);
+    }
 
     let base_url = model_endpoint_metadata_string(endpoint, "base_url");
     let healthz_url = model_endpoint_metadata_string(endpoint, "healthz_url");
@@ -2976,6 +3231,14 @@ fn normalize_builtin_local_model_api_endpoint(endpoint: &mut ModelEndpoint) {
             "legacy_model_api_migrated_from_healthz_url",
             value.to_string(),
         );
+    }
+}
+
+fn ensure_model_endpoint_tag(endpoint: &mut ModelEndpoint, tag: &str) {
+    if !endpoint.capability_tags.iter().any(|value| value == tag) {
+        endpoint.capability_tags.push(tag.to_string());
+        endpoint.capability_tags.sort();
+        endpoint.capability_tags.dedup();
     }
 }
 
@@ -3239,6 +3502,27 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
             }),
         },
         ModelEndpoint {
+            model_endpoint_id: "rerank-local-compatible".to_string(),
+            workspace_id: Some(DEFAULT_MODEL_WORKSPACE_ID.to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Reranker,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "rerank_compatible".to_string(),
+            model_name: "local-reranker".to_string(),
+            capability_tags: vec!["local_first".to_string(), "rerank".to_string()],
+            cost_policy: json!({"cost_hint": "local_or_sidecar"}),
+            status: ModelEndpointStatus::Disabled,
+            metadata: json!({
+                "builtin": true,
+                "base_url": local_base_url.clone(),
+                "healthz_url": local_healthz_url.clone(),
+                "api_key": local_api_key.clone(),
+                "api_key_configured": true,
+                "rerank_path": "/rerank",
+                "cloud_fallback_allowed": false,
+            }),
+        },
+        ModelEndpoint {
             model_endpoint_id: "llm-local-openai-compatible".to_string(),
             workspace_id: Some(DEFAULT_MODEL_WORKSPACE_ID.to_string()),
             provider_account_id: None,
@@ -3246,7 +3530,13 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
             endpoint_kind: ModelEndpointKind::Local,
             provider_key: "openai_compatible".to_string(),
             model_name: "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
-            capability_tags: vec!["chat".to_string(), "local_first".to_string()],
+            capability_tags: vec![
+                "assistant_input_parser".to_string(),
+                "chat".to_string(),
+                "k3_nsp".to_string(),
+                "local_first".to_string(),
+                "semantic_router".to_string(),
+            ],
             cost_policy: json!({"cost_hint": "local_or_sidecar"}),
             status: ModelEndpointStatus::Degraded,
             metadata: json!({
@@ -3255,6 +3545,9 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
                 "healthz_url": local_healthz_url.clone(),
                 "api_key": local_api_key.clone(),
                 "api_key_configured": true,
+                "semantic_router": true,
+                "local_only": true,
+                "cloud_fallback_allowed": false,
             }),
         },
         ModelEndpoint {
@@ -3284,7 +3577,6 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
                 "api_key_configured": false,
                 "model": DEFAULT_SILICONFLOW_MODEL,
                 "fallback_scope": [
-                    DEFAULT_POLICY_SEMANTIC_ROUTER,
                     DEFAULT_POLICY_RETRIEVAL_ANSWER,
                 ],
                 "secret_redaction": "endpoint_metadata",
@@ -3376,23 +3668,35 @@ pub fn default_model_route_policies() -> Vec<ModelRoutePolicy> {
             metadata: json!({"capability": "embed"}),
         },
         ModelRoutePolicy {
+            route_policy_id: DEFAULT_POLICY_RETRIEVAL_RERANK.to_string(),
+            workspace_id: DEFAULT_MODEL_WORKSPACE_ID.to_string(),
+            domain_scope: "retrieval".to_string(),
+            modality: "text".to_string(),
+            privacy_level: PrivacyLevel::StrictLocal,
+            local_preferred: true,
+            max_cost_per_run: None,
+            fallback_order: vec!["local".to_string(), "sidecar".to_string()],
+            status: "active".to_string(),
+            metadata: json!({
+                "capability": "rerank",
+                "local_only": true,
+                "cloud_fallback_allowed": false,
+            }),
+        },
+        ModelRoutePolicy {
             route_policy_id: DEFAULT_POLICY_SEMANTIC_ROUTER.to_string(),
             workspace_id: DEFAULT_MODEL_WORKSPACE_ID.to_string(),
             domain_scope: "semantic".to_string(),
             modality: "text".to_string(),
-            privacy_level: PrivacyLevel::AllowRedactedCloud,
+            privacy_level: PrivacyLevel::StrictLocal,
             local_preferred: true,
             max_cost_per_run: None,
-            fallback_order: vec![
-                "local".to_string(),
-                "sidecar".to_string(),
-                "cloud".to_string(),
-            ],
+            fallback_order: vec!["local".to_string(), "sidecar".to_string()],
             status: "active".to_string(),
             metadata: json!({
                 "capability": "router",
-                "cloud_fallback_scope": "semantic_router_only",
-                "redaction_required": true,
+                "local_only": true,
+                "cloud_fallback_allowed": false,
             }),
         },
         ModelRoutePolicy {
@@ -3546,6 +3850,7 @@ fn sanitize_legacy_admin_fields(state: &mut AdminConsoleState) {
     state.knowledge = sanitize_knowledge_settings(state.knowledge.clone());
     state.knowledge_index_jobs = sanitize_knowledge_index_jobs(state.knowledge_index_jobs.clone());
     state.home_assistant = sanitize_home_assistant_state(state.home_assistant.clone());
+    state.audit_records = sanitize_audit_stream(state.audit_records.clone());
 }
 
 pub fn default_home_assistant_exposed_domains() -> Vec<String> {
@@ -4045,7 +4350,11 @@ fn sync_platform_from_legacy(state: &AdminConsoleState) -> AdminPlatformState {
     platform
         .credentials
         .retain(|credential| credential.credential_id != LOCAL_RTSP_CREDENTIAL_ID);
-    platform.credentials.extend(build_credentials(state));
+    dedupe_credentials_by_id(&mut platform.credentials);
+    for credential in build_credentials(state) {
+        upsert_credential(&mut platform.credentials, credential);
+    }
+    dedupe_credentials_by_id(&mut platform.credentials);
 
     platform
         .recording_policies
@@ -4356,6 +4665,22 @@ fn upsert_provider_account(providers: &mut Vec<ProviderAccount>, provider: Provi
     } else {
         providers.push(provider);
     }
+}
+
+fn upsert_credential(credentials: &mut Vec<CredentialRecord>, credential: CredentialRecord) {
+    if let Some(existing) = credentials
+        .iter_mut()
+        .find(|existing| existing.credential_id == credential.credential_id)
+    {
+        *existing = credential;
+    } else {
+        credentials.push(credential);
+    }
+}
+
+fn dedupe_credentials_by_id(credentials: &mut Vec<CredentialRecord>) {
+    let mut seen = HashSet::new();
+    credentials.retain(|credential| seen.insert(credential.credential_id.clone()));
 }
 
 fn preferred_workspace_mut(platform: &mut AdminPlatformState) -> Option<&mut Workspace> {
@@ -5436,9 +5761,12 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::control_plane::auth::{AuthSource, IdentityBinding};
+    use crate::control_plane::credentials::{
+        CredentialKind, CredentialRecord, CredentialRotationState,
+    };
     use crate::control_plane::media::RecordingTriggerMode;
     use crate::control_plane::models::{
-        ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind,
+        ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, PrivacyLevel,
     };
     use crate::control_plane::users::{
         Membership, MembershipStatus, RoleKind, UserAccount, UserStatus,
@@ -5452,9 +5780,10 @@ mod tests {
         default_model_store_root, default_rtsp_paths, derive_rtsp_hints, device_rtsp_credential_id,
         normalize_binding_code, normalize_loaded_admin_state, parse_rtsp_auth, parse_rtsp_path,
         resolved_identity_binding_records, resolved_remote_view_config,
-        sanitize_bridge_provider_config, sanitize_defaults, sanitize_model_center_state,
-        user_default_delivery_surface, user_recent_interactive_surface, AdminConsoleStore,
-        AdminDefaults, AdminModelCenterState, AutomationRuleReview, BridgeProviderCapabilities,
+        sanitize_bridge_provider_config, sanitize_defaults, sanitize_knowledge_settings,
+        sanitize_model_center_state, sync_platform_from_legacy, user_default_delivery_surface,
+        user_recent_interactive_surface, AdminConsoleState, AdminConsoleStore, AdminDefaults,
+        AdminModelCenterState, AutomationRuleReview, BridgeProviderCapabilities,
         BridgeProviderConfig, DeviceCredentialSecret, DeviceEvidenceRecord, DvrRecordingSettings,
         HomeAssistantConfigUpdate, IdentityBindingRecord, KnowledgeSettings, KnowledgeSourceRoot,
         RemoteViewConfig, BRIDGE_PROVIDER_ACCOUNT_ID, LOCAL_RTSP_CREDENTIAL_ID,
@@ -5467,6 +5796,49 @@ mod tests {
             .expect("clock")
             .as_nanos();
         std::env::temp_dir().join(format!("harborbeacon-{name}-{unique}.json"))
+    }
+
+    #[test]
+    fn old_knowledge_settings_json_defaults_retrieval_config() {
+        let settings = serde_json::from_value::<KnowledgeSettings>(json!({
+            "source_roots": [],
+            "index_root": ".harborbeacon/knowledge-index",
+            "privacy_level": "strict_local",
+            "default_resource_profile": "cpu_only"
+        }))
+        .expect("old knowledge settings json");
+        let settings = sanitize_knowledge_settings(settings);
+
+        assert_eq!(settings.retrieval.fusion_strategy, "rrf");
+        assert_eq!(settings.retrieval.candidate_limit, 80);
+        assert!(settings.retrieval.rerank_enabled);
+        assert!(settings.retrieval.mmr_enabled);
+    }
+
+    #[test]
+    fn default_rerank_policy_is_strict_local_without_cloud_fallback() {
+        let endpoint = default_model_endpoints()
+            .into_iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "rerank-local-compatible")
+            .expect("default rerank endpoint");
+        assert_eq!(endpoint.model_kind, ModelKind::Reranker);
+        assert_eq!(endpoint.endpoint_kind, ModelEndpointKind::Local);
+        assert_eq!(endpoint.provider_key, "rerank_compatible");
+        assert_eq!(endpoint.status, ModelEndpointStatus::Disabled);
+
+        let policy = default_model_route_policies()
+            .into_iter()
+            .find(|policy| policy.route_policy_id == "retrieval.rerank")
+            .expect("default rerank policy");
+        assert_eq!(policy.privacy_level, PrivacyLevel::StrictLocal);
+        assert_eq!(
+            policy.fallback_order,
+            vec!["local".to_string(), "sidecar".to_string()]
+        );
+        assert!(!policy
+            .fallback_order
+            .iter()
+            .any(|kind| kind.eq_ignore_ascii_case("cloud")));
     }
 
     #[test]
@@ -5866,6 +6238,49 @@ mod tests {
     }
 
     #[test]
+    fn platform_sync_dedupes_projected_credentials() {
+        let mut state = AdminConsoleState::default();
+        state.defaults.rtsp_password = "secret-rtsp".to_string();
+        state.platform.credentials = vec![
+            CredentialRecord {
+                credential_id: LOCAL_RTSP_CREDENTIAL_ID.to_string(),
+                provider_account_id: LOCAL_RTSP_PROVIDER_ACCOUNT_ID.to_string(),
+                credential_kind: CredentialKind::SessionSecret,
+                vault_key: "stale".to_string(),
+                scope: json!({}),
+                expires_at: None,
+                rotation_state: CredentialRotationState::Valid,
+                last_verified_at: None,
+                metadata: json!({"stale": true}),
+            },
+            CredentialRecord {
+                credential_id: LOCAL_RTSP_CREDENTIAL_ID.to_string(),
+                provider_account_id: LOCAL_RTSP_PROVIDER_ACCOUNT_ID.to_string(),
+                credential_kind: CredentialKind::SessionSecret,
+                vault_key: "stale-duplicate".to_string(),
+                scope: json!({}),
+                expires_at: None,
+                rotation_state: CredentialRotationState::Valid,
+                last_verified_at: None,
+                metadata: json!({"stale": true}),
+            },
+        ];
+
+        let platform = sync_platform_from_legacy(&state);
+        let matching = platform
+            .credentials
+            .iter()
+            .filter(|credential| credential.credential_id == LOCAL_RTSP_CREDENTIAL_ID)
+            .collect::<Vec<_>>();
+
+        assert_eq!(matching.len(), 1);
+        assert_eq!(
+            matching[0].vault_key,
+            "admin_console.defaults.rtsp_password"
+        );
+    }
+
+    #[test]
     fn save_knowledge_settings_rejects_index_root_inside_source_root() {
         let registry_path = temp_path("registry-knowledge-invalid");
         let admin_path = temp_path("admin-knowledge-invalid");
@@ -6262,6 +6677,25 @@ mod tests {
     }
 
     #[test]
+    fn load_state_reads_without_rewriting_admin_file() {
+        let registry_path = temp_path("registry-readonly-load");
+        let admin_path = temp_path("admin-readonly-load");
+        let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
+        let store = AdminConsoleStore::new(admin_path.clone(), registry);
+
+        store.load_or_create_state().expect("bootstrap state");
+        let before = std::fs::read_to_string(&admin_path).expect("read before");
+
+        store.load_state().expect("read-only load");
+
+        let after = std::fs::read_to_string(&admin_path).expect("read after");
+        assert_eq!(after, before);
+
+        let _ = std::fs::remove_file(admin_path);
+        let _ = std::fs::remove_file(registry_path);
+    }
+
+    #[test]
     fn record_member_interactive_surface_persists_recent_surface() {
         let registry_path = temp_path("registry-recent-surface");
         let admin_path = temp_path("admin-recent-surface");
@@ -6392,9 +6826,9 @@ mod tests {
             .expect("semantic router policy");
         assert_eq!(
             router_policy.privacy_level,
-            crate::control_plane::models::PrivacyLevel::AllowRedactedCloud
+            crate::control_plane::models::PrivacyLevel::StrictLocal
         );
-        assert!(router_policy
+        assert!(!router_policy
             .fallback_order
             .iter()
             .any(|kind| kind == "cloud"));
@@ -6500,6 +6934,48 @@ mod tests {
             json!("http://127.0.0.1:4174/api/inference/healthz")
         );
         assert_eq!(endpoint.metadata["legacy_model_api_migrated"], json!(true));
+    }
+
+    #[test]
+    fn sanitize_model_center_keeps_semantic_router_local_only() {
+        let mut state = AdminModelCenterState {
+            endpoints: default_model_endpoints(),
+            route_policies: default_model_route_policies(),
+            model_store_root: default_model_store_root(),
+            capability_bindings: Vec::new(),
+            runtimes: Vec::new(),
+        };
+        let router = state
+            .route_policies
+            .iter_mut()
+            .find(|policy| policy.route_policy_id == "semantic.router")
+            .expect("router policy");
+        router.privacy_level = PrivacyLevel::AllowRedactedCloud;
+        router.fallback_order = vec![
+            "local".to_string(),
+            "sidecar".to_string(),
+            "cloud".to_string(),
+        ];
+        router.metadata = json!({
+            "capability": "router",
+            "cloud_fallback_scope": "semantic_router_only",
+            "redaction_required": true,
+        });
+
+        let sanitized = sanitize_model_center_state(state);
+        let router = sanitized
+            .route_policies
+            .iter()
+            .find(|policy| policy.route_policy_id == "semantic.router")
+            .expect("sanitized router policy");
+        assert_eq!(router.privacy_level, PrivacyLevel::StrictLocal);
+        assert!(!router
+            .fallback_order
+            .iter()
+            .any(|kind| kind.eq_ignore_ascii_case("cloud")));
+        assert_eq!(router.metadata["local_only"], json!(true));
+        assert_eq!(router.metadata["cloud_fallback_allowed"], json!(false));
+        assert!(router.metadata.get("cloud_fallback_scope").is_none());
     }
 
     #[test]

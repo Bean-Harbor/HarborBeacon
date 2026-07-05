@@ -1,5 +1,12 @@
 # HarborBeacon Harbor Collaboration Contract v2
 
+> Superseded note: for the current HarborBeacon core architecture and Harbor
+> collaboration boundary, read
+> `docs/HarborBeacon-Harbor-Collaboration-Contract-v3.md` first. This v2 file
+> remains useful historical context, but v3 is the current HarborBeacon
+> collaboration contract. The external HarborBeacon <-> HarborGate IM contract
+> remains v2.0.
+
 ## Status
 
 This document is the working freeze candidate for the current multi-lane

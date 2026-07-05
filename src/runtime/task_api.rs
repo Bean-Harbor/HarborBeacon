@@ -1,7 +1,16 @@
 //! Minimal Assistant Task API service for HarborBeacon integration.
 
+mod evt_actions;
+mod family_guardian_actions;
+mod general_message_plan;
+mod general_message_router;
+mod home_assistant_actions;
+mod system_readiness_actions;
+mod vision_event_actions;
+
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -10,6 +19,32 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+use self::general_message_plan::{
+    GeneralMessageCandidate, GeneralMessageControllerTrace, GeneralMessageConversationAct,
+    GeneralMessagePlan, GeneralMessagePlanKind, GeneralMessagePlanPayload, GeneralMessageSignals,
+    GeneralMessageWorkflowCompilerShadowTrace,
+};
+#[cfg(test)]
+use self::general_message_router::general_message_requests_capability_summary;
+use self::general_message_router::{
+    build_general_message_candidates, build_general_message_renderer_prompt,
+    build_general_message_renderer_system_prompt, build_general_message_router_prompt,
+    build_general_message_router_system_prompt, deterministic_stage_for_plan,
+    enforce_general_message_nsp_hard_guards, extract_general_message_signals,
+    fallback_general_message_plan, general_message_conversation_summary,
+    general_message_default_clarification_prompt, general_message_nsp_schema_valid,
+    general_message_nsp_validation_failure, general_message_plan_decision_label,
+    general_message_support_summary_for_request, general_message_supported_examples,
+    general_message_unsupported_summary, infer_general_message_conversation_act,
+    parse_general_message_plan, parse_general_message_router_decision,
+    record_general_message_nsp_plan_trace, resolve_deterministic_general_message_plan,
+    should_try_general_message_router_llm,
+};
+#[cfg(test)]
+use self::system_readiness_actions::build_general_message_readiness_summary;
+#[cfg(test)]
+use self::vision_event_actions::build_redacted_vision_event_summary;
 
 use crate::adapters::rtsp::CommandRtspAdapter;
 use crate::connectors::home_assistant::{
@@ -28,6 +63,7 @@ use crate::connectors::notifications::{
 use crate::connectors::notifications::{NotificationRecipient, NotificationRecipientIdType};
 use crate::connectors::storage::StorageTarget;
 use crate::control_plane::approvals::{ApprovalStatus, ApprovalTicket};
+use crate::control_plane::audit::{build_metadata_audit_record, AuditActorKind};
 use crate::control_plane::events::{EventRecord, EventSeverity, EventSourceKind};
 use crate::control_plane::media::{
     MediaAsset, MediaAssetKind, MediaDeliveryMode, MediaSession, MediaSessionKind,
@@ -51,6 +87,9 @@ use crate::orchestrator::policy::{
     ApprovalContext,
 };
 use crate::orchestrator::router::{Executor, Router};
+use crate::orchestrator::workflow_compiler::{
+    compile_system_diagnostics_candidate, WorkflowCandidate,
+};
 use crate::runtime::admin_console::{
     harboros_writable_root, AdminConsoleState, AdminConsoleStore, AdminModelCenterState,
     NotificationTargetRecord, RagResourceProfile,
@@ -70,24 +109,22 @@ use crate::runtime::model_center::{
     run_llm_text_with_state_and_options, run_ocr_with_state, run_vlm_summary_with_state,
     LlmTextExecution, LlmTextOptions,
 };
+use crate::runtime::privacy_gateway::{PrivacyGateway, PrivacyGatewayEvaluation};
 use crate::runtime::registry::ResolvedCameraTarget;
 use crate::runtime::remote_view;
 use crate::runtime::task_session::{
     session_state_value_from_conversation, PendingTaskCandidate, PendingTaskClipConfirmation,
     PendingTaskConnect, PendingTaskGeneralMessageLoop, PendingTaskHomeAssistantCandidate,
-    PendingTaskHomeAssistantClarification, RecentClipPlaybackState, TaskConversationState,
-    TaskConversationStore,
+    PendingTaskHomeAssistantClarification, RecentClipPlaybackState, RecentFamilyMemoryEventState,
+    TaskConversationState, TaskConversationStore,
 };
-use crate::runtime::vision_event::{
-    build_local_vision_notification_intent, list_recent_local_vision_events_default,
-    LocalVisionEventArtifact, SnapshotArtifact, StoredLocalVisionEvent,
-};
-
+use crate::runtime::vision_event::StoredLocalVisionEvent;
 const ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV: &str = "HARBOR_ALLOW_NON_HARBOROS_CAPTURE_ROOT";
 const GENERAL_MESSAGE_RECAP_LIMIT: usize = 3;
-const GENERAL_MESSAGE_TURN_BUDGET_MS: u64 = 12_000;
-const GENERAL_MESSAGE_ROUTER_BUDGET_MS: u64 = 3_500;
-const GENERAL_MESSAGE_ROUTER_MAX_TOKENS: u32 = 8;
+const GENERAL_MESSAGE_TURN_BUDGET_MS: u64 = 24_000;
+const GENERAL_MESSAGE_ROUTER_BUDGET_MS: u64 = 12_000;
+const GENERAL_MESSAGE_ROUTER_MAX_TOKENS: u32 = 220;
+const GENERAL_MESSAGE_NSP_MIN_CONFIDENCE: u8 = 60;
 const GENERAL_MESSAGE_RENDERER_BUDGET_MS: u64 = 1_800;
 const GENERAL_MESSAGE_RENDERER_MAX_TOKENS: u32 = 48;
 const RAG_DOMAIN: &str = "rag";
@@ -98,6 +135,7 @@ const RAG_ANSWER_MAX_TOKENS: u32 = 256;
 const RAG_ANSWER_BUDGET_MS_ENV: &str = "HARBOR_RAG_ANSWER_BUDGET_MS";
 const RAG_ANSWER_MAX_TOKENS_ENV: &str = "HARBOR_RAG_ANSWER_MAX_TOKENS";
 const RECENT_CLIP_PLAYBACK_WINDOW_MS: u128 = 15 * 60 * 1000;
+const RECENT_FAMILY_MEMORY_EVENT_WINDOW_MS: u128 = 24 * 60 * 60 * 1000;
 const DEFAULT_TURN_INTENT_DOMAIN: &str = "general";
 const DEFAULT_TURN_INTENT_ACTION: &str = "message";
 const CONTINUATION_TOKEN_KEY: &str = "continuation_token";
@@ -460,114 +498,6 @@ pub enum TaskTurnRequestAcceptance {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GeneralMessagePlanKind {
-    CapabilitySummary,
-    Clarify,
-    ConversationAct,
-    CameraReplayRecentClip,
-    CameraSnapshot,
-    CameraRecordClip,
-    KnowledgeSearch,
-    RagAnswer,
-    HomeAssistantServiceAction,
-    VisionEventSummary,
-    VisionEventNotifyLatest,
-    SystemReadiness,
-    #[allow(dead_code)]
-    Unsupported,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GeneralMessageConversationAct {
-    Continue,
-    Boundary,
-    Repair,
-    Cancel,
-    ClarifyContinue,
-}
-
-impl GeneralMessageConversationAct {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Continue => "continue",
-            Self::Boundary => "boundary",
-            Self::Repair => "repair",
-            Self::Cancel => "cancel",
-            Self::ClarifyContinue => "clarify_continue",
-        }
-    }
-
-    fn reply_pack_kind(self) -> &'static str {
-        match self {
-            Self::Continue => "conversation_continue",
-            Self::Boundary => "conversation_boundary",
-            Self::Repair => "conversation_repair",
-            Self::Cancel => "conversation_cancel",
-            Self::ClarifyContinue => "conversation_clarify_continue",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GeneralMessagePlan {
-    kind: GeneralMessagePlanKind,
-    conversation_act: Option<GeneralMessageConversationAct>,
-    reply_text: Option<String>,
-    camera_hint: Option<String>,
-    query: Option<String>,
-    recent_clip: Option<RecentClipPlaybackState>,
-    reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
-struct GeneralMessagePlanPayload {
-    #[serde(default)]
-    decision: String,
-    #[serde(default)]
-    action: String,
-    #[serde(default)]
-    conversation_act: Option<String>,
-    #[serde(default)]
-    reply_text: Option<String>,
-    #[serde(default)]
-    camera_hint: Option<String>,
-    #[serde(default)]
-    query: Option<String>,
-    #[serde(default)]
-    reason: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct GeneralMessageSignals {
-    normalized: String,
-    asks_capability: bool,
-    explicit_clip_playback: bool,
-    explicit_snapshot: bool,
-    explicit_clip: bool,
-    explicit_search: bool,
-    explicit_rag_answer: bool,
-    explicit_ha_action: bool,
-    explicit_event_summary: bool,
-    explicit_event_notify: bool,
-    explicit_system_readiness: bool,
-    mentions_camera_context: bool,
-    ambiguous_visual_request: bool,
-    recent_camera_context: bool,
-    recent_clip_available: bool,
-    recent_search_context: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GeneralMessageCandidate {
-    kind: GeneralMessagePlanKind,
-    confidence: u8,
-    camera_hint: Option<String>,
-    query: Option<String>,
-    recent_clip: Option<RecentClipPlaybackState>,
-    reason: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClipConfirmationReplyDecision {
     Deliver,
     Decline,
@@ -582,20 +512,11 @@ enum ActiveFrameDecision {
     Cancel,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct GeneralMessageControllerTrace {
-    controller_stage: String,
-    router_llm: bool,
-    router_latency_ms: Option<u64>,
-    renderer_latency_ms: Option<u64>,
-    fallback_reason: Option<String>,
-    candidate_count: usize,
-}
-
 #[derive(Debug, Clone)]
 pub struct TaskApiService {
     admin_store: AdminConsoleStore,
     conversation_store: TaskConversationStore,
+    last_evt_preflight: Arc<Mutex<Option<Value>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -617,11 +538,26 @@ impl TaskApiService {
         Self {
             admin_store,
             conversation_store,
+            last_evt_preflight: Arc::new(Mutex::new(None)),
         }
     }
 
     pub fn conversation_store(&self) -> &TaskConversationStore {
         &self.conversation_store
+    }
+
+    fn record_last_evt_preflight(&self, preflight: &Value) {
+        let Ok(mut guard) = self.last_evt_preflight.lock() else {
+            return;
+        };
+        *guard = Some(preflight.clone());
+    }
+
+    fn last_evt_preflight(&self) -> Option<Value> {
+        self.last_evt_preflight
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
     pub fn accept_or_replay_task(
@@ -1734,7 +1670,7 @@ impl TaskApiService {
             {
                 return Some(response);
             }
-            return Some(self.handle_general_message_home_assistant_action(request));
+            return Some(self.handle_general_message_home_assistant_action(request, None));
         }
 
         let selected = match resolve_pending_home_assistant_candidate_selection(
@@ -2101,10 +2037,7 @@ impl TaskApiService {
                 {
                     return response;
                 }
-                self.general_message_capability_summary_response(
-                    request,
-                    plan.reply_text.as_deref(),
-                )
+                self.general_message_capability_summary_response(request, None)
             }
             GeneralMessagePlanKind::Clarify => {
                 self.general_message_clarification_response(request, &plan, prior_pending)
@@ -2185,7 +2118,10 @@ impl TaskApiService {
                 {
                     return response;
                 }
-                self.handle_general_message_home_assistant_action(request)
+                self.handle_general_message_home_assistant_action(
+                    request,
+                    plan.home_assistant_action.as_ref(),
+                )
             }
             GeneralMessagePlanKind::VisionEventSummary => {
                 if let Err(response) =
@@ -2203,6 +2139,23 @@ impl TaskApiService {
                 }
                 self.handle_general_message_notify_latest_vision_event(request)
             }
+            GeneralMessagePlanKind::VlmDescribeLatestEvent
+            | GeneralMessagePlanKind::VlmDescribeEvent => {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
+                self.handle_general_message_vlm_describe_latest_event(request, &plan)
+            }
+            GeneralMessagePlanKind::FamilyMemorySummary => {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
+                self.handle_general_message_family_timeline(request, &plan)
+            }
             GeneralMessagePlanKind::SystemReadiness => {
                 if let Err(response) =
                     self.clear_general_message_loop_if_matches(request, prior_pending)
@@ -2210,6 +2163,84 @@ impl TaskApiService {
                     return response;
                 }
                 self.handle_general_message_system_readiness(request)
+            }
+            GeneralMessagePlanKind::EvtReadiness => {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
+                self.handle_general_message_evt_readiness(request)
+            }
+            GeneralMessagePlanKind::EvtPreflight => {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
+                self.handle_general_message_evt_preflight(request)
+            }
+            GeneralMessagePlanKind::EvtEvidenceBundle => {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
+                self.handle_general_message_evt_evidence_bundle(request)
+            }
+            GeneralMessagePlanKind::FamilyTimelineSummary
+            | GeneralMessagePlanKind::FamilyTimelineQuery => {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
+                self.handle_general_message_family_timeline(request, &plan)
+            }
+            GeneralMessagePlanKind::GuardianRuleProposal => {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
+                self.handle_general_message_guardian_rule_proposal(request, &plan)
+            }
+            GeneralMessagePlanKind::GuardianRuleList | GeneralMessagePlanKind::GuardianStatus => {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
+                self.handle_general_message_guardian_status(request)
+            }
+            GeneralMessagePlanKind::GuardianRuleEnable => {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
+                self.handle_general_message_guardian_status_update(request, "active")
+            }
+            GeneralMessagePlanKind::GuardianRulePause => {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
+                self.handle_general_message_guardian_status_update(request, "paused")
+            }
+            GeneralMessagePlanKind::FamilyMemoryConfirm
+            | GeneralMessagePlanKind::FamilyMemoryFavorite
+            | GeneralMessagePlanKind::FamilyMemoryHide
+            | GeneralMessagePlanKind::FamilyMemoryCorrectSummary
+            | GeneralMessagePlanKind::FamilyMemoryCorrectLabels
+            | GeneralMessagePlanKind::FamilyMemoryShowFavorites => {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
+                self.handle_general_message_family_memory_feedback(request, &plan)
             }
             GeneralMessagePlanKind::Unsupported => {
                 if let Err(response) =
@@ -2235,688 +2266,6 @@ impl TaskApiService {
             build_clip_delivery_payload(recent_clip),
             vec![build_clip_delivery_artifact(recent_clip)],
             Vec::new(),
-        )
-    }
-
-    fn handle_general_message_latest_vision_event(&self, request: &TaskRequest) -> TaskResponse {
-        let stored = match latest_local_vision_event() {
-            Ok(Some(stored)) => stored,
-            Ok(None) => {
-                let message = "最近还没有可查看的摄像头事件。".to_string();
-                let event = self.serialize_event_record(&build_task_event_record(
-                    request,
-                    &step_id_for_request(request),
-                    "local_vision_event.summary_blocked",
-                    EventSeverity::Warning,
-                    json!({
-                        "status": "blocked",
-                        "reason": "no_recent_event",
-                        "metadata_only": true,
-                    }),
-                ));
-                return self.completed_with_context(
-                    request,
-                    "vision_event_store",
-                    RiskLevel::Low,
-                    message.clone(),
-                    json!({
-                        "reply_pack": {
-                            "kind": "vision_event_summary",
-                            "status": "blocked",
-                            "summary": message,
-                        }
-                    }),
-                    Vec::new(),
-                    vec![event],
-                    vec!["拍一张门口".to_string(), "录一段门口".to_string()],
-                );
-            }
-            Err(error) => {
-                let message = format!("读取最近摄像头事件失败：{}", redact_task_api_text(&error));
-                return self.failed(request, "vision_event_store", RiskLevel::Low, message);
-            }
-        };
-        let summary = build_redacted_vision_event_summary(&stored);
-        let message = latest_vision_event_reply(&stored);
-        let event = self.serialize_event_record(&build_task_event_record(
-            request,
-            &step_id_for_request(request),
-            "local_vision_event.summary_read",
-            EventSeverity::Info,
-            json!({
-                "status": "summarized",
-                "metadata_only": true,
-                "secret_scan": "clean",
-                "event_id": stored.event.event_id,
-                "camera_id": stored.event.camera_id,
-                "raw_image_included": false,
-                "local_paths_included": false,
-            }),
-        ));
-        self.completed_with_context(
-            request,
-            "vision_event_store",
-            RiskLevel::Low,
-            message.clone(),
-            json!({
-                "reply_pack": {
-                    "kind": "vision_event_summary",
-                    "status": "summarized",
-                    "summary": message,
-                    "event": summary,
-                }
-            }),
-            Vec::new(),
-            vec![event],
-            vec![
-                "通知最新事件".to_string(),
-                "状态".to_string(),
-                "拍一张门口".to_string(),
-            ],
-        )
-    }
-
-    fn handle_general_message_notify_latest_vision_event(
-        &self,
-        request: &TaskRequest,
-    ) -> TaskResponse {
-        let stored = match latest_local_vision_event() {
-            Ok(Some(stored)) => stored,
-            Ok(None) => {
-                return self.general_message_vision_event_notification_response(
-                    request,
-                    None,
-                    None,
-                    "blocked",
-                    "最近还没有可通知的摄像头事件。",
-                    None,
-                    "no_recent_event",
-                    EventSeverity::Warning,
-                );
-            }
-            Err(error) => {
-                let message = format!("读取最近摄像头事件失败：{}", redact_task_api_text(&error));
-                return self.failed(request, "notification_delivery", RiskLevel::Low, message);
-            }
-        };
-        let state = match self.admin_store.load_or_create_state() {
-            Ok(state) => state,
-            Err(error) => {
-                return self.general_message_vision_event_notification_response(
-                    request,
-                    Some(&stored),
-                    None,
-                    "failed",
-                    &format!("读取默认通知目标失败：{}", redact_task_api_text(&error)),
-                    None,
-                    "state_unavailable",
-                    EventSeverity::Error,
-                );
-            }
-        };
-        let target = match default_notification_target_record(&state.notification_targets).cloned()
-        {
-            Some(target) => target,
-            None => {
-                return self.general_message_vision_event_notification_response(
-                    request,
-                    Some(&stored),
-                    None,
-                    "blocked",
-                    "还没有配置默认通知目标，最新事件没有发出。",
-                    None,
-                    "no_default_target",
-                    EventSeverity::Warning,
-                );
-            }
-        };
-        let intent = match build_local_vision_notification_intent(&stored, &target.route_key) {
-            Ok(intent) => intent,
-            Err(error) => {
-                return self.general_message_vision_event_notification_response(
-                    request,
-                    Some(&stored),
-                    Some(&target),
-                    "failed",
-                    &format!("生成事件通知失败：{}", redact_task_api_text(&error)),
-                    None,
-                    "intent_failed",
-                    EventSeverity::Error,
-                );
-            }
-        };
-        let service = match NotificationDeliveryService::new() {
-            Ok(service) => service,
-            Err(error) => {
-                return self.general_message_vision_event_notification_response(
-                    request,
-                    Some(&stored),
-                    Some(&target),
-                    "blocked",
-                    &format!(
-                        "HarborGate 通知通道不可用：{}",
-                        redact_task_api_text(&error)
-                    ),
-                    None,
-                    "gateway_unavailable",
-                    EventSeverity::Warning,
-                );
-            }
-        };
-        match service.deliver(&intent.notification_request) {
-            Ok(record) if record.ok => self.general_message_vision_event_notification_response(
-                request,
-                Some(&stored),
-                Some(&target),
-                "delivered",
-                "已把最新摄像头事件发送到默认通知目标。",
-                Some(notification_delivery_record_summary(&record)),
-                "delivered",
-                EventSeverity::Info,
-            ),
-            Ok(record) => self.general_message_vision_event_notification_response(
-                request,
-                Some(&stored),
-                Some(&target),
-                "failed",
-                "HarborGate 返回投递失败记录，最新事件没有确认送达。",
-                Some(notification_delivery_record_summary(&record)),
-                "delivery_record_failed",
-                EventSeverity::Error,
-            ),
-            Err(error) => {
-                let (status, message, reason, severity) =
-                    classify_task_notification_delivery_error(error);
-                self.general_message_vision_event_notification_response(
-                    request,
-                    Some(&stored),
-                    Some(&target),
-                    status,
-                    &message,
-                    None,
-                    reason,
-                    severity,
-                )
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn general_message_vision_event_notification_response(
-        &self,
-        request: &TaskRequest,
-        stored: Option<&StoredLocalVisionEvent>,
-        target: Option<&NotificationTargetRecord>,
-        status: &str,
-        message: &str,
-        delivery_record: Option<Value>,
-        reason: &str,
-        severity: EventSeverity,
-    ) -> TaskResponse {
-        let event_type = match status {
-            "delivered" => "local_vision_event.notification_delivered",
-            "blocked" => "local_vision_event.notification_blocked",
-            _ => "local_vision_event.notification_failed",
-        };
-        let event = self.serialize_event_record(&build_task_event_record(
-            request,
-            &step_id_for_request(request),
-            event_type,
-            severity,
-            json!({
-                "status": status,
-                "reason": reason,
-                "metadata_only": true,
-                "secret_scan": "clean",
-                "event_id": stored.map(|stored| stored.event.event_id.clone()),
-                "camera_id": stored.map(|stored| stored.event.camera_id.clone()),
-                "target_bound": target.is_some(),
-                "target_label": target.map(|target| target.label.clone()),
-                "platform_hint": target.and_then(|target| non_empty_task_string(&target.platform_hint)),
-                "route_key_redacted": target.is_some(),
-                "text_only": true,
-                "attachments_included": false,
-                "raw_image_included": false,
-                "local_paths_included": false,
-            }),
-        ));
-        let redacted_message = redact_task_api_text(message);
-        self.completed_with_context(
-            request,
-            "notification_delivery",
-            RiskLevel::Low,
-            redacted_message.clone(),
-            json!({
-                "reply_pack": {
-                    "kind": "vision_event_notify_latest",
-                    "status": status,
-                    "summary": redacted_message,
-                    "event": stored.map(build_redacted_vision_event_summary),
-                    "target": {
-                        "configured": target.is_some(),
-                        "label": target.map(|target| target.label.clone()),
-                        "platform_hint": target.and_then(|target| non_empty_task_string(&target.platform_hint)),
-                        "route_key_redacted": target.is_some(),
-                    },
-                    "delivery_record": delivery_record,
-                }
-            }),
-            Vec::new(),
-            vec![event],
-            vec!["最近事件".to_string(), "状态".to_string()],
-        )
-    }
-
-    fn handle_general_message_home_assistant_action(&self, request: &TaskRequest) -> TaskResponse {
-        let Some(action) = infer_home_assistant_natural_action(request.intent.raw_text.as_str())
-        else {
-            return self.general_message_unsupported_response(request, None);
-        };
-        let action = match action {
-            HomeAssistantNaturalAction::Blocked { message } => {
-                return self.general_message_home_assistant_action_response(
-                    request,
-                    "blocked",
-                    false,
-                    false,
-                    &message,
-                    None,
-                    HomeAssistantServiceActionRequest::default(),
-                    "home_assistant.service_action_blocked",
-                    EventSeverity::Warning,
-                    None,
-                );
-            }
-            HomeAssistantNaturalAction::Request(action) => action,
-        };
-        let state = match self.admin_store.home_assistant_secret_state() {
-            Ok(state) => state,
-            Err(error) => {
-                return self.general_message_home_assistant_action_response(
-                    request,
-                    "failed",
-                    false,
-                    false,
-                    &format!(
-                        "读取 Home Assistant 配置失败：{}",
-                        redact_task_api_text(&error)
-                    ),
-                    None,
-                    HomeAssistantServiceActionRequest {
-                        domain: action.domain.clone(),
-                        service: action.service.clone(),
-                        fields: json!({}),
-                        ..Default::default()
-                    },
-                    "home_assistant.service_action_failed",
-                    EventSeverity::Error,
-                    None,
-                );
-            }
-        };
-        let client = match home_assistant_client_from_admin_state(&state) {
-            Ok(client) => client,
-            Err(error) => {
-                return self.general_message_home_assistant_action_response(
-                    request,
-                    "blocked",
-                    false,
-                    false,
-                    &redact_task_api_text(&error),
-                    None,
-                    HomeAssistantServiceActionRequest {
-                        domain: action.domain.clone(),
-                        service: action.service.clone(),
-                        fields: json!({}),
-                        ..Default::default()
-                    },
-                    "home_assistant.service_action_blocked",
-                    EventSeverity::Warning,
-                    None,
-                );
-            }
-        };
-        let entities = match client.fetch_entities() {
-            Ok(entities) => entities,
-            Err(error) => {
-                return self.general_message_home_assistant_action_response(
-                    request,
-                    "failed",
-                    false,
-                    false,
-                    &format!(
-                        "读取 Home Assistant 实体失败：{}",
-                        redact_task_api_text(&error)
-                    ),
-                    None,
-                    HomeAssistantServiceActionRequest {
-                        domain: action.domain.clone(),
-                        service: action.service.clone(),
-                        fields: json!({}),
-                        ..Default::default()
-                    },
-                    "home_assistant.service_action_failed",
-                    EventSeverity::Error,
-                    None,
-                );
-            }
-        };
-        let entity = match resolve_home_assistant_action_entity(&action, &entities) {
-            HomeAssistantEntityResolution::Resolved(entity) => entity,
-            HomeAssistantEntityResolution::Clarify(candidates) => {
-                return self.general_message_home_assistant_clarification_response(
-                    request,
-                    &action,
-                    &candidates,
-                    "ambiguous_entity",
-                    None,
-                );
-            }
-            HomeAssistantEntityResolution::Missing(message) => {
-                return self.general_message_home_assistant_action_response(
-                    request,
-                    "blocked",
-                    false,
-                    false,
-                    &message,
-                    None,
-                    HomeAssistantServiceActionRequest {
-                        domain: action.domain.clone(),
-                        service: action.service.clone(),
-                        fields: json!({}),
-                        ..Default::default()
-                    },
-                    "home_assistant.service_action_blocked",
-                    EventSeverity::Warning,
-                    None,
-                );
-            }
-        };
-        let action_request =
-            normalize_home_assistant_service_action_request(&HomeAssistantServiceActionRequest {
-                entity_id: entity.entity_id.clone(),
-                domain: action.domain.clone(),
-                service: action.service.clone(),
-                fields: json!({}),
-            });
-        if let Err(message) = validate_home_assistant_service_action_request(
-            &action_request,
-            state.enabled,
-            &state.exposed_domains,
-        ) {
-            return self.general_message_home_assistant_action_response(
-                request,
-                "blocked",
-                false,
-                false,
-                &message,
-                None,
-                action_request,
-                "home_assistant.service_action_blocked",
-                EventSeverity::Warning,
-                Some(&entity),
-            );
-        }
-        match client.call_service(
-            &action_request.domain,
-            &action_request.service,
-            &action_request.entity_id,
-            Some(&action_request.fields),
-        ) {
-            Ok(result) => self.general_message_home_assistant_action_response(
-                request,
-                "succeeded",
-                true,
-                true,
-                &format!(
-                    "已执行：{} {}.{}。",
-                    entity.display_name, action_request.domain, action_request.service
-                ),
-                Some(json!(result)),
-                action_request,
-                "home_assistant.service_action_executed",
-                EventSeverity::Info,
-                Some(&entity),
-            ),
-            Err(error) => self.general_message_home_assistant_action_response(
-                request,
-                "failed",
-                true,
-                false,
-                &format!(
-                    "Home Assistant 动作执行失败：{}",
-                    redact_task_api_text(&error)
-                ),
-                None,
-                action_request,
-                "home_assistant.service_action_failed",
-                EventSeverity::Error,
-                Some(&entity),
-            ),
-        }
-    }
-
-    fn general_message_home_assistant_clarification_response(
-        &self,
-        request: &TaskRequest,
-        action: &HomeAssistantNaturalActionRequest,
-        candidates: &[HomeAssistantEntity],
-        reason: &str,
-        prior_pending: Option<&PendingTaskGeneralMessageLoop>,
-    ) -> TaskResponse {
-        let pending_candidates = pending_home_assistant_candidates_from_entities(candidates);
-        let message = home_assistant_clarification_prompt(action, pending_candidates.as_slice());
-        let resume_token = prior_pending
-            .map(|pending| pending.resume_token.clone())
-            .filter(|token| !token.trim().is_empty())
-            .unwrap_or_else(ensure_resume_token);
-        let pending_ha = PendingTaskHomeAssistantClarification {
-            domain: action.domain.clone(),
-            service: action.service.clone(),
-            entity_hint: action.entity_hint.clone(),
-            candidates: pending_candidates,
-        };
-        let mut conversation = self.load_or_create_conversation(request);
-        conversation.set_general_message_loop(Some(PendingTaskGeneralMessageLoop {
-            resume_token: resume_token.clone(),
-            original_goal: prior_pending
-                .map(|pending| pending.original_goal.clone())
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| request.intent.raw_text.trim().to_string()),
-            latest_user_intent_text: request.intent.raw_text.trim().to_string(),
-            last_clarification_prompt: message.clone(),
-            selected_candidate_action: None,
-            camera_hint: prior_pending.and_then(|pending| pending.camera_hint.clone()),
-            query: prior_pending.and_then(|pending| pending.query.clone()),
-            home_assistant: Some(pending_ha.clone()),
-        }));
-        if let Err(error) = self.save_conversation(request, &conversation) {
-            return self.failed(
-                request,
-                "agentic_interpreter",
-                RiskLevel::Low,
-                format!("无法保存 Home Assistant 澄清状态: {error}"),
-            );
-        }
-
-        let event = self.serialize_event_record(&build_task_event_record(
-            request,
-            &step_id_for_request(request),
-            "home_assistant.service_action_clarification_required",
-            EventSeverity::Warning,
-            json!({
-                "status": "needs_input",
-                "reason": reason,
-                "metadata_only": true,
-                "secret_scan": "clean",
-                "domain": action.domain,
-                "service": action.service,
-                "candidate_count": pending_ha.candidates.len(),
-                "executed": false,
-            }),
-        ));
-        self.needs_input_with_context(
-            request,
-            "agentic_interpreter",
-            RiskLevel::Low,
-            message.clone(),
-            vec!["home_assistant_entity".to_string()],
-            resume_token,
-            json!({
-                "reply_pack": {
-                    "kind": "ha_action_clarify",
-                    "status": "needs_input",
-                    "summary": message,
-                    "domain": action.domain,
-                    "service": action.service,
-                    "candidates": pending_ha.candidates.iter().map(redacted_pending_home_assistant_candidate_summary).collect::<Vec<_>>(),
-                    "redacted": true,
-                },
-                "home_assistant_clarification": {
-                    "kind": "home_assistant.service_action_clarification",
-                    "reason": reason,
-                    "candidate_count": pending_ha.candidates.len(),
-                    "redacted": true,
-                }
-            }),
-            vec![event],
-            home_assistant_pending_clarification_actions(&pending_ha.candidates),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn general_message_home_assistant_action_response(
-        &self,
-        request: &TaskRequest,
-        status: &str,
-        allowed: bool,
-        executed: bool,
-        message: &str,
-        result: Option<Value>,
-        action_request: HomeAssistantServiceActionRequest,
-        audit_kind: &str,
-        severity: EventSeverity,
-        entity: Option<&HomeAssistantEntity>,
-    ) -> TaskResponse {
-        let redacted_message = redact_task_api_text(message);
-        let event = self.serialize_event_record(&build_task_event_record(
-            request,
-            &step_id_for_request(request),
-            audit_kind,
-            severity,
-            json!({
-                "audit_kind": audit_kind,
-                "status": status,
-                "metadata_only": true,
-                "secret_scan": "clean",
-                "allowed": allowed,
-                "executed": executed,
-                "entity_id": non_empty_task_string(&action_request.entity_id),
-                "entity_display_name": entity.map(|entity| entity.display_name.clone()),
-                "domain": non_empty_task_string(&action_request.domain),
-                "service": non_empty_task_string(&action_request.service),
-                "fields_empty": action_request.fields.as_object().map(|object| object.is_empty()).unwrap_or(true),
-                "message": redacted_message,
-            }),
-        ));
-        self.completed_with_context(
-            request,
-            "home_assistant_connector",
-            RiskLevel::Low,
-            redacted_message.clone(),
-            json!({
-                "reply_pack": {
-                    "kind": "ha_service_action",
-                    "status": status,
-                    "summary": redacted_message,
-                    "allowed": allowed,
-                    "executed": executed,
-                    "domain": non_empty_task_string(&action_request.domain),
-                    "service": non_empty_task_string(&action_request.service),
-                    "entity": entity.map(redacted_home_assistant_entity_summary),
-                    "fields": {},
-                    "result": result,
-                    "redacted": true,
-                }
-            }),
-            Vec::new(),
-            vec![event],
-            vec!["状态".to_string(), "最近事件".to_string()],
-        )
-    }
-
-    fn handle_general_message_system_readiness(&self, request: &TaskRequest) -> TaskResponse {
-        let state = match self.admin_store.load_or_create_state() {
-            Ok(state) => state,
-            Err(error) => {
-                return self.failed(
-                    request,
-                    "agentic_interpreter",
-                    RiskLevel::Low,
-                    format!("读取状态失败：{}", redact_task_api_text(&error)),
-                );
-            }
-        };
-        let gateway_status = fetch_task_gateway_status().ok();
-        let camera_count = self
-            .admin_store
-            .registry_store()
-            .load_devices()
-            .map(|devices| devices.len())
-            .unwrap_or(0);
-        let latest_event = latest_local_vision_event().ok().flatten();
-        let readiness = build_general_message_readiness_summary(
-            &state,
-            gateway_status.as_ref(),
-            camera_count,
-            latest_event.as_ref(),
-        );
-        let message =
-            format!(
-            "当前状态：微信 {}；默认通知目标 {}；HA {}（{} 个实体）；摄像头 {} 个，最近事件 {}。",
-            readiness["gateway"]["weixin"]["status"]
-                .as_str()
-                .unwrap_or("unknown"),
-            readiness["default_notification_target"]["status"]
-                .as_str()
-                .unwrap_or("unknown"),
-            readiness["home_assistant"]["status"]
-                .as_str()
-                .unwrap_or("unknown"),
-            readiness["home_assistant"]["entity_count"]
-                .as_u64()
-                .unwrap_or(0),
-            camera_count,
-            if latest_event.is_some() { "可用" } else { "暂无" },
-        );
-        let event = self.serialize_event_record(&build_task_event_record(
-            request,
-            &step_id_for_request(request),
-            "general_message.system_readiness_read",
-            EventSeverity::Info,
-            json!({
-                "status": "summarized",
-                "metadata_only": true,
-                "secret_scan": "clean",
-                "redacted": true,
-            }),
-        ));
-        self.completed_with_context(
-            request,
-            "agentic_interpreter",
-            RiskLevel::Low,
-            message.clone(),
-            json!({
-                "reply_pack": {
-                    "kind": "system_readiness",
-                    "summary": message,
-                    "readiness": readiness,
-                    "redacted": true,
-                }
-            }),
-            Vec::new(),
-            vec![event],
-            vec!["最近事件".to_string(), "通知最新事件".to_string()],
         )
     }
 
@@ -2947,8 +2296,17 @@ impl TaskApiService {
                         "camera_record_clip",
                         "vision_event_summary",
                         "vision_event_notify_latest",
+                        "vlm_describe_latest_event",
+                        "family_memory_summary",
                         "ha_service_action",
                         "system_readiness",
+                        "evt_readiness",
+                        "evt_preflight",
+                        "evt_evidence_bundle",
+                        "family_timeline_summary",
+                        "family_timeline_query",
+                        "guardian_rule_proposal",
+                        "guardian_status",
                         "knowledge_search",
                         "rag_answer",
                     ],
@@ -2962,6 +2320,9 @@ impl TaskApiService {
                 "通知最新事件".to_string(),
                 "开灯".to_string(),
                 "状态".to_string(),
+                "压测前状态怎么样".to_string(),
+                "今天家里发生了什么".to_string(),
+                "以后门口有人就通知我".to_string(),
             ],
         )
     }
@@ -2991,8 +2352,17 @@ impl TaskApiService {
                         "camera_record_clip",
                         "vision_event_summary",
                         "vision_event_notify_latest",
+                        "vlm_describe_latest_event",
+                        "family_memory_summary",
                         "ha_service_action",
                         "system_readiness",
+                        "evt_readiness",
+                        "evt_preflight",
+                        "evt_evidence_bundle",
+                        "family_timeline_summary",
+                        "family_timeline_query",
+                        "guardian_rule_proposal",
+                        "guardian_status",
                         "knowledge_search",
                         "rag_answer",
                     ],
@@ -3185,25 +2555,13 @@ impl TaskApiService {
             &session_recap,
             recent_clip.as_ref(),
         );
+        let workflow_shadow_candidate =
+            compile_system_diagnostics_candidate(request.intent.raw_text.as_str());
         let mut trace = GeneralMessageControllerTrace {
             controller_stage: "candidate_builder".to_string(),
             candidate_count: candidates.len(),
             ..Default::default()
         };
-
-        if let Some(mut plan) =
-            resolve_deterministic_general_message_plan(request, &candidates, pending_loop)
-        {
-            trace.controller_stage = deterministic_stage_for_plan(&plan).to_string();
-            maybe_render_general_message_reply(
-                request,
-                pending_loop,
-                &admin_state.models,
-                &mut plan,
-                &mut trace,
-            );
-            return Ok((plan, trace));
-        }
 
         if should_try_general_message_router_llm(&signals, pending_loop) {
             let router_started = Instant::now();
@@ -3224,72 +2582,53 @@ impl TaskApiService {
                 &router_options,
             );
             trace.router_llm = true;
+            trace.nsp_local_only = true;
             trace.router_latency_ms = Some(router_started.elapsed().as_millis() as u64);
             if router_result.available {
-                if let Some((kind, conversation_act)) =
-                    parse_general_message_router_decision(&router_result.text)
-                {
-                    let mut plan = plan_from_router_decision(
-                        kind,
-                        conversation_act,
-                        request,
-                        selected_camera.as_deref(),
-                        pending_loop,
-                    );
-                    trace.controller_stage = "router_llm".to_string();
-                    maybe_render_general_message_reply(
-                        request,
-                        pending_loop,
-                        &admin_state.models,
-                        &mut plan,
-                        &mut trace,
-                    );
-                    return Ok((plan, trace));
-                }
-                trace.fallback_reason = Some("router_invalid_label".to_string());
-                if llm_selected_endpoint_kind(&router_result) != Some("cloud") {
-                    if let Some(cloud_model_state) = cloud_only_llm_model_state_for_policy(
-                        &admin_state.models,
-                        "semantic.router",
-                    ) {
-                        let cloud_result = run_llm_text_with_state_and_options(
-                            &router_prompt,
-                            &cloud_model_state,
-                            &router_options,
+                if let Some(mut plan) = parse_general_message_plan(&router_result.text) {
+                    enforce_general_message_nsp_hard_guards(request, &mut plan);
+                    trace.nsp_schema_valid = general_message_nsp_schema_valid(&plan);
+                    record_general_message_nsp_plan_trace(&mut trace, &plan);
+                    if let Some(reason) = general_message_nsp_validation_failure(request, &plan) {
+                        trace.fallback_reason = Some(reason);
+                    } else {
+                        trace.controller_stage = "nsp_router".to_string();
+                        maybe_render_general_message_reply(
+                            request,
+                            pending_loop,
+                            &admin_state.models,
+                            &mut plan,
+                            &mut trace,
                         );
-                        if cloud_result.available {
-                            if let Some((kind, conversation_act)) =
-                                parse_general_message_router_decision(&cloud_result.text)
-                            {
-                                let mut plan = plan_from_router_decision(
-                                    kind,
-                                    conversation_act,
-                                    request,
-                                    selected_camera.as_deref(),
-                                    pending_loop,
-                                );
-                                trace.controller_stage = "router_cloud_fallback".to_string();
-                                trace.fallback_reason =
-                                    Some("router_invalid_label_cloud_retry".to_string());
-                                maybe_render_general_message_reply(
-                                    request,
-                                    pending_loop,
-                                    &admin_state.models,
-                                    &mut plan,
-                                    &mut trace,
-                                );
-                                return Ok((plan, trace));
-                            }
-                        }
-                        trace.fallback_reason = Some(format!(
-                            "router_invalid_label; cloud_retry={}",
-                            cloud_result.summary
-                        ));
+                        record_workflow_compiler_shadow(
+                            &mut trace,
+                            workflow_shadow_candidate.as_ref(),
+                            &plan,
+                        );
+                        return Ok((plan, trace));
                     }
+                } else {
+                    trace.nsp_schema_valid = false;
+                    trace.fallback_reason = Some("nsp_invalid_json_or_decision".to_string());
                 }
             } else {
                 trace.fallback_reason = Some(router_result.summary);
             }
+        }
+
+        if let Some(mut plan) =
+            resolve_deterministic_general_message_plan(request, &candidates, pending_loop)
+        {
+            trace.controller_stage = deterministic_stage_for_plan(&plan).to_string();
+            maybe_render_general_message_reply(
+                request,
+                pending_loop,
+                &admin_state.models,
+                &mut plan,
+                &mut trace,
+            );
+            record_workflow_compiler_shadow(&mut trace, workflow_shadow_candidate.as_ref(), &plan);
+            return Ok((plan, trace));
         }
 
         if let Some(mut plan) = fallback_general_message_plan(
@@ -3307,6 +2646,7 @@ impl TaskApiService {
                 &mut plan,
                 &mut trace,
             );
+            record_workflow_compiler_shadow(&mut trace, workflow_shadow_candidate.as_ref(), &plan);
             return Ok((plan, trace));
         }
 
@@ -3317,10 +2657,17 @@ impl TaskApiService {
                 pending_loop,
             )),
             reply_text: None,
+            canonical_phrase: None,
             camera_hint: pending_loop.and_then(|pending| pending.camera_hint.clone()),
             query: pending_loop
                 .and_then(|pending| pending.query.clone())
                 .or_else(|| infer_query_from_raw_text(request.intent.raw_text.as_str())),
+            home_assistant_action: None,
+            guardian_rule: None,
+            event_id: None,
+            corrected_summary: None,
+            corrected_labels: None,
+            confidence: None,
             recent_clip: None,
             reason: Some("no_supported_candidate".to_string()),
         };
@@ -3335,6 +2682,7 @@ impl TaskApiService {
             &mut plan,
             &mut trace,
         );
+        record_workflow_compiler_shadow(&mut trace, workflow_shadow_candidate.as_ref(), &plan);
         Ok((plan, trace))
     }
 
@@ -3971,6 +3319,7 @@ impl TaskApiService {
             limit: knowledge_result_limit(request),
             privacy_level,
             resource_profile,
+            retrieval: knowledge_settings.retrieval.clone(),
             require_embeddings: knowledge_require_embeddings(request),
             latency_budget_ms: knowledge_latency_budget_ms(request),
         };
@@ -4135,6 +3484,7 @@ impl TaskApiService {
             limit: knowledge_result_limit(request),
             privacy_level,
             resource_profile,
+            retrieval: knowledge_settings.retrieval.clone(),
             require_embeddings: knowledge_require_embeddings(request),
             latency_budget_ms: knowledge_latency_budget_ms(request),
         };
@@ -4163,6 +3513,7 @@ impl TaskApiService {
                 &citations,
                 Value::Null,
                 search_result.warnings.clone(),
+                Value::Null,
             );
             return self.failed_with_context(
                 request,
@@ -4190,6 +3541,7 @@ impl TaskApiService {
                 &citations,
                 Value::Null,
                 search_result.warnings.clone(),
+                Value::Null,
             );
             return self.completed(
                 request,
@@ -4202,105 +3554,151 @@ impl TaskApiService {
             );
         }
 
+        let privacy_gateway_evaluation = PrivacyGateway::evaluate_rag_answer_cloud_context(
+            &query,
+            &citations,
+            privacy_level,
+            &workspace_id_for_request(request),
+            &request.task_id,
+            request.source.user_id.as_str(),
+        );
+        let cloud_profile_requested = resource_profile == RagResourceProfile::CloudAllowed;
+        let mut capsule_prompt_used = false;
         let mut warnings = search_result.warnings.clone();
         let mut degraded_reason = search_result.degraded_reason.clone();
         let mut model = Value::Null;
         let mut answer = build_limited_rag_answer(&query, &citations);
+        let mut prompt = build_rag_answer_prompt(&query, &citations);
+        let mut skip_model = false;
 
-        match self.admin_store.load_or_create_state() {
-            Ok(admin_state) => {
-                match rag_answer_model_state_for_policy(
-                    &admin_state.models,
-                    privacy_level,
-                    resource_profile,
-                ) {
-                    Ok(model_state) => {
-                        let prompt = build_rag_answer_prompt(&query, &citations);
-                        let llm_result = run_llm_text_with_state_and_options(
-                            &prompt,
-                            &model_state,
-                            &LlmTextOptions {
-                                purpose: Some("rag.answer".to_string()),
-                                system_prompt: Some(build_rag_answer_system_prompt()),
-                                temperature: Some(0.0),
-                                max_tokens: Some(rag_answer_max_tokens()),
-                                timeout: Some(Duration::from_millis(rag_answer_budget_ms())),
-                            },
-                        );
-                        model = llm_execution_model_json(&llm_result);
-                        let generated = normalize_rag_answer_text(&llm_result.text);
-                        if llm_result.available && !generated.is_empty() {
-                            if rag_answer_has_citation_marker(&generated, citations.len()) {
-                                answer = generated;
-                            } else {
-                                let mut answered_by_cloud = false;
-                                if llm_selected_endpoint_kind(&llm_result) != Some("cloud") {
-                                    if let Some(cloud_state) = cloud_only_llm_model_state_for_policy(
-                                        &model_state,
-                                        "retrieval.answer",
-                                    ) {
-                                        let cloud_result = run_llm_text_with_state_and_options(
-                                            &prompt,
-                                            &cloud_state,
-                                            &LlmTextOptions {
-                                                purpose: Some("rag.answer".to_string()),
-                                                system_prompt: Some(
-                                                    build_rag_answer_system_prompt(),
-                                                ),
-                                                temperature: Some(0.0),
-                                                max_tokens: Some(rag_answer_max_tokens()),
-                                                timeout: Some(Duration::from_millis(
-                                                    rag_answer_budget_ms(),
-                                                )),
-                                            },
-                                        );
-                                        model = llm_execution_model_json(&cloud_result);
-                                        let cloud_generated =
-                                            normalize_rag_answer_text(&cloud_result.text);
-                                        if cloud_result.available
-                                            && !cloud_generated.is_empty()
-                                            && rag_answer_has_citation_marker(
-                                                &cloud_generated,
-                                                citations.len(),
-                                            )
-                                        {
-                                            answer = cloud_generated;
-                                            answered_by_cloud = true;
-                                        }
-                                    }
-                                }
-                                if !answered_by_cloud {
-                                    degraded_reason
-                                        .get_or_insert_with(|| "uncited_answer".to_string());
-                                    warnings.push(
-                                        "LLM 输出缺少可解析 citation 标记，已降级为引用片段摘要。"
-                                            .to_string(),
-                                    );
-                                }
-                            }
-                        } else {
-                            degraded_reason.get_or_insert_with(|| "llm_unavailable".to_string());
-                            warnings.push(format!(
-                                "LLM 不可用，已降级为引用片段摘要：{}",
-                                llm_result.summary
-                            ));
-                        }
-                    }
-                    Err(error) => {
-                        degraded_reason.get_or_insert_with(|| "llm_policy_blocked".to_string());
-                        warnings.push(error);
-                    }
-                }
-            }
-            Err(error) => {
-                degraded_reason.get_or_insert_with(|| "model_settings_unavailable".to_string());
-                warnings.push(format!("模型设置不可用，已降级为引用片段摘要：{error}"));
+        if cloud_profile_requested && privacy_level == PrivacyLevel::AllowRedactedCloud {
+            if !privacy_gateway_evaluation.decision.cloud_allowed {
+                degraded_reason.get_or_insert_with(|| "privacy_gateway_blocked".to_string());
+                warnings.extend(privacy_gateway_evaluation.decision.warnings.clone());
+                answer = format!(
+                    "Privacy Gateway 已阻断云端回答：{}",
+                    privacy_gateway_evaluation.decision.reason
+                );
+                skip_model = true;
+            } else if let Some(capsule) = privacy_gateway_evaluation.semantic_capsule.as_ref() {
+                prompt = capsule.to_cloud_prompt();
+                capsule_prompt_used = true;
+            } else {
+                degraded_reason.get_or_insert_with(|| "privacy_gateway_blocked".to_string());
+                warnings.push(
+                    "Privacy Gateway 未能生成 semantic capsule，已跳过云端模型。".to_string(),
+                );
+                answer =
+                    "Privacy Gateway 未能生成可上云的 semantic capsule，已降级为本地引用摘要。"
+                        .to_string();
+                skip_model = true;
             }
         }
 
-        let degraded = search_result.degraded || !warnings.is_empty() || degraded_reason.is_some();
+        if !skip_model {
+            match self.admin_store.load_or_create_state() {
+                Ok(admin_state) => {
+                    match rag_answer_model_state_for_policy(
+                        &admin_state.models,
+                        privacy_level,
+                        resource_profile,
+                    ) {
+                        Ok(model_state) => {
+                            let llm_result = run_llm_text_with_state_and_options(
+                                &prompt,
+                                &model_state,
+                                &LlmTextOptions {
+                                    purpose: Some("rag.answer".to_string()),
+                                    system_prompt: Some(build_rag_answer_system_prompt()),
+                                    temperature: Some(0.0),
+                                    max_tokens: Some(rag_answer_max_tokens()),
+                                    timeout: Some(Duration::from_millis(rag_answer_budget_ms())),
+                                },
+                            );
+                            model = llm_execution_model_json(&llm_result);
+                            let generated = normalize_rag_answer_text(&llm_result.text);
+                            if llm_result.available && !generated.is_empty() {
+                                if rag_answer_has_citation_marker(&generated, citations.len()) {
+                                    answer = generated;
+                                } else {
+                                    let mut answered_by_cloud = false;
+                                    if llm_selected_endpoint_kind(&llm_result) != Some("cloud") {
+                                        if let Some(cloud_state) =
+                                            cloud_only_llm_model_state_for_policy(
+                                                &model_state,
+                                                "retrieval.answer",
+                                            )
+                                        {
+                                            let cloud_result = run_llm_text_with_state_and_options(
+                                                &prompt,
+                                                &cloud_state,
+                                                &LlmTextOptions {
+                                                    purpose: Some("rag.answer".to_string()),
+                                                    system_prompt: Some(
+                                                        build_rag_answer_system_prompt(),
+                                                    ),
+                                                    temperature: Some(0.0),
+                                                    max_tokens: Some(rag_answer_max_tokens()),
+                                                    timeout: Some(Duration::from_millis(
+                                                        rag_answer_budget_ms(),
+                                                    )),
+                                                },
+                                            );
+                                            model = llm_execution_model_json(&cloud_result);
+                                            let cloud_generated =
+                                                normalize_rag_answer_text(&cloud_result.text);
+                                            if cloud_result.available
+                                                && !cloud_generated.is_empty()
+                                                && rag_answer_has_citation_marker(
+                                                    &cloud_generated,
+                                                    citations.len(),
+                                                )
+                                            {
+                                                answer = cloud_generated;
+                                                answered_by_cloud = true;
+                                            }
+                                        }
+                                    }
+                                    if !answered_by_cloud {
+                                        degraded_reason
+                                            .get_or_insert_with(|| "uncited_answer".to_string());
+                                        warnings.push(
+                                            "LLM 输出缺少可解析 citation 标记，已降级为引用片段摘要。"
+                                                .to_string(),
+                                        );
+                                    }
+                                }
+                            } else {
+                                degraded_reason
+                                    .get_or_insert_with(|| "llm_unavailable".to_string());
+                                warnings.push(format!(
+                                    "LLM 不可用，已降级为引用片段摘要：{}",
+                                    llm_result.summary
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            degraded_reason.get_or_insert_with(|| "llm_policy_blocked".to_string());
+                            warnings.push(error);
+                        }
+                    }
+                }
+                Err(error) => {
+                    degraded_reason.get_or_insert_with(|| "model_settings_unavailable".to_string());
+                    warnings.push(format!("模型设置不可用，已降级为引用片段摘要：{error}"));
+                }
+            }
+        }
+
+        let degraded = search_result.degraded || degraded_reason.is_some();
         let status = if degraded { "degraded" } else { "completed" };
         let reason = degraded_reason.as_deref().unwrap_or("none");
+        let privacy_gateway = privacy_gateway_evaluation.evidence_value(capsule_prompt_used);
+        self.record_privacy_gateway_audit(
+            request,
+            &privacy_gateway_evaluation,
+            capsule_prompt_used,
+        );
         let data = build_rag_answer_data(
             &query,
             &answer,
@@ -4311,6 +3709,7 @@ impl TaskApiService {
             &citations,
             model,
             warnings,
+            privacy_gateway,
         );
         self.completed(
             request,
@@ -4352,6 +3751,7 @@ impl TaskApiService {
             &citations,
             Value::Null,
             Vec::new(),
+            Value::Null,
         );
         self.failed_with_context(
             request,
@@ -4361,6 +3761,36 @@ impl TaskApiService {
             data,
             Vec::new(),
         )
+    }
+
+    fn record_privacy_gateway_audit(
+        &self,
+        request: &TaskRequest,
+        evaluation: &PrivacyGatewayEvaluation,
+        capsule_prompt_used: bool,
+    ) {
+        let actor_id = first_non_empty(&[request.source.user_id.as_str()])
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "system".to_string());
+        let evidence = evaluation.evidence_value(capsule_prompt_used);
+        let record = build_metadata_audit_record(
+            evaluation.privacy_transform.workspace_id.clone(),
+            "privacy_transform",
+            evaluation.privacy_transform.privacy_transform_id.clone(),
+            "privacy_gateway.rag_answer.evaluate",
+            AuditActorKind::System,
+            actor_id,
+            json!({
+                "task_id": request.task_id,
+                "trace_id": request.trace_id,
+                "purpose": evaluation.flow.purpose,
+                "privacy_level": evaluation.flow.privacy_level,
+                "policy_version": evaluation.flow.policy_version,
+                "metadata_only": true,
+            }),
+            evidence,
+        );
+        let _ = self.admin_store.append_audit_record(record);
     }
 
     fn resolve_camera_target(&self, request: &TaskRequest) -> Result<ResolvedCameraTarget, String> {
@@ -5388,6 +4818,38 @@ impl TaskApiService {
             })
     }
 
+    fn remember_family_memory_event(
+        &self,
+        request: &TaskRequest,
+        stored: &StoredLocalVisionEvent,
+    ) -> Result<(), String> {
+        let mut conversation = self.load_or_create_conversation(request);
+        conversation.set_recent_family_memory_event(Some(RecentFamilyMemoryEventState {
+            event_id: stored.event.event_id.clone(),
+            camera_id: stored.event.camera_id.clone(),
+            event_type: stored.event.event_type.clone(),
+            summary: redact_task_api_text(&stored.event.summary)
+                .chars()
+                .take(160)
+                .collect(),
+            referenced_at_epoch_ms: current_epoch_ms(),
+        }));
+        self.save_conversation(request, &conversation)
+    }
+
+    fn recent_family_memory_event_for_request(
+        &self,
+        request: &TaskRequest,
+    ) -> Option<RecentFamilyMemoryEventState> {
+        self.load_conversation(request)
+            .and_then(|conversation| conversation.recent_family_memory_event())
+            .filter(|recent| {
+                !recent.event_id.trim().is_empty()
+                    && current_epoch_ms().saturating_sub(recent.referenced_at_epoch_ms)
+                        <= RECENT_FAMILY_MEMORY_EVENT_WINDOW_MS
+            })
+    }
+
     fn save_conversation(
         &self,
         request: &TaskRequest,
@@ -6100,7 +5562,26 @@ fn clip_confirmation_active_frame_decision(plan: &GeneralMessagePlan) -> ActiveF
         | GeneralMessagePlanKind::HomeAssistantServiceAction
         | GeneralMessagePlanKind::VisionEventSummary
         | GeneralMessagePlanKind::VisionEventNotifyLatest
-        | GeneralMessagePlanKind::SystemReadiness => ActiveFrameDecision::Supersede,
+        | GeneralMessagePlanKind::VlmDescribeLatestEvent
+        | GeneralMessagePlanKind::VlmDescribeEvent
+        | GeneralMessagePlanKind::FamilyMemorySummary
+        | GeneralMessagePlanKind::SystemReadiness
+        | GeneralMessagePlanKind::EvtReadiness
+        | GeneralMessagePlanKind::EvtPreflight
+        | GeneralMessagePlanKind::EvtEvidenceBundle
+        | GeneralMessagePlanKind::FamilyTimelineSummary
+        | GeneralMessagePlanKind::FamilyTimelineQuery
+        | GeneralMessagePlanKind::GuardianRuleProposal
+        | GeneralMessagePlanKind::GuardianRuleList
+        | GeneralMessagePlanKind::GuardianRuleEnable
+        | GeneralMessagePlanKind::GuardianRulePause
+        | GeneralMessagePlanKind::GuardianStatus
+        | GeneralMessagePlanKind::FamilyMemoryConfirm
+        | GeneralMessagePlanKind::FamilyMemoryFavorite
+        | GeneralMessagePlanKind::FamilyMemoryHide
+        | GeneralMessagePlanKind::FamilyMemoryCorrectSummary
+        | GeneralMessagePlanKind::FamilyMemoryCorrectLabels
+        | GeneralMessagePlanKind::FamilyMemoryShowFavorites => ActiveFrameDecision::Supersede,
         GeneralMessagePlanKind::ConversationAct
             if plan.conversation_act == Some(GeneralMessageConversationAct::Cancel) =>
         {
@@ -6626,6 +6107,10 @@ fn build_knowledge_search_artifacts(response: &KnowledgeSearchResponse) -> Vec<T
                         "matched_terms": hit.matched_terms.clone(),
                         "preview": hit.snippet.clone(),
                         "score": hit.score,
+                        "lexical_score": hit.lexical_score,
+                        "embedding_score": hit.embedding_score,
+                        "hybrid_score": hit.hybrid_score,
+                        "rerank_score": hit.rerank_score,
                         "provenance": hit.provenance.clone(),
                         "match_source": knowledge_hit_match_source(hit),
                         "segment_locator": video_segment_locator(hit),
@@ -6904,6 +6389,7 @@ fn build_rag_answer_data(
     citations: &[KnowledgeSearchCitation],
     model: Value,
     warnings: Vec<String>,
+    privacy_gateway: Value,
 ) -> Value {
     let degraded_reason = if degraded_reason == "none" {
         None
@@ -6926,6 +6412,7 @@ fn build_rag_answer_data(
         },
         "search": search,
         "model": model,
+        "privacy_gateway": privacy_gateway,
         "warnings": warnings,
         "privacy_level": search.privacy_level,
         "resource_profile": search.resource_profile,
@@ -7079,6 +6566,7 @@ fn llm_execution_model_json(result: &LlmTextExecution) -> Value {
         "provider_key": result.provider_key,
         "model_endpoint_id": result.model_endpoint_id,
         "selected_endpoint": result.details.get("selected_endpoint").cloned().unwrap_or(Value::Null),
+        "selected_endpoint_kind": result.details.get("selected_endpoint_kind").cloned().unwrap_or(Value::Null),
         "attempted_endpoints": result.details.get("attempted_endpoints").cloned().unwrap_or_else(|| json!([])),
         "fallback_reason": result.details.get("fallback_reason").cloned().unwrap_or(Value::Null),
         "fallback_used": result.details.get("fallback_used").cloned().unwrap_or(Value::Bool(false)),
@@ -8860,87 +8348,6 @@ fn home_assistant_client_from_admin_state(
     HomeAssistantClient::new(config)
 }
 
-fn latest_local_vision_event() -> Result<Option<StoredLocalVisionEvent>, String> {
-    Ok(list_recent_local_vision_events_default(1)?
-        .into_iter()
-        .next())
-}
-
-fn build_redacted_vision_event_summary(stored: &StoredLocalVisionEvent) -> Value {
-    let event = &stored.event;
-    json!({
-        "event_id": event.event_id,
-        "summary": event.summary,
-        "labels": event.labels,
-        "confidence": event.confidence,
-        "camera_id": event.camera_id,
-        "event_type": event.event_type,
-        "started_at": event.started_at,
-        "received_at": stored.received_at,
-        "latency_ms": event.latency_ms,
-        "analyzer": event.analyzer,
-        "vlm": event.vlm.as_ref().map(|vlm| json!({
-            "status": vlm.status,
-            "summary": vlm.summary,
-            "tags": vlm.tags,
-            "labels": vlm.labels,
-            "artifact_count": vlm.artifacts.len(),
-            "artifacts": vlm.artifacts.iter().map(redacted_vision_event_artifact).collect::<Vec<_>>(),
-            "error": vlm.error.as_ref().map(|error| redact_task_api_text(error)),
-        })),
-        "snapshot_artifact": redacted_snapshot_artifact(&event.snapshot_artifact),
-        "raw_image_included": false,
-        "local_paths_included": false,
-        "redacted": true,
-    })
-}
-
-fn redacted_snapshot_artifact(artifact: &SnapshotArtifact) -> Value {
-    json!({
-        "artifact_id": artifact.artifact_id,
-        "mime_type": artifact.mime_type,
-        "byte_size": artifact.byte_size,
-        "sha256_present": artifact.sha256.as_ref().is_some_and(|value| !value.trim().is_empty()),
-        "source": artifact.source,
-        "path_redacted": artifact.path.as_ref().is_some(),
-    })
-}
-
-fn redacted_vision_event_artifact(artifact: &LocalVisionEventArtifact) -> Value {
-    json!({
-        "artifact_id": artifact.artifact_id,
-        "role": artifact.role,
-        "mime_type": artifact.mime_type,
-        "byte_size": artifact.byte_size,
-        "sha256_present": artifact.sha256.as_ref().is_some_and(|value| !value.trim().is_empty()),
-        "source": artifact.source,
-    })
-}
-
-fn latest_vision_event_reply(stored: &StoredLocalVisionEvent) -> String {
-    let event = &stored.event;
-    let labels = if event.labels.is_empty() {
-        "无标签".to_string()
-    } else {
-        event.labels.join("、")
-    };
-    let vlm_status = event
-        .vlm
-        .as_ref()
-        .map(|vlm| vlm.status.as_str())
-        .unwrap_or("not_available");
-    format!(
-        "最近事件：{}；标签：{}；置信度：{:.2}；摄像头：{}；时间：{}；延迟：{}ms；VLM：{}。",
-        event.summary,
-        labels,
-        event.confidence,
-        event.camera_id,
-        event.started_at,
-        event.latency_ms,
-        vlm_status
-    )
-}
-
 fn default_notification_target_record(
     targets: &[NotificationTargetRecord],
 ) -> Option<&NotificationTargetRecord> {
@@ -9006,42 +8413,6 @@ fn classify_task_notification_delivery_error(
             EventSeverity::Error,
         ),
     }
-}
-
-fn build_general_message_readiness_summary(
-    state: &AdminConsoleState,
-    gateway_status: Option<&Value>,
-    camera_count: usize,
-    latest_event: Option<&StoredLocalVisionEvent>,
-) -> Value {
-    json!({
-        "gateway": {
-            "weixin": build_task_weixin_gateway_status(gateway_status),
-        },
-        "default_notification_target": build_task_default_notification_target_readiness(
-            &state.notification_targets,
-            gateway_status,
-        ),
-        "home_assistant": {
-            "configured": !state.home_assistant.base_url.trim().is_empty()
-                && !state.home_assistant.access_token.trim().is_empty(),
-            "enabled": state.home_assistant.enabled,
-            "status": state.home_assistant.last_status,
-            "token_configured": !state.home_assistant.access_token.trim().is_empty(),
-            "token_redacted": !state.home_assistant.access_token.trim().is_empty(),
-            "last_sync_at": state.home_assistant.last_sync_at,
-            "entity_count": state.home_assistant.entity_count,
-            "service_count": state.home_assistant.service_count,
-            "exposed_domains": state.home_assistant.exposed_domains,
-        },
-        "camera": {
-            "camera_count": camera_count,
-            "event_available": latest_event.is_some(),
-            "latest_event_id": latest_event.map(|stored| stored.event.event_id.clone()),
-            "latest_event_camera_id": latest_event.map(|stored| stored.event.camera_id.clone()),
-        },
-        "redacted": true,
-    })
 }
 
 fn build_task_default_notification_target_readiness(
@@ -9245,7 +8616,74 @@ fn redact_task_api_text(value: &str) -> String {
     {
         return "[redacted sensitive detail]".to_string();
     }
-    trimmed.to_string()
+    redact_local_path_occurrences(trimmed)
+}
+
+fn redact_local_path_occurrences(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut index = 0;
+    while index < value.len() {
+        let remaining = &value[index..];
+        if remaining.starts_with('/') && is_local_path_boundary(value, index) {
+            let end = consume_local_path(value, index);
+            if end > index + 1 {
+                output.push_str("[redacted local path]");
+                index = end;
+                continue;
+            }
+        }
+        if looks_like_windows_absolute_path(value, index) && is_local_path_boundary(value, index) {
+            let end = consume_local_path(value, index);
+            if end > index + 2 {
+                output.push_str("[redacted local path]");
+                index = end;
+                continue;
+            }
+        }
+        let ch = remaining.chars().next().unwrap_or_default();
+        output.push(ch);
+        index += ch.len_utf8();
+    }
+    output
+}
+
+fn is_local_path_boundary(value: &str, index: usize) -> bool {
+    if index == 0 {
+        return true;
+    }
+    value[..index]
+        .chars()
+        .last()
+        .map(|ch| ch.is_whitespace() || matches!(ch, '"' | '\'' | '(' | '[' | '{'))
+        .unwrap_or(true)
+}
+
+fn looks_like_windows_absolute_path(value: &str, index: usize) -> bool {
+    let bytes = value.as_bytes();
+    bytes
+        .get(index)
+        .copied()
+        .map(|byte| byte.is_ascii_alphabetic())
+        .unwrap_or(false)
+        && bytes.get(index + 1) == Some(&b':')
+        && matches!(bytes.get(index + 2), Some(b'\\' | b'/'))
+}
+
+fn consume_local_path(value: &str, start: usize) -> usize {
+    let mut saw_separator = false;
+    for (offset, ch) in value[start..].char_indices() {
+        if matches!(ch, '/' | '\\') {
+            saw_separator = true;
+        }
+        if ch.is_whitespace() || matches!(ch, '"' | '\'' | ')' | ']' | '}' | ',' | ';') {
+            return if saw_separator { start + offset } else { start };
+        }
+    }
+    if saw_separator {
+        value.len()
+    } else {
+        start
+    }
 }
 
 fn looks_like_vision_event_notify_request(normalized: &str) -> bool {
@@ -9289,760 +8727,6 @@ fn looks_like_system_readiness_request(normalized: &str) -> bool {
             "健康状态",
         ],
     )
-}
-
-fn extract_general_message_signals(
-    request: &TaskRequest,
-    session_recap: &[Value],
-    pending_loop: Option<&PendingTaskGeneralMessageLoop>,
-    recent_clip: Option<&RecentClipPlaybackState>,
-) -> GeneralMessageSignals {
-    let normalized = normalize_command_text(request.intent.raw_text.as_str());
-    let recent_camera_context = session_recap.iter().any(|entry| {
-        entry
-            .get("domain")
-            .and_then(Value::as_str)
-            .is_some_and(|value| value.eq_ignore_ascii_case("camera"))
-    });
-    let recent_search_context = session_recap.iter().any(|entry| {
-        entry
-            .get("domain")
-            .and_then(Value::as_str)
-            .is_some_and(|value| value.eq_ignore_ascii_case(KNOWLEDGE_DOMAIN))
-            || entry
-                .get("data_kind")
-                .and_then(Value::as_str)
-                .is_some_and(|value| {
-                    matches!(value, "knowledge.search" | "rag.answer")
-                        || value.eq_ignore_ascii_case(KNOWLEDGE_OP_SEARCH)
-                })
-            || entry.get("query").and_then(Value::as_str).is_some()
-    });
-    let explicit_snapshot = matches_any(
-        &normalized,
-        &["抓拍", "拍照", "拍一张", "来一张", "快照", "截图", "截一张"],
-    );
-    let explicit_video_search = looks_like_video_search_request(&normalized);
-    let explicit_clip = !explicit_video_search
-        && matches_any(
-            &normalized,
-            &[
-                "录一段",
-                "录一下",
-                "录个",
-                "录像",
-                "录视频",
-                "拍视频",
-                "短视频",
-            ],
-        );
-    let explicit_search = explicit_video_search
-        || matches_any(
-            &normalized,
-            &[
-                "找一下",
-                "找到",
-                "查一下",
-                "查找",
-                "搜索",
-                "搜一下",
-                "搜搜",
-                "检索",
-                "找视频",
-                "找录像",
-                "找片段",
-                "找回放",
-                "查录像",
-                "搜索录像",
-                "找照片",
-                "找图片",
-                "只看视频",
-                "只看视频结果",
-                "排除图片和文档",
-                "搜索已有内容",
-            ],
-        );
-    let recent_clip_available = recent_clip.is_some();
-    let explicit_clip_playback =
-        recent_clip_available && recent_clip_playback_request_from_normalized(&normalized);
-    let asks_capability =
-        general_message_requests_capability_summary(request.intent.raw_text.as_str());
-    let explicit_rag_answer = looks_like_rag_answer_request(&normalized) && !asks_capability;
-    let explicit_event_notify = looks_like_vision_event_notify_request(&normalized);
-    let explicit_event_summary =
-        !explicit_event_notify && looks_like_vision_event_summary_request(&normalized);
-    let explicit_system_readiness = looks_like_system_readiness_request(&normalized);
-    let explicit_ha_action =
-        infer_home_assistant_natural_action(request.intent.raw_text.as_str()).is_some();
-    let mentions_camera_context = matches_any(
-        &normalized,
-        &[
-            "摄像头",
-            "监控",
-            "画面",
-            "门口",
-            "客厅",
-            "卧室",
-            "车库",
-            "院子",
-            "阳台",
-        ],
-    ) || pending_loop
-        .and_then(|pending| pending.camera_hint.as_ref())
-        .is_some();
-    let ambiguous_visual_request = !asks_capability
-        && !explicit_snapshot
-        && !explicit_clip
-        && !explicit_search
-        && (matches_any(
-            &normalized,
-            &["看一下", "看一眼", "看下", "看看", "瞅一眼", "瞅瞅"],
-        ) || (mentions_camera_context && matches_any(&normalized, &["看", "瞅"])));
-
-    GeneralMessageSignals {
-        normalized,
-        asks_capability,
-        explicit_clip_playback,
-        explicit_snapshot,
-        explicit_clip,
-        explicit_search,
-        explicit_rag_answer,
-        explicit_ha_action,
-        explicit_event_summary,
-        explicit_event_notify,
-        explicit_system_readiness,
-        mentions_camera_context,
-        ambiguous_visual_request,
-        recent_camera_context,
-        recent_clip_available,
-        recent_search_context,
-    }
-}
-
-fn build_general_message_candidates(
-    request: &TaskRequest,
-    signals: &GeneralMessageSignals,
-    default_camera_hint: Option<&str>,
-    pending_loop: Option<&PendingTaskGeneralMessageLoop>,
-    session_recap: &[Value],
-    recent_clip: Option<&RecentClipPlaybackState>,
-) -> Vec<GeneralMessageCandidate> {
-    let mut candidates = Vec::new();
-    let camera_hint = pending_loop
-        .and_then(|pending| pending.camera_hint.clone())
-        .or_else(|| {
-            infer_camera_hint_from_general_message(
-                request.intent.raw_text.as_str(),
-                default_camera_hint,
-            )
-        });
-    let recent_query = recent_search_query_from_recap(session_recap);
-    let contextual_search_follow_up = knowledge_search_contextual_follow_up(&signals.normalized);
-    let query = pending_loop
-        .and_then(|pending| pending.query.clone())
-        .or_else(|| {
-            contextual_search_follow_up
-                .then(|| recent_query.clone())
-                .flatten()
-        })
-        .or_else(|| infer_query_from_raw_text(request.intent.raw_text.as_str()));
-
-    if signals.asks_capability {
-        push_general_message_candidate(
-            &mut candidates,
-            GeneralMessageCandidate {
-                kind: GeneralMessagePlanKind::CapabilitySummary,
-                confidence: 100,
-                camera_hint: None,
-                query: None,
-                recent_clip: None,
-                reason: "structured_signal_capability_summary".to_string(),
-            },
-        );
-    }
-    if signals.explicit_clip_playback {
-        push_general_message_candidate(
-            &mut candidates,
-            GeneralMessageCandidate {
-                kind: GeneralMessagePlanKind::CameraReplayRecentClip,
-                confidence: 98,
-                camera_hint: None,
-                query: None,
-                recent_clip: recent_clip.cloned(),
-                reason: "structured_signal_recent_clip_playback".to_string(),
-            },
-        );
-    }
-    if signals.explicit_event_notify {
-        push_general_message_candidate(
-            &mut candidates,
-            GeneralMessageCandidate {
-                kind: GeneralMessagePlanKind::VisionEventNotifyLatest,
-                confidence: 99,
-                camera_hint: None,
-                query: None,
-                recent_clip: None,
-                reason: "structured_signal_vision_event_notify".to_string(),
-            },
-        );
-    }
-    if signals.explicit_event_summary {
-        push_general_message_candidate(
-            &mut candidates,
-            GeneralMessageCandidate {
-                kind: GeneralMessagePlanKind::VisionEventSummary,
-                confidence: 98,
-                camera_hint: None,
-                query: None,
-                recent_clip: None,
-                reason: "structured_signal_vision_event_summary".to_string(),
-            },
-        );
-    }
-    if signals.explicit_system_readiness {
-        push_general_message_candidate(
-            &mut candidates,
-            GeneralMessageCandidate {
-                kind: GeneralMessagePlanKind::SystemReadiness,
-                confidence: 98,
-                camera_hint: None,
-                query: None,
-                recent_clip: None,
-                reason: "structured_signal_system_readiness".to_string(),
-            },
-        );
-    }
-    if signals.explicit_ha_action {
-        push_general_message_candidate(
-            &mut candidates,
-            GeneralMessageCandidate {
-                kind: GeneralMessagePlanKind::HomeAssistantServiceAction,
-                confidence: 98,
-                camera_hint: None,
-                query: None,
-                recent_clip: None,
-                reason: "structured_signal_home_assistant_service_action".to_string(),
-            },
-        );
-    }
-    if signals.explicit_snapshot {
-        push_general_message_candidate(
-            &mut candidates,
-            GeneralMessageCandidate {
-                kind: GeneralMessagePlanKind::CameraSnapshot,
-                confidence: 95,
-                camera_hint: camera_hint.clone(),
-                query: None,
-                recent_clip: None,
-                reason: "structured_signal_snapshot".to_string(),
-            },
-        );
-    }
-    if signals.explicit_clip {
-        push_general_message_candidate(
-            &mut candidates,
-            GeneralMessageCandidate {
-                kind: GeneralMessagePlanKind::CameraRecordClip,
-                confidence: 95,
-                camera_hint: camera_hint.clone(),
-                query: None,
-                recent_clip: None,
-                reason: "structured_signal_clip".to_string(),
-            },
-        );
-    }
-    if signals.explicit_search && !signals.explicit_rag_answer {
-        push_general_message_candidate(
-            &mut candidates,
-            GeneralMessageCandidate {
-                kind: GeneralMessagePlanKind::KnowledgeSearch,
-                confidence: 95,
-                camera_hint: None,
-                query: query.clone(),
-                recent_clip: None,
-                reason: "structured_signal_search".to_string(),
-            },
-        );
-    }
-    if !signals.explicit_search && signals.recent_search_context && contextual_search_follow_up {
-        push_general_message_candidate(
-            &mut candidates,
-            GeneralMessageCandidate {
-                kind: GeneralMessagePlanKind::KnowledgeSearch,
-                confidence: 90,
-                camera_hint: None,
-                query: query.clone(),
-                recent_clip: None,
-                reason: "recent_search_context_filter".to_string(),
-            },
-        );
-    }
-    if signals.explicit_rag_answer {
-        push_general_message_candidate(
-            &mut candidates,
-            GeneralMessageCandidate {
-                kind: GeneralMessagePlanKind::RagAnswer,
-                confidence: 95,
-                camera_hint: None,
-                query: query.clone(),
-                recent_clip: None,
-                reason: "structured_signal_rag_answer".to_string(),
-            },
-        );
-    }
-
-    if signals.ambiguous_visual_request {
-        push_general_message_candidate(
-            &mut candidates,
-            GeneralMessageCandidate {
-                kind: GeneralMessagePlanKind::Clarify,
-                confidence: 90,
-                camera_hint: camera_hint.clone(),
-                query: query.clone(),
-                recent_clip: None,
-                reason: "ambiguous_visual_request".to_string(),
-            },
-        );
-        push_general_message_candidate(
-            &mut candidates,
-            GeneralMessageCandidate {
-                kind: GeneralMessagePlanKind::CameraSnapshot,
-                confidence: 55,
-                camera_hint: camera_hint.clone(),
-                query: None,
-                recent_clip: None,
-                reason: "plausible_visual_snapshot".to_string(),
-            },
-        );
-        push_general_message_candidate(
-            &mut candidates,
-            GeneralMessageCandidate {
-                kind: GeneralMessagePlanKind::CameraRecordClip,
-                confidence: 55,
-                camera_hint,
-                query: None,
-                recent_clip: None,
-                reason: "plausible_visual_clip".to_string(),
-            },
-        );
-    }
-
-    if !signals.explicit_snapshot
-        && !signals.explicit_clip
-        && signals.recent_camera_context
-        && matches_any(&signals.normalized, &["再来一张", "再拍一张", "再看一眼"])
-    {
-        push_general_message_candidate(
-            &mut candidates,
-            GeneralMessageCandidate {
-                kind: GeneralMessagePlanKind::CameraSnapshot,
-                confidence: 85,
-                camera_hint: pending_loop
-                    .and_then(|pending| pending.camera_hint.clone())
-                    .or_else(|| default_camera_hint.map(str::to_string)),
-                query: None,
-                recent_clip: None,
-                reason: "recent_camera_context_snapshot".to_string(),
-            },
-        );
-    }
-
-    if !signals.explicit_clip
-        && signals.recent_camera_context
-        && matches_any(&signals.normalized, &["再来一段", "再录一段", "再录一下"])
-    {
-        push_general_message_candidate(
-            &mut candidates,
-            GeneralMessageCandidate {
-                kind: GeneralMessagePlanKind::CameraRecordClip,
-                confidence: 85,
-                camera_hint: pending_loop
-                    .and_then(|pending| pending.camera_hint.clone())
-                    .or_else(|| default_camera_hint.map(str::to_string)),
-                query: None,
-                recent_clip: None,
-                reason: "recent_camera_context_clip".to_string(),
-            },
-        );
-    }
-
-    if !signals.explicit_clip_playback
-        && signals.recent_clip_available
-        && matches_any(&signals.normalized, &["再放一下", "再回放一下", "再播一下"])
-    {
-        push_general_message_candidate(
-            &mut candidates,
-            GeneralMessageCandidate {
-                kind: GeneralMessagePlanKind::CameraReplayRecentClip,
-                confidence: 85,
-                camera_hint: None,
-                query: None,
-                recent_clip: recent_clip.cloned(),
-                reason: "recent_clip_context_playback".to_string(),
-            },
-        );
-    }
-
-    if !signals.explicit_search
-        && signals.recent_search_context
-        && matches_any(
-            &signals.normalized,
-            &["再搜一下", "再查一下", "再找找", "搜已有内容"],
-        )
-    {
-        push_general_message_candidate(
-            &mut candidates,
-            GeneralMessageCandidate {
-                kind: GeneralMessagePlanKind::KnowledgeSearch,
-                confidence: 85,
-                camera_hint: None,
-                query,
-                recent_clip: None,
-                reason: "recent_search_context_search".to_string(),
-            },
-        );
-    }
-
-    candidates
-}
-
-fn push_general_message_candidate(
-    candidates: &mut Vec<GeneralMessageCandidate>,
-    candidate: GeneralMessageCandidate,
-) {
-    if let Some(existing) = candidates
-        .iter_mut()
-        .find(|item| item.kind == candidate.kind)
-    {
-        if candidate.confidence > existing.confidence {
-            *existing = candidate;
-            return;
-        }
-        if existing.camera_hint.is_none() {
-            existing.camera_hint = candidate.camera_hint;
-        }
-        if existing.query.is_none() {
-            existing.query = candidate.query;
-        }
-        if existing.recent_clip.is_none() {
-            existing.recent_clip = candidate.recent_clip;
-        }
-        if existing.reason.trim().is_empty() {
-            existing.reason = candidate.reason;
-        }
-        return;
-    }
-    candidates.push(candidate);
-}
-
-fn infer_camera_hint_from_general_message(
-    raw_text: &str,
-    default_camera_hint: Option<&str>,
-) -> Option<String> {
-    if let Some(default_camera_hint) = default_camera_hint
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return Some(default_camera_hint.to_string());
-    }
-
-    let normalized = normalize_command_text(raw_text);
-    [
-        ("front-door", &["门口", "门前", "前门", "玄关"][..]),
-        ("living-room", &["客厅"][..]),
-        ("bedroom", &["卧室"][..]),
-        ("garage", &["车库"][..]),
-        ("yard", &["院子", "院门"][..]),
-        ("balcony", &["阳台"][..]),
-    ]
-    .into_iter()
-    .find_map(|(hint, tokens)| {
-        tokens
-            .iter()
-            .any(|token| normalized.contains(&normalize_command_text(token)))
-            .then(|| hint.to_string())
-    })
-}
-
-fn resolve_deterministic_general_message_plan(
-    request: &TaskRequest,
-    candidates: &[GeneralMessageCandidate],
-    pending_loop: Option<&PendingTaskGeneralMessageLoop>,
-) -> Option<GeneralMessagePlan> {
-    if candidates.is_empty() {
-        return None;
-    }
-
-    let mut actionable = candidates
-        .iter()
-        .filter(|candidate| {
-            !matches!(
-                candidate.kind,
-                GeneralMessagePlanKind::Clarify
-                    | GeneralMessagePlanKind::ConversationAct
-                    | GeneralMessagePlanKind::Unsupported
-            )
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    actionable.sort_by(|left, right| {
-        right
-            .confidence
-            .cmp(&left.confidence)
-            .then_with(|| left.reason.cmp(&right.reason))
-    });
-
-    if let Some(primary) = actionable.first() {
-        let competing = actionable
-            .iter()
-            .skip(1)
-            .filter(|candidate| candidate.confidence + 15 >= primary.confidence)
-            .count();
-        if primary.confidence >= 90 && competing == 0 {
-            return Some(plan_from_general_message_candidate(primary));
-        }
-    }
-
-    if let Some(clarify) = candidates
-        .iter()
-        .filter(|candidate| candidate.kind == GeneralMessagePlanKind::Clarify)
-        .max_by_key(|candidate| candidate.confidence)
-    {
-        let plausible_actions = actionable
-            .iter()
-            .filter(|candidate| candidate.confidence >= 50)
-            .count();
-        if clarify.confidence >= 80 || plausible_actions >= 2 {
-            return Some(plan_from_general_message_candidate(clarify));
-        }
-    }
-
-    if let Some(primary) = actionable.first() {
-        let runner_up = actionable
-            .get(1)
-            .map(|candidate| candidate.confidence)
-            .unwrap_or(0);
-        if primary.confidence >= 80 && primary.confidence >= runner_up + 20 {
-            return Some(plan_from_general_message_candidate(primary));
-        }
-    }
-
-    if pending_loop.is_some() {
-        return fallback_general_message_plan(
-            request.intent.raw_text.as_str(),
-            pending_loop.and_then(|pending| pending.camera_hint.as_deref()),
-        );
-    }
-
-    None
-}
-
-fn plan_from_general_message_candidate(candidate: &GeneralMessageCandidate) -> GeneralMessagePlan {
-    GeneralMessagePlan {
-        kind: candidate.kind.clone(),
-        conversation_act: None,
-        reply_text: None,
-        camera_hint: candidate.camera_hint.clone(),
-        query: candidate.query.clone(),
-        recent_clip: candidate.recent_clip.clone(),
-        reason: Some(candidate.reason.clone()),
-    }
-}
-
-fn deterministic_stage_for_plan(plan: &GeneralMessagePlan) -> &'static str {
-    match plan.kind {
-        GeneralMessagePlanKind::Clarify => "deterministic_clarify",
-        GeneralMessagePlanKind::ConversationAct => "deterministic_conversation_act",
-        _ => "deterministic_single_candidate",
-    }
-}
-
-fn should_try_general_message_router_llm(
-    signals: &GeneralMessageSignals,
-    _pending_loop: Option<&PendingTaskGeneralMessageLoop>,
-) -> bool {
-    !signals.normalized.is_empty()
-}
-
-fn build_general_message_router_system_prompt() -> String {
-    concat!(
-        "You are a HarborBeacon router. Return exactly one lowercase label from this closed set ",
-        "and nothing else: capability_summary, camera_snapshot, camera_record_clip, ",
-        "vision_event_summary, vision_event_notify_latest, ha_service_action, system_readiness, ",
-        "knowledge_search, rag_answer, clarify, conversation_continue, conversation_boundary, ",
-        "conversation_repair, conversation_cancel, conversation_clarify_continue. ",
-        "Choose a tool label only for a clear supported request; otherwise choose a conversation_* label. ",
-        "Do not invent external weather, news, stock, or internet providers."
-    )
-    .to_string()
-}
-
-fn build_general_message_router_prompt(
-    request: &TaskRequest,
-    session_recap: &[Value],
-    pending_loop: Option<&PendingTaskGeneralMessageLoop>,
-) -> String {
-    format!(
-        concat!(
-            "User message: {message}\n",
-            "Recent session recap (newest first, max {limit}): {session_recap}\n",
-            "Pending loop context: {pending_loop}\n",
-            "Choose the single best label. If the message is not a clear supported tool request, ",
-            "choose the best conversation_* act instead of unsupported.\n"
-        ),
-        message = request.intent.raw_text,
-        limit = GENERAL_MESSAGE_RECAP_LIMIT,
-        session_recap = serde_json::to_string(session_recap).unwrap_or_else(|_| "[]".to_string()),
-        pending_loop = serde_json::to_string(&pending_loop.map(|pending| {
-            json!({
-                "original_goal": pending.original_goal,
-                "latest_user_intent_text": pending.latest_user_intent_text,
-                "last_clarification_prompt": pending.last_clarification_prompt,
-                "camera_hint": pending.camera_hint,
-                "query": pending.query,
-            })
-        }))
-        .unwrap_or_else(|_| "null".to_string()),
-    )
-}
-
-fn parse_general_message_router_decision(
-    text: &str,
-) -> Option<(
-    GeneralMessagePlanKind,
-    Option<GeneralMessageConversationAct>,
-)> {
-    if let Some(plan) = parse_general_message_plan(text) {
-        return Some((plan.kind, plan.conversation_act));
-    }
-
-    let candidates = [
-        text.trim().to_ascii_lowercase(),
-        text.lines()
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase(),
-        text.split_whitespace()
-            .next()
-            .unwrap_or_default()
-            .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | ',' | '.' | ';' | '：' | ':'))
-            .to_ascii_lowercase(),
-    ];
-
-    for candidate in candidates {
-        match candidate.as_str() {
-            "clarify" => return Some((GeneralMessagePlanKind::Clarify, None)),
-            "capability_summary" | "capability" | "help" => {
-                return Some((GeneralMessagePlanKind::CapabilitySummary, None))
-            }
-            "camera_snapshot" | "snapshot" => {
-                return Some((GeneralMessagePlanKind::CameraSnapshot, None))
-            }
-            "camera_record_clip" | "record_clip" | "clip" => {
-                return Some((GeneralMessagePlanKind::CameraRecordClip, None))
-            }
-            "knowledge_search" | "search" => {
-                return Some((GeneralMessagePlanKind::KnowledgeSearch, None))
-            }
-            "rag_answer" | "rag.answer" | "answer" => {
-                return Some((GeneralMessagePlanKind::RagAnswer, None))
-            }
-            "ha_service_action" | "home_assistant_service_action" | "home_assistant_action" => {
-                return Some((GeneralMessagePlanKind::HomeAssistantServiceAction, None))
-            }
-            "vision_event_summary" | "event_summary" | "recent_event" => {
-                return Some((GeneralMessagePlanKind::VisionEventSummary, None))
-            }
-            "vision_event_notify_latest" | "event_notify" | "notify_latest_event" => {
-                return Some((GeneralMessagePlanKind::VisionEventNotifyLatest, None))
-            }
-            "system_readiness" | "status" | "diagnostics" => {
-                return Some((GeneralMessagePlanKind::SystemReadiness, None))
-            }
-            "conversation" | "conversation_continue" | "continue" => {
-                return Some((
-                    GeneralMessagePlanKind::ConversationAct,
-                    Some(GeneralMessageConversationAct::Continue),
-                ))
-            }
-            "conversation_boundary" | "boundary" | "unsupported" => {
-                return Some((
-                    GeneralMessagePlanKind::ConversationAct,
-                    Some(GeneralMessageConversationAct::Boundary),
-                ))
-            }
-            "conversation_repair" | "repair" => {
-                return Some((
-                    GeneralMessagePlanKind::ConversationAct,
-                    Some(GeneralMessageConversationAct::Repair),
-                ))
-            }
-            "conversation_cancel" | "cancel" => {
-                return Some((
-                    GeneralMessagePlanKind::ConversationAct,
-                    Some(GeneralMessageConversationAct::Cancel),
-                ))
-            }
-            "conversation_clarify_continue" | "clarify_continue" => {
-                return Some((
-                    GeneralMessagePlanKind::ConversationAct,
-                    Some(GeneralMessageConversationAct::ClarifyContinue),
-                ))
-            }
-            _ => {}
-        }
-    }
-
-    None
-}
-
-fn plan_from_router_decision(
-    kind: GeneralMessagePlanKind,
-    conversation_act: Option<GeneralMessageConversationAct>,
-    request: &TaskRequest,
-    default_camera_hint: Option<&str>,
-    pending_loop: Option<&PendingTaskGeneralMessageLoop>,
-) -> GeneralMessagePlan {
-    let camera_hint = pending_loop
-        .and_then(|pending| pending.camera_hint.clone())
-        .or_else(|| {
-            infer_camera_hint_from_general_message(
-                request.intent.raw_text.as_str(),
-                default_camera_hint,
-            )
-        });
-    let query = pending_loop
-        .and_then(|pending| pending.query.clone())
-        .or_else(|| infer_query_from_raw_text(request.intent.raw_text.as_str()));
-    let plan_camera_hint = match kind {
-        GeneralMessagePlanKind::CameraSnapshot
-        | GeneralMessagePlanKind::CameraRecordClip
-        | GeneralMessagePlanKind::Clarify => camera_hint,
-        _ => None,
-    };
-    let plan_query = match kind {
-        GeneralMessagePlanKind::KnowledgeSearch
-        | GeneralMessagePlanKind::RagAnswer
-        | GeneralMessagePlanKind::Clarify => query,
-        _ => None,
-    };
-    let plan_conversation_act = if kind == GeneralMessagePlanKind::ConversationAct {
-        Some(conversation_act.unwrap_or_else(|| {
-            infer_general_message_conversation_act(request.intent.raw_text.as_str(), pending_loop)
-        }))
-    } else {
-        None
-    };
-    GeneralMessagePlan {
-        kind,
-        conversation_act: plan_conversation_act,
-        reply_text: None,
-        camera_hint: plan_camera_hint,
-        query: plan_query,
-        recent_clip: None,
-        reason: Some("router_llm".to_string()),
-    }
 }
 
 fn maybe_render_general_message_reply(
@@ -10130,53 +8814,35 @@ fn maybe_render_general_message_reply(
     }
 }
 
-fn build_general_message_renderer_system_prompt() -> String {
-    "You are a concise Chinese HarborBeacon reply writer. Output only one short Chinese user-facing sentence or question. Do not mention internal reasoning or JSON.".to_string()
-}
-
-fn build_general_message_renderer_prompt(
-    request: &TaskRequest,
-    pending_loop: Option<&PendingTaskGeneralMessageLoop>,
+fn record_workflow_compiler_shadow(
+    trace: &mut GeneralMessageControllerTrace,
+    candidate: Option<&WorkflowCandidate>,
     plan: &GeneralMessagePlan,
-    fallback_text: &str,
-) -> String {
-    format!(
-        concat!(
-            "Reply kind: {kind}\n",
-            "Current user message: {message}\n",
-            "Pending loop context: {pending_loop}\n",
-            "Fallback text: {fallback}\n",
-            "Write a short natural Chinese reply. If the fallback text is already appropriate, keep its meaning.\n"
-        ),
-        kind = match plan.kind {
-            GeneralMessagePlanKind::Clarify => "clarify",
-            GeneralMessagePlanKind::ConversationAct => plan
-                .conversation_act
-                .map(GeneralMessageConversationAct::reply_pack_kind)
-                .unwrap_or("conversation_continue"),
-            GeneralMessagePlanKind::Unsupported => "unsupported",
-            GeneralMessagePlanKind::CapabilitySummary => "capability_summary",
-            GeneralMessagePlanKind::CameraReplayRecentClip => "camera_replay_recent_clip",
-            GeneralMessagePlanKind::CameraSnapshot => "camera_snapshot",
-            GeneralMessagePlanKind::CameraRecordClip => "camera_record_clip",
-            GeneralMessagePlanKind::KnowledgeSearch => "knowledge_search",
-            GeneralMessagePlanKind::RagAnswer => "rag_answer",
-            GeneralMessagePlanKind::HomeAssistantServiceAction => "ha_service_action",
-            GeneralMessagePlanKind::VisionEventSummary => "vision_event_summary",
-            GeneralMessagePlanKind::VisionEventNotifyLatest => "vision_event_notify_latest",
-            GeneralMessagePlanKind::SystemReadiness => "system_readiness",
+) {
+    let current_plan = general_message_plan_decision_label(plan);
+    let shadow = match candidate {
+        Some(candidate) => GeneralMessageWorkflowCompilerShadowTrace {
+            workflow_id: Some(candidate.workflow_id.clone()),
+            node_id: Some(candidate.node_id.clone()),
+            candidate_kind: Some(candidate.candidate_kind.clone()),
+            confidence: Some(candidate.confidence),
+            matched_current_plan: candidate.candidate_kind == current_plan,
+            read_only: candidate.read_only,
+            unsafe_action: candidate.has_unsafe_action(),
+            reason: Some(candidate.reason.clone()),
         },
-        message = request.intent.raw_text,
-        pending_loop = serde_json::to_string(&pending_loop.map(|pending| {
-            json!({
-                "original_goal": pending.original_goal,
-                "latest_user_intent_text": pending.latest_user_intent_text,
-                "last_clarification_prompt": pending.last_clarification_prompt,
-            })
-        }))
-        .unwrap_or_else(|_| "null".to_string()),
-        fallback = fallback_text,
-    )
+        None => GeneralMessageWorkflowCompilerShadowTrace {
+            workflow_id: None,
+            node_id: None,
+            candidate_kind: None,
+            confidence: None,
+            matched_current_plan: false,
+            read_only: true,
+            unsafe_action: false,
+            reason: Some("no workflow compiler candidate".to_string()),
+        },
+    };
+    trace.workflow_compiler_shadow = Some(shadow);
 }
 
 fn attach_general_message_controller_trace(
@@ -10193,6 +8859,31 @@ fn attach_general_message_controller_trace(
         json!({ "payload": previous })
     };
     if let Some(map) = payload.as_object_mut() {
+        let fallback_reason = trace.fallback_reason.as_deref().map(redact_task_api_text);
+        let nsp_route = json!({
+            "stage": trace.controller_stage,
+            "schema_valid": trace.nsp_schema_valid,
+            "local_only": trace.nsp_local_only,
+            "decision": trace.nsp_decision,
+            "confidence": trace.nsp_confidence,
+            "canonical_phrase": trace
+                .nsp_canonical_phrase
+                .as_deref()
+                .map(redact_task_api_text),
+            "fallback_reason": fallback_reason.clone(),
+        });
+        let workflow_compiler_shadow = trace.workflow_compiler_shadow.as_ref().map(|shadow| {
+            json!({
+                "workflow_id": shadow.workflow_id,
+                "node_id": shadow.node_id,
+                "candidate_kind": shadow.candidate_kind,
+                "confidence": shadow.confidence,
+                "matched_current_plan": shadow.matched_current_plan,
+                "read_only": shadow.read_only,
+                "unsafe_action": shadow.unsafe_action,
+                "reason": shadow.reason.as_deref().map(redact_task_api_text),
+            })
+        });
         map.insert(
             "general_message_controller".to_string(),
             json!({
@@ -10201,10 +8892,15 @@ fn attach_general_message_controller_trace(
                 "router_latency_ms": trace.router_latency_ms,
                 "renderer_latency_ms": trace.renderer_latency_ms,
                 "candidate_count": trace.candidate_count,
-                "fallback_reason": trace.fallback_reason,
+                "fallback_reason": fallback_reason.clone(),
+                "nsp_route": nsp_route.clone(),
+                "workflow_compiler_shadow": workflow_compiler_shadow,
                 "total_turn_latency_ms": elapsed.as_millis() as u64,
             }),
         );
+        if let Some(reply_pack) = map.get_mut("reply_pack").and_then(Value::as_object_mut) {
+            reply_pack.insert("nsp_route".to_string(), nsp_route);
+        }
     }
     response.result.data = payload;
 }
@@ -10216,209 +8912,6 @@ fn should_route_general_message_to_knowledge(request: &TaskRequest) -> bool {
         first_string(&[&request.args], &["/device_hint"]).as_deref(),
     )
     .is_some_and(|plan| matches!(plan.kind, GeneralMessagePlanKind::KnowledgeSearch))
-}
-
-fn general_message_requests_capability_summary(raw_text: &str) -> bool {
-    let normalized = normalize_command_text(raw_text);
-    if normalized.is_empty() {
-        return false;
-    }
-
-    if general_message_requests_local_first_architecture_summary(raw_text) {
-        return true;
-    }
-
-    let exact_matches = ["帮助", "帮助一下", "help", "helpme"];
-    if exact_matches
-        .iter()
-        .any(|candidate| normalized == normalize_command_text(candidate))
-    {
-        return true;
-    }
-
-    [
-        "你能做什么",
-        "你还能做什么",
-        "你可以做什么",
-        "你会做什么",
-        "你能干什么",
-        "你可以干什么",
-        "你能帮我做什么",
-        "你还能帮我做什么",
-        "摄像头能做什么",
-        "摄像头可以做什么",
-        "摄像头能干什么",
-        "摄像头可以干什么",
-        "监控能做什么",
-        "监控可以做什么",
-        "监控能干什么",
-        "监控可以干什么",
-    ]
-    .iter()
-    .map(|candidate| normalize_command_text(candidate))
-    .any(|candidate| normalized.contains(&candidate))
-}
-
-fn general_message_requests_local_first_architecture_summary(raw_text: &str) -> bool {
-    let normalized = normalize_command_text(raw_text);
-    if normalized.is_empty() {
-        return false;
-    }
-
-    let mentions_harbor_core = matches_any(&normalized, &["harborbeacon", "harborgate"]);
-    let mentions_policy_or_fallback = matches_any(
-        &normalized,
-        &[
-            "fallback", "回退", "云端", "privacy", "resource", "policy", "策略",
-        ],
-    );
-    let mentions_local_first = matches_any(
-        &normalized,
-        &[
-            "local-first",
-            "localfirst",
-            "本地优先",
-            "本地优先策略",
-            "云端fallback",
-            "受控fallback",
-            "受控回退",
-        ],
-    );
-    let asks_architecture = matches_any(
-        &normalized,
-        &[
-            "架构",
-            "怎么受控",
-            "怎么工作",
-            "如何工作",
-            "解释一下",
-            "说明一下",
-            "讲一下",
-        ],
-    );
-
-    asks_architecture
-        && (mentions_local_first || mentions_harbor_core || mentions_policy_or_fallback)
-}
-
-fn general_message_supported_examples() -> Vec<String> {
-    vec![
-        "拍一张门口".to_string(),
-        "录一段门口".to_string(),
-        "最近事件".to_string(),
-        "通知最新事件".to_string(),
-        "开灯".to_string(),
-        "关灯".to_string(),
-        "切换开关".to_string(),
-        "执行测试场景".to_string(),
-        "状态".to_string(),
-        "帮我找到和樱花有关的文件".to_string(),
-        "根据资料回答樱花计划是什么".to_string(),
-    ]
-}
-
-fn general_message_support_summary_for_request(raw_text: &str) -> String {
-    if general_message_requests_local_first_architecture_summary(raw_text) {
-        return "当前链路默认 local-first：HarborBeacon 负责业务状态、RAG 和策略裁决，HarborGate 只负责 IM 传输；云端模型只有在 privacy/resource policy 放行时才作为受控 fallback，SiliconFlow 只是当前 .82 fallback proof，不是默认架构。".to_string();
-    }
-
-    general_message_support_summary()
-}
-
-fn general_message_support_summary() -> String {
-    "我可以作为 K3 家庭入口：摄像头抓拍/短视频、最近事件、通知最新事件、低风险家居动作、状态诊断，也能搜索/问答已有知识库；遇到多个家居实体时我会先让你选择，不会猜着执行。".to_string()
-}
-
-fn general_message_unsupported_summary() -> String {
-    let examples = general_message_supported_examples();
-    format!(
-        "这类请求我现在不处理；我不接公网天气、新闻、股票等外部实时信息。你可以直接说：{}。",
-        examples.join("；")
-    )
-}
-
-fn infer_general_message_conversation_act(
-    raw_text: &str,
-    pending_loop: Option<&PendingTaskGeneralMessageLoop>,
-) -> GeneralMessageConversationAct {
-    let normalized = normalize_command_text(raw_text);
-    if matches_any(
-        &normalized,
-        &["算了", "不用了", "先不用", "不要了", "别处理", "取消"],
-    ) || normalized == normalize_command_text("不要")
-    {
-        return GeneralMessageConversationAct::Cancel;
-    }
-    if matches_any(
-        &normalized,
-        &["不对", "不是", "不是这个", "错了", "理解错了", "重新来"],
-    ) {
-        return GeneralMessageConversationAct::Repair;
-    }
-    if pending_loop.is_some() {
-        return GeneralMessageConversationAct::ClarifyContinue;
-    }
-    if matches_any(
-        &normalized,
-        &[
-            "天气",
-            "温度",
-            "下雨",
-            "新闻",
-            "股价",
-            "股票",
-            "汇率",
-            "外卖",
-            "打车",
-            "讲个笑话",
-            "唱歌",
-            "播放音乐",
-        ],
-    ) {
-        return GeneralMessageConversationAct::Boundary;
-    }
-    GeneralMessageConversationAct::Continue
-}
-
-fn general_message_conversation_summary(
-    request: &TaskRequest,
-    pending_loop: Option<&PendingTaskGeneralMessageLoop>,
-    act: GeneralMessageConversationAct,
-) -> String {
-    match act {
-        GeneralMessageConversationAct::Continue => {
-            "收到，有需要你直接说要看什么或找什么。".to_string()
-        }
-        GeneralMessageConversationAct::Boundary => {
-            let normalized = normalize_command_text(request.intent.raw_text.as_str());
-            if matches_any(&normalized, &["天气", "温度", "下雨"]) {
-                return "天气这类公网实时信息我现在不处理；我可以帮你看摄像头、查最近事件、通知默认目标、执行低风险家居动作或看状态。"
-                    .to_string();
-            }
-            "这件事我现在不直接处理；我可以帮你看摄像头、查最近事件、通知默认目标、执行低风险家居动作或看状态。".to_string()
-        }
-        GeneralMessageConversationAct::Repair => {
-            "收到，我重新理解；你可以换个说法告诉我要处理什么。".to_string()
-        }
-        GeneralMessageConversationAct::Cancel => "好的，先不处理这件事。".to_string(),
-        GeneralMessageConversationAct::ClarifyContinue => pending_loop
-            .and_then(|pending| {
-                let prompt = pending.last_clarification_prompt.trim();
-                (!prompt.is_empty()).then(|| format!("收到。{prompt}"))
-            })
-            .unwrap_or_else(|| {
-                "收到。你可以继续补一句具体要拍、录、查事件、通知、开关设备还是看状态。".to_string()
-            }),
-    }
-}
-
-fn general_message_default_clarification_prompt(raw_text: &str) -> String {
-    let normalized = normalize_command_text(raw_text);
-    if normalized.contains("看") || normalized.contains("门口") || normalized.contains("摄像头")
-    {
-        return "你是想让我拍一张最新画面、录一段短视频，还是搜索已经保存的内容？".to_string();
-    }
-    "你是想让我拍一张、录一段，还是搜索已有内容？".to_string()
 }
 
 fn extract_password_from_raw_text(raw_text: &str) -> Option<String> {
@@ -10566,93 +9059,15 @@ fn infer_query_from_raw_text(raw_text: &str) -> Option<String> {
     }
 }
 
-fn parse_general_message_plan(text: &str) -> Option<GeneralMessagePlan> {
-    let payload = parse_json_object_from_text(text)?;
-    let payload = serde_json::from_value::<GeneralMessagePlanPayload>(payload).ok()?;
-    let decision = if payload.decision.trim().is_empty() {
-        payload.action.trim().to_ascii_lowercase()
-    } else {
-        payload.decision.trim().to_ascii_lowercase()
-    };
-    let payload_conversation_act = payload
-        .conversation_act
-        .as_deref()
-        .and_then(parse_general_message_conversation_act_label);
-    let (kind, conversation_act) = match decision.as_str() {
-        "clarify" => (GeneralMessagePlanKind::Clarify, None),
-        "capability_summary" | "capability" | "help" => {
-            (GeneralMessagePlanKind::CapabilitySummary, None)
-        }
-        "camera_snapshot" | "snapshot" => (GeneralMessagePlanKind::CameraSnapshot, None),
-        "camera_record_clip" | "record_clip" | "clip" => {
-            (GeneralMessagePlanKind::CameraRecordClip, None)
-        }
-        "knowledge_search" | "search" => (GeneralMessagePlanKind::KnowledgeSearch, None),
-        "rag_answer" | "rag.answer" | "answer" => (GeneralMessagePlanKind::RagAnswer, None),
-        "ha_service_action" | "home_assistant_service_action" | "home_assistant_action" => {
-            (GeneralMessagePlanKind::HomeAssistantServiceAction, None)
-        }
-        "vision_event_summary" | "event_summary" | "recent_event" => {
-            (GeneralMessagePlanKind::VisionEventSummary, None)
-        }
-        "vision_event_notify_latest" | "event_notify" | "notify_latest_event" => {
-            (GeneralMessagePlanKind::VisionEventNotifyLatest, None)
-        }
-        "system_readiness" | "status" | "diagnostics" => {
-            (GeneralMessagePlanKind::SystemReadiness, None)
-        }
-        "conversation" | "conversation_continue" | "continue" => (
-            GeneralMessagePlanKind::ConversationAct,
-            Some(payload_conversation_act.unwrap_or(GeneralMessageConversationAct::Continue)),
-        ),
-        "conversation_boundary" | "boundary" | "unsupported" => (
-            GeneralMessagePlanKind::ConversationAct,
-            Some(payload_conversation_act.unwrap_or(GeneralMessageConversationAct::Boundary)),
-        ),
-        "conversation_repair" | "repair" => (
-            GeneralMessagePlanKind::ConversationAct,
-            Some(payload_conversation_act.unwrap_or(GeneralMessageConversationAct::Repair)),
-        ),
-        "conversation_cancel" | "cancel" => (
-            GeneralMessagePlanKind::ConversationAct,
-            Some(payload_conversation_act.unwrap_or(GeneralMessageConversationAct::Cancel)),
-        ),
-        "conversation_clarify_continue" | "clarify_continue" => (
-            GeneralMessagePlanKind::ConversationAct,
-            Some(
-                payload_conversation_act.unwrap_or(GeneralMessageConversationAct::ClarifyContinue),
-            ),
-        ),
-        _ => return None,
-    };
-    Some(GeneralMessagePlan {
-        kind,
-        conversation_act,
-        reply_text: normalize_optional_general_message_plan_field(payload.reply_text),
-        camera_hint: normalize_optional_general_message_plan_field(payload.camera_hint),
-        query: normalize_optional_general_message_plan_field(payload.query),
-        recent_clip: None,
-        reason: normalize_optional_general_message_plan_field(payload.reason),
+fn json_string_at_paths_task(value: &Value, paths: &[&str]) -> Option<String> {
+    paths.iter().find_map(|path| {
+        value
+            .pointer(path)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
     })
-}
-
-fn parse_general_message_conversation_act_label(
-    label: &str,
-) -> Option<GeneralMessageConversationAct> {
-    match label.trim().to_ascii_lowercase().as_str() {
-        "continue" | "conversation" | "conversation_continue" => {
-            Some(GeneralMessageConversationAct::Continue)
-        }
-        "boundary" | "unsupported" | "conversation_boundary" => {
-            Some(GeneralMessageConversationAct::Boundary)
-        }
-        "repair" | "conversation_repair" => Some(GeneralMessageConversationAct::Repair),
-        "cancel" | "conversation_cancel" => Some(GeneralMessageConversationAct::Cancel),
-        "clarify_continue" | "conversation_clarify_continue" => {
-            Some(GeneralMessageConversationAct::ClarifyContinue)
-        }
-        _ => None,
-    }
 }
 
 fn normalize_optional_general_message_plan_field(value: Option<String>) -> Option<String> {
@@ -10725,140 +9140,6 @@ fn extract_first_balanced_json_object(text: &str) -> Option<&str> {
         }
     }
 
-    None
-}
-
-fn fallback_general_message_plan(
-    raw_text: &str,
-    default_camera_hint: Option<&str>,
-) -> Option<GeneralMessagePlan> {
-    let normalized = normalize_command_text(raw_text);
-    if normalized.is_empty() {
-        return None;
-    }
-
-    if general_message_requests_capability_summary(raw_text) {
-        return Some(GeneralMessagePlan {
-            kind: GeneralMessagePlanKind::CapabilitySummary,
-            conversation_act: None,
-            reply_text: None,
-            camera_hint: None,
-            query: None,
-            recent_clip: None,
-            reason: Some("fallback rule inferred a capability summary request".to_string()),
-        });
-    }
-
-    if looks_like_vision_event_notify_request(&normalized) {
-        return Some(GeneralMessagePlan {
-            kind: GeneralMessagePlanKind::VisionEventNotifyLatest,
-            conversation_act: None,
-            reply_text: None,
-            camera_hint: None,
-            query: None,
-            recent_clip: None,
-            reason: Some("fallback rule inferred a latest event notification request".to_string()),
-        });
-    }
-    if looks_like_vision_event_summary_request(&normalized) {
-        return Some(GeneralMessagePlan {
-            kind: GeneralMessagePlanKind::VisionEventSummary,
-            conversation_act: None,
-            reply_text: None,
-            camera_hint: None,
-            query: None,
-            recent_clip: None,
-            reason: Some("fallback rule inferred a recent event summary request".to_string()),
-        });
-    }
-    if looks_like_system_readiness_request(&normalized) {
-        return Some(GeneralMessagePlan {
-            kind: GeneralMessagePlanKind::SystemReadiness,
-            conversation_act: None,
-            reply_text: None,
-            camera_hint: None,
-            query: None,
-            recent_clip: None,
-            reason: Some("fallback rule inferred a system readiness request".to_string()),
-        });
-    }
-    if infer_home_assistant_natural_action(raw_text).is_some() {
-        return Some(GeneralMessagePlan {
-            kind: GeneralMessagePlanKind::HomeAssistantServiceAction,
-            conversation_act: None,
-            reply_text: None,
-            camera_hint: None,
-            query: None,
-            recent_clip: None,
-            reason: Some("fallback rule inferred a Home Assistant service action".to_string()),
-        });
-    }
-
-    if !looks_like_video_search_request(&normalized)
-        && matches_any(
-            &normalized,
-            &["录一段", "录视频", "拍视频", "录个视频", "录像"],
-        )
-    {
-        return Some(GeneralMessagePlan {
-            kind: GeneralMessagePlanKind::CameraRecordClip,
-            conversation_act: None,
-            reply_text: None,
-            camera_hint: default_camera_hint.map(str::to_string),
-            query: None,
-            recent_clip: None,
-            reason: Some("fallback rule inferred a short clip request".to_string()),
-        });
-    }
-    if matches_any(&normalized, &["抓拍", "拍照", "拍一张", "看一眼", "截一张"]) {
-        return Some(GeneralMessagePlan {
-            kind: GeneralMessagePlanKind::CameraSnapshot,
-            conversation_act: None,
-            reply_text: None,
-            camera_hint: default_camera_hint.map(str::to_string),
-            query: None,
-            recent_clip: None,
-            reason: Some("fallback rule inferred a snapshot request".to_string()),
-        });
-    }
-    if looks_like_rag_answer_request(&normalized) {
-        return Some(GeneralMessagePlan {
-            kind: GeneralMessagePlanKind::RagAnswer,
-            conversation_act: None,
-            reply_text: None,
-            camera_hint: None,
-            query: infer_query_from_raw_text(raw_text),
-            recent_clip: None,
-            reason: Some("fallback rule inferred a RAG answer request".to_string()),
-        });
-    }
-    if matches_any(
-        &normalized,
-        &[
-            "找一下",
-            "找到",
-            "查一下",
-            "搜索",
-            "检索",
-            "找照片",
-            "找视频",
-            "找录像",
-            "找片段",
-            "找回放",
-            "只看视频",
-            "排除图片和文档",
-        ],
-    ) {
-        return Some(GeneralMessagePlan {
-            kind: GeneralMessagePlanKind::KnowledgeSearch,
-            conversation_act: None,
-            reply_text: None,
-            camera_hint: None,
-            query: infer_query_from_raw_text(raw_text),
-            recent_clip: None,
-            reason: Some("fallback rule inferred a knowledge search request".to_string()),
-        });
-    }
     None
 }
 
@@ -11773,7 +10054,7 @@ mod tests {
     use crate::control_plane::auth::{AuthSource, IdentityBinding};
     use crate::control_plane::media::{MediaAssetKind, StorageTargetKind};
     use crate::control_plane::models::{
-        ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind,
+        ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, PrivacyLevel,
     };
     use crate::control_plane::tasks::{
         ArtifactKind, ConversationSession, ExecutionRoute, TaskRunStatus, TaskStepRunStatus,
@@ -11781,7 +10062,8 @@ mod tests {
     use crate::orchestrator::contracts::RiskLevel;
     use crate::runtime::admin_console::{
         AdminConsoleState, AdminConsoleStore, HomeAssistantConfigUpdate, IdentityBindingRecord,
-        KnowledgeSettings, KnowledgeSourceRoot, NotificationTargetRecord, RemoteViewConfig,
+        KnowledgeSettings, KnowledgeSourceRoot, NotificationTargetRecord, RagResourceProfile,
+        RemoteViewConfig,
     };
     use crate::runtime::hub::HubScanResultItem;
     use crate::runtime::knowledge::{
@@ -11833,6 +10115,7 @@ mod tests {
                 lexical_score: Some(0.82),
                 embedding_score: None,
                 hybrid_score: Some(0.82),
+                rerank_score: None,
                 chunk_id: Some("chunk-0001".to_string()),
                 line_start: Some(1),
                 line_end: Some(1),
@@ -11900,6 +10183,7 @@ mod tests {
                 lexical_score: Some(0.76),
                 embedding_score: None,
                 hybrid_score: Some(0.76),
+                rerank_score: None,
                 chunk_id: Some("chunk-0001".to_string()),
                 line_start: Some(1),
                 line_end: Some(1),
@@ -11978,6 +10262,7 @@ mod tests {
                 lexical_score: Some(0.76),
                 embedding_score: None,
                 hybrid_score: Some(0.76),
+                rerank_score: None,
                 chunk_id: Some("chunk-0001".to_string()),
                 line_start: Some(1),
                 line_end: Some(1),
@@ -12038,7 +10323,31 @@ mod tests {
         std::env::temp_dir().join(format!("{prefix}-{unique}"))
     }
 
+    fn restore_env_var(name: &str, previous: Option<std::ffi::OsString>) {
+        if let Some(value) = previous {
+            std::env::set_var(name, value);
+        } else {
+            std::env::remove_var(name);
+        }
+    }
+
     fn configure_knowledge_source(store: &AdminConsoleStore, root: &Path, index_root: &Path) {
+        configure_knowledge_source_with_policy(
+            store,
+            root,
+            index_root,
+            PrivacyLevel::StrictLocal,
+            RagResourceProfile::CpuOnly,
+        );
+    }
+
+    fn configure_knowledge_source_with_policy(
+        store: &AdminConsoleStore,
+        root: &Path,
+        index_root: &Path,
+        privacy_level: PrivacyLevel,
+        default_resource_profile: RagResourceProfile,
+    ) {
         fs::create_dir_all(index_root).expect("create knowledge index root");
         store
             .save_knowledge_settings(KnowledgeSettings {
@@ -12052,7 +10361,9 @@ mod tests {
                     last_indexed_at: None,
                 }],
                 index_root: index_root.to_string_lossy().into_owned(),
-                ..Default::default()
+                privacy_level,
+                default_resource_profile,
+                retrieval: Default::default(),
             })
             .expect("save knowledge settings");
         KnowledgeIndexService::from_config(
@@ -12131,6 +10442,50 @@ mod tests {
                 }),
             })
             .expect("save mock llm endpoint");
+    }
+
+    fn configure_mock_cloud_llm(service: &TaskApiService, mock_text: &str) {
+        service
+            .clone()
+            .admin_store
+            .save_model_endpoint(ModelEndpoint {
+                model_endpoint_id: "llm-cloud-openai-compatible".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Llm,
+                endpoint_kind: ModelEndpointKind::Cloud,
+                provider_key: "openai_compatible".to_string(),
+                model_name: "harbor-cloud-chat".to_string(),
+                capability_tags: vec!["chat".to_string(), "cloud".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({
+                    "mock_text": mock_text,
+                }),
+            })
+            .expect("save mock cloud llm endpoint");
+    }
+
+    fn configure_mock_embedding(service: &TaskApiService) {
+        service
+            .clone()
+            .admin_store
+            .save_model_endpoint(ModelEndpoint {
+                model_endpoint_id: "embedder-local-mock".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Embedder,
+                endpoint_kind: ModelEndpointKind::Local,
+                provider_key: "mock".to_string(),
+                model_name: "harbor-mock-embedder".to_string(),
+                capability_tags: vec!["embedding".to_string(), "local_first".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({
+                    "mock_embedding_dimensions": 4,
+                }),
+            })
+            .expect("save mock embedding endpoint");
     }
 
     fn cleanup_task_api_service(
@@ -16073,6 +14428,271 @@ mod tests {
     }
 
     #[test]
+    fn handle_rag_answer_redacted_cloud_uses_privacy_capsule() {
+        let _guard = RETRIEVAL_GATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let previous_admin_state_path = std::env::var_os("HARBOR_ADMIN_STATE_PATH");
+        std::env::set_var("HARBOR_ADMIN_STATE_PATH", &admin_path);
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
+        let knowledge_root = unique_dir("harborbeacon-rag-answer-redacted-cloud-root");
+        let index_root = unique_dir("harborbeacon-rag-answer-redacted-cloud-index");
+        fs::create_dir_all(knowledge_root.join("docs")).expect("create docs");
+        fs::write(
+            knowledge_root.join("docs").join("family-plan.md"),
+            "The family garden plan includes photos, captions, and a sharing checklist.",
+        )
+        .expect("write doc");
+
+        let admin_store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        configure_knowledge_source_with_policy(
+            &admin_store,
+            &knowledge_root,
+            &index_root,
+            PrivacyLevel::AllowRedactedCloud,
+            RagResourceProfile::CloudAllowed,
+        );
+        let service = TaskApiService::new(
+            admin_store,
+            TaskConversationStore::new(conversation_path.clone()),
+        );
+        configure_mock_embedding(&service);
+        configure_mock_cloud_llm(&service, "The plan includes photos and captions. [1]");
+        let request = TaskRequest {
+            task_id: "task-rag-answer-redacted-cloud".to_string(),
+            trace_id: "trace-rag-answer-redacted-cloud".to_string(),
+            step_id: "step-rag-answer-redacted-cloud".to_string(),
+            source: TaskSource {
+                user_id: "owner-1".to_string(),
+                ..Default::default()
+            },
+            intent: TaskIntent {
+                domain: "rag".to_string(),
+                action: "answer".to_string(),
+                raw_text: "summarize the family plan".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "query": "family garden plan",
+                "roots": [knowledge_root.to_string_lossy().to_string()],
+                "privacy_level": "allow_redacted_cloud",
+                "resource_profile": "cloud_allowed"
+            }),
+            autonomy: Default::default(),
+            message: None,
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(
+            response.result.data["privacy_gateway"]["decision"],
+            "allow_redacted_cloud"
+        );
+        assert_eq!(
+            response.result.data["privacy_gateway"]["capsule_prompt_used"],
+            true
+        );
+        assert_eq!(
+            response.result.data["model"]["selected_endpoint_kind"],
+            "cloud"
+        );
+        assert_eq!(
+            response.result.data["privacy_gateway"]["capsule_fact_count"],
+            1
+        );
+        let audits = service.admin_store.audit_records().expect("audit records");
+        assert!(audits
+            .iter()
+            .any(|record| record.action == "privacy_gateway.rag_answer.evaluate"));
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+        let _ = fs::remove_dir_all(knowledge_root);
+        let _ = fs::remove_dir_all(index_root);
+        restore_env_var("HARBOR_ADMIN_STATE_PATH", previous_admin_state_path);
+    }
+
+    #[test]
+    fn handle_rag_answer_redacted_cloud_blocks_credential_capsule() {
+        let _guard = RETRIEVAL_GATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let previous_admin_state_path = std::env::var_os("HARBOR_ADMIN_STATE_PATH");
+        std::env::set_var("HARBOR_ADMIN_STATE_PATH", &admin_path);
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
+        let knowledge_root = unique_dir("harborbeacon-rag-answer-credential-root");
+        let index_root = unique_dir("harborbeacon-rag-answer-credential-index");
+        fs::create_dir_all(knowledge_root.join("docs")).expect("create docs");
+        fs::write(
+            knowledge_root.join("docs").join("garage-secret.md"),
+            "The garage integration api_key=secret-123 should never leave the home.",
+        )
+        .expect("write doc");
+
+        let admin_store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        configure_knowledge_source_with_policy(
+            &admin_store,
+            &knowledge_root,
+            &index_root,
+            PrivacyLevel::AllowRedactedCloud,
+            RagResourceProfile::CloudAllowed,
+        );
+        let service = TaskApiService::new(
+            admin_store,
+            TaskConversationStore::new(conversation_path.clone()),
+        );
+        configure_mock_embedding(&service);
+        configure_mock_cloud_llm(&service, "this cloud text should not be used [1]");
+        let request = TaskRequest {
+            task_id: "task-rag-answer-credential".to_string(),
+            trace_id: "trace-rag-answer-credential".to_string(),
+            step_id: "step-rag-answer-credential".to_string(),
+            source: TaskSource::default(),
+            intent: TaskIntent {
+                domain: "rag".to_string(),
+                action: "answer".to_string(),
+                raw_text: "what is the garage api key".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "query": "garage api key",
+                "roots": [knowledge_root.to_string_lossy().to_string()],
+                "privacy_level": "allow_redacted_cloud",
+                "resource_profile": "cloud_allowed"
+            }),
+            autonomy: Default::default(),
+            message: None,
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.result.data["status"], "degraded");
+        assert_eq!(
+            response.result.data["degraded_reason"],
+            "privacy_gateway_blocked"
+        );
+        assert_eq!(
+            response.result.data["privacy_gateway"]["decision"],
+            "blocked_or_degraded"
+        );
+        assert_eq!(
+            response.result.data["privacy_gateway"]["cloud_allowed"],
+            false
+        );
+        assert_eq!(response.result.data["model"], Value::Null);
+        assert!(response.result.message.contains("Privacy Gateway"));
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+        let _ = fs::remove_dir_all(knowledge_root);
+        let _ = fs::remove_dir_all(index_root);
+        restore_env_var("HARBOR_ADMIN_STATE_PATH", previous_admin_state_path);
+    }
+
+    #[test]
+    fn handle_rag_answer_allow_cloud_records_privacy_gateway_evidence() {
+        let _guard = RETRIEVAL_GATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let previous_admin_state_path = std::env::var_os("HARBOR_ADMIN_STATE_PATH");
+        std::env::set_var("HARBOR_ADMIN_STATE_PATH", &admin_path);
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
+        let knowledge_root = unique_dir("harborbeacon-rag-answer-allow-cloud-root");
+        let index_root = unique_dir("harborbeacon-rag-answer-allow-cloud-index");
+        fs::create_dir_all(knowledge_root.join("docs")).expect("create docs");
+        fs::write(
+            knowledge_root.join("docs").join("device-note.md"),
+            "The device note says Harbor can answer from controlled cloud fallback.",
+        )
+        .expect("write doc");
+
+        let admin_store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        configure_knowledge_source_with_policy(
+            &admin_store,
+            &knowledge_root,
+            &index_root,
+            PrivacyLevel::AllowCloud,
+            RagResourceProfile::CloudAllowed,
+        );
+        let service = TaskApiService::new(
+            admin_store,
+            TaskConversationStore::new(conversation_path.clone()),
+        );
+        configure_mock_embedding(&service);
+        configure_mock_cloud_llm(
+            &service,
+            "Harbor can answer from controlled cloud fallback. [1]",
+        );
+        let request = TaskRequest {
+            task_id: "task-rag-answer-allow-cloud".to_string(),
+            trace_id: "trace-rag-answer-allow-cloud".to_string(),
+            step_id: "step-rag-answer-allow-cloud".to_string(),
+            source: TaskSource::default(),
+            intent: TaskIntent {
+                domain: "rag".to_string(),
+                action: "answer".to_string(),
+                raw_text: "what does the device note say".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "query": "controlled cloud fallback",
+                "roots": [knowledge_root.to_string_lossy().to_string()],
+                "privacy_level": "allow_cloud",
+                "resource_profile": "cloud_allowed"
+            }),
+            autonomy: Default::default(),
+            message: None,
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(
+            response.result.data["privacy_gateway"]["decision"],
+            "allow_cloud"
+        );
+        assert_eq!(
+            response.result.data["privacy_gateway"]["capsule_prompt_used"],
+            false
+        );
+        assert_eq!(
+            response.result.data["model"]["selected_endpoint_kind"],
+            "cloud"
+        );
+        assert_eq!(
+            response.result.data["degraded"], false,
+            "{}",
+            response.result.data
+        );
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+        let _ = fs::remove_dir_all(knowledge_root);
+        let _ = fs::remove_dir_all(index_root);
+        restore_env_var("HARBOR_ADMIN_STATE_PATH", previous_admin_state_path);
+    }
+
+    #[test]
     fn general_message_routes_retrieval_query_to_knowledge_search() {
         let _guard = RETRIEVAL_GATE_TEST_LOCK
             .lock()
@@ -16344,7 +14964,11 @@ mod tests {
         );
         assert_eq!(
             response.result.data["general_message_controller"]["router_llm"],
-            false
+            true
+        );
+        assert_eq!(
+            response.result.data["general_message_controller"]["nsp_route"]["local_only"],
+            true
         );
 
         cleanup_task_api_service(admin_path, registry_path, conversation_path);
@@ -16938,6 +15562,68 @@ mod tests {
     }
 
     #[test]
+    fn general_message_workflow_compiler_shadow_matches_system_readiness() {
+        let (service, _conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-workflow-shadow-status");
+        let request = general_message_test_request(
+            "general_message_workflow_shadow_status",
+            "状态",
+            Value::Null,
+        );
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(
+            response.result.data["reply_pack"]["kind"],
+            json!("system_readiness")
+        );
+        let shadow =
+            &response.result.data["general_message_controller"]["workflow_compiler_shadow"];
+        assert_eq!(shadow["workflow_id"], json!("system_diagnostics_v1"));
+        assert_eq!(shadow["candidate_kind"], json!("system_readiness"));
+        assert_eq!(shadow["matched_current_plan"], json!(true));
+        assert_eq!(shadow["read_only"], json!(true));
+        assert_eq!(shadow["unsafe_action"], json!(false));
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+    }
+
+    #[test]
+    fn general_message_workflow_compiler_shadow_does_not_override_nsp_plan() {
+        let (service, _conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-workflow-shadow-mismatch");
+        configure_mock_general_message_llm(
+            &service,
+            r#"{"decision":"capability_summary","confidence":0.95,"reason":"forced mismatch"}"#,
+        );
+        let request = general_message_test_request(
+            "general_message_workflow_shadow_mismatch",
+            "状态",
+            Value::Null,
+        );
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(
+            response.result.data["general_message_controller"]["controller_stage"],
+            json!("nsp_router")
+        );
+        assert_eq!(
+            response.result.data["reply_pack"]["kind"],
+            json!("capability_summary")
+        );
+        let shadow =
+            &response.result.data["general_message_controller"]["workflow_compiler_shadow"];
+        assert_eq!(shadow["candidate_kind"], json!("system_readiness"));
+        assert_eq!(shadow["matched_current_plan"], json!(false));
+        assert_eq!(shadow["unsafe_action"], json!(false));
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+    }
+
+    #[test]
     fn parse_general_message_plan_accepts_json_embedded_in_text() {
         let plan = parse_general_message_plan(
             r#"先给出结论：
@@ -16975,6 +15661,32 @@ mod tests {
             ha_plan.kind,
             GeneralMessagePlanKind::HomeAssistantServiceAction
         );
+        assert!(ha_plan.home_assistant_action.is_none());
+        let ha_slots_plan = parse_general_message_plan(
+            r#"{
+                "decision": "ha_service_action",
+                "confidence": 0.91,
+                "canonical_phrase": "开灯",
+                "home_assistant": {
+                    "domain": "light",
+                    "service": "turn_on",
+                    "entity_hint": "厨房"
+                }
+            }"#,
+        )
+        .expect("HA slots plan");
+        assert_eq!(ha_slots_plan.confidence, Some(91));
+        assert_eq!(ha_slots_plan.canonical_phrase.as_deref(), Some("开灯"));
+        assert_eq!(
+            ha_slots_plan.home_assistant_action,
+            Some(HomeAssistantNaturalAction::Request(
+                HomeAssistantNaturalActionRequest {
+                    domain: "light".to_string(),
+                    service: "turn_on".to_string(),
+                    entity_hint: Some("厨房".to_string()),
+                }
+            ))
+        );
         let notify_plan =
             parse_general_message_plan(r#"{"decision":"vision_event_notify_latest"}"#)
                 .expect("event notify plan");
@@ -16997,6 +15709,292 @@ mod tests {
             Some(GeneralMessageConversationAct::Boundary)
         );
         assert_eq!(plan.reply_text.as_deref(), Some("这件事我现在不直接处理。"));
+    }
+
+    #[test]
+    fn parse_general_message_plan_accepts_closed_nsp_tool_decisions() {
+        let cases = [
+            ("camera_snapshot", GeneralMessagePlanKind::CameraSnapshot),
+            (
+                "camera_record_clip",
+                GeneralMessagePlanKind::CameraRecordClip,
+            ),
+            (
+                "vision_event_summary",
+                GeneralMessagePlanKind::VisionEventSummary,
+            ),
+            (
+                "vision_event_notify_latest",
+                GeneralMessagePlanKind::VisionEventNotifyLatest,
+            ),
+            ("system_readiness", GeneralMessagePlanKind::SystemReadiness),
+            ("evt_readiness", GeneralMessagePlanKind::EvtReadiness),
+            ("evt_preflight", GeneralMessagePlanKind::EvtPreflight),
+            (
+                "evt_evidence_bundle",
+                GeneralMessagePlanKind::EvtEvidenceBundle,
+            ),
+            ("knowledge_search", GeneralMessagePlanKind::KnowledgeSearch),
+            ("rag_answer", GeneralMessagePlanKind::RagAnswer),
+        ];
+
+        for (decision, expected_kind) in cases {
+            let plan = parse_general_message_plan(&format!(
+                r#"{{
+                    "decision": "{decision}",
+                    "confidence": 0.88,
+                    "canonical_phrase": "{decision}",
+                    "camera_hint": "门口",
+                    "query": "本地资料"
+                }}"#
+            ))
+            .expect("closed NSP decision");
+            assert_eq!(plan.kind, expected_kind);
+            assert_eq!(plan.confidence, Some(88));
+            assert_eq!(plan.canonical_phrase.as_deref(), Some(decision));
+        }
+    }
+
+    #[test]
+    fn general_message_router_system_prompt_disables_qwen3_thinking() {
+        let prompt = super::build_general_message_router_system_prompt();
+
+        assert!(prompt.starts_with("/no_think"));
+        assert!(prompt.contains("Return exactly one valid JSON object"));
+        assert!(prompt.contains("\"confidence\":0.95"));
+        assert!(prompt.contains("do not copy 0.0"));
+        assert!(prompt.contains("asking status/diagnostics/health"));
+        assert!(prompt.contains("evt_readiness, evt_preflight, evt_evidence_bundle"));
+        assert!(prompt.contains("4h or 72h stress test"));
+        assert!(prompt.contains("default notification"));
+        assert!(prompt.contains("\"domain\":\"scene\",\"service\":\"turn_on\""));
+        assert!(prompt.contains("帮我做一下EVT预检"));
+        assert!(prompt.contains("\"decision\":\"evt_preflight\""));
+        assert!(prompt.contains("生成压测证据"));
+        assert!(prompt.contains("\"decision\":\"evt_evidence_bundle\""));
+    }
+
+    #[test]
+    fn general_message_nsp_hard_guard_overrides_external_or_unsafe_continue() {
+        let weather_request =
+            general_message_test_request("nsp_boundary_weather", "深圳今天会下雨吗", Value::Null);
+        let mut weather_plan =
+            parse_general_message_plan(r#"{"decision":"conversation_continue","confidence":0.95}"#)
+                .expect("weather continue plan");
+
+        super::enforce_general_message_nsp_hard_guards(&weather_request, &mut weather_plan);
+
+        assert_eq!(weather_plan.kind, GeneralMessagePlanKind::ConversationAct);
+        assert_eq!(
+            weather_plan.conversation_act,
+            Some(GeneralMessageConversationAct::Boundary)
+        );
+        assert_eq!(
+            weather_plan.reason.as_deref(),
+            Some("nsp_boundary_hard_guard")
+        );
+
+        let lock_request = general_message_test_request(
+            "nsp_boundary_lock",
+            "我到门口了，把门锁打开",
+            Value::Null,
+        );
+        let mut lock_plan =
+            parse_general_message_plan(r#"{"decision":"conversation_continue","confidence":0.95}"#)
+                .expect("lock continue plan");
+
+        super::enforce_general_message_nsp_hard_guards(&lock_request, &mut lock_plan);
+
+        assert_eq!(
+            lock_plan.conversation_act,
+            Some(GeneralMessageConversationAct::Boundary)
+        );
+
+        let long_run_request = general_message_test_request(
+            "nsp_boundary_evt_long_run",
+            "开始72小时压测",
+            Value::Null,
+        );
+        let mut long_run_plan =
+            parse_general_message_plan(r#"{"decision":"evt_preflight","confidence":0.95}"#)
+                .expect("long run plan");
+
+        super::enforce_general_message_nsp_hard_guards(&long_run_request, &mut long_run_plan);
+
+        assert_eq!(long_run_plan.kind, GeneralMessagePlanKind::ConversationAct);
+        assert_eq!(
+            long_run_plan.conversation_act,
+            Some(GeneralMessageConversationAct::Boundary)
+        );
+        assert_eq!(
+            long_run_plan.reason.as_deref(),
+            Some("evt_long_run_requires_operator_supervisor")
+        );
+        assert!(long_run_plan
+            .reply_text
+            .as_deref()
+            .unwrap_or_default()
+            .contains("operator supervisor"));
+    }
+
+    #[test]
+    fn general_message_evt_preflight_runs_short_guard_only() {
+        let (service, _conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-evt-preflight");
+        configure_mock_general_message_llm(
+            &service,
+            r#"{
+                "decision": "evt_preflight",
+                "confidence": 0.94,
+                "canonical_phrase": "EVT预检",
+                "reason": "user asks for pre-stress environment preflight"
+            }"#,
+        );
+
+        let response = service.handle_task(general_message_test_request(
+            "evt_preflight",
+            "帮我做一下EVT预检",
+            Value::Null,
+        ));
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.result.data["reply_pack"]["kind"], "evt_preflight");
+        assert_eq!(
+            response.result.data["reply_pack"]["preflight"]["long_run_started"],
+            json!(false)
+        );
+        assert_eq!(
+            response.result.data["reply_pack"]["preflight"]["short_run_started"],
+            json!(false)
+        );
+        let text = serde_json::to_string(&response.result.data).expect("serialize reply");
+        assert!(!text.contains("rtsp://"));
+        assert!(!text.contains("Bearer "));
+        assert!(!text.contains("data:image"));
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+    }
+
+    #[test]
+    fn general_message_nsp_low_confidence_tool_does_not_execute() {
+        let (service, _conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-nsp-low-confidence");
+        configure_mock_general_message_llm(
+            &service,
+            r#"{
+                "decision": "camera_snapshot",
+                "confidence": 0.31,
+                "canonical_phrase": "拍一张门口",
+                "camera_hint": "front-door",
+                "reason": "weak visual request"
+            }"#,
+        );
+
+        let response = service.handle_task(general_message_test_request(
+            "nsp_low_confidence",
+            "门口现在咋样",
+            Value::Null,
+        ));
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.executor_used, "agentic_interpreter");
+        assert_eq!(
+            response.result.data["reply_pack"]["kind"],
+            "conversation_continue"
+        );
+        assert_eq!(
+            response.result.data["general_message_controller"]["fallback_reason"],
+            "nsp_low_confidence"
+        );
+        assert_eq!(
+            response.result.data["general_message_controller"]["nsp_route"]["confidence"],
+            json!(31)
+        );
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+    }
+
+    #[test]
+    fn general_message_nsp_home_assistant_slots_clarify_ambiguous_entities() {
+        let (service, _conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-nsp-ha-clarify");
+        let (base_url, posts, server_thread) =
+            start_mock_home_assistant_server(vec![home_assistant_light_entities()], 1);
+        configure_mock_home_assistant(&service, &base_url);
+        configure_mock_general_message_llm(
+            &service,
+            r#"{
+                "decision": "ha_service_action",
+                "confidence": 0.94,
+                "canonical_phrase": "开灯",
+                "home_assistant": {
+                    "domain": "light",
+                    "service": "turn_on",
+                    "entity_hint": null
+                },
+                "reason": "safe low-risk light action"
+            }"#,
+        );
+
+        let response = service.handle_task(general_message_test_request(
+            "nsp_ha_clarify",
+            "屋里太暗了，帮我弄亮一点",
+            Value::Null,
+        ));
+
+        assert_eq!(response.status, TaskStatus::NeedsInput);
+        assert_eq!(response.result.data["reply_pack"]["status"], "needs_input");
+        assert_eq!(
+            response.result.data["general_message_controller"]["controller_stage"],
+            "nsp_router"
+        );
+        assert_eq!(
+            response.result.data["general_message_controller"]["nsp_route"]["decision"],
+            "ha_service_action"
+        );
+        assert_eq!(posts.lock().expect("posts").len(), 0);
+
+        server_thread.join().expect("HA server");
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+    }
+
+    #[test]
+    fn general_message_nsp_unsafe_home_assistant_slots_are_blocked() {
+        let (service, _conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-nsp-ha-blocked");
+        configure_mock_general_message_llm(
+            &service,
+            r#"{
+                "decision": "ha_service_action",
+                "confidence": 0.95,
+                "canonical_phrase": "解锁门锁",
+                "home_assistant": {
+                    "domain": "lock",
+                    "service": "unlock",
+                    "entity_hint": "门口"
+                },
+                "reason": "unsafe lock action"
+            }"#,
+        );
+
+        let response = service.handle_task(general_message_test_request(
+            "nsp_ha_blocked",
+            "我回来了，帮我把门打开",
+            Value::Null,
+        ));
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.result.data["reply_pack"]["status"], "blocked");
+        assert_eq!(response.result.data["reply_pack"]["executed"], false);
+        assert_eq!(
+            response.result.data["general_message_controller"]["controller_stage"],
+            "nsp_router"
+        );
+        let text = serde_json::to_string(&response.result.data).expect("serialize response");
+        assert!(!text.contains("ha-test-token"));
+        assert!(!text.contains("rtsp://"));
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
     }
 
     #[test]
@@ -17055,7 +16053,7 @@ mod tests {
             response.result.data["reply_pack"]["examples"]
                 .as_array()
                 .map(Vec::len),
-            Some(11)
+            Some(19)
         );
         assert!(response.result.data["reply_pack"]["capabilities"]
             .as_array()
@@ -17067,6 +16065,26 @@ mod tests {
             .expect("capabilities")
             .iter()
             .any(|capability| capability.as_str() == Some("vision_event_notify_latest")));
+        assert!(response.result.data["reply_pack"]["capabilities"]
+            .as_array()
+            .expect("capabilities")
+            .iter()
+            .any(|capability| capability.as_str() == Some("evt_preflight")));
+        assert!(response.result.data["reply_pack"]["capabilities"]
+            .as_array()
+            .expect("capabilities")
+            .iter()
+            .any(|capability| capability.as_str() == Some("guardian_rule_proposal")));
+        assert!(response.result.data["reply_pack"]["capabilities"]
+            .as_array()
+            .expect("capabilities")
+            .iter()
+            .any(|capability| capability.as_str() == Some("vlm_describe_latest_event")));
+        assert!(response.result.data["reply_pack"]["capabilities"]
+            .as_array()
+            .expect("capabilities")
+            .iter()
+            .any(|capability| capability.as_str() == Some("family_memory_summary")));
         assert!(response.result.data["reply_pack"]["examples"]
             .as_array()
             .expect("examples")
@@ -17105,7 +16123,11 @@ mod tests {
         assert!(response.result.message.contains("SiliconFlow"));
         assert_eq!(
             response.result.data["general_message_controller"]["router_llm"],
-            false
+            true
+        );
+        assert_eq!(
+            response.result.data["general_message_controller"]["nsp_route"]["local_only"],
+            true
         );
 
         cleanup_task_api_service(admin_path, registry_path, conversation_path);
@@ -17159,7 +16181,11 @@ mod tests {
         );
         assert_eq!(
             response.result.data["general_message_controller"]["router_llm"],
-            false
+            true
+        );
+        assert_eq!(
+            response.result.data["general_message_controller"]["nsp_route"]["local_only"],
+            true
         );
         assert!(
             response.result.data["general_message_controller"]["total_turn_latency_ms"]
@@ -17957,7 +16983,7 @@ mod tests {
         );
         assert_eq!(
             response.result.data["general_message_controller"]["fallback_reason"],
-            "router_invalid_label"
+            "nsp_invalid_json_or_decision"
         );
         assert!(!response.result.message.contains("我暂时还不能稳定理解"));
 

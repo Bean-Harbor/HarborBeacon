@@ -136,9 +136,7 @@ impl TaskApiHttpServer {
 
         let response = match method {
             Method::Get if path == "/healthz" => ok_json(&json!({"status":"ok"})).boxed(),
-            Method::Post if path == "/api/turns" || path == "/api/web/turns" => {
-                self.handle_turn(&mut request).boxed()
-            }
+            Method::Post if is_turn_api_path(&path) => self.handle_turn(&mut request).boxed(),
             Method::Options => no_content().boxed(),
             _ => shared_error_json(
                 StatusCode(404),
@@ -227,6 +225,16 @@ impl TaskApiHttpServer {
             .and_then(|value| parse_bearer_token(&value))
             .is_some_and(|value| value == self.service_token)
     }
+}
+
+pub(crate) fn is_turn_api_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/api/web/turns"
+            | "/api/turns"
+            | "/web/turns"
+            | "/turns"
+    )
 }
 
 fn main() {
@@ -470,7 +478,7 @@ mod tests {
     use tiny_http::{Header, StatusCode};
 
     use super::{
-        header_value, parse_bearer_token, TaskApiHttpServer, HEADER_AUTHORIZATION,
+        header_value, is_turn_api_path, parse_bearer_token, TaskApiHttpServer, HEADER_AUTHORIZATION,
         HEADER_CONTRACT_VERSION,
     };
     use harborbeacon_local_agent::runtime::admin_console::AdminConsoleStore;
@@ -640,6 +648,16 @@ mod tests {
             Some("token-2".to_string())
         );
         assert_eq!(parse_bearer_token("token-3"), None);
+    }
+
+    #[test]
+    fn turn_api_path_accepts_harboros_stripped_aliases() {
+        assert!(is_turn_api_path("/api/web/turns"));
+        assert!(is_turn_api_path("/api/turns"));
+        assert!(is_turn_api_path("/web/turns"));
+        assert!(is_turn_api_path("/turns"));
+        assert!(!is_turn_api_path("/api/harbor-beacon/web/turns"));
+        assert!(!is_turn_api_path("/api/beacon/state"));
     }
 
     #[test]

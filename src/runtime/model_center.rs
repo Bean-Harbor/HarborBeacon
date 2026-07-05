@@ -2,19 +2,23 @@
 //! VLM summary execution.
 
 use base64::Engine as _;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::connectors::ai_provider::{
     EmbeddingRequest, OpenAiCompatibleConfig, OpenAiCompatibleEmbeddingClient,
-    OpenAiCompatibleTextClient, OpenAiCompatibleVisionClient, TextCompletionRequest,
+    OpenAiCompatibleTextClient, OpenAiCompatibleVisionClient, RerankCompatibleClient,
+    RerankCompatibleConfig, RerankRequest, RerankScore, TextCompletionRequest,
     VisionSummaryRequest,
 };
 use crate::control_plane::models::{
@@ -29,11 +33,23 @@ pub const OCR_TESSERACT_PATH_ENV: &str = "HARBOR_OCR_TESSERACT_PATH";
 pub const OCR_TESSERACT_LANGS_ENV: &str = "HARBOR_OCR_LANGS";
 const OCR_POLICY_ID: &str = "retrieval.ocr";
 const EMBED_POLICY_ID: &str = "retrieval.embed";
+pub const RERANK_POLICY_ID: &str = "retrieval.rerank";
 const LLM_POLICY_ID: &str = "retrieval.answer";
 const SEMANTIC_ROUTER_POLICY_ID: &str = "semantic.router";
 const VLM_POLICY_ID: &str = "retrieval.vision_summary";
 const DEFAULT_ADMIN_STATE_PATH: &str = ".harborbeacon/admin-console.json";
 const DEFAULT_TESSERACT_LANGS: &str = "chi_sim+eng";
+const SEMANTIC_ROUTER_BASE_URL_ENV: &str = "HARBOR_SEMANTIC_ROUTER_BASE_URL";
+const SEMANTIC_ROUTER_HEALTHZ_URL_ENV: &str = "HARBOR_SEMANTIC_ROUTER_HEALTHZ_URL";
+const SEMANTIC_ROUTER_TOKEN_ENV: &str = "HARBOR_SEMANTIC_ROUTER_TOKEN";
+const MODEL_API_TOKEN_ENV: &str = "HARBOR_MODEL_API_TOKEN";
+const DEFAULT_SEMANTIC_ROUTER_BASE_URL: &str = "http://127.0.0.1:4176/v1";
+const DEFAULT_SEMANTIC_ROUTER_MODEL: &str = "Qwen/Qwen2.5-0.5B-Instruct";
+static VLM_EXECUTION_BUSY: AtomicBool = AtomicBool::new(false);
+static VLM_EXECUTION_STARTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static VLM_EXECUTION_BUSY_TOTAL: AtomicU64 = AtomicU64::new(0);
+static VLM_EXECUTION_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static VLM_EXECUTION_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelEndpointTestResult {
@@ -126,6 +142,32 @@ pub struct EmbeddingExecution {
     pub vector: Vec<f32>,
     #[serde(default)]
     pub details: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RerankExecution {
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub provider_key: String,
+    #[serde(default)]
+    pub model_endpoint_id: Option<String>,
+    #[serde(default)]
+    pub model_name: Option<String>,
+    #[serde(default)]
+    pub scores: Vec<RerankDocumentScore>,
+    #[serde(default)]
+    pub details: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RerankDocumentScore {
+    pub index: usize,
+    pub score: f32,
 }
 
 pub fn default_admin_state_path() -> PathBuf {
@@ -234,6 +276,8 @@ pub fn run_ocr_with_state(image_path: &Path, state: &AdminModelCenterState) -> O
             text: String::new(),
             details: json!({
                 "endpoint_kind": endpoint.endpoint_kind.as_str(),
+                "local_only": true,
+                "fallback_allowed": false,
             }),
         };
     }
@@ -326,6 +370,22 @@ pub fn run_vlm_summary_with_state(
     image_path: &Path,
     state: &AdminModelCenterState,
 ) -> VlmSummaryExecution {
+    let Some(_guard) = VlmExecutionGuard::try_acquire() else {
+        return VlmSummaryExecution {
+            available: false,
+            status: "busy".to_string(),
+            summary: "VLM queue is busy; retry after the current local request completes."
+                .to_string(),
+            provider_key: String::new(),
+            model_endpoint_id: None,
+            text: String::new(),
+            details: json!({
+                "queue_result": "busy",
+                "local_only": true,
+                "fallback_allowed": false,
+            }),
+        };
+    };
     let Some(endpoint) = resolve_endpoint(state, ModelKind::Vlm, VLM_POLICY_ID) else {
         return VlmSummaryExecution {
             available: false,
@@ -338,6 +398,22 @@ pub fn run_vlm_summary_with_state(
         };
     };
 
+    if let Some(reason) = vlm_endpoint_local_only_blocker(&endpoint) {
+        return VlmSummaryExecution {
+            available: false,
+            status: "blocked".to_string(),
+            summary: reason,
+            provider_key: endpoint.provider_key.clone(),
+            model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
+            text: String::new(),
+            details: json!({
+                "endpoint_kind": endpoint.endpoint_kind.as_str(),
+                "local_only": false,
+                "fallback_allowed": false,
+            }),
+        };
+    }
+
     if let Some(mock_text) = metadata_string(&endpoint.metadata, "mock_text") {
         return VlmSummaryExecution {
             available: !mock_text.trim().is_empty(),
@@ -348,6 +424,8 @@ pub fn run_vlm_summary_with_state(
             text: mock_text,
             details: json!({
                 "endpoint_kind": endpoint.endpoint_kind.as_str(),
+                "local_only": true,
+                "fallback_allowed": false,
             }),
         };
     }
@@ -382,6 +460,8 @@ pub fn run_vlm_summary_with_state(
             text: String::new(),
             details: json!({
                 "endpoint_kind": endpoint.endpoint_kind.as_str(),
+                "local_only": true,
+                "fallback_allowed": false,
             }),
         };
     };
@@ -397,7 +477,9 @@ pub fn run_vlm_summary_with_state(
                 model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
                 text: String::new(),
                 details: json!({
-                    "image_path": image_path.to_string_lossy(),
+                    "image_path_redacted": true,
+                    "local_only": true,
+                    "fallback_allowed": false,
                 }),
             };
         }
@@ -421,7 +503,9 @@ pub fn run_vlm_summary_with_state(
                 model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
                 text: String::new(),
                 details: json!({
-                    "image_path": image_path.to_string_lossy(),
+                    "image_path_redacted": true,
+                    "local_only": true,
+                    "fallback_allowed": false,
                 }),
             };
         }
@@ -442,6 +526,8 @@ pub fn run_vlm_summary_with_state(
             text: response.summary,
             details: json!({
                 "raw_response": response.raw_response,
+                "local_only": true,
+                "fallback_allowed": false,
             }),
         },
         Err(error) => VlmSummaryExecution {
@@ -452,9 +538,141 @@ pub fn run_vlm_summary_with_state(
             model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
             text: String::new(),
             details: json!({
-                "image_path": image_path.to_string_lossy(),
+                "image_path_redacted": true,
+                "local_only": true,
+                "fallback_allowed": false,
             }),
         },
+    }
+}
+
+pub fn vlm_execution_runtime_snapshot() -> Value {
+    json!({
+        "busy": VLM_EXECUTION_BUSY.load(Ordering::Relaxed),
+        "mode": "global_serial_try_lock",
+        "started_total": VLM_EXECUTION_STARTED_TOTAL.load(Ordering::Relaxed),
+        "busy_total": VLM_EXECUTION_BUSY_TOTAL.load(Ordering::Relaxed),
+        "completed_total": VLM_EXECUTION_COMPLETED_TOTAL.load(Ordering::Relaxed),
+        "failed_total": VLM_EXECUTION_FAILED_TOTAL.load(Ordering::Relaxed),
+        "metadata_only": true,
+        "secret_scan": "clean",
+    })
+}
+
+pub fn vlm_endpoint_readiness(state: &AdminModelCenterState) -> Value {
+    let endpoint = resolve_endpoint(state, ModelKind::Vlm, VLM_POLICY_ID);
+    let Some(endpoint) = endpoint.as_ref() else {
+        return json!({
+            "status": "not_configured",
+            "endpoint_ready": false,
+            "local_only": true,
+            "fallback_allowed": false,
+            "endpoint_bound": false,
+            "queue": vlm_execution_runtime_snapshot(),
+            "metadata_only": true,
+            "secret_scan": "clean",
+        });
+    };
+    let blocker = vlm_endpoint_local_only_blocker(endpoint);
+    let configured = endpoint.status != ModelEndpointStatus::Disabled;
+    let endpoint_ready = configured && blocker.is_none();
+    json!({
+        "status": if endpoint_ready {
+            "available"
+        } else if configured {
+            "blocked"
+        } else {
+            "not_configured"
+        },
+        "endpoint_ready": endpoint_ready,
+        "local_only": blocker.is_none(),
+        "fallback_allowed": false,
+        "endpoint_bound": true,
+        "endpoint": {
+            "model_endpoint_id": endpoint.model_endpoint_id,
+            "provider_key": endpoint.provider_key,
+            "endpoint_kind": endpoint.endpoint_kind.as_str(),
+            "status": endpoint.status.as_str(),
+            "model_name": endpoint.model_name,
+            "base_url_redacted": metadata_string(&endpoint.metadata, "base_url").is_some(),
+        },
+        "blocker": blocker,
+        "queue": vlm_execution_runtime_snapshot(),
+        "metadata_only": true,
+        "secret_scan": "clean",
+    })
+}
+
+struct VlmExecutionGuard {
+    completed: bool,
+}
+
+impl VlmExecutionGuard {
+    fn try_acquire() -> Option<Self> {
+        match VLM_EXECUTION_BUSY.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        {
+            Ok(_) => {
+                VLM_EXECUTION_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                Some(Self { completed: false })
+            }
+            Err(_) => {
+                VLM_EXECUTION_BUSY_TOTAL.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+}
+
+impl Drop for VlmExecutionGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            VLM_EXECUTION_COMPLETED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        } else if !std::thread::panicking() {
+            VLM_EXECUTION_COMPLETED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        } else {
+            VLM_EXECUTION_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        VLM_EXECUTION_BUSY.store(false, Ordering::Release);
+    }
+}
+
+fn vlm_endpoint_local_only_blocker(endpoint: &ModelEndpoint) -> Option<String> {
+    if endpoint.endpoint_kind != ModelEndpointKind::Local {
+        return Some(
+            "VLM endpoint must be local-only; cloud or remote fallback is blocked.".to_string(),
+        );
+    }
+    let Some(base_url) = metadata_string(&endpoint.metadata, "base_url") else {
+        return None;
+    };
+    if !endpoint
+        .provider_key
+        .eq_ignore_ascii_case("openai_compatible")
+    {
+        return None;
+    }
+    if !url_is_loopback(&base_url) {
+        return Some(
+            "VLM endpoint base_url must bind to loopback for K3 local-only execution.".to_string(),
+        );
+    }
+    None
+}
+
+fn url_is_loopback(raw_url: &str) -> bool {
+    let Ok(url) = Url::parse(raw_url.trim()) else {
+        return false;
+    };
+    match url
+        .host_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "localhost" => true,
+        "::1" => true,
+        value if value.starts_with("127.") => true,
+        _ => false,
     }
 }
 
@@ -468,6 +686,209 @@ pub fn run_embedding(text: &str) -> EmbeddingExecution {
     run_embedding_with_state(text, &state)
 }
 
+pub fn run_rerank(query: &str, documents: &[String], top_n: usize) -> RerankExecution {
+    let state = load_model_center_state();
+    run_rerank_with_state(query, documents, top_n, &state)
+}
+
+pub fn run_rerank_with_state(
+    query: &str,
+    documents: &[String],
+    top_n: usize,
+    state: &AdminModelCenterState,
+) -> RerankExecution {
+    let query = query.trim();
+    if query.is_empty() {
+        return RerankExecution {
+            available: false,
+            status: "disabled".to_string(),
+            summary: "Rerank query is empty.".to_string(),
+            provider_key: String::new(),
+            model_endpoint_id: None,
+            model_name: None,
+            scores: Vec::new(),
+            details: json!({}),
+        };
+    }
+    let documents = documents
+        .iter()
+        .map(|document| document.trim().to_string())
+        .filter(|document| !document.is_empty())
+        .collect::<Vec<_>>();
+    if documents.is_empty() {
+        return RerankExecution {
+            available: false,
+            status: "disabled".to_string(),
+            summary: "Rerank documents are empty.".to_string(),
+            provider_key: String::new(),
+            model_endpoint_id: None,
+            model_name: None,
+            scores: Vec::new(),
+            details: json!({}),
+        };
+    }
+
+    let Some(endpoint) = resolve_endpoint(state, ModelKind::Reranker, RERANK_POLICY_ID) else {
+        return RerankExecution {
+            available: false,
+            status: "disabled".to_string(),
+            summary: "No local rerank endpoint is enabled.".to_string(),
+            provider_key: String::new(),
+            model_endpoint_id: None,
+            model_name: None,
+            scores: Vec::new(),
+            details: json!({
+                "route_policy_id": RERANK_POLICY_ID,
+                "local_only": true,
+                "fallback_allowed": false,
+            }),
+        };
+    };
+
+    if endpoint.endpoint_kind == ModelEndpointKind::Cloud {
+        return RerankExecution {
+            available: false,
+            status: "blocked".to_string(),
+            summary: "Cloud reranker endpoints are not allowed for retrieval.rerank.".to_string(),
+            provider_key: endpoint.provider_key.clone(),
+            model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
+            model_name: Some(endpoint.model_name.clone()),
+            scores: Vec::new(),
+            details: json!({
+                "route_policy_id": RERANK_POLICY_ID,
+                "endpoint_kind": endpoint.endpoint_kind.as_str(),
+                "local_only": true,
+                "fallback_allowed": false,
+            }),
+        };
+    }
+
+    if let Some(scores) = mock_rerank_scores_from_endpoint(&endpoint, documents.len()) {
+        return RerankExecution {
+            available: !scores.is_empty(),
+            status: "active".to_string(),
+            summary: "Mock rerank endpoint resolved.".to_string(),
+            provider_key: endpoint.provider_key.clone(),
+            model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
+            model_name: Some(endpoint.model_name.clone()),
+            scores,
+            details: json!({
+                "route_policy_id": RERANK_POLICY_ID,
+                "endpoint_kind": endpoint.endpoint_kind.as_str(),
+                "local_only": true,
+                "fallback_allowed": false,
+            }),
+        };
+    }
+
+    if !endpoint
+        .provider_key
+        .eq_ignore_ascii_case("rerank_compatible")
+    {
+        return RerankExecution {
+            available: false,
+            status: "degraded".to_string(),
+            summary: format!(
+                "Rerank endpoint {} is configured, but provider {} is not implemented yet.",
+                endpoint.model_endpoint_id, endpoint.provider_key
+            ),
+            provider_key: endpoint.provider_key.clone(),
+            model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
+            model_name: Some(endpoint.model_name.clone()),
+            scores: Vec::new(),
+            details: json!({
+                "route_policy_id": RERANK_POLICY_ID,
+                "endpoint_kind": endpoint.endpoint_kind.as_str(),
+                "local_only": true,
+                "fallback_allowed": false,
+            }),
+        };
+    }
+
+    let Some(config) = rerank_compatible_config_from_endpoint(&endpoint) else {
+        return RerankExecution {
+            available: false,
+            status: "degraded".to_string(),
+            summary: "Rerank endpoint base_url / model_name are not configured.".to_string(),
+            provider_key: endpoint.provider_key.clone(),
+            model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
+            model_name: Some(endpoint.model_name.clone()),
+            scores: Vec::new(),
+            details: json!({
+                "route_policy_id": RERANK_POLICY_ID,
+                "endpoint_kind": endpoint.endpoint_kind.as_str(),
+                "local_only": true,
+                "fallback_allowed": false,
+            }),
+        };
+    };
+
+    let client = match RerankCompatibleClient::new(config) {
+        Ok(client) => client,
+        Err(error) => {
+            return RerankExecution {
+                available: false,
+                status: "degraded".to_string(),
+                summary: format!("Failed to build rerank client: {error}"),
+                provider_key: endpoint.provider_key.clone(),
+                model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
+                model_name: Some(endpoint.model_name.clone()),
+                scores: Vec::new(),
+                details: json!({
+                    "route_policy_id": RERANK_POLICY_ID,
+                    "local_only": true,
+                    "fallback_allowed": false,
+                }),
+            };
+        }
+    };
+
+    let document_count = documents.len();
+    match client.rerank(&RerankRequest {
+        query: query.to_string(),
+        documents,
+        top_n: top_n.max(1),
+    }) {
+        Ok(response) => {
+            let scores = response
+                .scores
+                .into_iter()
+                .filter(|score| score.index < document_count)
+                .map(rerank_score_to_document_score)
+                .collect::<Vec<_>>();
+            RerankExecution {
+                available: !scores.is_empty(),
+                status: "active".to_string(),
+                summary: "Rerank request completed.".to_string(),
+                provider_key: endpoint.provider_key.clone(),
+                model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
+                model_name: Some(endpoint.model_name.clone()),
+                scores,
+                details: json!({
+                    "route_policy_id": RERANK_POLICY_ID,
+                    "raw_response": response.raw_response,
+                    "local_only": true,
+                    "fallback_allowed": false,
+                }),
+            }
+        }
+        Err(error) => RerankExecution {
+            available: false,
+            status: "degraded".to_string(),
+            summary: format!("Rerank request failed: {error}"),
+            provider_key: endpoint.provider_key.clone(),
+            model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
+            model_name: Some(endpoint.model_name.clone()),
+            scores: Vec::new(),
+            details: json!({
+                "route_policy_id": RERANK_POLICY_ID,
+                "local_only": true,
+                "fallback_allowed": false,
+            }),
+        },
+    }
+}
+
 pub fn run_llm_text_with_state(prompt: &str, state: &AdminModelCenterState) -> LlmTextExecution {
     run_llm_text_with_state_and_options(prompt, state, &LlmTextOptions::default())
 }
@@ -478,7 +899,14 @@ pub fn run_llm_text_with_state_and_options(
     options: &LlmTextOptions,
 ) -> LlmTextExecution {
     let route_policy_id = llm_route_policy_id(options);
-    let candidates = resolve_endpoint_candidates(state, ModelKind::Llm, route_policy_id);
+    let local_only_state;
+    let effective_state = if route_policy_id == SEMANTIC_ROUTER_POLICY_ID {
+        local_only_state = semantic_router_local_only_model_state(state);
+        &local_only_state
+    } else {
+        state
+    };
+    let candidates = resolve_endpoint_candidates(effective_state, ModelKind::Llm, route_policy_id);
     if candidates.is_empty() {
         return LlmTextExecution {
             available: false,
@@ -583,6 +1011,9 @@ fn merge_llm_execution_details(
         json!(attempted_endpoints),
     );
     details.insert("fallback_used".to_string(), json!(fallback_used));
+    if route_policy_id == SEMANTIC_ROUTER_POLICY_ID {
+        details.insert("local_only".to_string(), json!(true));
+    }
     details.insert(
         "attempt_summaries".to_string(),
         Value::Array(attempt_summaries),
@@ -600,6 +1031,135 @@ fn merge_llm_execution_details(
         );
     }
     result.details = Value::Object(details);
+}
+
+fn semantic_router_local_only_model_state(state: &AdminModelCenterState) -> AdminModelCenterState {
+    let mut local_state = state.clone();
+    local_state
+        .endpoints
+        .retain(|endpoint| endpoint.endpoint_kind != ModelEndpointKind::Cloud);
+    wire_semantic_router_resident_endpoint(&mut local_state);
+    for policy in &mut local_state.route_policies {
+        if policy.route_policy_id == SEMANTIC_ROUTER_POLICY_ID {
+            policy.privacy_level = PrivacyLevel::StrictLocal;
+            policy
+                .fallback_order
+                .retain(|kind| !kind.eq_ignore_ascii_case("cloud"));
+            if policy.fallback_order.is_empty() {
+                policy.fallback_order = vec!["local".to_string(), "sidecar".to_string()];
+            }
+            if let Some(metadata) = policy.metadata.as_object_mut() {
+                metadata.insert("local_only".to_string(), json!(true));
+                metadata.insert("cloud_fallback_allowed".to_string(), json!(false));
+            }
+        }
+    }
+    local_state
+}
+
+pub(crate) fn wire_semantic_router_resident_endpoint(state: &mut AdminModelCenterState) {
+    let base_url = env_trimmed(SEMANTIC_ROUTER_BASE_URL_ENV)
+        .map(|value| value.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| DEFAULT_SEMANTIC_ROUTER_BASE_URL.to_string());
+    let healthz_url = env_trimmed(SEMANTIC_ROUTER_HEALTHZ_URL_ENV)
+        .unwrap_or_else(|| infer_healthz_url(&base_url));
+    let api_key = env_trimmed(SEMANTIC_ROUTER_TOKEN_ENV)
+        .or_else(|| env_trimmed(MODEL_API_TOKEN_ENV))
+        .unwrap_or_default();
+
+    let has_explicit_router = state.endpoints.iter().any(|endpoint| {
+        endpoint.model_kind == ModelKind::Llm
+            && endpoint.endpoint_kind == ModelEndpointKind::Local
+            && endpoint.status != ModelEndpointStatus::Disabled
+            && (endpoint
+                .capability_tags
+                .iter()
+                .any(|tag| matches_semantic_router_tag(tag))
+                || metadata_bool(&endpoint.metadata, "semantic_router"))
+    });
+
+    let mut wired_any = false;
+    for endpoint in state.endpoints.iter_mut() {
+        if endpoint.model_kind != ModelKind::Llm
+            || endpoint.endpoint_kind != ModelEndpointKind::Local
+            || endpoint.status == ModelEndpointStatus::Disabled
+            || !endpoint
+                .provider_key
+                .eq_ignore_ascii_case("openai_compatible")
+        {
+            continue;
+        }
+        let is_explicit_router = endpoint
+            .capability_tags
+            .iter()
+            .any(|tag| matches_semantic_router_tag(tag))
+            || metadata_bool(&endpoint.metadata, "semantic_router");
+        let is_builtin_default = endpoint.model_endpoint_id == "llm-local-openai-compatible";
+        if !is_explicit_router && !(is_builtin_default && !has_explicit_router) {
+            continue;
+        }
+        mark_semantic_router_resident_endpoint(endpoint, &base_url, &healthz_url, &api_key);
+        wired_any = true;
+    }
+
+    if wired_any {
+        return;
+    }
+
+    let mut endpoint = ModelEndpoint {
+        model_endpoint_id: "llm-local-semantic-router".to_string(),
+        workspace_id: Some("home-1".to_string()),
+        provider_account_id: None,
+        model_kind: ModelKind::Llm,
+        endpoint_kind: ModelEndpointKind::Local,
+        provider_key: "openai_compatible".to_string(),
+        model_name: DEFAULT_SEMANTIC_ROUTER_MODEL.to_string(),
+        capability_tags: Vec::new(),
+        cost_policy: json!({"cost_hint": "local_candle"}),
+        status: ModelEndpointStatus::Degraded,
+        metadata: json!({"builtin": true}),
+    };
+    mark_semantic_router_resident_endpoint(&mut endpoint, &base_url, &healthz_url, &api_key);
+    state.endpoints.push(endpoint);
+}
+
+fn mark_semantic_router_resident_endpoint(
+    endpoint: &mut ModelEndpoint,
+    base_url: &str,
+    healthz_url: &str,
+    api_key: &str,
+) {
+    for tag in [
+        "chat",
+        "local_first",
+        "semantic_router",
+        "assistant_input_parser",
+        "k3_nsp",
+    ] {
+        if !endpoint.capability_tags.iter().any(|value| value == tag) {
+            endpoint.capability_tags.push(tag.to_string());
+        }
+    }
+    endpoint.capability_tags.sort();
+    endpoint.capability_tags.dedup();
+    set_metadata_string(&mut endpoint.metadata, "base_url", base_url.to_string());
+    set_metadata_string(
+        &mut endpoint.metadata,
+        "healthz_url",
+        healthz_url.to_string(),
+    );
+    set_metadata_bool(&mut endpoint.metadata, "semantic_router", true);
+    set_metadata_bool(&mut endpoint.metadata, "local_only", true);
+    set_metadata_bool(&mut endpoint.metadata, "cloud_fallback_allowed", false);
+    set_metadata_bool(
+        &mut endpoint.metadata,
+        "semantic_router_resident_endpoint",
+        true,
+    );
+    if !api_key.trim().is_empty() {
+        set_metadata_string(&mut endpoint.metadata, "api_key", api_key.to_string());
+        set_metadata_bool(&mut endpoint.metadata, "api_key_configured", true);
+    }
 }
 
 fn run_llm_text_on_endpoint(
@@ -940,13 +1500,45 @@ fn resolve_endpoint_candidates(
         .collect::<Vec<_>>();
 
     candidates.sort_by(|left, right| {
-        endpoint_priority(left, &fallback_order)
-            .cmp(&endpoint_priority(right, &fallback_order))
+        semantic_router_endpoint_priority(left, route_policy_id)
+            .cmp(&semantic_router_endpoint_priority(right, route_policy_id))
+            .then(
+                endpoint_priority(left, &fallback_order)
+                    .cmp(&endpoint_priority(right, &fallback_order)),
+            )
             .then(status_priority(left.status).cmp(&status_priority(right.status)))
             .then(left.model_endpoint_id.cmp(&right.model_endpoint_id))
     });
 
     candidates
+}
+
+fn semantic_router_endpoint_priority(endpoint: &ModelEndpoint, route_policy_id: &str) -> usize {
+    if route_policy_id != SEMANTIC_ROUTER_POLICY_ID {
+        return 0;
+    }
+    if endpoint
+        .capability_tags
+        .iter()
+        .any(|tag| matches_semantic_router_tag(tag))
+        || metadata_bool(&endpoint.metadata, "semantic_router")
+        || metadata_bool(&endpoint.metadata, "local_only")
+            && endpoint
+                .model_endpoint_id
+                .to_ascii_lowercase()
+                .contains("nsp")
+    {
+        0
+    } else {
+        1
+    }
+}
+
+fn matches_semantic_router_tag(tag: &str) -> bool {
+    matches!(
+        tag.trim().to_ascii_lowercase().as_str(),
+        "semantic_router" | "assistant_input_parser" | "k3_nsp"
+    )
 }
 
 fn probe_local_runtime(endpoints: &[ModelEndpoint]) -> LocalRuntimeProjection {
@@ -1151,8 +1743,12 @@ fn overlay_endpoints_with_runtime_truth(
             let mut overlayed = endpoint.clone();
             if let Some(default_endpoint) = builtin_defaults.get(&overlayed.model_endpoint_id) {
                 if is_builtin_local_openai_endpoint(default_endpoint) {
+                    let resident_router_endpoint =
+                        metadata_bool(&overlayed.metadata, "semantic_router_resident_endpoint");
                     let legacy_base_url = metadata_string(&overlayed.metadata, "base_url")
-                        .is_some_and(|value| is_legacy_model_api_url(&value));
+                        .is_some_and(|value| {
+                            is_legacy_model_api_url(&value) && !resident_router_endpoint
+                        });
                     if metadata_missing_or_empty(&overlayed.metadata, "base_url") || legacy_base_url
                     {
                         set_metadata_string(
@@ -1171,7 +1767,9 @@ fn overlay_endpoints_with_runtime_truth(
                         }
                     }
                     let legacy_healthz_url = metadata_string(&overlayed.metadata, "healthz_url")
-                        .is_some_and(|value| is_legacy_model_api_url(&value));
+                        .is_some_and(|value| {
+                            is_legacy_model_api_url(&value) && !resident_router_endpoint
+                        });
                     if metadata_missing_or_empty(&overlayed.metadata, "healthz_url")
                         || legacy_healthz_url
                     {
@@ -1406,7 +2004,10 @@ fn openai_compatible_config_from_endpoint(
     endpoint: &ModelEndpoint,
 ) -> Option<OpenAiCompatibleConfig> {
     let base_url = metadata_string(&endpoint.metadata, "base_url")?;
-    let api_key = metadata_string(&endpoint.metadata, "api_key")?;
+    let api_key = metadata_string(&endpoint.metadata, "api_key").unwrap_or_default();
+    if endpoint.endpoint_kind == ModelEndpointKind::Cloud && api_key.trim().is_empty() {
+        return None;
+    }
     let model = metadata_string(&endpoint.metadata, "model").or_else(|| {
         (!endpoint.model_name.trim().is_empty()).then_some(endpoint.model_name.clone())
     })?;
@@ -1414,6 +2015,27 @@ fn openai_compatible_config_from_endpoint(
         base_url: base_url.trim_end_matches('/').to_string(),
         api_key,
         model,
+    })
+}
+
+fn rerank_compatible_config_from_endpoint(
+    endpoint: &ModelEndpoint,
+) -> Option<RerankCompatibleConfig> {
+    let base_url = metadata_string(&endpoint.metadata, "base_url")?;
+    if endpoint.endpoint_kind == ModelEndpointKind::Cloud {
+        return None;
+    }
+    let api_key = metadata_string(&endpoint.metadata, "api_key").unwrap_or_default();
+    let model = metadata_string(&endpoint.metadata, "model").or_else(|| {
+        (!endpoint.model_name.trim().is_empty()).then_some(endpoint.model_name.clone())
+    })?;
+    let rerank_path =
+        metadata_string(&endpoint.metadata, "rerank_path").unwrap_or_else(|| "/rerank".to_string());
+    Some(RerankCompatibleConfig {
+        base_url: base_url.trim_end_matches('/').to_string(),
+        api_key,
+        model,
+        rerank_path,
     })
 }
 
@@ -1456,6 +2078,13 @@ fn metadata_bool(metadata: &Value, key: &str) -> bool {
 
 fn metadata_missing_or_empty(metadata: &Value, key: &str) -> bool {
     metadata_string(metadata, key).is_none()
+}
+
+fn env_trimmed(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn is_legacy_model_api_url(value: &str) -> bool {
@@ -1555,6 +2184,39 @@ fn mock_embedding_vector_from_endpoint(endpoint: &ModelEndpoint, input: &str) ->
     Some(build_mock_embedding(input, dimensions))
 }
 
+fn mock_rerank_scores_from_endpoint(
+    endpoint: &ModelEndpoint,
+    document_count: usize,
+) -> Option<Vec<RerankDocumentScore>> {
+    let values = endpoint
+        .metadata
+        .get("mock_rerank_scores")
+        .and_then(Value::as_array)?;
+    let mut scores = values
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| {
+            let score = value.as_f64()? as f32;
+            (index < document_count && score.is_finite())
+                .then_some(RerankDocumentScore { index, score })
+        })
+        .collect::<Vec<_>>();
+    scores.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.index.cmp(&right.index))
+    });
+    Some(scores)
+}
+
+fn rerank_score_to_document_score(score: RerankScore) -> RerankDocumentScore {
+    RerankDocumentScore {
+        index: score.index,
+        score: score.score,
+    }
+}
+
 fn parse_embedding_vector(value: &Value) -> Option<Vec<f32>> {
     let items = value.as_array()?;
     let mut vector = Vec::with_capacity(items.len());
@@ -1635,9 +2297,11 @@ mod tests {
     use tiny_http::{Header, Method, Response, Server};
 
     use super::{
-        clear_local_runtime_projection_cache, connectivity_url, redact_model_endpoint,
-        run_embedding_with_state, run_llm_text_with_state, run_llm_text_with_state_and_options,
-        run_vlm_summary_with_state, test_model_endpoint, LlmTextOptions,
+        clear_local_runtime_projection_cache, connectivity_url,
+        openai_compatible_config_from_endpoint, redact_model_endpoint, run_embedding_with_state,
+        run_llm_text_with_state, run_llm_text_with_state_and_options, run_rerank_with_state,
+        run_vlm_summary_with_state, semantic_router_local_only_model_state, test_model_endpoint,
+        vlm_endpoint_readiness, LlmTextOptions, RERANK_POLICY_ID,
     };
     use crate::control_plane::models::{
         ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, ModelRoutePolicy,
@@ -1646,6 +2310,130 @@ mod tests {
     use crate::runtime::admin_console::AdminModelCenterState;
 
     static MODEL_RUNTIME_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn rerank_mock_endpoint_returns_scores() {
+        let _env_guard = MODEL_RUNTIME_ENV_LOCK
+            .lock()
+            .expect("model runtime env lock");
+        clear_local_runtime_projection_cache();
+        let state = AdminModelCenterState {
+            endpoints: vec![ModelEndpoint {
+                model_endpoint_id: "rerank-local".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Reranker,
+                endpoint_kind: ModelEndpointKind::Local,
+                provider_key: "rerank_compatible".to_string(),
+                model_name: "mock-reranker".to_string(),
+                capability_tags: vec!["rerank".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({"mock_rerank_scores": [0.2, 0.9]}),
+            }],
+            route_policies: vec![ModelRoutePolicy {
+                route_policy_id: RERANK_POLICY_ID.to_string(),
+                workspace_id: "home-1".to_string(),
+                domain_scope: "retrieval".to_string(),
+                modality: "text".to_string(),
+                privacy_level: PrivacyLevel::StrictLocal,
+                local_preferred: true,
+                max_cost_per_run: None,
+                fallback_order: vec!["local".to_string(), "sidecar".to_string()],
+                status: "active".to_string(),
+                metadata: json!({"capability": "rerank"}),
+            }],
+            ..Default::default()
+        };
+
+        let documents = vec!["alpha".to_string(), "beta".to_string()];
+        let result = run_rerank_with_state("query", &documents, 2, &state);
+
+        assert!(result.available);
+        assert_eq!(result.model_endpoint_id.as_deref(), Some("rerank-local"));
+        assert_eq!(result.scores[0].index, 1);
+    }
+
+    #[test]
+    fn rerank_strict_local_policy_does_not_select_cloud_endpoint() {
+        let _env_guard = MODEL_RUNTIME_ENV_LOCK
+            .lock()
+            .expect("model runtime env lock");
+        clear_local_runtime_projection_cache();
+        let state = AdminModelCenterState {
+            endpoints: vec![
+                ModelEndpoint {
+                    model_endpoint_id: "rerank-cloud".to_string(),
+                    workspace_id: Some("home-1".to_string()),
+                    provider_account_id: None,
+                    model_kind: ModelKind::Reranker,
+                    endpoint_kind: ModelEndpointKind::Cloud,
+                    provider_key: "rerank_compatible".to_string(),
+                    model_name: "cloud-reranker".to_string(),
+                    capability_tags: vec!["rerank".to_string()],
+                    cost_policy: json!({}),
+                    status: ModelEndpointStatus::Active,
+                    metadata: json!({"mock_rerank_scores": [1.0, 1.0]}),
+                },
+                ModelEndpoint {
+                    model_endpoint_id: "rerank-local".to_string(),
+                    workspace_id: Some("home-1".to_string()),
+                    provider_account_id: None,
+                    model_kind: ModelKind::Reranker,
+                    endpoint_kind: ModelEndpointKind::Local,
+                    provider_key: "rerank_compatible".to_string(),
+                    model_name: "local-reranker".to_string(),
+                    capability_tags: vec!["rerank".to_string()],
+                    cost_policy: json!({}),
+                    status: ModelEndpointStatus::Active,
+                    metadata: json!({"mock_rerank_scores": [0.1, 0.7]}),
+                },
+            ],
+            route_policies: vec![ModelRoutePolicy {
+                route_policy_id: RERANK_POLICY_ID.to_string(),
+                workspace_id: "home-1".to_string(),
+                domain_scope: "retrieval".to_string(),
+                modality: "text".to_string(),
+                privacy_level: PrivacyLevel::StrictLocal,
+                local_preferred: true,
+                max_cost_per_run: None,
+                fallback_order: vec!["cloud".to_string(), "local".to_string()],
+                status: "active".to_string(),
+                metadata: json!({"capability": "rerank", "cloud_fallback_allowed": false}),
+            }],
+            ..Default::default()
+        };
+
+        let documents = vec!["alpha".to_string(), "beta".to_string()];
+        let result = run_rerank_with_state("query", &documents, 2, &state);
+
+        assert!(result.available);
+        assert_eq!(result.model_endpoint_id.as_deref(), Some("rerank-local"));
+        assert_eq!(result.scores[0].index, 1);
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.previous.as_ref() {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     #[test]
     fn redact_model_endpoint_masks_api_keys() {
@@ -1674,6 +2462,117 @@ mod tests {
             redacted.metadata["base_url"],
             json!("https://api.example.com/v1")
         );
+    }
+
+    #[test]
+    fn local_openai_compatible_endpoint_allows_empty_api_key() {
+        let endpoint = ModelEndpoint {
+            model_endpoint_id: "llm-k3-nsp-local-llama".to_string(),
+            workspace_id: Some("home-1".to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Llm,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "openai_compatible".to_string(),
+            model_name: "Qwen3-1.7B-Q8_0.gguf".to_string(),
+            capability_tags: vec!["semantic_router".to_string()],
+            cost_policy: json!({}),
+            status: ModelEndpointStatus::Active,
+            metadata: json!({
+                "base_url": "http://127.0.0.1:8091/v1",
+                "local_only": true,
+            }),
+        };
+
+        let config = openai_compatible_config_from_endpoint(&endpoint).expect("local config");
+
+        assert_eq!(config.base_url, "http://127.0.0.1:8091/v1");
+        assert_eq!(config.api_key, "");
+        assert_eq!(config.model, "Qwen3-1.7B-Q8_0.gguf");
+    }
+
+    #[test]
+    fn cloud_openai_compatible_endpoint_requires_api_key() {
+        let endpoint = ModelEndpoint {
+            model_endpoint_id: "llm-cloud-siliconflow".to_string(),
+            workspace_id: Some("home-1".to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Llm,
+            endpoint_kind: ModelEndpointKind::Cloud,
+            provider_key: "openai_compatible".to_string(),
+            model_name: "deepseek-ai/DeepSeek-V4-Flash".to_string(),
+            capability_tags: vec!["cloud_fallback".to_string()],
+            cost_policy: json!({}),
+            status: ModelEndpointStatus::Active,
+            metadata: json!({
+                "base_url": "https://api.siliconflow.cn/v1",
+            }),
+        };
+
+        assert!(openai_compatible_config_from_endpoint(&endpoint).is_none());
+    }
+
+    #[test]
+    fn vlm_endpoint_readiness_blocks_cloud_and_non_loopback_endpoints() {
+        let cloud_state = AdminModelCenterState {
+            endpoints: vec![ModelEndpoint {
+                model_endpoint_id: "vlm-cloud".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Vlm,
+                endpoint_kind: ModelEndpointKind::Cloud,
+                provider_key: "openai_compatible".to_string(),
+                model_name: "remote-vlm".to_string(),
+                capability_tags: vec!["vision".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({
+                    "base_url": "https://example.invalid/v1",
+                    "api_key_configured": true,
+                }),
+            }],
+            route_policies: vec![ModelRoutePolicy {
+                route_policy_id: "retrieval.vision_summary".to_string(),
+                workspace_id: "home-1".to_string(),
+                domain_scope: "retrieval".to_string(),
+                modality: "vision".to_string(),
+                privacy_level: PrivacyLevel::AllowCloud,
+                local_preferred: false,
+                max_cost_per_run: None,
+                fallback_order: vec!["cloud".to_string()],
+                status: "active".to_string(),
+                metadata: json!({}),
+            }],
+            ..Default::default()
+        };
+        let cloud_readiness = vlm_endpoint_readiness(&cloud_state);
+        assert_eq!(cloud_readiness["status"], json!("blocked"));
+        assert_eq!(cloud_readiness["endpoint_ready"], json!(false));
+        assert_eq!(cloud_readiness["local_only"], json!(false));
+
+        let remote_local_state = AdminModelCenterState {
+            endpoints: vec![ModelEndpoint {
+                model_endpoint_id: "vlm-remote-local".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Vlm,
+                endpoint_kind: ModelEndpointKind::Local,
+                provider_key: "openai_compatible".to_string(),
+                model_name: "local-vlm".to_string(),
+                capability_tags: vec!["vision".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({
+                    "base_url": "http://192.168.3.50:8080/v1",
+                    "local_only": true,
+                }),
+            }],
+            ..Default::default()
+        };
+        let remote_readiness = vlm_endpoint_readiness(&remote_local_state);
+        assert_eq!(remote_readiness["status"], json!("blocked"));
+        assert_eq!(remote_readiness["endpoint_ready"], json!(false));
+        assert_eq!(remote_readiness["local_only"], json!(false));
+        assert_eq!(remote_readiness["fallback_allowed"], json!(false));
     }
 
     #[test]
@@ -2073,7 +2972,7 @@ mod tests {
             "摄像头能干什么",
             &state,
             &LlmTextOptions {
-                purpose: Some("router".to_string()),
+                purpose: Some("rag.answer".to_string()),
                 max_tokens: Some(12),
                 ..Default::default()
             },
@@ -2088,7 +2987,7 @@ mod tests {
     }
 
     #[test]
-    fn run_llm_text_with_state_falls_back_from_local_to_cloud_for_router() {
+    fn run_llm_text_with_state_keeps_router_local_only_even_when_cloud_is_configured() {
         let state = AdminModelCenterState {
             endpoints: vec![
                 ModelEndpoint {
@@ -2155,17 +3054,198 @@ mod tests {
             },
         );
 
-        assert!(result.available);
-        assert_eq!(result.text, "rag_answer");
-        assert_eq!(
-            result.model_endpoint_id.as_deref(),
-            Some("llm-cloud-siliconflow")
-        );
+        assert!(!result.available);
         assert_eq!(result.details["route_policy_id"], json!("semantic.router"));
-        assert_eq!(result.details["fallback_used"], json!(true));
+        assert_eq!(result.details["local_only"], json!(true));
+        assert_eq!(result.details["fallback_used"], json!(false));
         assert_eq!(
             result.details["attempted_endpoints"],
-            json!(["llm-local-openai-compatible", "llm-cloud-siliconflow"])
+            json!(["llm-local-openai-compatible"])
+        );
+    }
+
+    #[test]
+    fn semantic_router_local_only_state_wires_resident_endpoint() {
+        let _guard = MODEL_RUNTIME_ENV_LOCK
+            .lock()
+            .expect("model runtime env lock");
+        let _base_url = EnvVarGuard::set(
+            "HARBOR_SEMANTIC_ROUTER_BASE_URL",
+            "http://127.0.0.1:4176/v1",
+        );
+        let _healthz = EnvVarGuard::set(
+            "HARBOR_SEMANTIC_ROUTER_HEALTHZ_URL",
+            "http://127.0.0.1:4176/healthz",
+        );
+        let state = AdminModelCenterState {
+            endpoints: vec![
+                ModelEndpoint {
+                    model_endpoint_id: "llm-local-openai-compatible".to_string(),
+                    workspace_id: Some("home-1".to_string()),
+                    provider_account_id: None,
+                    model_kind: ModelKind::Llm,
+                    endpoint_kind: ModelEndpointKind::Local,
+                    provider_key: "openai_compatible".to_string(),
+                    model_name: "harbor-local-chat".to_string(),
+                    capability_tags: vec!["chat".to_string(), "local_first".to_string()],
+                    cost_policy: json!({}),
+                    status: ModelEndpointStatus::Degraded,
+                    metadata: json!({
+                        "builtin": true,
+                        "base_url": "http://127.0.0.1:4174/api/inference/v1",
+                        "healthz_url": "http://127.0.0.1:4174/api/inference/healthz",
+                    }),
+                },
+                ModelEndpoint {
+                    model_endpoint_id: "llm-cloud-siliconflow".to_string(),
+                    workspace_id: Some("home-1".to_string()),
+                    provider_account_id: None,
+                    model_kind: ModelKind::Llm,
+                    endpoint_kind: ModelEndpointKind::Cloud,
+                    provider_key: "openai_compatible".to_string(),
+                    model_name: "deepseek-ai/DeepSeek-V4-Flash".to_string(),
+                    capability_tags: vec!["cloud_fallback".to_string()],
+                    cost_policy: json!({}),
+                    status: ModelEndpointStatus::Active,
+                    metadata: json!({
+                        "base_url": "https://api.siliconflow.cn/v1",
+                        "api_key": "configured",
+                    }),
+                },
+            ],
+            route_policies: vec![ModelRoutePolicy {
+                route_policy_id: "semantic.router".to_string(),
+                workspace_id: "home-1".to_string(),
+                domain_scope: "semantic".to_string(),
+                modality: "text".to_string(),
+                privacy_level: PrivacyLevel::AllowRedactedCloud,
+                local_preferred: true,
+                max_cost_per_run: None,
+                fallback_order: vec!["local".to_string(), "cloud".to_string()],
+                status: "active".to_string(),
+                metadata: json!({"capability": "router"}),
+            }],
+            ..AdminModelCenterState::default()
+        };
+
+        let local_state = semantic_router_local_only_model_state(&state);
+        let endpoint = local_state
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "llm-local-openai-compatible")
+            .expect("resident semantic router endpoint");
+        assert_eq!(
+            endpoint.metadata["base_url"],
+            json!("http://127.0.0.1:4176/v1")
+        );
+        assert_eq!(
+            endpoint.metadata["healthz_url"],
+            json!("http://127.0.0.1:4176/healthz")
+        );
+        assert_eq!(endpoint.metadata["semantic_router"], json!(true));
+        assert_eq!(endpoint.metadata["local_only"], json!(true));
+        assert_eq!(
+            endpoint.metadata["semantic_router_resident_endpoint"],
+            json!(true)
+        );
+        assert!(endpoint
+            .capability_tags
+            .iter()
+            .any(|tag| tag == "semantic_router"));
+        assert!(!local_state
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.endpoint_kind == ModelEndpointKind::Cloud));
+        let router_policy = local_state
+            .route_policies
+            .iter()
+            .find(|policy| policy.route_policy_id == "semantic.router")
+            .expect("router policy");
+        assert_eq!(router_policy.privacy_level, PrivacyLevel::StrictLocal);
+        assert!(!router_policy
+            .fallback_order
+            .iter()
+            .any(|kind| kind.eq_ignore_ascii_case("cloud")));
+    }
+
+    #[test]
+    fn semantic_router_prefers_tagged_local_parser_endpoint() {
+        let state = AdminModelCenterState {
+            endpoints: vec![
+                ModelEndpoint {
+                    model_endpoint_id: "llm-local-openai-compatible".to_string(),
+                    workspace_id: Some("home-1".to_string()),
+                    provider_account_id: None,
+                    model_kind: ModelKind::Llm,
+                    endpoint_kind: ModelEndpointKind::Local,
+                    provider_key: "openai_compatible".to_string(),
+                    model_name: "harbor-local-chat".to_string(),
+                    capability_tags: vec!["chat".to_string(), "local_first".to_string()],
+                    cost_policy: json!({}),
+                    status: ModelEndpointStatus::Active,
+                    metadata: json!({
+                        "builtin": false,
+                        "mock_text": "generic_local",
+                    }),
+                },
+                ModelEndpoint {
+                    model_endpoint_id: "zz-k3-nsp-router".to_string(),
+                    workspace_id: Some("home-1".to_string()),
+                    provider_account_id: None,
+                    model_kind: ModelKind::Llm,
+                    endpoint_kind: ModelEndpointKind::Local,
+                    provider_key: "openai_compatible".to_string(),
+                    model_name: "Qwen3-1.7B-Q8_0.gguf".to_string(),
+                    capability_tags: vec![
+                        "assistant_input_parser".to_string(),
+                        "k3_nsp".to_string(),
+                        "semantic_router".to_string(),
+                    ],
+                    cost_policy: json!({}),
+                    status: ModelEndpointStatus::Active,
+                    metadata: json!({
+                        "builtin": false,
+                        "local_only": true,
+                        "mock_text": "{\"decision\":\"status\",\"confidence\":0.95}",
+                    }),
+                },
+            ],
+            route_policies: vec![ModelRoutePolicy {
+                route_policy_id: "semantic.router".to_string(),
+                workspace_id: "home-1".to_string(),
+                domain_scope: "semantic".to_string(),
+                modality: "text".to_string(),
+                privacy_level: PrivacyLevel::StrictLocal,
+                local_preferred: true,
+                max_cost_per_run: None,
+                fallback_order: vec!["local".to_string(), "sidecar".to_string()],
+                status: "active".to_string(),
+                metadata: json!({"capability": "router", "local_only": true}),
+            }],
+            ..AdminModelCenterState::default()
+        };
+
+        let result = run_llm_text_with_state_and_options(
+            "家里入口现在状态正常吗",
+            &state,
+            &LlmTextOptions {
+                purpose: Some("semantic.router".to_string()),
+                ..Default::default()
+            },
+        );
+
+        assert!(result.available);
+        assert_eq!(
+            result.model_endpoint_id.as_deref(),
+            Some("zz-k3-nsp-router")
+        );
+        assert_eq!(
+            result.details["selected_endpoint"],
+            json!("zz-k3-nsp-router")
+        );
+        assert_eq!(
+            result.details["attempted_endpoints"],
+            json!(["zz-k3-nsp-router"])
         );
     }
 

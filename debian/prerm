@@ -3,5 +3,7 @@ set -e
 
 systemctl stop harboros-beacon.service || true
 systemctl disable harboros-beacon.service || true
+systemctl stop semantic-router.service || true
+systemctl disable semantic-router.service || true
 
 exit 0

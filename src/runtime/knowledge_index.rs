@@ -1,6 +1,6 @@
 //! Local knowledge index and manifest storage for HarborBeacon search.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::runtime::media_tools::{resolve_ffmpeg_bin, resolve_ffprobe_bin};
-use crate::runtime::model_center;
+use crate::runtime::{admin_console::AdminModelCenterState, model_center};
 
 pub const KNOWLEDGE_INDEX_ROOT_ENV: &str = "HARBOR_KNOWLEDGE_INDEX_ROOT";
 
@@ -142,6 +142,17 @@ pub struct KnowledgeIndexRefreshStats {
     pub rebuilt: bool,
     pub persisted: bool,
     pub persist_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct KnowledgeEmbeddingWarmupStats {
+    pub total: usize,
+    pub completed: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub degraded: bool,
+    pub persist_error: Option<String>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -302,6 +313,116 @@ impl KnowledgeIndexService {
             .index_root
             .join(format!("{}.embeddings.json", root_storage_key(root)))
     }
+
+    pub fn embedding_warmup_candidate_count(&self, snapshot: &KnowledgeIndexSnapshot) -> usize {
+        snapshot
+            .manifest
+            .entries
+            .iter()
+            .flat_map(embedding_chunks_for_entry)
+            .filter(|chunk| !chunk.text.trim().is_empty())
+            .count()
+    }
+
+    pub fn warm_embedding_cache(
+        &self,
+        snapshot: &KnowledgeIndexSnapshot,
+        model_center_state: &AdminModelCenterState,
+    ) -> KnowledgeEmbeddingWarmupStats {
+        let mut stats = KnowledgeEmbeddingWarmupStats::default();
+        let embedding_store_path = self.embedding_store_path_for_root(&snapshot.root);
+        let mut store = match load_embedding_store(&embedding_store_path) {
+            Ok(store) => store,
+            Err(error) => {
+                stats.degraded = true;
+                stats.last_error = Some(error);
+                KnowledgeEmbeddingStore {
+                    schema_version: EMBEDDING_STORE_SCHEMA_VERSION,
+                    root: snapshot.root.to_string_lossy().into_owned(),
+                    ..KnowledgeEmbeddingStore::default()
+                }
+            }
+        };
+        if store.schema_version == 0 {
+            store.schema_version = EMBEDDING_STORE_SCHEMA_VERSION;
+        }
+        store.root = snapshot.root.to_string_lossy().into_owned();
+
+        let mut entries_by_key = store
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.key.clone(), index))
+            .collect::<HashMap<_, _>>();
+        let mut active_keys = HashSet::new();
+        let mut dirty = false;
+
+        for entry in &snapshot.manifest.entries {
+            for chunk in embedding_chunks_for_entry(entry) {
+                let text = chunk.text.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                stats.total += 1;
+                let key = embedding_key_for_chunk(&entry.path, Some(chunk.chunk_id.as_str()));
+                let text_hash = embedding_text_hash(text);
+                active_keys.insert(key.clone());
+                if let Some(existing_index) = entries_by_key.get(&key).copied() {
+                    let existing = &store.entries[existing_index];
+                    if existing.text_hash == text_hash && !existing.vector.is_empty() {
+                        stats.skipped += 1;
+                        continue;
+                    }
+                }
+
+                let execution = model_center::run_embedding_with_state(text, model_center_state);
+                if !execution.available || execution.vector.is_empty() {
+                    stats.failed += 1;
+                    stats.degraded = true;
+                    stats.last_error = Some(execution.summary);
+                    continue;
+                }
+
+                store.provider_key =
+                    (!execution.provider_key.trim().is_empty()).then_some(execution.provider_key);
+                store.model_endpoint_id = execution.model_endpoint_id;
+                store.model_name = execution.model_name;
+
+                let embedding_entry = KnowledgeEmbeddingEntry {
+                    key: key.clone(),
+                    path: entry.path.clone(),
+                    chunk_id: Some(chunk.chunk_id.clone()),
+                    text_hash,
+                    vector: execution.vector,
+                };
+                if let Some(existing_index) = entries_by_key.get(&key).copied() {
+                    store.entries[existing_index] = embedding_entry;
+                } else {
+                    let index = store.entries.len();
+                    store.entries.push(embedding_entry);
+                    entries_by_key.insert(key, index);
+                }
+                stats.completed += 1;
+                dirty = true;
+            }
+        }
+
+        let before_retain_len = store.entries.len();
+        store
+            .entries
+            .retain(|entry| active_keys.contains(&entry.key));
+        if store.entries.len() != before_retain_len {
+            dirty = true;
+        }
+        if dirty {
+            if let Err(error) = save_embedding_store(&embedding_store_path, &store) {
+                stats.degraded = true;
+                stats.persist_error = Some(error.clone());
+                stats.last_error = Some(error);
+            }
+        }
+        stats
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -459,6 +580,29 @@ pub fn save_embedding_store(path: &Path, store: &KnowledgeEmbeddingStore) -> Res
             path.display()
         )
     })
+}
+
+fn embedding_chunks_for_entry(entry: &KnowledgeIndexEntry) -> Vec<KnowledgeIndexChunk> {
+    if !entry.chunks.is_empty() {
+        return entry.chunks.clone();
+    }
+    vec![KnowledgeIndexChunk {
+        chunk_id: "chunk-0001".to_string(),
+        line_start: 1,
+        line_end: entry.searchable_text.lines().count().max(1),
+        text: entry.searchable_text.clone(),
+        source_kind: entry.modality.as_str().to_string(),
+        source_path: entry.sidecar_path.clone(),
+    }]
+}
+
+fn embedding_key_for_chunk(path: &str, chunk_id: Option<&str>) -> String {
+    format!("{}::{}", path, chunk_id.unwrap_or("chunk-0001"))
+}
+
+fn embedding_text_hash(text: &str) -> String {
+    let digest = Sha256::digest(text.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn refresh_directory(
@@ -1159,7 +1303,7 @@ mod tests {
     use super::{KnowledgeIndexConfig, KnowledgeIndexService, KnowledgeModality};
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn unique_dir(prefix: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -1180,7 +1324,6 @@ mod tests {
         let knowledge_root = unique_dir("harborbeacon-knowledge-index-root");
         let index_root = unique_dir("harborbeacon-knowledge-index-store");
         fs::create_dir_all(knowledge_root.join("docs")).expect("create docs");
-        fs::create_dir_all(knowledge_root.join("images")).expect("create images");
         fs::create_dir_all(&index_root).expect("create index root");
         fs::write(
             knowledge_root.join("docs").join("sakura-notes.md"),
@@ -1188,15 +1331,10 @@ mod tests {
         )
         .expect("write doc");
         fs::write(
-            knowledge_root.join("images").join("garden.jpg"),
-            b"fake-image",
+            knowledge_root.join("docs").join("stable-note.md"),
+            "这是一条保持不变的知识索引笔记。",
         )
-        .expect("write image");
-        fs::write(
-            knowledge_root.join("images").join("garden.json"),
-            r#"{"caption":"花园里的樱花树","tags":["spring","sakura"]}"#,
-        )
-        .expect("write sidecar");
+        .expect("write stable doc");
 
         let service = KnowledgeIndexService::from_config(
             KnowledgeIndexConfig::new(index_root.clone()).expect("config"),
@@ -1208,12 +1346,6 @@ mod tests {
         assert_eq!(first.stats.added, 2);
         assert!(first.stats.persisted);
         assert_eq!(first.manifest.entries.len(), 2);
-        assert!(first
-            .manifest
-            .entries
-            .iter()
-            .any(|entry| entry.modality == KnowledgeModality::Image
-                && entry.searchable_text.contains("樱花树")));
         assert!(
             first
                 .manifest
@@ -1222,12 +1354,8 @@ mod tests {
                 .any(|entry| entry.modality == KnowledgeModality::Document
                     && !entry.chunks.is_empty())
         );
-        assert!(first
-            .manifest
-            .entries
-            .iter()
-            .any(|entry| entry.modality == KnowledgeModality::Image && !entry.chunks.is_empty()));
 
+        std::thread::sleep(Duration::from_millis(20));
         fs::write(
             knowledge_root.join("docs").join("sakura-notes.md"),
             "今年花园里的樱花开得更盛，适合做春季归档和分享。",

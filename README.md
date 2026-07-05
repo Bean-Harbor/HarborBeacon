@@ -6,7 +6,8 @@ This repository contains the completed planning deliverables for a HarborBeacon 
 
 The active HarborBeacon <-> HarborGate seam is the v2.0 upgrade control pack.
 
-- Active contract: `C:\Users\beanw\OpenSource\HarborGate\HarborBeacon-HarborGate-Agent-Contract-v2.0.md`
+- HarborBeacon core architecture contract: `docs/HarborBeacon-Harbor-Collaboration-Contract-v3.md`
+- Active contract: `C:\Users\beanw\OpenSource\HarborGate\docs\HarborBeacon-HarborGate-Agent-Contract-v2.0.md`
 - HarborBeacon runbook: `HarborBeacon-HarborGate-v2.0-Upgrade-Runbook.md`
 - Cutover gates: `docs/im-v2.0-cutover-rollback-observability-gates.md`
 
@@ -46,6 +47,7 @@ Useful flags:
 - `--force-dry-run`: force all actions into dry-run mode
 
 ## Documents
+- HarborBeacon-Harbor-Collaboration-Contract-v3.md
 - HarborBeacon-LocalAgent-Plan.md
 - HarborBeacon-LocalAgent-Roadmap.md
 - HarborBeacon-LocalAgent-QuickRef.md

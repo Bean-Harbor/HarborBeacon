@@ -29,6 +29,14 @@ name = "evaluate-release-gate"
 path = "src/bin/evaluate_release_gate.rs"
 
 [[bin]]
+name = "evaluate-workflow-compiler"
+path = "src/bin/evaluate_workflow_compiler.rs"
+
+[[bin]]
+name = "evaluate-privacy-gateway"
+path = "src/bin/evaluate_privacy_gateway.rs"
+
+[[bin]]
 name = "agent-hub-admin-api"
 path = "src/bin/agent_hub_admin_api.rs"
 

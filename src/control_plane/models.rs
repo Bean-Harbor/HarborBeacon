@@ -13,6 +13,7 @@ pub enum ModelKind {
     Asr,
     Detector,
     Embedder,
+    Reranker,
 }
 
 impl ModelKind {
@@ -24,6 +25,7 @@ impl ModelKind {
             Self::Asr => "asr",
             Self::Detector => "detector",
             Self::Embedder => "embedder",
+            Self::Reranker => "reranker",
         }
     }
 }

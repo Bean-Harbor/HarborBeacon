@@ -5,7 +5,7 @@
 > IM 仓库负责 `adapter/gateway/route/平台凭据/delivery`；HarborBeacon 负责 `conversation turn/business state/active frame/approval/artifact/audit`。
 > 两边只通过 HTTP/JSON contract 通信，不互相 import，也不共享 `.harborbeacon/*.json`。  
 > 本文档以下实施阶段与近期行动，均以 HarborBeacon 侧可执行工作为准。  
-> 协作术语统一以 `HarborBeacon-Harbor-Collaboration-Contract-v2` 与 `harbor-*` lane 命名为准。
+> 协作术语统一以 `HarborBeacon-Harbor-Collaboration-Contract-v3` 与 `harbor-*` lane 命名为准。
 > 已验证 baseline：HarborBeacon `a5f6da0` + HarborGate `57ff759`
 > 已打包为 `.82` RC2
 > `20260430-rc2-beacona5f6da0-gate57ff759`，并通过 Harbor Assistant、Search、knowledge search/preview、protected

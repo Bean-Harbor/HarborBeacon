@@ -6,9 +6,11 @@ use std::io::{Cursor, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use hf_hub::{
@@ -36,6 +38,10 @@ use harborbeacon_local_agent::connectors::notifications::{
     NotificationDeliveryError, NotificationDeliveryRecord, NotificationDeliveryService,
 };
 use harborbeacon_local_agent::connectors::storage::StorageTarget;
+use harborbeacon_local_agent::control_plane::audit::{
+    build_audit_summary, build_metadata_audit_record, query_audit_records, AuditActorKind,
+    AuditRecord, AuditRecordQuery,
+};
 use harborbeacon_local_agent::control_plane::events::EventRecord;
 use harborbeacon_local_agent::control_plane::media::{
     MediaAsset, MediaAssetKind, MediaSession, MediaSessionStatus, ShareLink,
@@ -44,6 +50,10 @@ use harborbeacon_local_agent::control_plane::models::{
     ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, ModelRoutePolicy,
     PrivacyLevel,
 };
+use harborbeacon_local_agent::control_plane::routing::{
+    build_routing_status, RoutingRuntimeProjection,
+};
+use harborbeacon_local_agent::control_plane::tasks::TaskStepRun;
 use harborbeacon_local_agent::control_plane::users::{MembershipStatus, RoleKind};
 use harborbeacon_local_agent::runtime::access_control::{
     authorize_access, AccessAction, AccessIdentityHints, AccessPrincipal,
@@ -65,6 +75,33 @@ use harborbeacon_local_agent::runtime::dvr::{
     apply_retention_policy, build_status_response, dvr_media_preview_path, media_library_root_path,
     scan_timeline, store_snapshot_bytes, DvrRecordingSettings, DvrRuntime, DvrTimelineSegment,
 };
+use harborbeacon_local_agent::runtime::evt_readiness::{
+    build_evt_evidence_bundle, build_evt_readiness_report, evt_preflight_workflow_summary,
+    evt_readiness_workflow_summary, run_evt_preflight_report,
+};
+use harborbeacon_local_agent::runtime::family_memory::{
+    append_family_memory_feedback_default, apply_family_memory_overlays_to_events,
+    build_family_memory_event_views, build_family_memory_stats,
+    compact_family_memory_feedback_evidence, family_memory_overlays_default,
+    family_memory_stats_default, list_family_memory_feedback_default, FamilyMemoryEventFilter,
+    FamilyMemoryEventView, FamilyMemoryFeedbackRecord, FamilyMemoryFeedbackRequest,
+    FamilyMemoryStats, DEFAULT_FAMILY_MEMORY_FEEDBACK_LIMIT,
+};
+use harborbeacon_local_agent::runtime::family_timeline::{
+    build_family_timeline_digest_from_query, build_family_timeline_from_query,
+    FamilyTimelineDigest, FamilyTimelineQueryOptions, FamilyTimelineResponse,
+};
+use harborbeacon_local_agent::runtime::home_guardian::{
+    append_home_guardian_run_summary, automation_review_is_home_guardian,
+    build_home_guardian_activity_response_with_activity, build_home_guardian_evaluation_response,
+    build_home_guardian_rule_evaluation_plan, compact_home_guardian_evaluation_evidence,
+    compact_home_guardian_proposal_evidence, complete_home_guardian_rule_execution,
+    home_guardian_ha_service_request, home_guardian_idempotent_action_result,
+    home_guardian_redacted_action_plan, home_guardian_rule_run_summary,
+    home_guardian_run_already_recorded, home_guardian_unsupported_action_result,
+    select_home_guardian_reviews, HomeGuardianActionExecutionKind, HomeGuardianEvaluationResponse,
+    HomeGuardianRuleEvaluationPlan,
+};
 use harborbeacon_local_agent::runtime::hub::{
     CameraConnectRequest, CameraHubService, HubManualAddSummary, HubScanRequest, HubScanSummary,
     HubStateSnapshot,
@@ -73,14 +110,17 @@ use harborbeacon_local_agent::runtime::knowledge::{
     KnowledgeSearchRequest, KnowledgeSearchService,
 };
 use harborbeacon_local_agent::runtime::knowledge_index::{
-    load_embedding_store, KnowledgeIndexConfig, KnowledgeIndexManifest, KnowledgeIndexService,
-    KnowledgeModality,
+    load_embedding_store, KnowledgeEmbeddingWarmupStats, KnowledgeIndexConfig,
+    KnowledgeIndexManifest, KnowledgeIndexService, KnowledgeIndexSnapshot, KnowledgeModality,
 };
 use harborbeacon_local_agent::runtime::media::{SnapshotCaptureRequest, SnapshotFormat};
 use harborbeacon_local_agent::runtime::media_tools::{ffmpeg_resolution_hint, resolve_ffmpeg_bin};
 use harborbeacon_local_agent::runtime::model_center::{
-    redact_model_endpoint, test_model_endpoint, ModelEndpointTestResult, ADMIN_STATE_PATH_ENV,
+    load_model_center_state, redact_model_endpoint, run_vlm_summary_with_state,
+    test_model_endpoint, vlm_endpoint_readiness, vlm_execution_runtime_snapshot,
+    ModelEndpointTestResult, ADMIN_STATE_PATH_ENV,
 };
+use harborbeacon_local_agent::runtime::privacy_gateway::PRIVACY_GATEWAY_POLICY_VERSION;
 use harborbeacon_local_agent::runtime::registry::{
     CameraCapabilities, CameraDevice, DeviceRegistryStore, HomeAssistantRegistryEntity,
 };
@@ -91,11 +131,27 @@ use harborbeacon_local_agent::runtime::task_api::{
 };
 use harborbeacon_local_agent::runtime::task_session::TaskConversationStore;
 use harborbeacon_local_agent::runtime::vision_event::{
-    build_local_vision_notification_intent, ingest_local_vision_event_default,
-    list_recent_local_vision_events_default, LocalVisionEvent, StoredLocalVisionEvent,
+    attach_vlm_summary_to_event, build_local_vision_notification_intent,
+    ingest_local_vision_event_default, list_recent_local_vision_events_default,
+    local_vision_event_store_stats_default, LocalVisionEvent, StoredLocalVisionEvent,
+    MAX_LOCAL_VISION_EVENT_JSON_BYTES,
 };
 
 const DEFAULT_HF_ENDPOINT: &str = "https://hf-mirror.com";
+const KNOWLEDGE_EMBEDDING_WARMUP_TIMEOUT_MS_ENV: &str =
+    "HARBORBEACON_KNOWLEDGE_EMBEDDING_WARMUP_TIMEOUT_MS";
+const DEFAULT_KNOWLEDGE_EMBEDDING_WARMUP_TIMEOUT_MS: u64 = 120_000;
+const HOME_GUARDIAN_EVALUATION_QUEUE_CAPACITY: usize = 128;
+const HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS: u64 = 60;
+const PRIVACY_GATEWAY_AUDIT_ACTION: &str = "privacy_gateway.rag_answer.evaluate";
+const PRIVACY_GATEWAY_READINESS_AUDIT_LIMIT: usize = 20;
+const HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS: u64 = 300;
+const HOME_GUARDIAN_IDEMPOTENCY_MEMORY_SECONDS: u64 = 7 * 24 * 60 * 60;
+const ADMIN_HTTP_WORKER_COUNT: usize = 32;
+const ADMIN_HTTP_REQUEST_QUEUE_CAPACITY: usize = 256;
+const MAX_VISION_EVENT_INGEST_INFLIGHT: usize = 8;
+const HOME_GUARDIAN_ACTIVITY_LIMIT: usize = 500;
+const MAX_FAMILY_MEMORY_FEEDBACK_JSON_BYTES: usize = 32 * 1024;
 
 #[derive(Debug, Clone)]
 struct Cli {
@@ -220,6 +276,224 @@ pub struct AdminApi {
     model_runtime_activation: Option<ModelRuntimeActivationHandler>,
     last_event_notification_attempt: Arc<Mutex<Option<Value>>>,
     last_home_assistant_service_action: Arc<Mutex<Option<Value>>>,
+    last_evt_preflight: Arc<Mutex<Option<Value>>>,
+    last_vlm_enrichment: Arc<Mutex<Option<Value>>>,
+    last_family_timeline_digest: Arc<Mutex<Option<Value>>>,
+    last_family_memory_feedback: Arc<Mutex<Option<Value>>>,
+    last_guardian_rule_proposal: Arc<Mutex<Option<Value>>>,
+    last_guardian_rule_evaluation: Arc<Mutex<Option<Value>>>,
+    guardian_queue: HomeGuardianEvaluationQueue,
+    guardian_auto_eval_cooldowns: Arc<Mutex<HashMap<String, u64>>>,
+    guardian_cooldowns: Arc<Mutex<HashMap<String, u64>>>,
+    guardian_action_runs: Arc<Mutex<HashMap<String, u64>>>,
+    guardian_rule_cache: Arc<Mutex<HomeGuardianRuleCache>>,
+    guardian_activity_log_lock: Arc<Mutex<()>>,
+    http_runtime: HttpRuntimeCounters,
+    vision_ingest_limiter: VisionIngestLimiter,
+}
+
+#[derive(Clone, Default)]
+struct HomeGuardianRuleCache {
+    active_reviews: Vec<AutomationRuleReview>,
+    loaded_at_epoch: u64,
+    file_bytes: u64,
+    modified_epoch_ms: Option<u128>,
+    refresh_error: Option<String>,
+}
+
+#[derive(Clone)]
+struct HttpRuntimeCounters {
+    active: Arc<AtomicUsize>,
+    accepted_total: Arc<AtomicU64>,
+    rejected_total: Arc<AtomicU64>,
+    completed_total: Arc<AtomicU64>,
+}
+
+impl HttpRuntimeCounters {
+    fn new() -> Self {
+        Self {
+            active: Arc::new(AtomicUsize::new(0)),
+            accepted_total: Arc::new(AtomicU64::new(0)),
+            rejected_total: Arc::new(AtomicU64::new(0)),
+            completed_total: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn record_accepted(&self) {
+        self.accepted_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_rejected(&self) {
+        self.rejected_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn begin_request(&self) -> HttpRequestGuard {
+        self.active.fetch_add(1, Ordering::Relaxed);
+        HttpRequestGuard {
+            counters: self.clone(),
+        }
+    }
+
+    fn snapshot(&self) -> Value {
+        let active = self.active.load(Ordering::Relaxed);
+        let accepted_total = self.accepted_total.load(Ordering::Relaxed);
+        let completed_total = self.completed_total.load(Ordering::Relaxed);
+        let queued_pending = accepted_total
+            .saturating_sub(completed_total)
+            .saturating_sub(active as u64);
+        json!({
+            "worker_count": ADMIN_HTTP_WORKER_COUNT,
+            "queue_capacity": ADMIN_HTTP_REQUEST_QUEUE_CAPACITY,
+            "active_requests": active,
+            "queued_pending": queued_pending,
+            "accepted_total": accepted_total,
+            "rejected_total": self.rejected_total.load(Ordering::Relaxed),
+            "completed_total": completed_total,
+            "process_thread_count": current_process_thread_count(),
+            "bounded": true,
+            "metadata_only": true,
+        })
+    }
+}
+
+struct HttpRequestGuard {
+    counters: HttpRuntimeCounters,
+}
+
+impl Drop for HttpRequestGuard {
+    fn drop(&mut self) {
+        self.counters.active.fetch_sub(1, Ordering::Relaxed);
+        self.counters
+            .completed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone)]
+struct VisionIngestLimiter {
+    active: Arc<AtomicUsize>,
+    accepted_total: Arc<AtomicU64>,
+    rejected_total: Arc<AtomicU64>,
+}
+
+impl VisionIngestLimiter {
+    fn new() -> Self {
+        Self {
+            active: Arc::new(AtomicUsize::new(0)),
+            accepted_total: Arc::new(AtomicU64::new(0)),
+            rejected_total: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn try_acquire(&self) -> Option<VisionIngestGuard> {
+        loop {
+            let active = self.active.load(Ordering::Relaxed);
+            if active >= MAX_VISION_EVENT_INGEST_INFLIGHT {
+                self.rejected_total.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            if self
+                .active
+                .compare_exchange_weak(active, active + 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.accepted_total.fetch_add(1, Ordering::Relaxed);
+                return Some(VisionIngestGuard {
+                    limiter: self.clone(),
+                });
+            }
+        }
+    }
+
+    fn snapshot(&self) -> Value {
+        json!({
+            "max_inflight": MAX_VISION_EVENT_INGEST_INFLIGHT,
+            "active_inflight": self.active.load(Ordering::Relaxed),
+            "accepted_total": self.accepted_total.load(Ordering::Relaxed),
+            "rejected_total": self.rejected_total.load(Ordering::Relaxed),
+            "bounded": true,
+            "metadata_only": true,
+        })
+    }
+}
+
+struct VisionIngestGuard {
+    limiter: VisionIngestLimiter,
+}
+
+impl Drop for VisionIngestGuard {
+    fn drop(&mut self) {
+        self.limiter.active.fetch_sub(1, Ordering::Release);
+    }
+}
+
+#[derive(Clone)]
+struct HomeGuardianEvaluationQueue {
+    sender: SyncSender<StoredLocalVisionEvent>,
+    queued: Arc<AtomicU64>,
+    dropped: Arc<AtomicU64>,
+    processed: Arc<AtomicU64>,
+    failed: Arc<AtomicU64>,
+    coalesced: Arc<AtomicU64>,
+    disconnected: Arc<AtomicU64>,
+}
+
+impl HomeGuardianEvaluationQueue {
+    fn new(sender: SyncSender<StoredLocalVisionEvent>) -> Self {
+        Self {
+            sender,
+            queued: Arc::new(AtomicU64::new(0)),
+            dropped: Arc::new(AtomicU64::new(0)),
+            processed: Arc::new(AtomicU64::new(0)),
+            failed: Arc::new(AtomicU64::new(0)),
+            coalesced: Arc::new(AtomicU64::new(0)),
+            disconnected: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn enqueue(&self, event: StoredLocalVisionEvent) -> &'static str {
+        match self.sender.try_send(event) {
+            Ok(()) => {
+                self.queued.fetch_add(1, Ordering::Relaxed);
+                "queued"
+            }
+            Err(TrySendError::Full(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                "dropped"
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.disconnected.fetch_add(1, Ordering::Relaxed);
+                "disconnected"
+            }
+        }
+    }
+
+    fn record_processed(&self) {
+        self.processed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_failed(&self) {
+        self.failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_coalesced(&self) {
+        self.coalesced.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> Value {
+        json!({
+            "capacity": HOME_GUARDIAN_EVALUATION_QUEUE_CAPACITY,
+            "auto_evaluation_min_interval_seconds": HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS,
+            "queued_total": self.queued.load(Ordering::Relaxed),
+            "dropped_total": self.dropped.load(Ordering::Relaxed),
+            "processed_total": self.processed.load(Ordering::Relaxed),
+            "failed_total": self.failed.load(Ordering::Relaxed),
+            "coalesced_total": self.coalesced.load(Ordering::Relaxed),
+            "disconnected_total": self.disconnected.load(Ordering::Relaxed),
+            "bounded": true,
+            "metadata_only": true,
+        })
+    }
 }
 
 pub(crate) type ModelRuntimeActivationHandler = Arc<
@@ -607,6 +881,49 @@ struct VisionEventsResponse {
     events: Vec<StoredLocalVisionEvent>,
 }
 
+#[derive(Debug, Serialize)]
+struct FamilyTimelineApiResponse {
+    #[serde(flatten)]
+    timeline: FamilyTimelineResponse,
+    memory_overlay: FamilyMemoryStats,
+}
+
+#[derive(Debug, Serialize)]
+struct FamilyTimelineDigestApiResponse {
+    #[serde(flatten)]
+    digest: FamilyTimelineDigest,
+    memory_overlay: FamilyMemoryStats,
+}
+
+#[derive(Debug, Serialize)]
+struct FamilyMemoryEventsResponse {
+    generated_at: String,
+    limit: usize,
+    metadata_only: bool,
+    secret_scan: String,
+    memory_overlay: FamilyMemoryStats,
+    events: Vec<FamilyMemoryEventView>,
+}
+
+#[derive(Debug, Serialize)]
+struct FamilyMemoryEventResponse {
+    generated_at: String,
+    metadata_only: bool,
+    secret_scan: String,
+    event: FamilyMemoryEventView,
+}
+
+#[derive(Debug, Serialize)]
+struct FamilyMemoryFeedbackResponse {
+    status: String,
+    event_id: String,
+    feedback: FamilyMemoryFeedbackRecord,
+    memory_overlay: FamilyMemoryStats,
+    evidence: Value,
+    metadata_only: bool,
+    secret_scan: String,
+}
+
 #[derive(Debug, Serialize, Clone)]
 struct LocalVisionEventNotificationResponse {
     event_id: String,
@@ -813,6 +1130,7 @@ struct RagReadinessResponse {
     resource_profiles: Vec<RagResourceProfileStatus>,
     capability_profiles: Vec<RagCapabilityReadinessCard>,
     privacy_policy: RagReadinessComponent,
+    privacy_gateway: RagPrivacyGatewayReadiness,
     media_parser: RagReadinessComponent,
     storage_writable: RagReadinessComponent,
     index_jobs: Vec<KnowledgeIndexJobRecord>,
@@ -826,6 +1144,25 @@ struct RagReadinessComponent {
     status: String,
     summary: String,
     detail: String,
+    evidence: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+struct RagPrivacyGatewayReadiness {
+    status: String,
+    summary: String,
+    policy_version: String,
+    covered_routes: Vec<String>,
+    privacy_level: String,
+    default_resource_profile: String,
+    recent_audit_count: usize,
+    decision_counts: BTreeMap<String, usize>,
+    risk_counts: BTreeMap<String, usize>,
+    latest_privacy_transform_id: Option<String>,
+    latest_evaluated_at: Option<String>,
+    warning_count: usize,
+    metadata_only: bool,
+    secret_scan: String,
     evidence: Vec<String>,
 }
 
@@ -908,7 +1245,7 @@ impl KnowledgeSearchApiRequest {
     }
 }
 
-#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Clone, PartialEq)]
 struct KnowledgeIndexStatusResponse {
     generated_at: String,
     status: String,
@@ -1342,7 +1679,9 @@ impl AdminApi {
         harbor_assistant_dist: PathBuf,
         public_origin: String,
     ) -> Self {
-        Self {
+        let (guardian_sender, guardian_receiver) =
+            sync_channel(HOME_GUARDIAN_EVALUATION_QUEUE_CAPACITY);
+        let api = Self {
             admin_store,
             task_service,
             dvr_runtime: DvrRuntime::default(),
@@ -1352,7 +1691,24 @@ impl AdminApi {
             model_runtime_activation: None,
             last_event_notification_attempt: Arc::new(Mutex::new(None)),
             last_home_assistant_service_action: Arc::new(Mutex::new(None)),
-        }
+            last_evt_preflight: Arc::new(Mutex::new(None)),
+            last_vlm_enrichment: Arc::new(Mutex::new(None)),
+            last_family_timeline_digest: Arc::new(Mutex::new(None)),
+            last_family_memory_feedback: Arc::new(Mutex::new(None)),
+            last_guardian_rule_proposal: Arc::new(Mutex::new(None)),
+            last_guardian_rule_evaluation: Arc::new(Mutex::new(None)),
+            guardian_queue: HomeGuardianEvaluationQueue::new(guardian_sender),
+            guardian_auto_eval_cooldowns: Arc::new(Mutex::new(HashMap::new())),
+            guardian_cooldowns: Arc::new(Mutex::new(HashMap::new())),
+            guardian_action_runs: Arc::new(Mutex::new(HashMap::new())),
+            guardian_rule_cache: Arc::new(Mutex::new(HomeGuardianRuleCache::default())),
+            guardian_activity_log_lock: Arc::new(Mutex::new(())),
+            http_runtime: HttpRuntimeCounters::new(),
+            vision_ingest_limiter: VisionIngestLimiter::new(),
+        };
+        api.refresh_home_guardian_rule_cache_best_effort();
+        api.start_home_guardian_worker(guardian_receiver);
+        api
     }
 
     pub(crate) fn with_model_runtime_activation_handler(
@@ -1365,6 +1721,254 @@ impl AdminApi {
 
     fn hub(&self) -> CameraHubService {
         CameraHubService::new(self.admin_store.clone())
+    }
+
+    fn start_home_guardian_worker(&self, receiver: Receiver<StoredLocalVisionEvent>) {
+        let worker = self.clone();
+        let _ = thread::Builder::new()
+            .name("home-guardian-eval".to_string())
+            .spawn(move || worker.run_home_guardian_worker(receiver));
+    }
+
+    fn run_home_guardian_worker(self, receiver: Receiver<StoredLocalVisionEvent>) {
+        for stored in receiver {
+            match self.evaluate_home_guardian_rules_for_event(&stored, None, true) {
+                Ok(evaluation) => {
+                    self.guardian_queue.record_processed();
+                    self.record_last_guardian_rule_evaluation(
+                        &serde_json::to_value(&evaluation).unwrap_or_else(|_| json!({})),
+                    );
+                }
+                Err(error) => {
+                    self.guardian_queue.record_failed();
+                    self.record_last_guardian_rule_evaluation(&json!({
+                        "status": "failed",
+                        "event_id": stored.event.event_id,
+                        "reason": redact_admin_string(&error),
+                        "metadata_only": true,
+                        "secret_scan": "clean",
+                    }));
+                }
+            }
+        }
+    }
+
+    fn enqueue_home_guardian_evaluation(&self, stored: &StoredLocalVisionEvent) -> &'static str {
+        let now_epoch = current_epoch_secs();
+        if !self.guardian_auto_evaluation_due(stored, now_epoch) {
+            self.guardian_queue.record_coalesced();
+            return "coalesced";
+        }
+        self.guardian_queue.enqueue(stored.clone())
+    }
+
+    fn home_guardian_queue_snapshot(&self) -> Value {
+        self.guardian_queue.snapshot()
+    }
+
+    fn refresh_home_guardian_rule_cache_best_effort(&self) {
+        if let Err(error) = self.refresh_home_guardian_rule_cache() {
+            if let Ok(mut guard) = self.guardian_rule_cache.lock() {
+                guard.refresh_error = Some(redact_admin_string(&error));
+            }
+        }
+    }
+
+    fn refresh_home_guardian_rule_cache(&self) -> Result<(), String> {
+        let state = self.admin_store.load_state()?;
+        let active_reviews = state
+            .automation_reviews
+            .into_iter()
+            .filter(|review| {
+                automation_review_is_home_guardian(review) && review.status.as_str() == "active"
+            })
+            .collect::<Vec<_>>();
+        let (file_bytes, modified_epoch_ms) = admin_state_file_fingerprint(self.admin_store.path());
+        let mut guard = self
+            .guardian_rule_cache
+            .lock()
+            .map_err(|_| "home guardian rule cache lock poisoned".to_string())?;
+        *guard = HomeGuardianRuleCache {
+            active_reviews,
+            loaded_at_epoch: current_epoch_secs(),
+            file_bytes,
+            modified_epoch_ms,
+            refresh_error: None,
+        };
+        Ok(())
+    }
+
+    fn cached_home_guardian_reviews_for_auto(&self) -> Result<Vec<AutomationRuleReview>, String> {
+        let (file_bytes, modified_epoch_ms) = admin_state_file_fingerprint(self.admin_store.path());
+        let needs_refresh = self
+            .guardian_rule_cache
+            .lock()
+            .map(|guard| {
+                guard.loaded_at_epoch == 0
+                    || guard.file_bytes != file_bytes
+                    || guard.modified_epoch_ms != modified_epoch_ms
+            })
+            .unwrap_or(true);
+        if needs_refresh {
+            self.refresh_home_guardian_rule_cache()?;
+        }
+        let guard = self
+            .guardian_rule_cache
+            .lock()
+            .map_err(|_| "home guardian rule cache lock poisoned".to_string())?;
+        if let Some(error) = guard.refresh_error.as_ref() {
+            return Err(error.clone());
+        }
+        Ok(guard.active_reviews.clone())
+    }
+
+    fn guardian_rule_cache_snapshot(&self) -> Value {
+        match self.guardian_rule_cache.lock() {
+            Ok(guard) => json!({
+                "active_rule_count": guard.active_reviews.len(),
+                "loaded_at_epoch": guard.loaded_at_epoch,
+                "file_bytes": guard.file_bytes,
+                "modified_epoch_ms": guard.modified_epoch_ms.map(|value| value.to_string()),
+                "refresh_error": guard.refresh_error.as_deref().map(redact_admin_string),
+                "metadata_only": true,
+            }),
+            Err(_) => json!({
+                "status": "unavailable",
+                "reason": "home guardian rule cache lock poisoned",
+                "metadata_only": true,
+            }),
+        }
+    }
+
+    fn guardian_action_run_seen(&self, idempotency_key: &str, now_epoch: u64) -> bool {
+        let Ok(mut guard) = self.guardian_action_runs.lock() else {
+            return false;
+        };
+        guard.retain(|_, last_epoch| {
+            now_epoch.saturating_sub(*last_epoch) <= HOME_GUARDIAN_IDEMPOTENCY_MEMORY_SECONDS
+        });
+        guard.contains_key(idempotency_key)
+    }
+
+    fn mark_guardian_action_run_seen(&self, idempotency_key: &str, now_epoch: u64) {
+        if let Ok(mut guard) = self.guardian_action_runs.lock() {
+            guard.insert(idempotency_key.to_string(), now_epoch);
+        }
+    }
+
+    fn record_http_request_accepted(&self) {
+        self.http_runtime.record_accepted();
+    }
+
+    fn record_http_request_rejected(&self) {
+        self.http_runtime.record_rejected();
+    }
+
+    fn begin_http_request(&self) -> HttpRequestGuard {
+        self.http_runtime.begin_request()
+    }
+
+    fn runtime_backpressure_snapshot(&self) -> Value {
+        json!({
+            "http": self.http_runtime.snapshot(),
+            "vision_ingest": self.vision_ingest_limiter.snapshot(),
+            "vlm": vlm_execution_runtime_snapshot(),
+            "home_guardian": self.home_guardian_queue_snapshot(),
+            "home_guardian_rule_cache": self.guardian_rule_cache_snapshot(),
+            "metadata_only": true,
+        })
+    }
+
+    fn home_guardian_activity_log_path(&self) -> PathBuf {
+        self.admin_store
+            .path()
+            .with_file_name("home_guardian_activity.jsonl")
+    }
+
+    fn load_home_guardian_activity_summaries(&self) -> Vec<Value> {
+        let path = self.home_guardian_activity_log_path();
+        let Ok(text) = fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        let summaries = text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+            .collect::<Vec<_>>();
+        latest_home_guardian_activity_summaries(summaries)
+    }
+
+    fn append_home_guardian_activity_summary(&self, summary: &Value) {
+        let Ok(_guard) = self.guardian_activity_log_lock.lock() else {
+            return;
+        };
+        let path = self.home_guardian_activity_log_path();
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let mut summaries = self.load_home_guardian_activity_summaries();
+        summaries.push(summary.clone());
+        summaries = latest_home_guardian_activity_summaries(summaries);
+        let payload = summaries
+            .into_iter()
+            .filter_map(|summary| serde_json::to_string(&summary).ok())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = fs::write(path, format!("{payload}\n"));
+    }
+
+    fn guardian_action_in_cooldown(
+        &self,
+        review: &AutomationRuleReview,
+        stored: &StoredLocalVisionEvent,
+        action_key: &str,
+        now_epoch: u64,
+    ) -> bool {
+        let key = home_guardian_action_cooldown_key(review, stored, action_key);
+        let Ok(mut guard) = self.guardian_cooldowns.lock() else {
+            return false;
+        };
+        guard.retain(|_, last_epoch| {
+            now_epoch.saturating_sub(*last_epoch) <= HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS * 2
+        });
+        guard.get(&key).is_some_and(|last_epoch| {
+            now_epoch.saturating_sub(*last_epoch) < HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS
+        })
+    }
+
+    fn mark_guardian_action_cooldown(
+        &self,
+        review: &AutomationRuleReview,
+        stored: &StoredLocalVisionEvent,
+        action_key: &str,
+        now_epoch: u64,
+    ) {
+        let key = home_guardian_action_cooldown_key(review, stored, action_key);
+        if let Ok(mut guard) = self.guardian_cooldowns.lock() {
+            guard.insert(key, now_epoch);
+        }
+    }
+
+    fn guardian_auto_evaluation_due(
+        &self,
+        stored: &StoredLocalVisionEvent,
+        now_epoch: u64,
+    ) -> bool {
+        let key = home_guardian_auto_evaluation_cooldown_key(stored);
+        let Ok(mut guard) = self.guardian_auto_eval_cooldowns.lock() else {
+            return true;
+        };
+        guard.retain(|_, last_epoch| {
+            now_epoch.saturating_sub(*last_epoch)
+                <= HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS * 2
+        });
+        if guard.get(&key).is_some_and(|last_epoch| {
+            now_epoch.saturating_sub(*last_epoch)
+                < HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS
+        }) {
+            return false;
+        }
+        guard.insert(key, now_epoch);
+        true
     }
 
     fn record_last_event_notification_attempt(
@@ -1401,12 +2005,143 @@ impl AdminApi {
             .and_then(|guard| guard.clone())
     }
 
+    fn record_last_evt_preflight(&self, preflight: &Value) {
+        let Ok(mut guard) = self.last_evt_preflight.lock() else {
+            return;
+        };
+        *guard = Some(preflight.clone());
+    }
+
+    fn last_evt_preflight(&self) -> Option<Value> {
+        self.last_evt_preflight
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    fn record_last_vlm_enrichment(&self, evidence: Value) {
+        let Ok(mut guard) = self.last_vlm_enrichment.lock() else {
+            return;
+        };
+        *guard = Some(evidence);
+    }
+
+    fn last_vlm_enrichment(&self) -> Option<Value> {
+        self.last_vlm_enrichment
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    fn record_last_family_timeline_digest(&self, digest: &FamilyTimelineDigest) {
+        let Ok(mut guard) = self.last_family_timeline_digest.lock() else {
+            return;
+        };
+        *guard = Some(serde_json::to_value(digest).unwrap_or_else(|_| json!({})));
+    }
+
+    fn record_last_family_memory_feedback(&self, record: &FamilyMemoryFeedbackRecord) {
+        let Ok(mut guard) = self.last_family_memory_feedback.lock() else {
+            return;
+        };
+        *guard = Some(compact_family_memory_feedback_evidence(record));
+    }
+
+    fn record_last_guardian_rule_proposal(&self, proposal: &Value) {
+        let Ok(mut guard) = self.last_guardian_rule_proposal.lock() else {
+            return;
+        };
+        *guard = Some(compact_home_guardian_proposal_evidence(proposal));
+    }
+
+    fn record_last_guardian_rule_evaluation(&self, evaluation: &Value) {
+        let Ok(mut guard) = self.last_guardian_rule_evaluation.lock() else {
+            return;
+        };
+        *guard = Some(compact_home_guardian_evaluation_evidence(evaluation));
+    }
+
+    fn last_family_timeline_digest(&self) -> Option<Value> {
+        self.last_family_timeline_digest
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    fn last_family_memory_feedback(&self) -> Option<Value> {
+        self.last_family_memory_feedback
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    fn last_guardian_rule_proposal(&self) -> Option<Value> {
+        self.last_guardian_rule_proposal
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    fn last_guardian_rule_evaluation(&self) -> Option<Value> {
+        self.last_guardian_rule_evaluation
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    fn record_admin_audit(
+        &self,
+        principal: &AccessPrincipal,
+        entity_kind: &str,
+        entity_id: &str,
+        action: &str,
+        request_snapshot: Value,
+        result_snapshot: Value,
+    ) {
+        let actor_kind = if principal.user_id == "system" {
+            AuditActorKind::System
+        } else {
+            AuditActorKind::User
+        };
+        let record = build_metadata_audit_record(
+            principal.workspace_id.clone(),
+            entity_kind,
+            entity_id,
+            action,
+            actor_kind,
+            principal.user_id.clone(),
+            request_snapshot,
+            result_snapshot,
+        );
+        let _ = self.admin_store.append_audit_record(record);
+    }
+
+    fn record_local_vision_notify_audit(
+        &self,
+        principal: &AccessPrincipal,
+        response: &LocalVisionEventNotificationResponse,
+    ) {
+        self.record_admin_audit(
+            principal,
+            "vision_event",
+            &response.event_id,
+            "vision_event.notify",
+            json!({"event_id": response.event_id}),
+            json!({
+                "status": response.status,
+                "notification_id": response.notification_id,
+                "delivery_id": response.delivery_id,
+                "target_bound": response.target_label.is_some(),
+            }),
+        );
+    }
+
     fn authorize_admin_action(
         &self,
         hints: &AccessIdentityHints,
         action: AccessAction,
     ) -> Result<AccessPrincipal, String> {
-        let state = self.admin_store.load_or_create_state()?;
+        let state = self.admin_store.load_state()?;
         let workspace_id = state
             .platform
             .workspaces
@@ -1435,7 +2170,7 @@ impl AdminApi {
         device_id: &str,
         action: AccessAction,
     ) -> Result<AccessPrincipal, String> {
-        let state = self.admin_store.load_or_create_state()?;
+        let state = self.admin_store.load_state()?;
         authorize_access(&state, hints, action, &format!("camera:{device_id}"), true)
     }
 
@@ -1506,9 +2241,30 @@ impl AdminApi {
             Method::Get if path == "/api/rag/readiness" => {
                 self.handle_rag_readiness(&identity_hints).boxed()
             }
+            Method::Get if path == "/api/evt/readiness" => {
+                self.handle_evt_readiness(&identity_hints).boxed()
+            }
+            Method::Post if path == "/api/evt/preflight" => {
+                self.handle_run_evt_preflight(&identity_hints).boxed()
+            }
+            Method::Get if path == "/api/evt/preflight/latest" => {
+                self.handle_latest_evt_preflight(&identity_hints).boxed()
+            }
+            Method::Get if path == "/api/evt/evidence-bundle" => {
+                self.handle_evt_evidence_bundle(&identity_hints).boxed()
+            }
             Method::Get if path == "/api/diagnostics/redacted-bundle" => self
                 .handle_redacted_diagnostics_bundle(&identity_hints)
                 .boxed(),
+            Method::Get if path == "/api/routing/status" => {
+                self.handle_routing_status(&identity_hints).boxed()
+            }
+            Method::Get if path == "/api/audit/records" => {
+                self.handle_audit_records(&raw_url, &identity_hints).boxed()
+            }
+            Method::Get if path == "/api/audit/summary" => {
+                self.handle_audit_summary(&raw_url, &identity_hints).boxed()
+            }
             Method::Get if path == "/api/knowledge/settings" => {
                 self.handle_knowledge_settings(&identity_hints).boxed()
             }
@@ -1620,13 +2376,57 @@ impl AdminApi {
             Method::Get if path == "/api/vision/events" => self
                 .handle_list_local_vision_events(&raw_url, &identity_hints)
                 .boxed(),
+            Method::Get if path == "/api/vision/vlm/status" => {
+                self.handle_vision_vlm_status(&identity_hints).boxed()
+            }
             Method::Post if path == "/api/vision/events" => self
                 .handle_ingest_local_vision_event(&mut request, &identity_hints)
                 .boxed(),
+            Method::Post if path == "/api/vision/events/latest/vlm-enrich" => self
+                .handle_vlm_enrich_latest_local_vision_event(&identity_hints)
+                .boxed(),
+            Method::Post
+                if path.starts_with("/api/vision/events/") && path.ends_with("/vlm-enrich") =>
+            {
+                self.handle_vlm_enrich_local_vision_event(&path, &identity_hints)
+                    .boxed()
+            }
             Method::Post
                 if path.starts_with("/api/vision/events/") && path.ends_with("/notify") =>
             {
                 self.handle_notify_local_vision_event(&path, &identity_hints)
+                    .boxed()
+            }
+            Method::Get if path == "/api/family/timeline" => self
+                .handle_family_timeline(&raw_url, &identity_hints)
+                .boxed(),
+            Method::Get if path == "/api/family/timeline/digest" => self
+                .handle_family_timeline_digest(&raw_url, &identity_hints)
+                .boxed(),
+            Method::Get if path == "/api/family/memory/events" => self
+                .handle_family_memory_events(&raw_url, &identity_hints)
+                .boxed(),
+            Method::Get if path == "/api/family/memory/stats" => {
+                self.handle_family_memory_stats(&identity_hints).boxed()
+            }
+            Method::Get if path.starts_with("/api/family/memory/events/") => self
+                .handle_family_memory_event(&path, &identity_hints)
+                .boxed(),
+            Method::Post
+                if path.starts_with("/api/family/memory/events/")
+                    && path.ends_with("/feedback") =>
+            {
+                self.handle_family_memory_feedback(&path, &mut request, &identity_hints)
+                    .boxed()
+            }
+            Method::Get if path == "/api/home-guardian/activity" => {
+                self.handle_home_guardian_activity(&identity_hints).boxed()
+            }
+            Method::Post
+                if path.starts_with("/api/automation/reviews/")
+                    && path.ends_with("/evaluate-latest") =>
+            {
+                self.handle_evaluate_automation_review_latest(&path, &identity_hints)
                     .boxed()
             }
             Method::Get if path == "/api/models/policies" => {
@@ -1915,7 +2715,7 @@ impl AdminApi {
         let live_bridge_provider = fetch_remote_gateway_status()
             .ok()
             .and_then(|payload| live_bridge_provider_from_setup_status(&payload));
-        match self.admin_store.load_or_create_state() {
+        match self.admin_store.load_state() {
             Ok(state) => match self.current_state() {
                 Ok(mut payload) => {
                     let mut account_management =
@@ -1953,7 +2753,7 @@ impl AdminApi {
         let live_bridge_provider = fetch_remote_gateway_status()
             .ok()
             .and_then(|payload| live_bridge_provider_from_setup_status(&payload));
-        match self.admin_store.load_or_create_state() {
+        match self.admin_store.load_state() {
             Ok(state) => {
                 let mut snapshot = account_management_snapshot(&state, Some(&self.public_origin));
                 if let Some(provider) = live_bridge_provider.as_ref() {
@@ -1977,7 +2777,7 @@ impl AdminApi {
         }
 
         self.refresh_gateway_projection_best_effort();
-        match self.admin_store.load_or_create_state() {
+        match self.admin_store.load_state() {
             Ok(state) => {
                 if let Ok(payload) = fetch_remote_gateway_status() {
                     ok_json(&payload)
@@ -2005,7 +2805,7 @@ impl AdminApi {
             .as_ref()
             .and_then(live_bridge_provider_from_setup_status);
 
-        match self.admin_store.load_or_create_state() {
+        match self.admin_store.load_state() {
             Ok(state) => {
                 let state_snapshot = self.current_state().ok().map(redact_state_snapshot);
                 let runtime_projection = probe_local_model_runtime(&state.models.endpoints);
@@ -2036,6 +2836,7 @@ impl AdminApi {
                     &state.knowledge,
                     &state.models.endpoints,
                     &state.knowledge_index_jobs,
+                    &state.audit_records,
                 );
                 let response = build_release_readiness_response(
                     &self.public_origin,
@@ -2074,7 +2875,7 @@ impl AdminApi {
             .as_ref()
             .and_then(live_bridge_provider_from_setup_status);
 
-        match self.admin_store.load_or_create_state() {
+        match self.admin_store.load_state() {
             Ok(state) => {
                 let state_snapshot = self.current_state().ok().map(redact_state_snapshot);
                 let runtime_projection = probe_local_model_runtime(&state.models.endpoints);
@@ -2105,6 +2906,7 @@ impl AdminApi {
                     &state.knowledge,
                     &state.models.endpoints,
                     &state.knowledge_index_jobs,
+                    &state.audit_records,
                 );
                 let current = build_release_readiness_response(
                     &self.public_origin,
@@ -2142,7 +2944,7 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        match self.admin_store.load_or_create_state() {
+        match self.admin_store.load_state() {
             Ok(state) => {
                 let runtime_projection = probe_local_model_runtime(&state.models.endpoints);
                 ok_json(&build_rag_readiness_response(
@@ -2150,10 +2952,115 @@ impl AdminApi {
                     &state.knowledge,
                     &state.models.endpoints,
                     &state.knowledge_index_jobs,
+                    &state.audit_records,
                 ))
             }
             Err(error) => error_json(StatusCode(500), &error),
         }
+    }
+
+    fn evt_readiness_report_with_runtime(
+        &self,
+        gateway_status: Option<&Value>,
+    ) -> Result<Value, String> {
+        let mut readiness = build_evt_readiness_report(&self.admin_store, gateway_status)?;
+        if let Some(object) = readiness.as_object_mut() {
+            object.insert(
+                "runtime_backpressure".to_string(),
+                self.runtime_backpressure_snapshot(),
+            );
+            if let Ok(state) = self.admin_store.load_state() {
+                let models = object.entry("models").or_insert_with(|| json!({}));
+                if let Some(models_object) = models.as_object_mut() {
+                    models_object.insert("vlm".to_string(), vlm_endpoint_readiness(&state.models));
+                }
+            }
+        }
+        Ok(readiness)
+    }
+
+    fn handle_evt_readiness(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let live_gateway_status = fetch_remote_gateway_status().ok();
+        match self.evt_readiness_report_with_runtime(live_gateway_status.as_ref()) {
+            Ok(readiness) => ok_json(&readiness),
+            Err(error) => error_json(StatusCode(500), &redact_admin_string(&error)),
+        }
+    }
+
+    fn handle_run_evt_preflight(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let live_gateway_status = fetch_remote_gateway_status().ok();
+        match run_evt_preflight_report(&self.admin_store, live_gateway_status.as_ref()) {
+            Ok(preflight) => {
+                self.record_last_evt_preflight(&preflight);
+                ok_json(&preflight)
+            }
+            Err(error) => error_json(StatusCode(500), &redact_admin_string(&error)),
+        }
+    }
+
+    fn handle_latest_evt_preflight(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        ok_json(&evt_preflight_workflow_summary(self.last_evt_preflight()))
+    }
+
+    fn handle_evt_evidence_bundle(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let live_gateway_status = fetch_remote_gateway_status().ok();
+        let readiness = match self.evt_readiness_report_with_runtime(live_gateway_status.as_ref()) {
+            Ok(readiness) => readiness,
+            Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
+        };
+        let admin_state_stats = self
+            .admin_store
+            .load_state()
+            .ok()
+            .map(|state| {
+                serde_json::to_value(self.admin_store.state_stats(Some(&state)))
+                    .unwrap_or_else(|_| json!({}))
+            })
+            .unwrap_or_else(|| json!({"status": "unavailable", "metadata_only": true}));
+        let diagnostics_workflow = build_evt_diagnostics_workflow(
+            &readiness,
+            self.last_evt_preflight(),
+            self.last_event_notification_attempt(),
+            self.last_vlm_enrichment(),
+            self.last_home_assistant_service_action(),
+            self.last_family_timeline_digest(),
+            self.last_family_memory_feedback(),
+            self.last_guardian_rule_proposal(),
+            self.last_guardian_rule_evaluation(),
+            self.home_guardian_queue_snapshot(),
+            self.runtime_backpressure_snapshot(),
+            admin_state_stats,
+            build_latest_general_message_nsp_route_workflow(&self.task_service),
+            build_latest_home_assistant_task_api_workflow(&self.task_service),
+            build_latest_family_memory_task_api_workflow(&self.task_service),
+        );
+        let bundle =
+            build_evt_evidence_bundle(readiness, self.last_evt_preflight(), diagnostics_workflow);
+        ok_json(&bundle)
     }
 
     fn handle_redacted_diagnostics_bundle(
@@ -2163,7 +3070,7 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        let admin_state = match self.admin_store.load_or_create_state() {
+        let admin_state = match self.admin_store.load_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -2174,20 +3081,130 @@ impl AdminApi {
         let runtime_projection = probe_local_model_runtime(&admin_state.models.endpoints);
         let home_assistant =
             harborbeacon_local_agent::runtime::admin_console::redact_home_assistant_state(
-                admin_state.home_assistant,
+                admin_state.home_assistant.clone(),
             );
         let live_gateway_status = fetch_remote_gateway_status().ok();
+        let evt_readiness = self
+            .evt_readiness_report_with_runtime(live_gateway_status.as_ref())
+            .unwrap_or_else(|error| {
+                json!({
+                    "kind": "evt_readiness_v1",
+                    "status": "blocked",
+                    "error": redact_admin_string(&error),
+                    "redacted": true,
+                })
+            });
         let bundle = build_redacted_diagnostics_bundle(
             &redacted_state,
             &build_home_assistant_status_response(&home_assistant),
             &runtime_projection,
             self.last_event_notification_attempt(),
+            self.last_vlm_enrichment(),
             self.last_home_assistant_service_action(),
+            self.last_family_timeline_digest(),
+            self.last_family_memory_feedback(),
+            self.last_guardian_rule_proposal(),
+            self.last_guardian_rule_evaluation(),
+            self.home_guardian_queue_snapshot(),
+            self.runtime_backpressure_snapshot(),
+            serde_json::to_value(self.admin_store.state_stats(Some(&admin_state)))
+                .unwrap_or_else(|_| json!({})),
+            build_latest_general_message_nsp_route_workflow(&self.task_service),
             build_latest_home_assistant_task_api_workflow(&self.task_service),
+            build_latest_family_memory_task_api_workflow(&self.task_service),
+            evt_readiness,
+            self.last_evt_preflight(),
             &admin_state.notification_targets,
             live_gateway_status.as_ref(),
         );
+        self.record_admin_audit(
+            &AccessPrincipal {
+                workspace_id: "home-1".to_string(),
+                user_id: "system".to_string(),
+                display_name: "system".to_string(),
+                role_kind: RoleKind::Owner,
+            },
+            "diagnostics",
+            "redacted-bundle",
+            "diagnostics.redacted_bundle.generate",
+            json!({"surface": "admin_api"}),
+            json!({"status": "generated", "metadata_only": true}),
+        );
         ok_json(&bundle)
+    }
+
+    fn handle_routing_status(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        match self.admin_store.load_state() {
+            Ok(state) => {
+                let runtimes = state
+                    .models
+                    .runtimes
+                    .iter()
+                    .map(|runtime| RoutingRuntimeProjection {
+                        runtime_id: runtime.runtime_id.clone(),
+                        status: runtime.status.clone(),
+                        enabled: runtime.enabled,
+                        capabilities: runtime.capabilities.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                ok_json(&build_routing_status(
+                    &state.models.endpoints,
+                    &state.models.route_policies,
+                    &runtimes,
+                    now_unix_string(),
+                ))
+            }
+            Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
+    fn handle_audit_records(
+        &self,
+        raw_url: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        match self.admin_store.audit_records() {
+            Ok(records) => ok_json(&query_audit_records(
+                &records,
+                AuditRecordQuery {
+                    limit: parse_query_param(raw_url, "limit")
+                        .and_then(|value| value.parse::<usize>().ok()),
+                    cursor: parse_query_param(raw_url, "cursor")
+                        .and_then(|value| value.parse::<usize>().ok()),
+                    entity_kind: parse_query_param(raw_url, "entity_kind")
+                        .and_then(|value| non_empty_string(&value)),
+                    entity_id: parse_query_param(raw_url, "entity_id")
+                        .and_then(|value| non_empty_string(&value)),
+                    action: parse_query_param(raw_url, "action")
+                        .and_then(|value| non_empty_string(&value)),
+                },
+            )),
+            Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
+    fn handle_audit_summary(
+        &self,
+        raw_url: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let window = parse_query_param(raw_url, "window").unwrap_or_else(|| "24h".to_string());
+        match self.admin_store.audit_records() {
+            Ok(records) => ok_json(&build_audit_summary(&records, window)),
+            Err(error) => error_json(StatusCode(500), &error),
+        }
     }
 
     fn handle_knowledge_settings(
@@ -3069,7 +4086,7 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        let state = match self.admin_store.load_or_create_state() {
+        let state = match self.admin_store.load_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -3087,7 +4104,7 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        let state = match self.admin_store.load_or_create_state() {
+        let state = match self.admin_store.load_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -3185,7 +4202,7 @@ impl AdminApi {
             .as_ref()
             .and_then(live_bridge_provider_from_setup_status);
 
-        match self.admin_store.load_or_create_state() {
+        match self.admin_store.load_state() {
             Ok(state) => {
                 let runtime_projection = probe_local_model_runtime(&state.models.endpoints);
                 let endpoints = overlay_model_endpoints_with_runtime_truth(
@@ -3218,15 +4235,45 @@ impl AdminApi {
         request: &mut Request,
         hints: &AccessIdentityHints,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let Some(_ingest_guard) = self.vision_ingest_limiter.try_acquire() else {
+            return json_response(
+                StatusCode(429),
+                &json!({
+                    "error": "vision ingest busy",
+                    "status": "blocked",
+                    "reason": "Too many local vision event ingests are in progress; retry after the current batch drains.",
+                    "metadata_only": true,
+                    "secret_scan": "clean",
+                    "limits": self.vision_ingest_limiter.snapshot(),
+                }),
+            );
+        };
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
             return error_json(StatusCode(403), &error);
         }
-        let event = match read_json_body::<LocalVisionEvent>(request) {
+        let event = match read_json_body_limited::<LocalVisionEvent>(
+            request,
+            MAX_LOCAL_VISION_EVENT_JSON_BYTES,
+        ) {
             Ok(event) => event,
+            Err(error) if error.contains("exceeds") => return error_json(StatusCode(413), &error),
             Err(error) => return error_json(StatusCode(400), &error),
         };
         match ingest_local_vision_event_default(event) {
-            Ok(stored) => ok_json(&stored),
+            Ok(stored) => {
+                let queue_status = self.enqueue_home_guardian_evaluation(&stored);
+                if queue_status != "queued" {
+                    self.record_last_guardian_rule_evaluation(&json!({
+                        "status": queue_status,
+                        "event_id": stored.event.event_id,
+                        "reason": "Home Guardian evaluation queue did not accept the event.",
+                        "queue": self.home_guardian_queue_snapshot(),
+                        "metadata_only": true,
+                        "secret_scan": "clean",
+                    }));
+                }
+                ok_json(&stored)
+            }
             Err(error) => error_json(StatusCode(422), &error),
         }
     }
@@ -3253,14 +4300,1004 @@ impl AdminApi {
         }
     }
 
+    fn handle_vision_vlm_status(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        match self.admin_store.load_state() {
+            Ok(state) => ok_json(&json!({
+                "generated_at": now_unix_string(),
+                "kind": "vision_vlm_status_v1",
+                "readiness": vlm_endpoint_readiness(&state.models),
+                "latest_enrichment": self.last_vlm_enrichment().unwrap_or_else(|| json!({
+                    "status": "not_run",
+                    "message": "No VLM enrichment has been attempted in this API process.",
+                    "metadata_only": true,
+                    "secret_scan": "clean",
+                })),
+                "metadata_only": true,
+                "secret_scan": "clean",
+            })),
+            Err(error) => error_json(StatusCode(500), &redact_admin_string(&error)),
+        }
+    }
+
+    fn handle_vlm_enrich_latest_local_vision_event(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
+        let event = match list_recent_local_vision_events_default(1) {
+            Ok(mut events) => match events.pop() {
+                Some(event) => event,
+                None => return error_json(StatusCode(404), "no local vision event available"),
+            },
+            Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
+        };
+        self.enrich_local_vision_event_with_vlm(&principal, event, "latest")
+    }
+
+    fn handle_vlm_enrich_local_vision_event(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
+        let event_id = match parse_local_vision_event_vlm_enrich_path(path) {
+            Some(event_id) => event_id,
+            None => return error_json(StatusCode(400), "invalid local vision event VLM path"),
+        };
+        let event = match find_recent_local_vision_event(&event_id) {
+            Ok(Some(event)) => event,
+            Ok(None) => return error_json(StatusCode(404), "local vision event not found"),
+            Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
+        };
+        self.enrich_local_vision_event_with_vlm(&principal, event, "event_id")
+    }
+
+    fn enrich_local_vision_event_with_vlm(
+        &self,
+        principal: &AccessPrincipal,
+        stored: StoredLocalVisionEvent,
+        trigger: &str,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let state = match self.admin_store.load_state() {
+            Ok(state) => state,
+            Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
+        };
+        let readiness = vlm_endpoint_readiness(&state.models);
+        if readiness
+            .get("endpoint_ready")
+            .and_then(Value::as_bool)
+            .is_some_and(|ready| !ready)
+        {
+            let evidence = build_vlm_enrichment_evidence(
+                &stored,
+                "blocked",
+                0,
+                None,
+                "endpoint_not_ready",
+                trigger,
+                readiness.clone(),
+            );
+            self.record_last_vlm_enrichment(evidence.clone());
+            self.record_admin_audit(
+                principal,
+                "local_vision_event",
+                &stored.event.event_id,
+                "local_vision_event.vlm_enrichment_blocked",
+                json!({"source": "vision_vlm_api", "trigger": trigger}),
+                evidence.clone(),
+            );
+            return json_response(
+                StatusCode(409),
+                &json!({
+                    "status": "blocked",
+                    "reason": "endpoint_not_ready",
+                    "message": "Local-only VLM endpoint is not ready.",
+                    "event_id": stored.event.event_id,
+                    "camera_id": stored.event.camera_id,
+                    "readiness": readiness,
+                    "evidence": evidence,
+                    "metadata_only": true,
+                    "secret_scan": "clean",
+                }),
+            );
+        }
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("harbornavi-vlm-enrich-{}", Uuid::new_v4().simple()));
+        let frame_path = temp_dir.join("frame.jpg");
+        let started = Instant::now();
+        let result = (|| -> Result<StoredLocalVisionEvent, String> {
+            fs::create_dir_all(&temp_dir)
+                .map_err(|error| format!("failed to create VLM temp dir: {error}"))?;
+            let bytes = self.capture_camera_snapshot(&stored.event.camera_id)?;
+            fs::write(&frame_path, bytes)
+                .map_err(|error| format!("failed to write VLM temp frame: {error}"))?;
+            let execution = run_vlm_summary_with_state(&frame_path, &state.models);
+            if execution.status == "busy" {
+                return Err("vlm_queue_busy".to_string());
+            }
+            if execution.status == "blocked" {
+                return Err("vlm_local_only_blocked".to_string());
+            }
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let enriched = attach_vlm_summary_to_event(
+                stored.event.clone(),
+                execution.clone(),
+                elapsed_ms,
+                json!({
+                    "trigger": trigger,
+                    "frame_source": "fresh_camera_snapshot",
+                    "queue_mode": "global_serial_try_lock",
+                    "local_only": true,
+                    "fallback_allowed": false,
+                    "model_endpoint_id": execution.model_endpoint_id,
+                    "provider_key": execution.provider_key,
+                }),
+            );
+            ingest_local_vision_event_default(enriched)
+        })();
+        let _ = fs::remove_dir_all(&temp_dir);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+
+        match result {
+            Ok(enriched) => {
+                let status = enriched
+                    .event
+                    .vlm
+                    .as_ref()
+                    .map(|vlm| vlm.status.as_str())
+                    .unwrap_or("degraded");
+                let reason = if status == "active" {
+                    "enriched"
+                } else if status == "busy" {
+                    "queue_busy"
+                } else if status == "blocked" {
+                    "local_only_blocked"
+                } else {
+                    "vlm_degraded"
+                };
+                let evidence = build_vlm_enrichment_evidence(
+                    &enriched,
+                    status,
+                    elapsed_ms,
+                    enriched
+                        .event
+                        .vlm
+                        .as_ref()
+                        .and_then(|vlm| vlm.vlm_metrics.get("model_endpoint_id").cloned()),
+                    reason,
+                    trigger,
+                    readiness,
+                );
+                self.record_last_vlm_enrichment(evidence.clone());
+                self.record_admin_audit(
+                    principal,
+                    "local_vision_event",
+                    &enriched.event.event_id,
+                    "local_vision_event.vlm_enrichment_attempted",
+                    json!({"source": "vision_vlm_api", "trigger": trigger}),
+                    evidence.clone(),
+                );
+                ok_json(&json!({
+                    "status": status,
+                    "reason": reason,
+                    "event": enriched,
+                    "evidence": evidence,
+                    "metadata_only": true,
+                    "secret_scan": "clean",
+                }))
+            }
+            Err(error) => {
+                let redacted_error = redact_admin_string(&error);
+                let (http_status, status, reason, message, audit_action) =
+                    if redacted_error == "vlm_queue_busy" {
+                        (
+                            StatusCode(409),
+                            "busy",
+                            "queue_busy",
+                            "VLM queue is busy; no event version was updated.",
+                            "local_vision_event.vlm_enrichment_busy",
+                        )
+                    } else if redacted_error == "vlm_local_only_blocked" {
+                        (
+                            StatusCode(409),
+                            "blocked",
+                            "local_only_blocked",
+                            "Local-only VLM guard blocked this enrichment.",
+                            "local_vision_event.vlm_enrichment_blocked",
+                        )
+                    } else {
+                        (
+                            StatusCode(422),
+                            "failed",
+                            redacted_error.as_str(),
+                            "VLM enrichment failed.",
+                            "local_vision_event.vlm_enrichment_failed",
+                        )
+                    };
+                let evidence = build_vlm_enrichment_evidence(
+                    &stored, status, elapsed_ms, None, reason, trigger, readiness,
+                );
+                self.record_last_vlm_enrichment(evidence.clone());
+                self.record_admin_audit(
+                    principal,
+                    "local_vision_event",
+                    &stored.event.event_id,
+                    audit_action,
+                    json!({"source": "vision_vlm_api", "trigger": trigger}),
+                    evidence.clone(),
+                );
+                json_response(
+                    http_status,
+                    &json!({
+                        "status": status,
+                        "reason": reason,
+                        "message": message,
+                        "event_id": stored.event.event_id,
+                        "camera_id": stored.event.camera_id,
+                        "evidence": evidence,
+                        "metadata_only": true,
+                        "secret_scan": "clean",
+                    }),
+                )
+            }
+        }
+    }
+
+    fn handle_family_timeline(
+        &self,
+        raw_url: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let limit = parse_query_param(raw_url, "limit")
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|value| value.clamp(1, 100))
+            .unwrap_or(50);
+        let window_seconds = parse_query_param(raw_url, "window_seconds")
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|value| value.clamp(60, 7 * 24 * 60 * 60))
+            .unwrap_or(24 * 60 * 60);
+        let camera_filter = parse_query_param(raw_url, "camera_id");
+        let label_filter = parse_query_param(raw_url, "label");
+        let include_hidden = parse_query_bool(raw_url, "include_hidden").unwrap_or(false);
+        let query = FamilyTimelineQueryOptions::new(
+            window_seconds,
+            camera_filter.clone(),
+            label_filter.clone(),
+            limit,
+        );
+        let events = match list_recent_local_vision_events_default(limit) {
+            Ok(events) => events,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let overlays = match family_memory_overlays_default() {
+            Ok(overlays) => overlays,
+            Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
+        };
+        let memory_overlay = match family_memory_stats_default() {
+            Ok(stats) => stats,
+            Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
+        };
+        let events = apply_family_memory_overlays_to_events(&events, &overlays, include_hidden);
+        match build_family_timeline_from_query(&events, &query) {
+            Ok(timeline) => ok_json(&FamilyTimelineApiResponse {
+                timeline,
+                memory_overlay,
+            }),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_family_timeline_digest(
+        &self,
+        raw_url: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let window_seconds = parse_query_param(raw_url, "window_seconds")
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|value| value.clamp(60, 7 * 24 * 60 * 60))
+            .unwrap_or(24 * 60 * 60);
+        let query = FamilyTimelineQueryOptions::new(window_seconds, None, None, 50);
+        let events = match list_recent_local_vision_events_default(50) {
+            Ok(events) => events,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let overlays = match family_memory_overlays_default() {
+            Ok(overlays) => overlays,
+            Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
+        };
+        let records =
+            match list_family_memory_feedback_default(DEFAULT_FAMILY_MEMORY_FEEDBACK_LIMIT) {
+                Ok(records) => records,
+                Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
+            };
+        let memory_overlay = build_family_memory_stats(&records);
+        let events = apply_family_memory_overlays_to_events(&events, &overlays, false);
+        match build_family_timeline_digest_from_query(&events, &query) {
+            Ok(digest) => {
+                self.record_last_family_timeline_digest(&digest);
+                ok_json(&FamilyTimelineDigestApiResponse {
+                    digest,
+                    memory_overlay,
+                })
+            }
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_family_memory_events(
+        &self,
+        raw_url: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let limit = parse_query_param(raw_url, "limit")
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|value| value.clamp(1, 100))
+            .unwrap_or(50);
+        let window_seconds = parse_query_param(raw_url, "window_seconds")
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|value| value.clamp(60, 7 * 24 * 60 * 60))
+            .unwrap_or(24 * 60 * 60);
+        let query = FamilyTimelineQueryOptions::new(
+            window_seconds,
+            parse_query_param(raw_url, "camera_id"),
+            parse_query_param(raw_url, "label"),
+            limit,
+        );
+        let filter = FamilyMemoryEventFilter {
+            include_hidden: parse_query_bool(raw_url, "include_hidden").unwrap_or(false),
+            favorites_only: parse_query_bool(raw_url, "favorites_only").unwrap_or(false),
+            hidden_only: parse_query_bool(raw_url, "hidden_only").unwrap_or(false),
+            corrected_only: parse_query_bool(raw_url, "corrected_only").unwrap_or(false),
+            limit,
+        };
+        let events = match list_recent_local_vision_events_default(limit) {
+            Ok(events) => events,
+            Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
+        };
+        let records =
+            match list_family_memory_feedback_default(DEFAULT_FAMILY_MEMORY_FEEDBACK_LIMIT) {
+                Ok(records) => records,
+                Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
+            };
+        let overlays =
+            harborbeacon_local_agent::runtime::family_memory::build_family_memory_overlays(
+                &records,
+            );
+        let memory_overlay = build_family_memory_stats(&records);
+        match build_family_memory_event_views(&events, &overlays, &filter, &query) {
+            Ok(events) => ok_json(&FamilyMemoryEventsResponse {
+                generated_at: now_unix_string(),
+                limit,
+                metadata_only: true,
+                secret_scan: "clean".to_string(),
+                memory_overlay,
+                events,
+            }),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_family_memory_event(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let event_id = match parse_family_memory_event_path(path) {
+            Some(event_id) => event_id,
+            None => return error_json(StatusCode(400), "invalid family memory event path"),
+        };
+        let event = match find_recent_local_vision_event(&event_id) {
+            Ok(Some(event)) => event,
+            Ok(None) => return error_json(StatusCode(404), "family memory event not found"),
+            Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
+        };
+        let records =
+            match list_family_memory_feedback_default(DEFAULT_FAMILY_MEMORY_FEEDBACK_LIMIT) {
+                Ok(records) => records,
+                Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
+            };
+        let overlays =
+            harborbeacon_local_agent::runtime::family_memory::build_family_memory_overlays(
+                &records,
+            );
+        let filter = FamilyMemoryEventFilter {
+            include_hidden: true,
+            limit: 1,
+            ..FamilyMemoryEventFilter::default()
+        };
+        let query = FamilyTimelineQueryOptions::new(7 * 24 * 60 * 60, None, None, 1);
+        match build_family_memory_event_views(&[event], &overlays, &filter, &query) {
+            Ok(mut events) => match events.pop() {
+                Some(event) => ok_json(&FamilyMemoryEventResponse {
+                    generated_at: now_unix_string(),
+                    metadata_only: true,
+                    secret_scan: "clean".to_string(),
+                    event,
+                }),
+                None => error_json(StatusCode(404), "family memory event not available"),
+            },
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_family_memory_feedback(
+        &self,
+        path: &str,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
+        let event_id = match parse_family_memory_feedback_path(path) {
+            Some(event_id) => event_id,
+            None => return error_json(StatusCode(400), "invalid family memory feedback path"),
+        };
+        match find_recent_local_vision_event(&event_id) {
+            Ok(Some(_)) => {}
+            Ok(None) => return error_json(StatusCode(404), "family memory event not found"),
+            Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
+        }
+        let body = match read_json_body_limited::<FamilyMemoryFeedbackRequest>(
+            request,
+            MAX_FAMILY_MEMORY_FEEDBACK_JSON_BYTES,
+        ) {
+            Ok(body) => body,
+            Err(error) if error.contains("exceeds") => return error_json(StatusCode(413), &error),
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let record = match append_family_memory_feedback_default(&event_id, body, "webui") {
+            Ok(record) => record,
+            Err(error) => return error_json(StatusCode(422), &redact_admin_string(&error)),
+        };
+        self.record_last_family_memory_feedback(&record);
+        let evidence = compact_family_memory_feedback_evidence(&record);
+        self.record_admin_audit(
+            &principal,
+            "family_memory_event",
+            &event_id,
+            "family_memory.feedback",
+            json!({
+                "action": record.action.as_str(),
+                "has_corrected_summary": record.corrected_summary.is_some(),
+                "corrected_label_count": record.corrected_labels.as_ref().map(Vec::len).unwrap_or(0),
+                "metadata_only": true,
+            }),
+            evidence.clone(),
+        );
+        match family_memory_stats_default() {
+            Ok(memory_overlay) => ok_json(&FamilyMemoryFeedbackResponse {
+                status: "stored".to_string(),
+                event_id,
+                feedback: record,
+                memory_overlay,
+                evidence,
+                metadata_only: true,
+                secret_scan: "clean".to_string(),
+            }),
+            Err(error) => error_json(StatusCode(500), &redact_admin_string(&error)),
+        }
+    }
+
+    fn handle_family_memory_stats(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        match family_memory_stats_default() {
+            Ok(stats) => ok_json(&stats),
+            Err(error) => error_json(StatusCode(500), &redact_admin_string(&error)),
+        }
+    }
+
+    fn handle_home_guardian_activity(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        match self.admin_store.load_state() {
+            Ok(state) => ok_json(&build_home_guardian_activity_response_with_activity(
+                state.automation_reviews,
+                self.load_home_guardian_activity_summaries(),
+            )),
+            Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
+    fn handle_evaluate_automation_review_latest(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = match self.authorize_admin_action(hints, AccessAction::ApprovalReview) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
+        let review_id = match parse_automation_review_evaluate_latest_path(path) {
+            Some(review_id) => review_id,
+            None => return error_json(StatusCode(400), "invalid automation evaluate path"),
+        };
+        let event = match list_recent_local_vision_events_default(1) {
+            Ok(mut events) => match events.pop() {
+                Some(event) => event,
+                None => return error_json(StatusCode(404), "no local vision event available"),
+            },
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        match self.evaluate_home_guardian_rules_for_event(&event, Some(&review_id), true) {
+            Ok(evaluation) => {
+                let value = serde_json::to_value(&evaluation).unwrap_or_else(|_| json!({}));
+                self.record_last_guardian_rule_evaluation(&value);
+                self.record_admin_audit(
+                    &principal,
+                    "automation_review",
+                    &review_id,
+                    "home_guardian.evaluate_latest",
+                    json!({"review_id": review_id, "latest_event_id": event.event.event_id}),
+                    json!({
+                        "status": evaluation.status,
+                        "result_count": evaluation.results.len(),
+                        "metadata_only": true,
+                    }),
+                );
+                ok_json(&evaluation)
+            }
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn evaluate_home_guardian_rules_for_event(
+        &self,
+        stored: &StoredLocalVisionEvent,
+        only_review_id: Option<&str>,
+        execute_active: bool,
+    ) -> Result<HomeGuardianEvaluationResponse, String> {
+        let automatic_evaluation = only_review_id.is_none();
+        let reviews = if automatic_evaluation {
+            self.cached_home_guardian_reviews_for_auto()?
+        } else {
+            let state = self.admin_store.load_state()?;
+            select_home_guardian_reviews(state.automation_reviews, only_review_id)?
+        };
+        let mut results = Vec::new();
+        for review in reviews {
+            let Some(plan) = build_home_guardian_rule_evaluation_plan(
+                review,
+                stored,
+                only_review_id.is_some(),
+                execute_active,
+            ) else {
+                continue;
+            };
+            match plan {
+                HomeGuardianRuleEvaluationPlan::Completed {
+                    review,
+                    summary,
+                    persist_summary,
+                } => {
+                    if persist_summary && !automatic_evaluation {
+                        let review = append_home_guardian_run_summary(review, summary.clone());
+                        self.admin_store.upsert_automation_review(review)?;
+                        self.append_home_guardian_activity_summary(&summary);
+                    } else if persist_summary {
+                        self.append_home_guardian_activity_summary(&summary);
+                    }
+                    results.push(summary);
+                }
+                HomeGuardianRuleEvaluationPlan::Execute { review, actions } => {
+                    let mut action_results = Vec::new();
+                    let mut cooldown_skipped = 0usize;
+                    let now_epoch = current_epoch_secs();
+                    for action_plan in actions {
+                        if only_review_id.is_none()
+                            && self.guardian_action_in_cooldown(
+                                &review,
+                                stored,
+                                &action_plan.action_key,
+                                now_epoch,
+                            )
+                        {
+                            cooldown_skipped = cooldown_skipped.saturating_add(1);
+                            continue;
+                        }
+                        if self.guardian_action_run_seen(&action_plan.idempotency_key, now_epoch)
+                            || home_guardian_run_already_recorded(
+                                &review,
+                                &action_plan.idempotency_key,
+                            )
+                        {
+                            action_results.push(home_guardian_idempotent_action_result(
+                                &action_plan.action_key,
+                                &action_plan.idempotency_key,
+                            ));
+                            continue;
+                        }
+                        let result = match action_plan.kind {
+                            HomeGuardianActionExecutionKind::NotifyDefaultTarget => self
+                                .execute_home_guardian_notify_action(
+                                    stored,
+                                    &action_plan.idempotency_key,
+                                ),
+                            HomeGuardianActionExecutionKind::HomeAssistantService => self
+                                .execute_home_guardian_ha_action(
+                                    &action_plan.action,
+                                    &action_plan.idempotency_key,
+                                ),
+                            HomeGuardianActionExecutionKind::Unsupported => {
+                                home_guardian_unsupported_action_result(
+                                    &action_plan.action_key,
+                                    &action_plan.idempotency_key,
+                                )
+                            }
+                        };
+                        let should_cooldown = !matches!(
+                            result.get("status").and_then(Value::as_str),
+                            Some("skipped")
+                        );
+                        if should_cooldown {
+                            self.mark_guardian_action_cooldown(
+                                &review,
+                                stored,
+                                &action_plan.action_key,
+                                now_epoch,
+                            );
+                            self.mark_guardian_action_run_seen(
+                                &action_plan.idempotency_key,
+                                now_epoch,
+                            );
+                        }
+                        action_results.push(result);
+                    }
+
+                    if action_results.is_empty() && cooldown_skipped > 0 {
+                        let summary = home_guardian_rule_run_summary(
+                            &review,
+                            stored,
+                            "skipped",
+                            true,
+                            false,
+                            "Home Guardian action cooldown is active; automatic evaluation was not persisted.",
+                            Vec::new(),
+                        );
+                        results.push(summary);
+                        continue;
+                    }
+
+                    let summary =
+                        complete_home_guardian_rule_execution(&review, stored, action_results);
+                    if !automatic_evaluation {
+                        let review = append_home_guardian_run_summary(review, summary.clone());
+                        self.admin_store.upsert_automation_review(review)?;
+                    }
+                    self.append_home_guardian_activity_summary(&summary);
+                    results.push(summary);
+                }
+            }
+        }
+
+        Ok(build_home_guardian_evaluation_response(stored, results))
+    }
+
+    fn execute_home_guardian_notify_action(
+        &self,
+        stored: &StoredLocalVisionEvent,
+        idempotency_key: &str,
+    ) -> Value {
+        let state = match self.admin_store.load_state() {
+            Ok(state) => state,
+            Err(error) => {
+                return json!({
+                    "action": "notify_default_target",
+                    "status": "failed",
+                    "executed": false,
+                    "idempotency_key": idempotency_key,
+                    "reason": redact_admin_string(&error),
+                    "redacted": true,
+                })
+            }
+        };
+        let Some(target) = default_notification_target_record(&state.notification_targets).cloned()
+        else {
+            let response = build_local_vision_event_notification_blocked_response(
+                stored,
+                None,
+                "No default notification target is configured.",
+            );
+            self.record_last_event_notification_attempt(&response);
+            return json!({
+                "action": "notify_default_target",
+                "status": "blocked",
+                "executed": false,
+                "idempotency_key": idempotency_key,
+                "notification_status": response.status,
+                "reason": response.message,
+                "redacted": true,
+            });
+        };
+        let intent = match build_local_vision_notification_intent(stored, &target.route_key) {
+            Ok(intent) => intent,
+            Err(error) => {
+                let response = build_local_vision_event_notification_failed_response(
+                    stored,
+                    Some(&target),
+                    None,
+                    None,
+                    &error,
+                );
+                self.record_last_event_notification_attempt(&response);
+                return json!({
+                    "action": "notify_default_target",
+                    "status": "failed",
+                    "executed": false,
+                    "idempotency_key": idempotency_key,
+                    "notification_status": response.status,
+                    "reason": response.message,
+                    "redacted": true,
+                });
+            }
+        };
+        let service = match NotificationDeliveryService::new() {
+            Ok(service) => service,
+            Err(error) => {
+                let response = build_local_vision_event_notification_blocked_response(
+                    stored,
+                    Some(&target),
+                    &redact_admin_string(&error),
+                );
+                self.record_last_event_notification_attempt(&response);
+                return json!({
+                    "action": "notify_default_target",
+                    "status": "blocked",
+                    "executed": false,
+                    "idempotency_key": idempotency_key,
+                    "notification_status": response.status,
+                    "reason": response.message,
+                    "redacted": true,
+                });
+            }
+        };
+        match service.deliver(&intent.notification_request) {
+            Ok(record) if record.ok => {
+                let response = build_local_vision_event_notification_delivered_response(
+                    stored,
+                    &target,
+                    record,
+                    intent.audit_record,
+                );
+                self.record_last_event_notification_attempt(&response);
+                json!({
+                    "action": "notify_default_target",
+                    "status": "delivered",
+                    "executed": true,
+                    "idempotency_key": idempotency_key,
+                    "notification_id": response.notification_id,
+                    "delivery_id": response.delivery_id,
+                    "target_label": response.target_label,
+                    "redacted": true,
+                })
+            }
+            Ok(record) => {
+                let response = build_local_vision_event_notification_failed_response(
+                    stored,
+                    Some(&target),
+                    Some(record),
+                    None,
+                    "HarborGate returned a failed delivery record.",
+                );
+                self.record_last_event_notification_attempt(&response);
+                json!({
+                    "action": "notify_default_target",
+                    "status": "failed",
+                    "executed": false,
+                    "idempotency_key": idempotency_key,
+                    "notification_status": response.status,
+                    "reason": response.message,
+                    "redacted": true,
+                })
+            }
+            Err(error) => {
+                let response = build_local_vision_event_notification_delivery_error_response(
+                    stored, &target, error,
+                );
+                self.record_last_event_notification_attempt(&response);
+                json!({
+                    "action": "notify_default_target",
+                    "status": response.status,
+                    "executed": false,
+                    "idempotency_key": idempotency_key,
+                    "reason": response.message,
+                    "redacted": true,
+                })
+            }
+        }
+    }
+
+    fn execute_home_guardian_ha_action(&self, action: &Value, idempotency_key: &str) -> Value {
+        let guardian_request = home_guardian_ha_service_request(action);
+        let request = HomeAssistantServiceActionRequest {
+            entity_id: guardian_request.entity_id,
+            domain: guardian_request.domain,
+            service: guardian_request.service,
+            fields: json!({}),
+        };
+        let state = match self.admin_store.home_assistant_secret_state() {
+            Ok(state) => state,
+            Err(error) => {
+                return json!({
+                    "action": "ha_service_action",
+                    "status": "failed",
+                    "executed": false,
+                    "idempotency_key": idempotency_key,
+                    "reason": redact_admin_string(&error),
+                    "redacted": true,
+                })
+            }
+        };
+        let action_id = format!("ha_action_{}", Uuid::new_v4().simple());
+        let normalized = normalize_home_assistant_service_smoke_request(&request);
+        if let Err(message) = validate_home_assistant_service_smoke(&normalized, &state) {
+            let response = HomeAssistantServiceActionResponse {
+                action_id,
+                status: "blocked".to_string(),
+                allowed: false,
+                executed: false,
+                domain: normalized.domain,
+                service: normalized.service,
+                entity_id: normalized.entity_id,
+                message: message.clone(),
+                result: None,
+                audit_record: build_home_assistant_operator_audit(
+                    "home_assistant.guardian_service_action_blocked",
+                    "blocked",
+                    false,
+                    false,
+                    &message,
+                    &request,
+                ),
+            };
+            self.record_last_home_assistant_service_action(&response);
+            return json!({
+                "action": "ha_service_action",
+                "status": "blocked",
+                "executed": false,
+                "idempotency_key": idempotency_key,
+                "domain": response.domain,
+                "service": response.service,
+                "entity_id": response.entity_id,
+                "reason": response.message,
+                "redacted": true,
+            });
+        }
+        let client = match home_assistant_client_from_state(&state) {
+            Ok(client) => client,
+            Err(error) => {
+                return json!({
+                    "action": "ha_service_action",
+                    "status": "blocked",
+                    "executed": false,
+                    "idempotency_key": idempotency_key,
+                    "domain": normalized.domain,
+                    "service": normalized.service,
+                    "entity_id": normalized.entity_id,
+                    "reason": redact_admin_string(&error),
+                    "redacted": true,
+                })
+            }
+        };
+        match client.call_service(
+            &normalized.domain,
+            &normalized.service,
+            &normalized.entity_id,
+            Some(&json!({})),
+        ) {
+            Ok(result) => {
+                let response = HomeAssistantServiceActionResponse {
+                    action_id,
+                    status: "succeeded".to_string(),
+                    allowed: true,
+                    executed: true,
+                    domain: normalized.domain,
+                    service: normalized.service,
+                    entity_id: normalized.entity_id,
+                    message: "Home Guardian low-risk service action completed.".to_string(),
+                    result: Some(result),
+                    audit_record: build_home_assistant_operator_audit(
+                        "home_assistant.guardian_service_action_executed",
+                        "succeeded",
+                        true,
+                        true,
+                        "Home Guardian low-risk service action completed.",
+                        &request,
+                    ),
+                };
+                self.record_last_home_assistant_service_action(&response);
+                json!({
+                    "action": "ha_service_action",
+                    "status": "acted",
+                    "executed": true,
+                    "idempotency_key": idempotency_key,
+                    "domain": response.domain,
+                    "service": response.service,
+                    "entity_id": response.entity_id,
+                    "redacted": true,
+                })
+            }
+            Err(error) => {
+                let message = redact_admin_string(&error);
+                let response = HomeAssistantServiceActionResponse {
+                    action_id,
+                    status: "failed".to_string(),
+                    allowed: true,
+                    executed: false,
+                    domain: normalized.domain,
+                    service: normalized.service,
+                    entity_id: normalized.entity_id,
+                    message: message.clone(),
+                    result: None,
+                    audit_record: build_home_assistant_operator_audit(
+                        "home_assistant.guardian_service_action_failed",
+                        "failed",
+                        true,
+                        false,
+                        &message,
+                        &request,
+                    ),
+                };
+                self.record_last_home_assistant_service_action(&response);
+                json!({
+                    "action": "ha_service_action",
+                    "status": "failed",
+                    "executed": false,
+                    "idempotency_key": idempotency_key,
+                    "domain": response.domain,
+                    "service": response.service,
+                    "entity_id": response.entity_id,
+                    "reason": response.message,
+                    "redacted": true,
+                })
+            }
+        }
+    }
+
     fn handle_notify_local_vision_event(
         &self,
         path: &str,
         hints: &AccessIdentityHints,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
-        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
-            return error_json(StatusCode(403), &error);
-        }
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
         let event_id = match parse_local_vision_event_notify_path(path) {
             Some(event_id) => event_id,
             None => return error_json(StatusCode(400), "invalid local vision event notify path"),
@@ -3270,7 +5307,7 @@ impl AdminApi {
             Ok(None) => return error_json(StatusCode(404), "local vision event not found"),
             Err(error) => return error_json(StatusCode(500), &error),
         };
-        let state = match self.admin_store.load_or_create_state() {
+        let state = match self.admin_store.load_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -3284,6 +5321,7 @@ impl AdminApi {
                     "No default notification target is configured.",
                 );
                 self.record_last_event_notification_attempt(&response);
+                self.record_local_vision_notify_audit(&principal, &response);
                 return ok_json(&response);
             }
         };
@@ -3298,6 +5336,7 @@ impl AdminApi {
                     &error,
                 );
                 self.record_last_event_notification_attempt(&response);
+                self.record_local_vision_notify_audit(&principal, &response);
                 return ok_json(&response);
             }
         };
@@ -3310,6 +5349,7 @@ impl AdminApi {
                     &redact_admin_string(&error),
                 );
                 self.record_last_event_notification_attempt(&response);
+                self.record_local_vision_notify_audit(&principal, &response);
                 return ok_json(&response);
             }
         };
@@ -3322,6 +5362,7 @@ impl AdminApi {
                     intent.audit_record,
                 );
                 self.record_last_event_notification_attempt(&response);
+                self.record_local_vision_notify_audit(&principal, &response);
                 ok_json(&response)
             }
             Ok(record) => {
@@ -3333,6 +5374,7 @@ impl AdminApi {
                     "HarborGate returned a failed delivery record.",
                 );
                 self.record_last_event_notification_attempt(&response);
+                self.record_local_vision_notify_audit(&principal, &response);
                 ok_json(&response)
             }
             Err(error) => {
@@ -3340,6 +5382,7 @@ impl AdminApi {
                     &event, &target, error,
                 );
                 self.record_last_event_notification_attempt(&response);
+                self.record_local_vision_notify_audit(&principal, &response);
                 ok_json(&response)
             }
         }
@@ -3352,7 +5395,7 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        match self.admin_store.load_or_create_state() {
+        match self.admin_store.load_state() {
             Ok(state) => ok_json(&ModelPoliciesResponse {
                 route_policies: state.models.route_policies,
             }),
@@ -3426,14 +5469,15 @@ impl AdminApi {
         path: &str,
         hints: &AccessIdentityHints,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
-        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
-            return error_json(StatusCode(403), &error);
-        }
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
         let endpoint_id = match parse_model_endpoint_test_path(path) {
             Some(endpoint_id) => endpoint_id,
             None => return error_json(StatusCode(400), "invalid model endpoint test path"),
         };
-        let state = match self.admin_store.load_or_create_state() {
+        let state = match self.admin_store.load_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -3455,6 +5499,19 @@ impl AdminApi {
         ) {
             return error_json(StatusCode(500), &error);
         }
+        self.record_admin_audit(
+            &principal,
+            "model_endpoint",
+            &endpoint_id,
+            "model.endpoint.test",
+            json!({"endpoint_id": endpoint_id}),
+            json!({
+                "ok": result.ok,
+                "status": result.status,
+                "summary": result.summary,
+                "endpoint_kind": result.endpoint.endpoint_kind.as_str(),
+            }),
+        );
         ok_json(&result)
     }
 
@@ -3470,7 +5527,7 @@ impl AdminApi {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
         };
-        let state = match self.admin_store.load_or_create_state() {
+        let state = match self.admin_store.load_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -3617,9 +5674,10 @@ impl AdminApi {
         request: &mut Request,
         hints: &AccessIdentityHints,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
-        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
-            return error_json(StatusCode(403), &error);
-        }
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
         let capability_id = match parse_model_capability_selection_path(path) {
             Some(capability_id) => capability_id,
             None => return error_json(StatusCode(400), "invalid model capability selection path"),
@@ -3638,6 +5696,14 @@ impl AdminApi {
         {
             return error_json(StatusCode(422), &error);
         }
+        self.record_admin_audit(
+            &principal,
+            "model_capability",
+            &capability_id,
+            "model.capability.select",
+            json!({"capability_id": capability_id}),
+            json!({"status": "selected", "model_id": body.model_id}),
+        );
         self.handle_model_capabilities(hints)
     }
 
@@ -3774,20 +5840,35 @@ impl AdminApi {
         request: &mut Request,
         hints: &AccessIdentityHints,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
-        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
-            return error_json(StatusCode(403), &error);
-        }
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
         let payload: ModelPoliciesRequest = match read_json_body(request) {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
         };
+        let requested_count = payload.route_policies.len();
         match self
             .admin_store
             .save_model_route_policies(payload.route_policies)
         {
-            Ok(state) => ok_json(&ModelPoliciesResponse {
-                route_policies: state.models.route_policies,
-            }),
+            Ok(state) => {
+                self.record_admin_audit(
+                    &principal,
+                    "model_route_policy",
+                    "bulk",
+                    "model.route_policy.save",
+                    json!({"requested_policy_count": requested_count}),
+                    json!({
+                        "status": "saved",
+                        "route_policy_count": state.models.route_policies.len(),
+                    }),
+                );
+                ok_json(&ModelPoliciesResponse {
+                    route_policies: state.models.route_policies,
+                })
+            }
             Err(error) => error_json(StatusCode(422), &error),
         }
     }
@@ -3800,7 +5881,7 @@ impl AdminApi {
             return error_json(StatusCode(403), &error);
         }
 
-        let state = match self.admin_store.load_or_create_state() {
+        let state = match self.admin_store.load_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -3917,7 +5998,7 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::ApprovalReview) {
             return error_json(StatusCode(403), &error);
         }
-        match self.admin_store.load_or_create_state() {
+        match self.admin_store.load_state() {
             Ok(state) => ok_json(&build_automation_reviews_response(state.automation_reviews)),
             Err(error) => error_json(StatusCode(500), &error),
         }
@@ -3958,12 +6039,36 @@ impl AdminApi {
             run_summaries: body.run_summaries,
             metadata: body.metadata,
         };
+        let is_home_guardian_review = automation_review_is_home_guardian(&review);
+        let proposal_evidence = if is_home_guardian_review {
+            Some(json!({
+                "status": "proposed",
+                "review_id": review.review_id,
+                "rule_id": review.rule_id,
+                "trigger": review.trigger_definition,
+                "action_plan": home_guardian_redacted_action_plan(review.action_plan.as_ref()),
+                "requires_enable": true,
+                "metadata_only": true,
+                "secret_scan": "clean",
+                "created_at": now_unix_string(),
+            }))
+        } else {
+            None
+        };
         match self
             .admin_store
             .upsert_automation_review(review)
             .map(|state| build_automation_reviews_response(state.automation_reviews))
         {
-            Ok(payload) => ok_json(&payload),
+            Ok(payload) => {
+                if let Some(proposal_evidence) = proposal_evidence.as_ref() {
+                    self.record_last_guardian_rule_proposal(proposal_evidence);
+                }
+                if is_home_guardian_review {
+                    self.refresh_home_guardian_rule_cache_best_effort();
+                }
+                ok_json(&payload)
+            }
             Err(error) => error_json(StatusCode(422), &error),
         }
     }
@@ -3974,9 +6079,10 @@ impl AdminApi {
         status: &str,
         hints: &AccessIdentityHints,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
-        if let Err(error) = self.authorize_admin_action(hints, AccessAction::ApprovalReview) {
-            return error_json(StatusCode(403), &error);
-        }
+        let principal = match self.authorize_admin_action(hints, AccessAction::ApprovalReview) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
         let review_id = match parse_automation_review_action_path(path) {
             Some(review_id) => review_id,
             None => return error_json(StatusCode(400), "invalid automation review path"),
@@ -3986,7 +6092,18 @@ impl AdminApi {
             .set_automation_review_status(&review_id, status)
             .map(|state| build_automation_reviews_response(state.automation_reviews))
         {
-            Ok(payload) => ok_json(&payload),
+            Ok(payload) => {
+                self.refresh_home_guardian_rule_cache_best_effort();
+                self.record_admin_audit(
+                    &principal,
+                    "automation_review",
+                    &review_id,
+                    "home_guardian.status.update",
+                    json!({"review_id": review_id}),
+                    json!({"status": status, "metadata_only": true}),
+                );
+                ok_json(&payload)
+            }
             Err(error) => error_json(StatusCode(422), &error),
         }
     }
@@ -4069,7 +6186,7 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        match self.admin_store.load_or_create_state() {
+        match self.admin_store.load_state() {
             Ok(state) => ok_json(&NotificationTargetsResponse {
                 targets: state.notification_targets,
             }),
@@ -4447,7 +6564,7 @@ impl AdminApi {
             }
             Err(error) => return error_json(StatusCode(422), &error),
         };
-        match self.admin_store.load_or_create_state() {
+        match self.admin_store.load_state() {
             Ok(state) => ok_json(&build_device_credential_status(&state, &device)),
             Err(error) => error_json(StatusCode(500), &error),
         }
@@ -4505,7 +6622,7 @@ impl AdminApi {
             Err(error) => return error_json(StatusCode(400), &error),
         };
 
-        let state = match self.admin_store.load_or_create_state() {
+        let state = match self.admin_store.load_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -5170,7 +7287,7 @@ impl AdminApi {
 
     fn current_gateway_manage_url(&self) -> String {
         self.admin_store
-            .load_or_create_state()
+            .load_state()
             .map(|state| {
                 harborbeacon_local_agent::runtime::admin_console::gateway_manage_url(
                     &state.bridge_provider.gateway_base_url,
@@ -5439,7 +7556,7 @@ impl AdminApi {
     }
 
     fn camera_device_with_runtime_credentials(&self, device: &CameraDevice) -> CameraDevice {
-        let Ok(state) = self.admin_store.load_or_create_state() else {
+        let Ok(state) = self.admin_store.load_state() else {
             return device.clone();
         };
         let Some(stream_url) = camera_stream_url_with_credentials(device, &state) else {
@@ -5474,7 +7591,7 @@ impl AdminApi {
         device: &CameraDevice,
         request: RtspCheckRequest,
     ) -> Result<RtspCheckResponse, String> {
-        let state = self.admin_store.load_or_create_state()?;
+        let state = self.admin_store.load_state()?;
         let credential = state
             .device_credentials
             .iter()
@@ -5601,7 +7718,7 @@ impl AdminApi {
         &self,
         device: &CameraDevice,
     ) -> Result<DeviceEvidenceResponse, String> {
-        let state = self.admin_store.load_or_create_state()?;
+        let state = self.admin_store.load_state()?;
         let credential_status = build_device_credential_status(&state, device);
         let share_links = self.list_share_links(Some(&device.device_id))?;
         let mut evidence = self.admin_store.list_device_evidence(&device.device_id)?;
@@ -5896,12 +8013,69 @@ fn main() {
     });
 
     println!("HarborBeacon admin API listening on http://{}", cli.bind);
-    for request in server.incoming_requests() {
-        let api = api.clone();
-        thread::spawn(move || {
-            api.handle(request);
-        });
+    let (request_sender, request_receiver) =
+        sync_channel::<Request>(ADMIN_HTTP_REQUEST_QUEUE_CAPACITY);
+    let request_receiver = Arc::new(Mutex::new(request_receiver));
+    for worker_index in 0..ADMIN_HTTP_WORKER_COUNT {
+        let worker_api = api.clone();
+        let worker_receiver = request_receiver.clone();
+        let _ = thread::Builder::new()
+            .name(format!("admin-api-worker-{worker_index}"))
+            .spawn(move || loop {
+                let request = {
+                    let Ok(receiver) = worker_receiver.lock() else {
+                        return;
+                    };
+                    receiver.recv()
+                };
+                match request {
+                    Ok(request) => {
+                        let _guard = worker_api.begin_http_request();
+                        worker_api.handle(request);
+                    }
+                    Err(_) => return,
+                }
+            });
     }
+
+    for request in server.incoming_requests() {
+        if is_healthz_request(&request) {
+            let _ = request.respond(ok_json(&json!({"status":"ok"})).boxed());
+            continue;
+        }
+        match request_sender.try_send(request) {
+            Ok(()) => api.record_http_request_accepted(),
+            Err(TrySendError::Full(request)) => {
+                api.record_http_request_rejected();
+                let _ = request.respond(service_overloaded_response().boxed());
+            }
+            Err(TrySendError::Disconnected(request)) => {
+                api.record_http_request_rejected();
+                let _ = request.respond(service_overloaded_response().boxed());
+            }
+        }
+    }
+}
+
+fn is_healthz_request(request: &Request) -> bool {
+    request.method() == &Method::Get
+        && normalize_unified_admin_url(request.url())
+            .split('?')
+            .next()
+            .is_some_and(|path| path == "/healthz")
+}
+
+fn service_overloaded_response() -> Response<std::io::Cursor<Vec<u8>>> {
+    json_response(
+        StatusCode(503),
+        &json!({
+            "error": "service overloaded",
+            "status": "blocked",
+            "reason": "HarborBeacon request queue is full; retry after the current load drops.",
+            "metadata_only": true,
+            "secret_scan": "clean",
+        }),
+    )
 }
 
 fn resolve_state_path(preferred: &Path) -> PathBuf {
@@ -5963,10 +8137,31 @@ fn parse_query_param(url: &str, key: &str) -> Option<String> {
     None
 }
 
+fn parse_query_bool(url: &str, key: &str) -> Option<bool> {
+    parse_query_param(url, key).and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    })
+}
+
 fn parse_automation_review_action_path(path: &str) -> Option<String> {
     let trimmed = path.strip_prefix("/api/automation/reviews/")?;
     let (review_id, action) = trimmed.rsplit_once('/')?;
     if !matches!(action, "enable" | "pause" | "discard") {
+        return None;
+    }
+    let review_id = review_id.trim();
+    if review_id.is_empty() || review_id.contains('/') {
+        return None;
+    }
+    Some(review_id.to_string())
+}
+
+fn parse_automation_review_evaluate_latest_path(path: &str) -> Option<String> {
+    let trimmed = path.strip_prefix("/api/automation/reviews/")?;
+    let (review_id, action) = trimmed.rsplit_once('/')?;
+    if action != "evaluate-latest" {
         return None;
     }
     let review_id = review_id.trim();
@@ -6077,6 +8272,32 @@ fn parse_notification_target_delete_path(path: &str) -> Option<String> {
 fn parse_local_vision_event_notify_path(path: &str) -> Option<String> {
     let trimmed = path.strip_prefix("/api/vision/events/")?;
     let event_id = trimmed.strip_suffix("/notify")?.trim();
+    if event_id.is_empty() || event_id.contains('/') {
+        return None;
+    }
+    percent_decode_path_segment(event_id).ok()
+}
+
+fn parse_local_vision_event_vlm_enrich_path(path: &str) -> Option<String> {
+    let trimmed = path.strip_prefix("/api/vision/events/")?;
+    let event_id = trimmed.strip_suffix("/vlm-enrich")?.trim();
+    if event_id.is_empty() || event_id.contains('/') || event_id == "latest" {
+        return None;
+    }
+    percent_decode_path_segment(event_id).ok()
+}
+
+fn parse_family_memory_event_path(path: &str) -> Option<String> {
+    let event_id = path.strip_prefix("/api/family/memory/events/")?.trim();
+    if event_id.is_empty() || event_id.contains('/') {
+        return None;
+    }
+    percent_decode_path_segment(event_id).ok()
+}
+
+fn parse_family_memory_feedback_path(path: &str) -> Option<String> {
+    let trimmed = path.strip_prefix("/api/family/memory/events/")?;
+    let event_id = trimmed.strip_suffix("/feedback")?.trim();
     if event_id.is_empty() || event_id.contains('/') {
         return None;
     }
@@ -6993,6 +9214,32 @@ fn read_json_body<T: for<'de> Deserialize<'de>>(request: &mut Request) -> Result
     serde_json::from_str(&body).map_err(|e| format!("invalid JSON body: {e}"))
 }
 
+fn read_json_body_limited<T: for<'de> Deserialize<'de>>(
+    request: &mut Request,
+    max_bytes: usize,
+) -> Result<T, String> {
+    let mut body = Vec::new();
+    request
+        .as_reader()
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut body)
+        .map_err(|e| format!("failed to read request body: {e}"))?;
+    if body.len() > max_bytes {
+        return Err(format!("request body exceeds {max_bytes} bytes"));
+    }
+    parse_json_body_limited(&body, max_bytes)
+}
+
+fn parse_json_body_limited<T: for<'de> Deserialize<'de>>(
+    body: &[u8],
+    max_bytes: usize,
+) -> Result<T, String> {
+    if body.len() > max_bytes {
+        return Err(format!("request body exceeds {max_bytes} bytes"));
+    }
+    serde_json::from_slice(body).map_err(|e| format!("invalid JSON body: {e}"))
+}
+
 fn read_json_body_or_default<T>(request: &mut Request) -> Result<T, String>
 where
     T: for<'de> Deserialize<'de> + Default,
@@ -7160,7 +9407,20 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/release/readiness/run"
         || path == "/api/hardware/readiness"
         || path == "/api/rag/readiness"
+        || path == "/api/evt/readiness"
+        || path == "/api/evt/preflight"
+        || path == "/api/evt/preflight/latest"
+        || path == "/api/evt/evidence-bundle"
         || path == "/api/diagnostics/redacted-bundle"
+        || path == "/api/routing/status"
+        || path == "/api/audit/records"
+        || path == "/api/audit/summary"
+        || path == "/api/family/timeline"
+        || path == "/api/family/timeline/digest"
+        || path == "/api/family/memory/events"
+        || path == "/api/family/memory/stats"
+        || path.starts_with("/api/family/memory/events/")
+        || path == "/api/home-guardian/activity"
         || path == "/api/knowledge/settings"
         || path == "/api/knowledge/search"
         || path == "/api/knowledge/preview"
@@ -7193,7 +9453,10 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/models/local-catalog"
         || path == "/api/models/policies"
         || path == "/api/vision/events"
+        || path == "/api/vision/vlm/status"
+        || path == "/api/vision/events/latest/vlm-enrich"
         || (path.starts_with("/api/vision/events/") && path.ends_with("/notify"))
+        || (path.starts_with("/api/vision/events/") && path.ends_with("/vlm-enrich"))
         || path == "/admin/models"
         || path == "/api/access/members"
         || path == "/api/share-links"
@@ -8234,6 +10497,79 @@ fn run_knowledge_index_jobs(
     }
 }
 
+fn knowledge_embedding_warmup_timeout() -> Duration {
+    env::var(KNOWLEDGE_EMBEDDING_WARMUP_TIMEOUT_MS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(DEFAULT_KNOWLEDGE_EMBEDDING_WARMUP_TIMEOUT_MS))
+}
+
+fn embedding_warmup_timeout_stats(
+    total: usize,
+    timeout: Duration,
+) -> KnowledgeEmbeddingWarmupStats {
+    KnowledgeEmbeddingWarmupStats {
+        total,
+        completed: 0,
+        skipped: 0,
+        failed: total,
+        degraded: true,
+        persist_error: None,
+        last_error: Some(format!(
+            "Embedding warmup exceeded {} ms; index completed with degraded embedding cache.",
+            timeout.as_millis()
+        )),
+    }
+}
+
+fn run_knowledge_embedding_warmup_with_timeout(
+    service: &KnowledgeIndexService,
+    snapshot: &KnowledgeIndexSnapshot,
+    model_center_state: &AdminModelCenterState,
+) -> KnowledgeEmbeddingWarmupStats {
+    let timeout = knowledge_embedding_warmup_timeout();
+    let total = service.embedding_warmup_candidate_count(snapshot);
+    let (sender, receiver) = sync_channel(1);
+    let worker_service = service.clone();
+    let worker_snapshot = snapshot.clone();
+    let worker_model_center_state = model_center_state.clone();
+
+    if let Err(error) = thread::Builder::new()
+        .name("harborbeacon-knowledge-embedding-warmup".to_string())
+        .spawn(move || {
+            let stats =
+                worker_service.warm_embedding_cache(&worker_snapshot, &worker_model_center_state);
+            let _ = sender.try_send(stats);
+        })
+    {
+        return KnowledgeEmbeddingWarmupStats {
+            total,
+            completed: 0,
+            skipped: 0,
+            failed: total,
+            degraded: true,
+            persist_error: None,
+            last_error: Some(format!("failed to spawn embedding warmup worker: {error}")),
+        };
+    }
+
+    match receiver.recv_timeout(timeout) {
+        Ok(stats) => stats,
+        Err(RecvTimeoutError::Timeout) => embedding_warmup_timeout_stats(total, timeout),
+        Err(RecvTimeoutError::Disconnected) => KnowledgeEmbeddingWarmupStats {
+            total,
+            completed: 0,
+            skipped: 0,
+            failed: total,
+            degraded: true,
+            persist_error: None,
+            last_error: Some("Embedding warmup worker exited without returning stats.".to_string()),
+        },
+    }
+}
+
 fn run_knowledge_index_job(
     store: &AdminConsoleStore,
     service: &KnowledgeIndexService,
@@ -8277,6 +10613,26 @@ fn run_knowledge_index_job(
                 cancel_knowledge_index_job(store, job, "canceled_after_refresh");
                 return;
             }
+            job.progress_percent = Some(85);
+            job.checkpoint = json!({
+                "phase": "embedding_warmup",
+                "entry_count": snapshot.manifest.entries.len(),
+                "manifest_path": snapshot.manifest_path.to_string_lossy(),
+            });
+            if let Err(error) = store.save_knowledge_index_job(job.clone()) {
+                fail_knowledge_index_job(store, job, "job_state_write_failed", error);
+                return;
+            }
+            let model_center_state = load_model_center_state();
+            let embedding_warmup = run_knowledge_embedding_warmup_with_timeout(
+                service,
+                &snapshot,
+                &model_center_state,
+            );
+            if knowledge_index_job_cancel_requested(store, &job.job_id) {
+                cancel_knowledge_index_job(store, job, "canceled_after_embedding_warmup");
+                return;
+            }
             let indexed_at = snapshot.manifest.generated_at.clone();
             let _ = mark_knowledge_source_root_indexed(
                 store,
@@ -8292,6 +10648,15 @@ fn run_knowledge_index_job(
                 "phase": "completed",
                 "entry_count": snapshot.manifest.entries.len(),
                 "manifest_path": snapshot.manifest_path.to_string_lossy(),
+                "embedding_total": embedding_warmup.total,
+                "embedding_completed": embedding_warmup.completed,
+                "embedding_skipped": embedding_warmup.skipped,
+                "embedding_failed": embedding_warmup.failed,
+                "embedding_warmup_degraded": embedding_warmup.degraded,
+                "embedding_warmup_timeout_ms": knowledge_embedding_warmup_timeout().as_millis()
+                    as u64,
+                "embedding_persist_error": embedding_warmup.persist_error,
+                "embedding_last_error": embedding_warmup.last_error,
             });
             let _ = store.save_knowledge_index_job(job);
         }
@@ -8570,6 +10935,7 @@ fn build_admin_knowledge_search_request(
     request.limit = payload.limit.unwrap_or(24).clamp(1, 50);
     request.privacy_level = settings.privacy_level;
     request.resource_profile = settings.default_resource_profile;
+    request.retrieval = settings.retrieval.clone();
     request.require_embeddings = false;
     request.latency_budget_ms = None;
     request.focus_paths = focus_paths;
@@ -8990,6 +11356,99 @@ fn build_rag_privacy_policy_component(
     }
 }
 
+fn build_rag_privacy_gateway_readiness(
+    knowledge: &KnowledgeSettings,
+    audit_records: &[AuditRecord],
+) -> RagPrivacyGatewayReadiness {
+    let recent = audit_records
+        .iter()
+        .rev()
+        .filter(|record| record.action == PRIVACY_GATEWAY_AUDIT_ACTION)
+        .take(PRIVACY_GATEWAY_READINESS_AUDIT_LIMIT)
+        .collect::<Vec<_>>();
+    let mut decision_counts = BTreeMap::new();
+    let mut risk_counts = BTreeMap::new();
+    let mut warning_count = 0usize;
+    let latest = recent.first().copied();
+
+    for record in &recent {
+        let decision = record
+            .result_snapshot
+            .get("decision")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let risk = record
+            .result_snapshot
+            .get("risk_level")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        *decision_counts.entry(decision).or_insert(0) += 1;
+        *risk_counts.entry(risk).or_insert(0) += 1;
+        warning_count += record
+            .result_snapshot
+            .get("warnings")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default();
+    }
+
+    let recent_audit_count = recent.len();
+    let status =
+        if knowledge.privacy_level == PrivacyLevel::StrictLocal || recent_audit_count > 0 {
+            "ready"
+        } else {
+            "needs-evidence"
+        }
+        .to_string();
+    let privacy_level = privacy_level_as_str(knowledge.privacy_level).to_string();
+    let default_resource_profile = knowledge.default_resource_profile.as_str().to_string();
+    let latest_privacy_transform_id = latest
+        .and_then(|record| {
+            record
+                .result_snapshot
+                .get("privacy_transform_id")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    (!record.entity_id.trim().is_empty()).then_some(record.entity_id.as_str())
+                })
+        })
+        .map(ToString::to_string);
+    let latest_evaluated_at = latest.and_then(|record| record.created_at.clone());
+
+    RagPrivacyGatewayReadiness {
+        status,
+        summary: if recent_audit_count > 0 {
+            format!("{recent_audit_count} recent Privacy Gateway audit record(s) found.")
+        } else if knowledge.privacy_level == PrivacyLevel::StrictLocal {
+            "Privacy Gateway is installed; strict_local blocks cloud execution.".to_string()
+        } else {
+            "Privacy Gateway is installed, but no recent RAG cloud-evaluation audit evidence exists yet."
+                .to_string()
+        },
+        policy_version: PRIVACY_GATEWAY_POLICY_VERSION.to_string(),
+        covered_routes: vec!["retrieval.answer".to_string()],
+        privacy_level,
+        default_resource_profile,
+        recent_audit_count,
+        decision_counts,
+        risk_counts,
+        latest_privacy_transform_id,
+        latest_evaluated_at,
+        warning_count,
+        metadata_only: true,
+        secret_scan: "clean".to_string(),
+        evidence: vec![
+            format!("policy_version={PRIVACY_GATEWAY_POLICY_VERSION}"),
+            "covered_route=retrieval.answer".to_string(),
+            format!("recent_audit_count={recent_audit_count}"),
+            format!("audit_action={PRIVACY_GATEWAY_AUDIT_ACTION}"),
+            "metadata_only=true".to_string(),
+        ],
+    }
+}
+
 fn build_rag_resource_profiles(
     knowledge: &KnowledgeSettings,
     model_endpoints: &[ModelEndpoint],
@@ -9265,6 +11724,7 @@ fn build_rag_readiness_response(
     knowledge: &KnowledgeSettings,
     model_endpoints: &[ModelEndpoint],
     index_jobs: &[KnowledgeIndexJobRecord],
+    audit_records: &[AuditRecord],
 ) -> RagReadinessResponse {
     let model_endpoints = overlay_model_endpoints_with_runtime_truth(model_endpoints, runtime);
     let generated_at = now_unix_string();
@@ -9294,6 +11754,7 @@ fn build_rag_readiness_response(
         .count();
     let model_readiness = build_rag_model_readiness(&model_endpoints);
     let privacy_policy = build_rag_privacy_policy_component(knowledge, &model_endpoints);
+    let privacy_gateway = build_rag_privacy_gateway_readiness(knowledge, audit_records);
 
     let source_roots = RagReadinessComponent {
         status: if existing_enabled_source_roots > 0 {
@@ -9512,6 +11973,7 @@ fn build_rag_readiness_response(
         resource_profiles,
         capability_profiles,
         privacy_policy,
+        privacy_gateway,
         media_parser,
         storage_writable: storage,
         index_jobs: recent_knowledge_index_jobs(index_jobs),
@@ -9650,6 +12112,122 @@ fn build_latest_home_assistant_task_api_workflow(task_service: &TaskApiService) 
     })
 }
 
+fn build_latest_family_memory_task_api_workflow(task_service: &TaskApiService) -> Value {
+    let events = match task_service.conversation_store().recent_events(200) {
+        Ok(events) => events,
+        Err(error) => {
+            return json!({
+                "status": "unavailable",
+                "message": redact_admin_string(&error),
+                "redacted": true,
+            })
+        }
+    };
+    let summaries = events
+        .iter()
+        .filter_map(redacted_family_memory_task_api_event_summary)
+        .collect::<Vec<_>>();
+    let Some(latest_event) = summaries.last().cloned() else {
+        return json!({
+            "status": "not_run",
+            "message": "No Family Memory Task API workflow evidence has been recorded.",
+            "redacted": true,
+        });
+    };
+    let recent_events = summaries
+        .iter()
+        .rev()
+        .take(6)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+    json!({
+        "status": "available",
+        "redacted": true,
+        "latest_event": latest_event,
+        "recent_events": recent_events,
+    })
+}
+
+fn build_latest_general_message_nsp_route_workflow(task_service: &TaskApiService) -> Value {
+    let steps = match task_service.conversation_store().recent_task_steps(200) {
+        Ok(steps) => steps,
+        Err(error) => {
+            return json!({
+                "status": "unavailable",
+                "message": redact_admin_string(&error),
+                "redacted": true,
+            })
+        }
+    };
+    let summaries = steps
+        .iter()
+        .filter_map(redacted_general_message_nsp_route_summary)
+        .collect::<Vec<_>>();
+    let Some(latest_step) = summaries.last().cloned() else {
+        return json!({
+            "status": "not_run",
+            "message": "No general.message NSP route evidence has been recorded.",
+            "redacted": true,
+        });
+    };
+    let recent_steps = summaries
+        .iter()
+        .rev()
+        .take(6)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+    json!({
+        "status": "available",
+        "redacted": true,
+        "latest_route": latest_step,
+        "recent_routes": recent_steps,
+    })
+}
+
+fn redacted_general_message_nsp_route_summary(step: &TaskStepRun) -> Option<Value> {
+    if step.domain != "general" || step.operation != "message" {
+        return None;
+    }
+    let nsp_route = step
+        .output_payload
+        .pointer("/data/reply_pack/nsp_route")
+        .or_else(|| {
+            step.output_payload
+                .pointer("/data/general_message_controller/nsp_route")
+        })?;
+    let stage = nsp_route
+        .pointer("/stage")
+        .or_else(|| {
+            step.output_payload
+                .pointer("/data/general_message_controller/controller_stage")
+        })
+        .cloned()
+        .unwrap_or(Value::Null);
+    Some(json!({
+        "step_id": step.step_id,
+        "task_id": step.task_id,
+        "status": step.status,
+        "stage": stage,
+        "decision": nsp_route.pointer("/decision").cloned().unwrap_or(Value::Null),
+        "confidence": nsp_route.pointer("/confidence").cloned().unwrap_or(Value::Null),
+        "schema_valid": nsp_route.pointer("/schema_valid").cloned().unwrap_or(Value::Null),
+        "local_only": nsp_route.pointer("/local_only").cloned().unwrap_or(Value::Null),
+        "fallback_reason": nsp_route
+            .pointer("/fallback_reason")
+            .and_then(Value::as_str)
+            .map(redact_admin_string)
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+        "redacted": true,
+    }))
+}
+
 fn redacted_home_assistant_task_api_event_summary(event: &EventRecord) -> Option<Value> {
     if !event
         .event_type
@@ -9666,6 +12244,26 @@ fn redacted_home_assistant_task_api_event_summary(event: &EventRecord) -> Option
         "entity_id": json_string_at_paths(payload, &["/entity_id", "/entity/entity_id", "/request/entity_id"]),
         "candidate_count": json_usize_at_paths(payload, &["/candidate_count"]),
         "reason": json_string_at_paths(payload, &["/reason"]),
+        "occurred_at": event.occurred_at,
+        "redacted": true,
+    }))
+}
+
+fn redacted_family_memory_task_api_event_summary(event: &EventRecord) -> Option<Value> {
+    if !event.event_type.starts_with("family_memory.") {
+        return None;
+    }
+    let payload = &event.payload;
+    Some(json!({
+        "event_type": event.event_type,
+        "status": json_string_at_paths(payload, &["/status"]),
+        "event_id": json_string_at_paths(payload, &["/event_id"]),
+        "camera_id": json_string_at_paths(payload, &["/camera_id"]),
+        "action": json_string_at_paths(payload, &["/feedback/action"]),
+        "favorite_count": json_usize_at_paths(payload, &["/memory_overlay/favorite_count", "/favorite_count"]),
+        "returned_count": json_usize_at_paths(payload, &["/returned_count"]),
+        "metadata_only": true,
+        "secret_scan": "clean",
         "occurred_at": event.occurred_at,
         "redacted": true,
     }))
@@ -9696,13 +12294,80 @@ fn json_usize_at_paths(value: &Value, paths: &[&str]) -> Option<usize> {
     })
 }
 
+fn latest_home_guardian_activity_summaries(mut summaries: Vec<Value>) -> Vec<Value> {
+    summaries.sort_by(|left, right| {
+        json_string_at_paths(right, &["/created_at", "/evaluated_at"]).cmp(&json_string_at_paths(
+            left,
+            &["/created_at", "/evaluated_at"],
+        ))
+    });
+    summaries.truncate(HOME_GUARDIAN_ACTIVITY_LIMIT);
+    summaries.reverse();
+    summaries
+}
+
+fn current_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn current_process_thread_count() -> Option<u64> {
+    let text = fs::read_to_string("/proc/self/status").ok()?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("Threads:"))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+fn admin_state_file_fingerprint(path: &Path) -> (u64, Option<u128>) {
+    let Ok(metadata) = fs::metadata(path) else {
+        return (0, None);
+    };
+    let modified_epoch_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis());
+    (metadata.len(), modified_epoch_ms)
+}
+
+fn home_guardian_action_cooldown_key(
+    review: &AutomationRuleReview,
+    stored: &StoredLocalVisionEvent,
+    action_key: &str,
+) -> String {
+    let rule_key = review
+        .rule_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&review.review_id);
+    format!("{}:{}:{}", rule_key, stored.event.camera_id, action_key)
+}
+
+fn home_guardian_auto_evaluation_cooldown_key(stored: &StoredLocalVisionEvent) -> String {
+    format!("{}:{}", stored.event.camera_id, stored.event.event_type)
+}
+
 fn build_redacted_diagnostics_bundle(
     state: &StateResponse,
     home_assistant: &HomeAssistantStatusResponse,
     runtime: &LocalModelRuntimeProjection,
     last_event_notification_attempt: Option<Value>,
+    last_vlm_enrichment: Option<Value>,
     last_home_assistant_service_action: Option<Value>,
+    last_family_timeline_digest: Option<Value>,
+    last_family_memory_feedback: Option<Value>,
+    last_guardian_rule_proposal: Option<Value>,
+    last_guardian_rule_evaluation: Option<Value>,
+    guardian_queue: Value,
+    runtime_backpressure: Value,
+    admin_state_stats: Value,
+    last_general_message_nsp_route: Value,
     last_home_assistant_task_api_workflow: Value,
+    last_family_memory_task_api_workflow: Value,
+    evt_readiness: Value,
+    last_evt_preflight: Option<Value>,
     notification_targets: &[NotificationTargetRecord],
     gateway_status: Option<&Value>,
 ) -> RedactedDiagnosticsBundleResponse {
@@ -9719,6 +12384,15 @@ fn build_redacted_diagnostics_bundle(
         .map(str::to_string);
     let latest_events = list_recent_local_vision_events_default(5).ok();
     let latest_event_count = latest_events.as_ref().map(Vec::len).unwrap_or(0);
+    let event_store_stats = local_vision_event_store_stats_default()
+        .map(|stats| serde_json::to_value(stats).unwrap_or_else(|_| json!({})))
+        .unwrap_or_else(|error| {
+            json!({
+                "status": "unavailable",
+                "error": redact_admin_string(&error),
+                "metadata_only": true,
+            })
+        });
     let latest_event = latest_events
         .as_ref()
         .and_then(|events| events.first())
@@ -9762,6 +12436,7 @@ fn build_redacted_diagnostics_bundle(
         events: json!({
             "latest_count": latest_event_count,
             "latest_event": latest_event,
+            "store": event_store_stats,
             "metadata_only": true,
         }),
         workflow: json!({
@@ -9769,11 +12444,38 @@ fn build_redacted_diagnostics_bundle(
                 "status": "not_run",
                 "message": "No event notification has been attempted in this API process.",
             })),
+            "vlm_enrichment": home_guardian_optional_workflow(
+                last_vlm_enrichment,
+                "No VLM enrichment has been attempted in this API process.",
+            ),
             "home_assistant_service_action": last_home_assistant_service_action.unwrap_or_else(|| json!({
                 "status": "not_run",
                 "message": "No Home Assistant service action has been attempted in this API process.",
             })),
+            "family_timeline_digest": home_guardian_optional_workflow(
+                last_family_timeline_digest,
+                "No Family Timeline digest has been generated in this API process.",
+            ),
+            "family_memory_feedback": home_guardian_optional_workflow(
+                last_family_memory_feedback,
+                "No Family Memory feedback has been recorded in this API process.",
+            ),
+            "guardian_rule_proposal": home_guardian_optional_workflow(
+                last_guardian_rule_proposal,
+                "No Home Guardian rule proposal has been recorded in this API process.",
+            ),
+            "guardian_rule_evaluation": home_guardian_optional_workflow(
+                last_guardian_rule_evaluation,
+                "No Home Guardian rule evaluation has been recorded in this API process.",
+            ),
+            "guardian_queue": guardian_queue,
+            "runtime_backpressure": runtime_backpressure,
+            "admin_state": admin_state_stats,
+            "general_message_nsp_route": last_general_message_nsp_route,
             "home_assistant_task_api_workflow": last_home_assistant_task_api_workflow,
+            "family_memory_task_api_workflow": last_family_memory_task_api_workflow,
+            "evt_readiness": evt_readiness_workflow_summary(&evt_readiness),
+            "evt_preflight": evt_preflight_workflow_summary(last_evt_preflight),
             "default_notification_target": build_default_notification_target_readiness(
                 notification_targets,
                 gateway_status,
@@ -9826,6 +12528,75 @@ fn build_redacted_diagnostics_bundle(
             "created_at": now_unix_string(),
         }),
     }
+}
+
+fn build_evt_diagnostics_workflow(
+    evt_readiness: &Value,
+    last_evt_preflight: Option<Value>,
+    last_event_notification_attempt: Option<Value>,
+    last_vlm_enrichment: Option<Value>,
+    last_home_assistant_service_action: Option<Value>,
+    last_family_timeline_digest: Option<Value>,
+    last_family_memory_feedback: Option<Value>,
+    last_guardian_rule_proposal: Option<Value>,
+    last_guardian_rule_evaluation: Option<Value>,
+    guardian_queue: Value,
+    runtime_backpressure: Value,
+    admin_state_stats: Value,
+    last_general_message_nsp_route: Value,
+    last_home_assistant_task_api_workflow: Value,
+    last_family_memory_task_api_workflow: Value,
+) -> Value {
+    json!({
+        "event_notification": last_event_notification_attempt.unwrap_or_else(|| json!({
+            "status": "not_run",
+            "message": "No event notification has been attempted in this API process.",
+        })),
+        "vlm_enrichment": home_guardian_optional_workflow(
+            last_vlm_enrichment,
+            "No VLM enrichment has been attempted in this API process.",
+        ),
+        "home_assistant_service_action": last_home_assistant_service_action.unwrap_or_else(|| json!({
+            "status": "not_run",
+            "message": "No Home Assistant service action has been attempted in this API process.",
+        })),
+        "family_timeline_digest": home_guardian_optional_workflow(
+            last_family_timeline_digest,
+            "No Family Timeline digest has been generated in this API process.",
+        ),
+        "family_memory_feedback": home_guardian_optional_workflow(
+            last_family_memory_feedback,
+            "No Family Memory feedback has been recorded in this API process.",
+        ),
+        "guardian_rule_proposal": home_guardian_optional_workflow(
+            last_guardian_rule_proposal,
+            "No Home Guardian rule proposal has been recorded in this API process.",
+        ),
+        "guardian_rule_evaluation": home_guardian_optional_workflow(
+            last_guardian_rule_evaluation,
+            "No Home Guardian rule evaluation has been recorded in this API process.",
+        ),
+        "guardian_queue": guardian_queue,
+        "runtime_backpressure": runtime_backpressure,
+        "admin_state": admin_state_stats,
+        "general_message_nsp_route": last_general_message_nsp_route,
+        "home_assistant_task_api_workflow": last_home_assistant_task_api_workflow,
+        "family_memory_task_api_workflow": last_family_memory_task_api_workflow,
+        "evt_readiness": evt_readiness_workflow_summary(evt_readiness),
+        "evt_preflight": evt_preflight_workflow_summary(last_evt_preflight),
+        "redacted": true,
+    })
+}
+
+fn home_guardian_optional_workflow(value: Option<Value>, message: &str) -> Value {
+    value.unwrap_or_else(|| {
+        json!({
+            "status": "not_run",
+            "message": message,
+            "metadata_only": true,
+            "secret_scan": "clean",
+        })
+    })
 }
 
 fn systemd_service_summary(service: &str) -> Value {
@@ -10040,6 +12811,41 @@ fn find_recent_local_vision_event(
     Ok(list_recent_local_vision_events_default(50)?
         .into_iter()
         .find(|stored| stored.event.event_id == event_id))
+}
+
+fn build_vlm_enrichment_evidence(
+    stored: &StoredLocalVisionEvent,
+    status: &str,
+    elapsed_ms: u64,
+    model_endpoint_id: Option<Value>,
+    reason: &str,
+    trigger: &str,
+    readiness: Value,
+) -> Value {
+    json!({
+        "kind": "vision_vlm_enrichment_v1",
+        "status": status,
+        "event_id": stored.event.event_id,
+        "camera_id": stored.event.camera_id,
+        "event_type": stored.event.event_type,
+        "elapsed_ms": elapsed_ms,
+        "model_endpoint_id": model_endpoint_id,
+        "model_endpoint_id_redacted": false,
+        "local_only": true,
+        "fallback_allowed": false,
+        "queue_result": if status == "busy" { "busy" } else { "accepted" },
+        "frame_source": "fresh_camera_snapshot",
+        "frame_path_redacted": true,
+        "raw_image_included": false,
+        "local_paths_included": false,
+        "summary_source": if status == "active" { "vlm" } else { "degraded_fallback" },
+        "redaction_status": "clean",
+        "reason": redact_admin_string(reason),
+        "trigger": trigger,
+        "readiness": readiness,
+        "metadata_only": true,
+        "secret_scan": "clean",
+    })
 }
 
 fn default_notification_target_record(
@@ -11714,6 +14520,7 @@ fn preferred_endpoint_id_for_model_kind(kind: ModelKind) -> &'static str {
         ModelKind::Asr => "asr-local",
         ModelKind::Detector => "detector-local",
         ModelKind::Embedder => "embed-local-openai-compatible",
+        ModelKind::Reranker => "rerank-local-compatible",
     }
 }
 
@@ -14823,7 +17630,101 @@ fn redact_stream_url_credentials(value: &str) -> String {
 }
 
 fn redact_admin_string(value: &str) -> String {
-    redact_url_query_secrets(&redact_stream_url_credentials(value))
+    redact_local_path_occurrences(&redact_url_query_secrets(&redact_stream_url_credentials(
+        value,
+    )))
+}
+
+fn redact_local_path_occurrences(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut index = 0;
+    while index < value.len() {
+        let remaining = &value[index..];
+        if remaining.starts_with('/') && is_local_path_boundary(value, index) {
+            let end = consume_local_path(value, index);
+            if end > index + 1 && looks_like_posix_local_path(value, index, end) {
+                output.push_str("[redacted local path]");
+                index = end;
+                continue;
+            }
+        }
+        if looks_like_windows_absolute_path(value, index) && is_local_path_boundary(value, index) {
+            let end = consume_local_path(value, index);
+            if end > index + 2 {
+                output.push_str("[redacted local path]");
+                index = end;
+                continue;
+            }
+        }
+        let ch = remaining.chars().next().unwrap_or_default();
+        output.push(ch);
+        index += ch.len_utf8();
+    }
+    output
+}
+
+fn looks_like_posix_local_path(value: &str, start: usize, end: usize) -> bool {
+    let candidate = &value[start..end];
+    const LOCAL_PATH_PREFIXES: &[&str] = &[
+        "/app/",
+        "/data/",
+        "/etc/",
+        "/home/",
+        "/media/",
+        "/mnt/",
+        "/opt/",
+        "/private/",
+        "/root/",
+        "/run/",
+        "/srv/",
+        "/tmp/",
+        "/usr/",
+        "/var/",
+        "/Volumes/",
+        "/workspace/",
+    ];
+    LOCAL_PATH_PREFIXES
+        .iter()
+        .any(|prefix| candidate.starts_with(prefix))
+}
+
+fn is_local_path_boundary(value: &str, index: usize) -> bool {
+    if index == 0 {
+        return true;
+    }
+    value[..index]
+        .chars()
+        .last()
+        .map(|ch| ch.is_whitespace() || matches!(ch, '"' | '\'' | '(' | '[' | '{' | '='))
+        .unwrap_or(true)
+}
+
+fn looks_like_windows_absolute_path(value: &str, index: usize) -> bool {
+    let bytes = value.as_bytes();
+    bytes
+        .get(index)
+        .copied()
+        .map(|byte| byte.is_ascii_alphabetic())
+        .unwrap_or(false)
+        && bytes.get(index + 1) == Some(&b':')
+        && matches!(bytes.get(index + 2), Some(b'\\' | b'/'))
+}
+
+fn consume_local_path(value: &str, start: usize) -> usize {
+    let mut saw_separator = false;
+    for (offset, ch) in value[start..].char_indices() {
+        if matches!(ch, '/' | '\\') {
+            saw_separator = true;
+        }
+        if ch.is_whitespace() || matches!(ch, '"' | '\'' | ')' | ']' | '}' | ',' | ';') {
+            return if saw_separator { start + offset } else { start };
+        }
+    }
+    if saw_separator {
+        value.len()
+    } else {
+        start
+    }
 }
 
 fn redact_url_query_secrets(value: &str) -> String {
@@ -15635,12 +18536,14 @@ mod tests {
         build_harboros_status_response, build_hardware_readiness_response,
         build_home_assistant_operator_audit, build_inference_health_alias_response,
         build_knowledge_index_job, build_knowledge_index_status_response,
-        build_local_model_catalog, build_model_capabilities_response, build_rag_readiness_response,
+        build_local_model_catalog, build_local_vision_event_notification_blocked_response,
+        build_model_capabilities_response, build_rag_readiness_response,
         build_redacted_diagnostics_bundle, build_release_readiness_response,
-        build_rtsp_url_from_patch, camera_stream_url_with_credentials,
+        build_rtsp_url_from_patch, camera_stream_url_with_credentials, current_epoch_secs,
         default_model_download_target_path, default_model_download_target_path_in_root,
-        default_model_endpoints, ensure_local_admin_access, ensure_local_camera_access,
-        harbor_assistant_build_missing_response, hardware_class_for_probe, has_forwarding_headers,
+        default_model_endpoints, embedding_warmup_timeout_stats, ensure_local_admin_access,
+        ensure_local_camera_access, harbor_assistant_build_missing_response,
+        hardware_class_for_probe, has_forwarding_headers,
         huggingface_download_should_fallback_to_plain_http, huggingface_resolve_url,
         identity_query_suffix, is_admin_surface_path, is_harbor_assistant_client_route,
         is_harbor_assistant_surface_path, is_safe_live_asset_name,
@@ -15658,24 +18561,31 @@ mod tests {
         parse_camera_task_snapshot_path, parse_device_credential_status_path,
         parse_device_credentials_path, parse_device_evidence_path,
         parse_device_metadata_patch_path, parse_device_rtsp_check_path,
-        parse_device_validation_run_path, parse_knowledge_index_job_cancel_path,
-        parse_local_vision_event_notify_path, parse_member_default_delivery_surface_update_path,
-        parse_member_role_update_path, parse_model_download_cancel_path,
-        parse_model_download_job_path, parse_model_endpoint_path, parse_model_endpoint_test_path,
-        parse_model_runtime_install_path, parse_notification_target_delete_path,
-        parse_optional_unix_seconds, parse_share_link_revoke_path,
-        parse_shared_camera_live_page_path, parse_shared_camera_live_stream_path,
-        percent_decode_path_segment, probe_local_model_runtime, redact_account_management_snapshot,
+        parse_device_validation_run_path, parse_json_body_limited,
+        parse_knowledge_index_job_cancel_path, parse_local_vision_event_notify_path,
+        parse_member_default_delivery_surface_update_path, parse_member_role_update_path,
+        parse_model_download_cancel_path, parse_model_download_job_path, parse_model_endpoint_path,
+        parse_model_endpoint_test_path, parse_model_runtime_install_path,
+        parse_notification_target_delete_path, parse_optional_unix_seconds,
+        parse_share_link_revoke_path, parse_shared_camera_live_page_path,
+        parse_shared_camera_live_stream_path, percent_decode_path_segment,
+        probe_local_model_runtime, redact_account_management_snapshot, redact_admin_string,
         redact_bridge_provider_config, redact_camera_device_projection,
         redact_model_endpoint_response, redact_state_snapshot, redact_stream_url_credentials,
-        redact_value_stream_credentials, redacted_home_assistant_task_api_event_summary,
-        release_item, request_identity_hints, resolve_harbor_assistant_asset_path,
-        resolve_knowledge_preview_path, run_knowledge_index_jobs, run_model_download_job,
-        run_model_download_transfer, scan_request_task_args, url_encode_path_segment,
+        redact_value_stream_credentials, redacted_general_message_nsp_route_summary,
+        redacted_home_assistant_task_api_event_summary, release_item, request_identity_hints,
+        resolve_harbor_assistant_asset_path, resolve_knowledge_preview_path,
+        run_knowledge_index_jobs, run_model_download_job, run_model_download_transfer,
+        scan_request_task_args, service_overloaded_response, url_encode_path_segment,
         validate_home_assistant_service_fields, validate_home_assistant_service_smoke, AdminApi,
-        HomeAssistantServiceSmokeRequest, KnowledgeSearchApiRequest, LocalModelRuntimeProjection,
-        ManualAddRequest, ModelRuntimeActivationRequest, ModelRuntimeActivationResult,
-        DEFAULT_HF_ENDPOINT,
+        HomeAssistantServiceSmokeRequest, HomeGuardianEvaluationQueue, KnowledgeSearchApiRequest,
+        LocalModelRuntimeProjection, ManualAddRequest, ModelRuntimeActivationRequest,
+        ModelRuntimeActivationResult, VisionIngestLimiter, DEFAULT_HF_ENDPOINT,
+        HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS, HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS,
+        MAX_VISION_EVENT_INGEST_INFLIGHT, PRIVACY_GATEWAY_AUDIT_ACTION,
+    };
+    use harborbeacon_local_agent::control_plane::audit::{
+        build_metadata_audit_record, AuditActorKind,
     };
     use harborbeacon_local_agent::control_plane::events::EventRecord;
     use harborbeacon_local_agent::control_plane::media::{
@@ -15683,7 +18593,7 @@ mod tests {
         ShareLink,
     };
     use harborbeacon_local_agent::control_plane::models::{
-        ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind,
+        ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, PrivacyLevel,
     };
     use harborbeacon_local_agent::control_plane::users::{MembershipStatus, RoleKind};
     use harborbeacon_local_agent::runtime::access_control::{
@@ -15691,27 +18601,33 @@ mod tests {
     };
     use harborbeacon_local_agent::runtime::admin_console::{
         default_model_route_policies, AdminConsoleState, AdminConsoleStore, AdminModelCenterState,
-        BridgeProviderConfig, DeviceCredentialSecret, DeviceEvidenceRecord,
+        AutomationRuleReview, BridgeProviderConfig, DeviceCredentialSecret, DeviceEvidenceRecord,
         HomeAssistantAdminState, KnowledgeSettings, KnowledgeSourceRoot, ModelDownloadJobRecord,
-        NotificationTargetRecord, RemoteViewConfig,
+        NotificationTargetRecord, RagResourceProfile, RemoteViewConfig,
     };
     use harborbeacon_local_agent::runtime::hub::CameraHubService;
     use harborbeacon_local_agent::runtime::knowledge_index::{
         KnowledgeIndexConfig, KnowledgeIndexService,
     };
+    use harborbeacon_local_agent::runtime::privacy_gateway::PRIVACY_GATEWAY_POLICY_VERSION;
     use harborbeacon_local_agent::runtime::registry::{CameraDevice, DeviceRegistryStore};
     use harborbeacon_local_agent::runtime::remote_view;
     use harborbeacon_local_agent::runtime::task_api::TaskApiService;
     use harborbeacon_local_agent::runtime::task_session::TaskConversationStore;
+    use harborbeacon_local_agent::runtime::vision_event::{
+        ingest_local_vision_event, LocalVisionEvent, SnapshotArtifact, StoredLocalVisionEvent,
+        VISION_EVENT_STORE_PATH_ENV,
+    };
     use serde_json::{json, Value};
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::path::{Path, PathBuf};
+    use std::sync::mpsc::sync_channel;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn hf_endpoint_env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -15719,12 +18635,289 @@ mod tests {
     }
     use tiny_http::{Header, StatusCode};
 
+    #[test]
+    fn parse_json_body_limited_blocks_oversized_payload() {
+        let payload = br#"{"ok":true}"#;
+        let parsed: Value =
+            parse_json_body_limited(payload, payload.len()).expect("valid small json");
+        assert_eq!(parsed["ok"], json!(true));
+
+        let error = parse_json_body_limited::<Value>(payload, payload.len() - 1)
+            .expect_err("oversized payload must fail");
+
+        assert!(error.contains("exceeds"));
+    }
+
     fn unique_store_path(prefix: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{unique}.json"))
+    }
+
+    fn build_test_admin_api(prefix: &str) -> (AdminApi, Vec<PathBuf>) {
+        let admin_path = unique_store_path(&format!("{prefix}-state"));
+        let registry_path = unique_store_path(&format!("{prefix}-registry"));
+        let conversation_path = unique_store_path(&format!("{prefix}-runtime"));
+        let registry_store = DeviceRegistryStore::new(registry_path.clone());
+        let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store);
+        let conversation_store = TaskConversationStore::new(conversation_path.clone());
+        let task_service = TaskApiService::new(admin_store.clone(), conversation_store);
+        let api = AdminApi::new(
+            admin_store,
+            task_service,
+            PathBuf::from("frontend/harbor-assistant/dist/harbor-assistant"),
+            "http://harborbeacon.local:4174".to_string(),
+        );
+        (api, vec![admin_path, registry_path, conversation_path])
+    }
+
+    fn cleanup_test_paths(paths: &[PathBuf]) {
+        for path in paths {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    fn response_json(
+        response: tiny_http::Response<std::io::Cursor<Vec<u8>>>,
+    ) -> (StatusCode, Value) {
+        let status = response.status_code();
+        let mut reader = response.into_reader();
+        let mut text = String::new();
+        reader.read_to_string(&mut text).expect("read response");
+        let value = serde_json::from_str(&text).expect("json response");
+        (status, value)
+    }
+
+    fn sample_home_guardian_review(status: &str) -> AutomationRuleReview {
+        AutomationRuleReview {
+            review_id: "guardian_review_shape_1".to_string(),
+            workspace_id: "home-1".to_string(),
+            source: "home_guardian".to_string(),
+            source_channel: Some("admin-api-test".to_string()),
+            source_conversation_id: Some("conv-shape".to_string()),
+            original_prompt: "notify me when the front door sees a person".to_string(),
+            status: status.to_string(),
+            trigger_definition: Some(json!({
+                "camera_id": "front-door",
+                "event_type": "person_detected",
+                "labels": ["person"],
+                "min_confidence": 0.75,
+            })),
+            condition_definition: None,
+            action_plan: Some(json!({
+                "actions": [{"kind": "notify_default_target"}],
+                "metadata_only": true
+            })),
+            device_refs: Vec::new(),
+            risk_level: Some("low".to_string()),
+            requires_approval: true,
+            created_at: Some("1700000000".to_string()),
+            updated_at: None,
+            expires_at: None,
+            rule_id: Some("guardian_rule_shape_1".to_string()),
+            run_summaries: Vec::new(),
+            metadata: Some(json!({"feature": "home_guardian", "home_guardian": true})),
+        }
+    }
+
+    fn sample_local_vision_event(event_id: &str) -> LocalVisionEvent {
+        let started_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_millis()
+            .to_string();
+        LocalVisionEvent {
+            event_id: event_id.to_string(),
+            camera_id: "front-door".to_string(),
+            event_type: "person_detected".to_string(),
+            confidence: 0.92,
+            labels: vec!["person".to_string(), "door".to_string()],
+            summary: "Person near front door".to_string(),
+            snapshot_artifact: SnapshotArtifact {
+                artifact_id: Some("artifact-shape-1".to_string()),
+                path: None,
+                mime_type: Some("image/jpeg".to_string()),
+                byte_size: Some(1234),
+                sha256: Some("abcd".to_string()),
+                source: Some("fixture".to_string()),
+            },
+            started_at,
+            analyzer: "fixture-yolo".to_string(),
+            latency_ms: 64,
+            metrics: json!({}),
+            vlm: None,
+        }
+    }
+
+    fn sample_stored_local_vision_event(event_id: &str) -> StoredLocalVisionEvent {
+        StoredLocalVisionEvent {
+            received_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_millis()
+                .to_string(),
+            event: sample_local_vision_event(event_id),
+            audit_record: json!({"metadata_only": true}),
+            ha_mqtt_payload: json!({"metadata_only": true}),
+        }
+    }
+
+    #[test]
+    fn home_guardian_evaluation_queue_drops_when_full() {
+        let (sender, _receiver) = sync_channel(1);
+        let queue = HomeGuardianEvaluationQueue::new(sender);
+
+        assert_eq!(
+            queue.enqueue(sample_stored_local_vision_event("queued-1")),
+            "queued"
+        );
+        assert_eq!(
+            queue.enqueue(sample_stored_local_vision_event("queued-2")),
+            "dropped"
+        );
+
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot["queued_total"], json!(1));
+        assert_eq!(snapshot["dropped_total"], json!(1));
+        assert_eq!(snapshot["bounded"], json!(true));
+    }
+
+    #[test]
+    fn service_overloaded_response_is_metadata_only() {
+        let (status, body) = response_json(service_overloaded_response());
+
+        assert_eq!(status, StatusCode(503));
+        assert_eq!(body["status"], json!("blocked"));
+        assert_eq!(body["metadata_only"], json!(true));
+        assert_eq!(body["secret_scan"], json!("clean"));
+        let text = serde_json::to_string(&body).expect("serialize");
+        assert!(!text.contains("rtsp://"));
+        assert!(!text.contains("token"));
+        assert!(!text.contains("route_key"));
+    }
+
+    #[test]
+    fn vision_ingest_limiter_blocks_after_max_inflight() {
+        let limiter = VisionIngestLimiter::new();
+        let mut guards = Vec::new();
+        for _ in 0..MAX_VISION_EVENT_INGEST_INFLIGHT {
+            guards.push(limiter.try_acquire().expect("acquire below limit"));
+        }
+
+        assert!(limiter.try_acquire().is_none());
+        assert_eq!(
+            limiter.snapshot()["active_inflight"],
+            json!(MAX_VISION_EVENT_INGEST_INFLIGHT)
+        );
+        assert_eq!(limiter.snapshot()["rejected_total"], json!(1));
+
+        drop(guards);
+        assert!(limiter.try_acquire().is_some());
+    }
+
+    #[test]
+    fn home_guardian_rule_cache_tracks_active_reviews_only() {
+        let (api, paths) = build_test_admin_api("guardian-rule-cache");
+        api.admin_store
+            .upsert_automation_review(sample_home_guardian_review("pending"))
+            .expect("save pending");
+        api.refresh_home_guardian_rule_cache()
+            .expect("refresh pending");
+        assert_eq!(
+            api.guardian_rule_cache_snapshot()["active_rule_count"],
+            json!(0)
+        );
+
+        api.admin_store
+            .set_automation_review_status("guardian_review_shape_1", "active")
+            .expect("activate");
+        api.refresh_home_guardian_rule_cache()
+            .expect("refresh active");
+        assert_eq!(
+            api.guardian_rule_cache_snapshot()["active_rule_count"],
+            json!(1)
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn home_guardian_auto_evaluation_does_not_persist_run_summaries() {
+        let (api, paths) = build_test_admin_api("guardian-auto-no-hot-write");
+        api.admin_store
+            .upsert_automation_review(sample_home_guardian_review("active"))
+            .expect("save active");
+        api.refresh_home_guardian_rule_cache()
+            .expect("refresh cache");
+
+        let stored = sample_stored_local_vision_event("auto-no-hot-write-event");
+        let response = api
+            .evaluate_home_guardian_rules_for_event(&stored, None, true)
+            .expect("auto evaluate");
+        assert_eq!(response.metadata_only, true);
+
+        let state = api.admin_store.load_state().expect("reload state");
+        let review = state
+            .automation_reviews
+            .iter()
+            .find(|review| review.review_id == "guardian_review_shape_1")
+            .expect("review");
+        assert_eq!(review.run_summaries.len(), 0);
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn home_guardian_action_cooldown_is_rule_camera_action_scoped() {
+        let (api, paths) = build_test_admin_api("guardian-cooldown");
+        let review = sample_home_guardian_review("active");
+        let stored = sample_stored_local_vision_event("cooldown-event-1");
+        let now = current_epoch_secs();
+
+        assert!(!api.guardian_action_in_cooldown(&review, &stored, "notify_default_target", now));
+        api.mark_guardian_action_cooldown(&review, &stored, "notify_default_target", now);
+
+        assert!(api.guardian_action_in_cooldown(
+            &review,
+            &stored,
+            "notify_default_target",
+            now + 1
+        ));
+        assert!(!api.guardian_action_in_cooldown(
+            &review,
+            &stored,
+            "home_assistant:light.turn_on",
+            now + 1
+        ));
+        assert!(!api.guardian_action_in_cooldown(
+            &review,
+            &stored,
+            "notify_default_target",
+            now + HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS + 1
+        ));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn home_guardian_auto_evaluation_coalesces_same_camera_event_type() {
+        let (api, paths) = build_test_admin_api("guardian-auto-coalesce");
+        let mut stored = sample_stored_local_vision_event("auto-event-1");
+        let now = current_epoch_secs();
+
+        assert!(api.guardian_auto_evaluation_due(&stored, now));
+        assert!(!api.guardian_auto_evaluation_due(&stored, now + 1));
+        assert!(api.guardian_auto_evaluation_due(
+            &stored,
+            now + HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS + 1
+        ));
+
+        stored.event.event_type = "vehicle_detected".to_string();
+        assert!(api.guardian_auto_evaluation_due(&stored, now + 2));
+
+        cleanup_test_paths(&paths);
     }
 
     struct EnvGuard {
@@ -15872,6 +19065,290 @@ mod tests {
     }
 
     #[test]
+    fn family_timeline_admin_handlers_preserve_shape_and_redaction() {
+        let (api, paths) = build_test_admin_api("harborbeacon-family-timeline-shape");
+        let event_store_path = unique_store_path("harborbeacon-family-timeline-events");
+        let _vision_store_guard = EnvGuard::set(
+            VISION_EVENT_STORE_PATH_ENV,
+            &event_store_path.to_string_lossy(),
+        );
+        ingest_local_vision_event(
+            &event_store_path,
+            sample_local_vision_event("event-family-1"),
+        )
+        .expect("ingest event");
+        let hints = AccessIdentityHints::default();
+
+        let (status, body) = response_json(api.handle_family_timeline(
+            "/api/family/timeline?camera_id=front-door&label=person&limit=10&window_seconds=3600",
+            &hints,
+        ));
+        assert_eq!(status, StatusCode(200));
+        assert_eq!(body["metadata_only"], json!(true));
+        assert_eq!(body["event_count"], json!(1));
+        assert_eq!(body["events"][0]["event_id"], json!("event-family-1"));
+        assert_eq!(
+            body["events"][0]["artifact"]["local_path_redacted"],
+            json!(true)
+        );
+
+        let (status, digest_body) = response_json(api.handle_family_timeline_digest(
+            "/api/family/timeline/digest?window_seconds=3600",
+            &hints,
+        ));
+        assert_eq!(status, StatusCode(200));
+        assert_eq!(digest_body["metadata_only"], json!(true));
+        assert_eq!(digest_body["secret_scan"], json!("clean"));
+        assert!(digest_body["headline"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("1 小时"));
+        assert!(api.last_family_timeline_digest().is_some());
+
+        let text = serde_json::to_string(&(body, digest_body)).expect("serialize");
+        assert!(!text.contains("/tmp/admin-family-shape.jpg"));
+        assert!(!text.contains("rtsp://"));
+
+        let _ = fs::remove_file(event_store_path);
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn home_guardian_admin_evaluate_latest_shape_keeps_pending_metadata_only() {
+        let (api, paths) = build_test_admin_api("harborbeacon-guardian-evaluate-shape");
+        api.admin_store
+            .upsert_automation_review(sample_home_guardian_review("pending"))
+            .expect("save review");
+        let stored = sample_stored_local_vision_event("event-guardian-1");
+
+        let response = api
+            .evaluate_home_guardian_rules_for_event(&stored, Some("guardian_review_shape_1"), true)
+            .expect("evaluate guardian");
+        let body = serde_json::to_value(&response).expect("serialize response");
+
+        assert_eq!(body["status"], json!("evaluated"));
+        assert_eq!(body["metadata_only"], json!(true));
+        assert_eq!(body["secret_scan"], json!("clean"));
+        assert_eq!(body["results"][0]["status"], json!("skipped"));
+        assert_eq!(body["results"][0]["matched"], json!(true));
+        assert_eq!(body["results"][0]["executed"], json!(false));
+        assert_eq!(body["results"][0]["actions"], json!([]));
+
+        let state = api
+            .admin_store
+            .load_or_create_state()
+            .expect("reload state");
+        let review = state
+            .automation_reviews
+            .iter()
+            .find(|review| review.review_id == "guardian_review_shape_1")
+            .expect("review");
+        assert_eq!(review.run_summaries.len(), 1);
+
+        let text = serde_json::to_string(&body).expect("serialize body");
+        assert!(!text.contains("/tmp/admin-family-shape.jpg"));
+        assert!(!text.contains("token=secret"));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn local_vision_notify_response_redacts_target_route_key() {
+        let stored = sample_stored_local_vision_event("event-notify-1");
+        let target = NotificationTargetRecord {
+            target_id: "target-1".to_string(),
+            label: "Family".to_string(),
+            route_key: "gw_route_secret".to_string(),
+            platform_hint: "weixin".to_string(),
+            is_default: true,
+        };
+        let response = build_local_vision_event_notification_blocked_response(
+            &stored,
+            Some(&target),
+            "blocked because token=secret and /tmp/admin-family-shape.jpg",
+        );
+        let text = serde_json::to_string(&response).expect("serialize response");
+
+        assert_eq!(response.status, "blocked");
+        assert_eq!(response.target_label.as_deref(), Some("Family"));
+        assert_eq!(response.platform_hint.as_deref(), Some("weixin"));
+        assert_eq!(response.audit_record["metadata_only"], json!(true));
+        assert_eq!(response.audit_record["secret_scan"], json!("clean"));
+        assert!(!text.contains("gw_route_secret"));
+        assert!(!text.contains("token=secret"));
+        assert!(!text.contains("/tmp/admin-family-shape.jpg"));
+    }
+
+    #[test]
+    fn routing_status_admin_handler_keeps_routing_and_gate_boundary_separate() {
+        let (api, paths) = build_test_admin_api("harborbeacon-routing-status-shape");
+        let hints = AccessIdentityHints::default();
+
+        let (status, body) = response_json(api.handle_routing_status(&hints));
+        assert_eq!(status, StatusCode(200));
+        assert_eq!(body["kind"], json!("harborbeacon.routing_status.v1"));
+        assert_eq!(body["metadata_only"], json!(true));
+        assert_eq!(body["scope"], json!("beacon_internal_orchestration"));
+        assert!(body["execution_routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|route| route["domain_id"] == json!("harboros_system")));
+        assert!(body["boundaries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|boundary| boundary["boundary_id"] == json!("im_gateway_route_registry")));
+        assert_eq!(
+            normalize_unified_admin_path("/api/beacon/routing/status"),
+            "/api/routing/status"
+        );
+        assert!(is_admin_surface_path("/api/routing/status"));
+
+        let text = serde_json::to_string(&body).expect("serialize routing status");
+        assert!(!text.contains("gw_route_"));
+        assert!(!text.contains("args.resume_token"));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn audit_records_admin_handler_filters_paginates_and_redacts() {
+        let (api, paths) = build_test_admin_api("harborbeacon-audit-records-shape");
+        api.admin_store
+            .append_audit_record(build_metadata_audit_record(
+                "home-1",
+                "model_route_policy",
+                "bulk",
+                "model.route_policy.save",
+                AuditActorKind::User,
+                "local-owner",
+                json!({
+                    "route_key": "gw_route_secret",
+                    "model_path": "C:\\models\\secret\\tokenizer.json",
+                    "token": "secret",
+                }),
+                json!({"status": "saved"}),
+            ))
+            .expect("append audit");
+        api.admin_store
+            .append_audit_record(build_metadata_audit_record(
+                "home-1",
+                "vision_event",
+                "event-audit-1",
+                "vision_event.notify",
+                AuditActorKind::User,
+                "local-owner",
+                json!({"event_id": "event-audit-1"}),
+                json!({"status": "blocked"}),
+            ))
+            .expect("append audit");
+
+        let hints = AccessIdentityHints::default();
+        let (status, body) = response_json(api.handle_audit_records(
+            "/api/audit/records?limit=1&action=model.route_policy.save",
+            &hints,
+        ));
+        assert_eq!(status, StatusCode(200));
+        assert_eq!(body["metadata_only"], json!(true));
+        assert_eq!(body["secret_scan"], json!("clean"));
+        assert_eq!(body["total"], json!(1));
+        assert_eq!(
+            body["records"][0]["action"],
+            json!("model.route_policy.save")
+        );
+        assert!(is_admin_surface_path("/api/audit/records"));
+        assert_eq!(
+            normalize_unified_admin_path("/api/beacon/audit/records"),
+            "/api/audit/records"
+        );
+
+        let text = serde_json::to_string(&body).expect("serialize audit page");
+        assert!(!text.contains("gw_route_secret"));
+        assert!(!text.contains("C:\\models"));
+        assert!(!text.contains("tokenizer"));
+        assert!(text.contains("metadata_only"));
+
+        let (status, summary) =
+            response_json(api.handle_audit_summary("/api/audit/summary?window=24h", &hints));
+        assert_eq!(status, StatusCode(200));
+        assert_eq!(summary["total"], json!(2));
+        assert_eq!(summary["by_action"]["vision_event.notify"], json!(1));
+        assert!(is_admin_surface_path("/api/audit/summary"));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn audit_records_admin_handler_clamps_and_filters_entity_id_with_safe_parse_fallbacks() {
+        let (api, paths) = build_test_admin_api("harborbeacon-audit-records-filter-console");
+        for index in 0..3 {
+            api.admin_store
+                .append_audit_record(build_metadata_audit_record(
+                    "home-1",
+                    if index == 1 {
+                        "home_guardian"
+                    } else {
+                        "vision_event"
+                    },
+                    if index == 1 {
+                        "rule-front"
+                    } else {
+                        "event-front"
+                    },
+                    if index == 1 {
+                        "home_guardian.evaluate_latest"
+                    } else {
+                        "vision_event.notify"
+                    },
+                    AuditActorKind::User,
+                    "local-owner",
+                    json!({
+                        "entity_id": if index == 1 { "rule-front" } else { "event-front" },
+                        "raw_path": "/mnt/pool/private/frame.jpg",
+                        "route_key": "gw_route_should_not_escape",
+                    }),
+                    json!({"status": "recorded"}),
+                ))
+                .expect("append audit");
+        }
+
+        let hints = AccessIdentityHints::default();
+        let (status, body) = response_json(api.handle_audit_records(
+            "/api/audit/records?limit=999&cursor=bogus&entity_kind=home_guardian&entity_id=rule-front&action=home_guardian.evaluate_latest",
+            &hints,
+        ));
+        assert_eq!(status, StatusCode(200));
+        assert_eq!(body["limit"], json!(200));
+        assert_eq!(body["cursor"], Value::Null);
+        assert_eq!(body["total"], json!(1));
+        assert_eq!(body["records"][0]["entity_id"], json!("rule-front"));
+        assert_eq!(
+            body["records"][0]["action"],
+            json!("home_guardian.evaluate_latest")
+        );
+
+        let text = serde_json::to_string(&body).expect("serialize audit page");
+        assert!(!text.contains("/mnt/pool/private"));
+        assert!(!text.contains("gw_route_should_not_escape"));
+        assert!(!text.contains("route_key"));
+        assert!(text.contains("opaque_delivery_route_present"));
+
+        let (status, body) = response_json(api.handle_audit_records(
+            "/api/audit/records?limit=1&cursor=1&action=vision_event.notify",
+            &hints,
+        ));
+        assert_eq!(status, StatusCode(200));
+        assert_eq!(body["limit"], json!(1));
+        assert_eq!(body["cursor"], json!("1"));
+        assert_eq!(body["total"], json!(2));
+        assert_eq!(body["records"].as_array().unwrap().len(), 1);
+        assert_eq!(body["next_cursor"], Value::Null);
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
     fn home_assistant_operator_audit_is_metadata_only() {
         let request = HomeAssistantServiceSmokeRequest {
             entity_id: "light.kitchen".to_string(),
@@ -15941,22 +19418,134 @@ mod tests {
             &LocalModelRuntimeProjection::default(),
             None,
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            json!({
+                "queued_total": 0,
+                "dropped_total": 0,
+                "metadata_only": true,
+            }),
+            json!({
+                "http": {"active_requests": 0, "metadata_only": true},
+                "vision_ingest": {"active_inflight": 0, "metadata_only": true},
+                "metadata_only": true,
+            }),
+            json!({
+                "exists": true,
+                "file_bytes": 0,
+                "automation_review_count": 0,
+                "audit_record_count": 0,
+                "metadata_only": true,
+            }),
             json!({
                 "status": "not_run",
                 "redacted": true,
             }),
+            json!({
+                "status": "not_run",
+                "redacted": true,
+            }),
+            json!({
+                "status": "not_run",
+                "redacted": true,
+            }),
+            json!({
+                "kind": "evt_readiness_v1",
+                "profile": "k3-direct-72h-readiness",
+                "status": "degraded",
+                "blockers": [],
+                "warnings": ["test"],
+                "redacted": true,
+            }),
+            Some(json!({
+                "kind": "evt_preflight_v1",
+                "profile": "k3-direct-72h-readiness",
+                "status": "degraded",
+                "long_run_started": false,
+                "short_run_started": false,
+                "redacted": true,
+            })),
             &[],
             None,
         );
         let text = serde_json::to_string(&bundle).expect("serialize bundle");
 
         assert_eq!(bundle.security["secret_scan"], json!("clean"));
+        assert_eq!(
+            bundle.workflow["general_message_nsp_route"]["status"],
+            json!("not_run")
+        );
+        assert_eq!(
+            bundle.workflow["evt_readiness"]["status"],
+            json!("degraded")
+        );
+        assert_eq!(
+            bundle.workflow["evt_preflight"]["long_run_started"],
+            json!(false)
+        );
         assert!(!text.contains("token=secret"));
         assert!(!text.contains("rtsp://"));
         assert!(!text.contains("api_key=abc"));
 
         let _ = fs::remove_file(admin_path);
         let _ = fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn nsp_route_diagnostics_redacts_local_paths() {
+        let step = harborbeacon_local_agent::control_plane::tasks::TaskStepRun {
+            step_id: "step-1".to_string(),
+            task_id: "turn-1".to_string(),
+            domain: "general".to_string(),
+            operation: "message".to_string(),
+            status: harborbeacon_local_agent::control_plane::tasks::TaskStepRunStatus::Success,
+            output_payload: json!({
+                "data": {
+                    "general_message_controller": {
+                        "controller_stage": "nsp_router",
+                        "nsp_route": {
+                            "decision": null,
+                            "confidence": null,
+                            "schema_valid": false,
+                            "local_only": true,
+                            "fallback_reason": "missing /mnt/software/harborbeacon-agent-ci/model-store/runtimes/harbor-candle/bootstrap-llm/tokenizer.json and C:\\\\models\\\\secret\\\\tokenizer.json token=secret"
+                        }
+                    }
+                }
+            }),
+            ..Default::default()
+        };
+
+        let summary = redacted_general_message_nsp_route_summary(&step).expect("summary");
+        let text = serde_json::to_string(&summary).expect("serialize");
+
+        assert_eq!(summary["stage"], json!("nsp_router"));
+        assert!(text.contains("[redacted local path]"));
+        assert!(!text.contains("/mnt/software"));
+        assert!(!text.contains("C:\\\\models"));
+        assert!(!text.contains("token=secret"));
+    }
+
+    #[test]
+    fn admin_string_redaction_preserves_plain_http_origin() {
+        let redacted = redact_admin_string("probe http://homeassistant.local:8123 ok");
+
+        assert!(redacted.contains("http://homeassistant.local:8123"));
+    }
+
+    #[test]
+    fn admin_string_redaction_preserves_public_shared_camera_route() {
+        let redacted = redact_admin_string(
+            "share=/shared/cameras/token local=/mnt/software/secret.bin win=C:\\models\\secret.bin",
+        );
+
+        assert!(redacted.contains("/shared/cameras/token"));
+        assert!(!redacted.contains("/mnt/software"));
+        assert!(!redacted.contains("C:\\models"));
+        assert!(redacted.contains("[redacted local path]"));
     }
 
     #[test]
@@ -16965,6 +20554,7 @@ mod tests {
             &state.knowledge,
             &state.models.endpoints,
             &state.knowledge_index_jobs,
+            &state.audit_records,
         );
 
         let response = build_release_readiness_response(
@@ -17859,6 +21449,7 @@ mod tests {
             &settings,
             &default_model_endpoints(),
             &[],
+            &[],
         );
 
         assert!(!response.generated_at.is_empty());
@@ -17868,6 +21459,95 @@ mod tests {
             .evidence
             .iter()
             .any(|entry| entry.contains("embedding_model=jina")));
+        assert_eq!(
+            response.privacy_gateway.policy_version,
+            PRIVACY_GATEWAY_POLICY_VERSION
+        );
+        assert_eq!(
+            response.privacy_gateway.covered_routes,
+            vec!["retrieval.answer".to_string()]
+        );
+        assert_eq!(response.privacy_gateway.secret_scan, "clean");
+        let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn rag_readiness_privacy_gateway_reports_metadata_only_audit_stats() {
+        let source_root = unique_store_path("harborbeacon-rag-source-privacy-gateway");
+        let index_root = unique_store_path("harborbeacon-rag-index-privacy-gateway");
+        fs::create_dir_all(&source_root).expect("create rag source root");
+        let settings = KnowledgeSettings {
+            source_roots: vec![KnowledgeSourceRoot {
+                root_id: "test-root".to_string(),
+                label: "Test root".to_string(),
+                path: source_root.to_string_lossy().into_owned(),
+                enabled: true,
+                include: Vec::new(),
+                exclude: Vec::new(),
+                last_indexed_at: None,
+            }],
+            index_root: index_root.to_string_lossy().into_owned(),
+            privacy_level: PrivacyLevel::AllowRedactedCloud,
+            default_resource_profile: RagResourceProfile::CloudAllowed,
+            ..Default::default()
+        };
+        let audit = build_metadata_audit_record(
+            "home-1",
+            "privacy_transform",
+            "privacy-transform-abc123",
+            PRIVACY_GATEWAY_AUDIT_ACTION,
+            AuditActorKind::System,
+            "system",
+            json!({
+                "task_id": "task-1",
+                "trace_id": "trace-1",
+                "metadata_only": true,
+            }),
+            json!({
+                "decision": "allow_redacted_cloud",
+                "risk_level": "medium",
+                "privacy_transform_id": "privacy-transform-abc123",
+                "warnings": ["redacted cloud capsule used"],
+                "metadata_only": true,
+            }),
+        );
+
+        let response = build_rag_readiness_response(
+            &LocalModelRuntimeProjection {
+                ready: true,
+                backend_ready: true,
+                embedding_model: Some("jina".to_string()),
+                ..Default::default()
+            },
+            &settings,
+            &default_model_endpoints(),
+            &[],
+            &[audit],
+        );
+
+        assert_eq!(response.privacy_gateway.status, "ready");
+        assert_eq!(response.privacy_gateway.recent_audit_count, 1);
+        assert_eq!(
+            response
+                .privacy_gateway
+                .decision_counts
+                .get("allow_redacted_cloud"),
+            Some(&1)
+        );
+        assert_eq!(response.privacy_gateway.risk_counts.get("medium"), Some(&1));
+        assert_eq!(response.privacy_gateway.warning_count, 1);
+        assert_eq!(
+            response
+                .privacy_gateway
+                .latest_privacy_transform_id
+                .as_deref(),
+            Some("privacy-transform-abc123")
+        );
+        let text = serde_json::to_string(&response.privacy_gateway).expect("serialize gateway");
+        assert!(!text.contains("C:\\Users"));
+        assert!(!text.contains("source_path"));
+        assert!(!text.contains("https://"));
+
         let _ = fs::remove_dir_all(source_root);
     }
 
@@ -17898,6 +21578,7 @@ mod tests {
                 ..Default::default()
             },
             &settings,
+            &[],
             &[],
             &[],
         );
@@ -17955,6 +21636,7 @@ mod tests {
                 status: ModelEndpointStatus::Active,
                 metadata: json!({}),
             }],
+            &[],
             &[],
         );
 
@@ -18050,6 +21732,7 @@ mod tests {
                 endpoint(ModelKind::Vlm, "vlm-local", "cpu-vlm"),
                 endpoint(ModelKind::Ocr, "ocr-local", "tesseract"),
             ],
+            &[],
             &[],
         );
 
@@ -18368,6 +22051,23 @@ mod tests {
     }
 
     #[test]
+    fn embedding_warmup_timeout_stats_complete_job_as_degraded() {
+        let stats = embedding_warmup_timeout_stats(2, Duration::from_millis(25));
+
+        assert_eq!(stats.total, 2);
+        assert_eq!(stats.completed, 0);
+        assert_eq!(stats.skipped, 0);
+        assert_eq!(stats.failed, 2);
+        assert!(stats.degraded);
+        assert!(stats.persist_error.is_none());
+        assert!(stats
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("exceeded 25 ms"));
+    }
+
+    #[test]
     fn knowledge_index_worker_completes_job_and_updates_source_root() {
         let admin_path = unique_store_path("harborbeacon-knowledge-index-worker-admin");
         let registry_path = unique_store_path("harborbeacon-knowledge-index-worker-registry");
@@ -18418,6 +22118,12 @@ mod tests {
         assert_eq!(jobs[0].status, "completed");
         assert_eq!(jobs[0].progress_percent, Some(100));
         assert_eq!(jobs[0].checkpoint["phase"], "completed");
+        assert_eq!(jobs[0].checkpoint["embedding_total"], 1);
+        assert!(jobs[0].checkpoint["embedding_completed"].is_number());
+        assert!(jobs[0].checkpoint["embedding_skipped"].is_number());
+        assert!(jobs[0].checkpoint["embedding_failed"].is_number());
+        assert!(jobs[0].checkpoint["embedding_warmup_degraded"].is_boolean());
+        assert!(jobs[0].checkpoint["embedding_warmup_timeout_ms"].is_number());
         let updated_settings = store.knowledge_settings().expect("load settings");
         assert!(updated_settings.source_roots[0].last_indexed_at.is_some());
         assert!(index_root

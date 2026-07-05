@@ -165,7 +165,7 @@ impl HarborBeaconService {
             })));
             return;
         }
-        if path == "/api/web/turns" || path == "/api/turns" {
+        if assistant_task_api::is_turn_api_path(&path) {
             self.task_api.handle(request);
             return;
         }
@@ -283,11 +283,13 @@ fn runtime_model_id_for_activation(config: &ModelApiConfig, kind: ModelKind) -> 
         ModelKind::Llm => Some(match config.backend {
             BackendKind::Candle => config.candle.chat_model_id.clone(),
             BackendKind::OpenAIProxy => config.chat_model.clone(),
+            BackendKind::SemanticRouter => config.chat_model.clone(),
         }),
-        ModelKind::Embedder => Some(match config.backend {
-            BackendKind::Candle => config.candle.embedding_model_id.clone(),
-            BackendKind::OpenAIProxy => config.embedding_model.clone(),
-        }),
+        ModelKind::Embedder => match config.backend {
+            BackendKind::Candle => Some(config.candle.embedding_model_id.clone()),
+            BackendKind::OpenAIProxy => Some(config.embedding_model.clone()),
+            BackendKind::SemanticRouter => None,
+        },
         _ => None,
     }
 }
@@ -610,6 +612,17 @@ mod tests {
             inference_model_path("/api/beacon/inference/v1/chat/completions"),
             "/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn single_port_turn_ingress_accepts_harboros_stripped_aliases() {
+        assert!(assistant_task_api::is_turn_api_path("/api/web/turns"));
+        assert!(assistant_task_api::is_turn_api_path("/api/turns"));
+        assert!(assistant_task_api::is_turn_api_path("/web/turns"));
+        assert!(assistant_task_api::is_turn_api_path("/turns"));
+        assert!(!assistant_task_api::is_turn_api_path(
+            "/api/harbor-beacon/web/turns"
+        ));
     }
 
     #[test]

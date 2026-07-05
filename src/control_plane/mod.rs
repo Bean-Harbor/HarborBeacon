@@ -11,6 +11,7 @@ pub mod events;
 pub mod media;
 pub mod models;
 pub mod plugins;
+pub mod routing;
 pub mod tasks;
 pub mod users;
 pub mod workflows;

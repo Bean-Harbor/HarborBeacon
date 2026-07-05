@@ -6,7 +6,7 @@
 > 双仓边界已经明确：IM 仓库负责 `adapter/gateway/route/平台凭据/delivery`，HarborBeacon 负责 `conversation turn/business state/active frame/approval/artifact/audit`。
 > 两边只通过 HTTP/JSON contract 通信，不互相 import，也不共享 `.harborbeacon/*.json`。  
 > 本仓库只负责 HarborBeacon 侧工作项；IM 仓库能力只作为外部依赖与联调对象跟踪。  
-> 协作术语统一以 `HarborBeacon-Harbor-Collaboration-Contract-v2` 与 `harbor-*` lane 命名为准。
+> 协作术语统一以 `HarborBeacon-Harbor-Collaboration-Contract-v3` 与 `harbor-*` lane 命名为准。
 >
 > 当前进展快照（2026-04-30）
 > 已合并：HarborBeacon v2.0 turn core、MMRAG/knowledge search/preview、VLM sidecar packaging、Harbor Assistant validation/docs、HarborGate v2.0 delivery guard、HarborNAS WebUI Harbor Assistant/Search native pages。

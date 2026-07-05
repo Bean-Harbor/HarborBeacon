@@ -59,7 +59,7 @@ envelopes.
 检查 HarborBeacon 对 HarborGate v2.0 contract 的实现情况，并完成最小必要改动。
 
 边界：
-先读 HarborBeacon-Harbor-Collaboration-Contract-v2.md、HarborBeacon-LocalAgent-Roadmap.md、HarborBeacon-LocalAgent-Plan.md，以及 HarborGate 仓库里的 HarborBeacon-HarborGate-Agent-Contract-v2.0.md。
+先读 HarborBeacon-Harbor-Collaboration-Contract-v3.md、HarborBeacon-LocalAgent-Roadmap.md、HarborBeacon-LocalAgent-Plan.md，以及 HarborGate 仓库里的 HarborBeacon-HarborGate-Agent-Contract-v2.0.md。
 不要扩大 contract surface。
 不要修改 HarborGate 仓库。
 

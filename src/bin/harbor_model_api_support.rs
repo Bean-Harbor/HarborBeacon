@@ -53,6 +53,7 @@ const CANDLE_OUTPUT_POLICY_PROMPT: &str =
 pub enum BackendKind {
     Candle,
     OpenAIProxy,
+    SemanticRouter,
 }
 
 impl BackendKind {
@@ -60,6 +61,7 @@ impl BackendKind {
         match self {
             Self::Candle => "candle",
             Self::OpenAIProxy => "openai_proxy",
+            Self::SemanticRouter => "semantic_router",
         }
     }
 }
@@ -77,8 +79,11 @@ impl FromStr for BackendKind {
         match value.trim().to_ascii_lowercase().as_str() {
             "candle" => Ok(Self::Candle),
             "openai_proxy" | "openai-proxy" | "proxy" => Ok(Self::OpenAIProxy),
+            "semantic_router" | "semantic-router" | "nsp" | "nsp_router" | "nsp-router" => {
+                Ok(Self::SemanticRouter)
+            }
             other => Err(format!(
-                "unsupported backend '{other}'; expected candle or openai_proxy"
+                "unsupported backend '{other}'; expected candle, openai_proxy, or semantic_router"
             )),
         }
     }
@@ -338,6 +343,7 @@ impl ModelApiService {
                 config.embedding_model.clone(),
                 config.request_timeout_ms,
             )),
+            BackendKind::SemanticRouter => BackendRuntime::SemanticRouter(SemanticRouterBackend),
         };
         Self { config, backend }
     }
@@ -434,6 +440,7 @@ struct BackendSummary {
 enum BackendRuntime {
     Candle(CandleBackend),
     OpenAIProxy(OpenAIProxyBackend),
+    SemanticRouter(SemanticRouterBackend),
 }
 
 impl fmt::Debug for BackendRuntime {
@@ -441,6 +448,7 @@ impl fmt::Debug for BackendRuntime {
         match self {
             Self::Candle(_) => f.write_str("BackendRuntime::Candle"),
             Self::OpenAIProxy(_) => f.write_str("BackendRuntime::OpenAIProxy"),
+            Self::SemanticRouter(_) => f.write_str("BackendRuntime::SemanticRouter"),
         }
     }
 }
@@ -450,6 +458,7 @@ impl Clone for BackendRuntime {
         match self {
             Self::Candle(value) => Self::Candle(value.clone()),
             Self::OpenAIProxy(value) => Self::OpenAIProxy(value.clone()),
+            Self::SemanticRouter(value) => Self::SemanticRouter(value.clone()),
         }
     }
 }
@@ -459,6 +468,7 @@ impl BackendRuntime {
         match self {
             Self::Candle(backend) => backend.health(config),
             Self::OpenAIProxy(backend) => backend.health(config),
+            Self::SemanticRouter(backend) => backend.health(config),
         }
     }
 
@@ -473,6 +483,7 @@ impl BackendRuntime {
             Self::OpenAIProxy(backend) => {
                 backend.forward_json("/chat/completions", &config.chat_model, headers, body)
             }
+            Self::SemanticRouter(backend) => backend.chat_completions(config, body),
         }
     }
 
@@ -487,8 +498,625 @@ impl BackendRuntime {
             Self::OpenAIProxy(backend) => {
                 backend.forward_json("/embeddings", &config.embedding_model, headers, body)
             }
+            Self::SemanticRouter(backend) => backend.embeddings(config),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct SemanticRouterBackend;
+
+impl SemanticRouterBackend {
+    fn health(&self, config: &ModelApiConfig) -> HealthReport {
+        HealthReport {
+            service: SERVICE_NAME,
+            status: HEALTH_OK,
+            backend: BackendSummary {
+                kind: BackendKind::SemanticRouter.as_str(),
+                ready: true,
+                model_loaded: Some(true),
+                note: Some(
+                    "local-only closed-decision semantic router; no cloud fallback".to_string(),
+                ),
+            },
+            bind: config.bind.clone(),
+            upstream_base_url: config.upstream_base_url.clone(),
+            chat_model: Some(config.chat_model.clone()),
+            embedding_model: None,
+            note: Some("resident NSP returns schema-controlled HarborBeacon decisions".to_string()),
+            ready: true,
+        }
+    }
+
+    fn chat_completions(&self, config: &ModelApiConfig, body: &[u8]) -> Response<Cursor<Vec<u8>>> {
+        let request = match parse_semantic_router_request(body) {
+            Ok(request) => request,
+            Err(error) => {
+                return error_response(
+                    StatusCode(400),
+                    "VALIDATION_ERROR",
+                    &error,
+                    BackendKind::SemanticRouter.as_str(),
+                );
+            }
+        };
+        let decision = semantic_router_decision(&request);
+        let content = serde_json::to_string(&decision).unwrap_or_else(|_| {
+            r#"{"decision":"clarify","confidence":0.5,"reason":"serialization_failed"}"#.to_string()
+        });
+        let prompt_tokens = rough_token_count(&request.raw_prompt);
+        let completion_tokens = rough_token_count(&content);
+        json_response(
+            StatusCode(200),
+            &json!({
+                "id": format!("chatcmpl-{}", current_timestamp_ms()),
+                "object": "chat.completion",
+                "created": current_timestamp_secs(),
+                "model": config.chat_model.clone(),
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": content,
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                },
+                "experimental": {
+                    "backend": BackendKind::SemanticRouter.as_str(),
+                    "mode": "local-only-closed-decision-nsp",
+                },
+                "bind": config.bind,
+            }),
+        )
+    }
+
+    fn embeddings(&self, _config: &ModelApiConfig) -> Response<Cursor<Vec<u8>>> {
+        error_response(
+            StatusCode(404),
+            "UNSUPPORTED_ENDPOINT",
+            "semantic_router backend only supports /v1/chat/completions",
+            BackendKind::SemanticRouter.as_str(),
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SemanticRouterRequest {
+    raw_prompt: String,
+    user_message: String,
+}
+
+fn parse_semantic_router_request(body: &[u8]) -> Result<SemanticRouterRequest, String> {
+    let payload: Value =
+        serde_json::from_slice(body).map_err(|error| format!("invalid JSON body: {error}"))?;
+    let messages = payload
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "messages must be a non-empty array".to_string())?;
+    if messages.is_empty() {
+        return Err("messages must be a non-empty array".to_string());
+    }
+    let mut raw_segments = Vec::new();
+    let mut latest_user = None;
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user")
+            .trim();
+        let content = extract_candle_message_content(message)
+            .ok_or_else(|| format!("message content missing or unsupported for role {role}"))?;
+        raw_segments.push(content.clone());
+        if role != "system" && role != "assistant" {
+            latest_user = Some(content);
+        }
+    }
+    let raw_prompt = raw_segments.join("\n");
+    let user_message = latest_user
+        .as_deref()
+        .and_then(extract_router_user_message)
+        .unwrap_or_else(|| latest_user.clone().unwrap_or_else(|| raw_prompt.clone()))
+        .trim()
+        .to_string();
+    Ok(SemanticRouterRequest {
+        raw_prompt,
+        user_message,
+    })
+}
+
+fn extract_router_user_message(prompt: &str) -> Option<String> {
+    prompt.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("User message:")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn semantic_router_decision(request: &SemanticRouterRequest) -> Value {
+    let text = request.user_message.trim();
+    let lower = text.to_ascii_lowercase();
+    let mut decision = "conversation_continue";
+    let mut confidence = 0.86;
+    let mut home_assistant = json!({"domain": null, "service": null, "entity_hint": null});
+    let mut camera_hint = Value::Null;
+    let mut query = Value::Null;
+    let mut guardian_rule = Value::Null;
+    let mut corrected_summary = Value::Null;
+    let mut corrected_labels = Value::Null;
+
+    let stress = contains_any(text, &lower, &["evt", "stress", "压测", "压力测试"]);
+    if stress
+        && contains_any(
+            text,
+            &lower,
+            &[
+                "开始", "启动", "执行", "跑", "run", "start", "72", "4h", "4小时",
+            ],
+        )
+    {
+        decision = "conversation_boundary";
+        confidence = 0.97;
+    } else if contains_any(
+        text,
+        &lower,
+        &[
+            "天气",
+            "新闻",
+            "股票",
+            "股价",
+            "实时外部",
+            "weather",
+            "news",
+            "stock",
+        ],
+    ) {
+        decision = "conversation_boundary";
+        confidence = 0.96;
+    } else if (stress && contains_any(text, &lower, &["证据", "bundle", "evidence"]))
+        || contains_any(text, &lower, &["压测证据", "evt证据", "证据包"])
+    {
+        decision = "evt_evidence_bundle";
+        confidence = 0.96;
+    } else if contains_any(text, &lower, &["预检", "preflight"])
+        || (stress && contains_any(text, &lower, &["环境检查", "检查一下", "做一下"]))
+    {
+        decision = "evt_preflight";
+        confidence = 0.96;
+    } else if stress
+        && contains_any(
+            text,
+            &lower,
+            &["状态", "准备", "ready", "readiness", "怎么样", "能不能进"],
+        )
+    {
+        decision = "evt_readiness";
+        confidence = 0.95;
+    } else if contains_any(text, &lower, &["你能干什么", "帮助", "help", "能力"]) {
+        decision = "capability_summary";
+        confidence = 0.95;
+    } else if semantic_router_asks_for_family_memory_favorites(text, &lower) {
+        decision = "family_memory_show_favorites";
+        confidence = 0.95;
+    } else if let Some(labels) = semantic_router_family_memory_corrected_labels(text, &lower) {
+        decision = "family_memory_correct_labels";
+        confidence = 0.95;
+        corrected_labels = json!(labels);
+    } else if let Some(summary) = semantic_router_family_memory_corrected_summary(text, &lower) {
+        decision = "family_memory_correct_summary";
+        confidence = 0.95;
+        corrected_summary = json!(summary);
+    } else if semantic_router_asks_to_favorite_family_memory(text, &lower) {
+        decision = "family_memory_favorite";
+        confidence = 0.95;
+    } else if semantic_router_asks_to_hide_family_memory(text, &lower) {
+        decision = "family_memory_hide";
+        confidence = 0.95;
+    } else if semantic_router_confirms_family_memory(text, &lower) {
+        decision = "family_memory_confirm";
+        confidence = 0.94;
+    } else if contains_any(
+        text,
+        &lower,
+        &[
+            "家庭守护状态",
+            "守护状态",
+            "guardian status",
+            "home guardian",
+        ],
+    ) {
+        decision = "guardian_status";
+        confidence = 0.94;
+    } else if contains_any(
+        text,
+        &lower,
+        &[
+            "启用这个规则",
+            "启用规则",
+            "启用",
+            "武装",
+            "armed",
+            "enable rule",
+        ],
+    ) {
+        decision = "guardian_rule_enable";
+        confidence = 0.94;
+    } else if contains_any(
+        text,
+        &lower,
+        &[
+            "暂停这个规则",
+            "暂停规则",
+            "取消这个规则",
+            "取消规则",
+            "取消",
+            "pause rule",
+        ],
+    ) {
+        decision = "guardian_rule_pause";
+        confidence = 0.94;
+    } else if semantic_router_looks_like_guardian_rule(text, &lower) {
+        decision = "guardian_rule_proposal";
+        confidence = 0.94;
+        camera_hint = infer_camera_hint(text);
+        if let Some(ha) = infer_semantic_router_home_assistant(text, &lower) {
+            home_assistant = ha.clone();
+            guardian_rule = json!({
+                "trigger": semantic_router_guardian_trigger(text),
+                "action_plan": {
+                    "actions": [{
+                        "kind": "ha_service_action",
+                        "domain": ha.get("domain").cloned().unwrap_or(Value::Null),
+                        "service": ha.get("service").cloned().unwrap_or(Value::Null),
+                        "entity_hint": ha.get("entity_hint").cloned().unwrap_or(Value::Null),
+                        "fields": {},
+                    }]
+                }
+            });
+        } else {
+            guardian_rule = json!({
+                "trigger": semantic_router_guardian_trigger(text),
+                "action_plan": {
+                    "actions": [{
+                        "kind": "notify_default_target"
+                    }]
+                }
+            });
+        }
+    } else if contains_any(
+        text,
+        &lower,
+        &[
+            "今天家里发生了什么",
+            "家里发生了什么",
+            "家庭时间线",
+            "family timeline",
+        ],
+    ) {
+        decision = "family_timeline_summary";
+        confidence = 0.94;
+    } else if contains_any(
+        text,
+        &lower,
+        &[
+            "值得注意",
+            "注意的",
+            "需要注意",
+            "worth noticing",
+            "noteworthy",
+        ],
+    ) {
+        decision = "family_memory_summary";
+        confidence = 0.94;
+        query = json!(text);
+    } else if contains_any(
+        text,
+        &lower,
+        &["今天有人", "有人来过", "门口今天", "今天门口", "家里今天"],
+    ) {
+        decision = "family_timeline_query";
+        confidence = 0.93;
+        camera_hint = infer_camera_hint(text);
+        query = json!(text);
+    } else if contains_any(
+        text,
+        &lower,
+        &["通知最新事件", "发送最新事件", "通知默认", "notify"],
+    ) {
+        decision = "vision_event_notify_latest";
+        confidence = 0.94;
+    } else if contains_any(
+        text,
+        &lower,
+        &["最近事件", "最新摄像头事件", "最近看见", "event"],
+    ) {
+        if semantic_router_asks_to_understand_visual_event(text, &lower) {
+            decision = "vlm_describe_latest_event";
+            confidence = 0.95;
+            camera_hint = infer_camera_hint(text);
+        } else {
+            decision = "vision_event_summary";
+            confidence = 0.94;
+        }
+    } else if contains_any(
+        text,
+        &lower,
+        &["录", "录像", "短视频", "视频", "clip", "record"],
+    ) {
+        decision = "camera_record_clip";
+        confidence = 0.94;
+        camera_hint = infer_camera_hint(text);
+    } else if semantic_router_asks_to_understand_visual_event(text, &lower) {
+        decision = "vlm_describe_latest_event";
+        confidence = 0.95;
+        camera_hint = infer_camera_hint(text);
+    } else if contains_any(
+        text,
+        &lower,
+        &["拍", "抓拍", "截图", "snapshot", "camera", "门口"],
+    ) {
+        decision = "camera_snapshot";
+        confidence = 0.93;
+        camera_hint = infer_camera_hint(text);
+    } else if let Some(ha) = infer_semantic_router_home_assistant(text, &lower) {
+        decision = "ha_service_action";
+        confidence = 0.94;
+        home_assistant = ha;
+    } else if contains_any(
+        text,
+        &lower,
+        &["状态", "诊断", "微信状态", "health", "diagnostics"],
+    ) {
+        decision = "system_readiness";
+        confidence = 0.92;
+    } else if contains_any(text, &lower, &["搜索", "查找", "找一下", "search"]) {
+        decision = "knowledge_search";
+        confidence = 0.88;
+        query = json!(text);
+    } else if text.ends_with('？') || text.ends_with('?') {
+        decision = "rag_answer";
+        confidence = 0.82;
+        query = json!(text);
+    }
+
+    json!({
+        "decision": decision,
+        "confidence": confidence,
+        "canonical_phrase": decision,
+        "camera_hint": camera_hint,
+        "query": query,
+        "home_assistant": home_assistant,
+        "guardian_rule": guardian_rule,
+        "corrected_summary": corrected_summary,
+        "corrected_labels": corrected_labels,
+        "conversation_act": Value::Null,
+        "reply_text": Value::Null,
+        "reason": "local_only_semantic_router_backend",
+    })
+}
+
+fn semantic_router_asks_for_family_memory_favorites(text: &str, lower: &str) -> bool {
+    contains_any(
+        text,
+        lower,
+        &["收藏的家庭记忆", "收藏的记忆", "收藏事件", "favorites"],
+    ) && contains_any(text, lower, &["看", "列", "显示", "show", "list"])
+}
+
+fn semantic_router_asks_to_favorite_family_memory(text: &str, lower: &str) -> bool {
+    contains_any(text, lower, &["收藏", "favorite", "save"])
+        && contains_any(text, lower, &["这个", "这条", "事件", "记忆", "it"])
+        && !semantic_router_asks_for_family_memory_favorites(text, lower)
+}
+
+fn semantic_router_asks_to_hide_family_memory(text: &str, lower: &str) -> bool {
+    contains_any(text, lower, &["隐藏", "不显示", "hide"])
+        && contains_any(text, lower, &["这个", "这条", "事件", "记忆", "it"])
+}
+
+fn semantic_router_confirms_family_memory(text: &str, lower: &str) -> bool {
+    contains_any(
+        text,
+        lower,
+        &["有用", "确认", "对的", "没错", "useful", "confirm"],
+    ) && contains_any(text, lower, &["这个", "这条", "事件", "记忆", "it"])
+}
+
+fn semantic_router_family_memory_corrected_summary(text: &str, lower: &str) -> Option<String> {
+    if !contains_any(
+        text,
+        lower,
+        &[
+            "不对",
+            "不是",
+            "其实是",
+            "应该是",
+            "改成",
+            "修正为",
+            "correct",
+        ],
+    ) {
+        return None;
+    }
+    for marker in ["其实是", "应该是", "修正为", "改成", "不是", "是"] {
+        if let Some((_, tail)) = text.split_once(marker) {
+            let summary = tail
+                .trim()
+                .trim_matches(|ch: char| matches!(ch, '。' | '，' | ',' | '.' | '：' | ':'));
+            if !summary.is_empty() && summary.chars().count() <= 160 {
+                return Some(summary.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn semantic_router_family_memory_corrected_labels(text: &str, lower: &str) -> Option<Vec<String>> {
+    if !contains_any(text, lower, &["标签", "label", "labels"]) {
+        return None;
+    }
+    let raw = ["改成", "修正为", "是", ":", "："]
+        .iter()
+        .find_map(|marker| text.split_once(marker).map(|(_, tail)| tail))
+        .unwrap_or(text);
+    let labels = raw
+        .split(|ch: char| matches!(ch, ',' | '，' | '、' | '/' | ' '))
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .filter(|label| !matches!(*label, "标签" | "改成" | "修正为"))
+        .take(12)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    (!labels.is_empty()).then_some(labels)
+}
+
+fn semantic_router_asks_to_understand_visual_event(text: &str, lower: &str) -> bool {
+    let visual_target = contains_any(
+        text,
+        lower,
+        &[
+            "最新事件",
+            "最近事件",
+            "刚才",
+            "门口",
+            "摄像头",
+            "画面",
+            "event",
+        ],
+    );
+    let understand_verb = contains_any(
+        text,
+        lower,
+        &[
+            "发生了什么",
+            "看一下",
+            "看看",
+            "看下",
+            "理解",
+            "描述",
+            "说明",
+            "到底是什么",
+            "what happened",
+            "describe",
+            "understand",
+        ],
+    );
+    visual_target && understand_verb
+}
+
+fn contains_any(text: &str, lower_ascii: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| {
+        if needle.is_ascii() {
+            lower_ascii.contains(&needle.to_ascii_lowercase())
+        } else {
+            text.contains(needle)
+        }
+    })
+}
+
+fn semantic_router_looks_like_guardian_rule(text: &str, lower: &str) -> bool {
+    let has_guardian_trigger = contains_any(
+        text,
+        lower,
+        &[
+            "以后",
+            "将来",
+            "下次",
+            "如果",
+            "有人",
+            "检测到",
+            "when",
+            "whenever",
+        ],
+    );
+    let has_notify_action = contains_any(text, lower, &["通知", "提醒", "发给我"]);
+    let has_safe_ha_action = infer_semantic_router_home_assistant(text, lower).is_some();
+    has_guardian_trigger && (has_notify_action || has_safe_ha_action)
+}
+
+fn semantic_router_guardian_trigger(text: &str) -> Value {
+    let camera_hint = infer_camera_hint(text);
+    let mut labels = Vec::new();
+    let event_type = if text.contains("人") || text.to_ascii_lowercase().contains("person") {
+        labels.push("person");
+        "person_detected"
+    } else if text.contains("车") || text.to_ascii_lowercase().contains("vehicle") {
+        labels.push("vehicle");
+        "vehicle_detected"
+    } else if text.contains("宠物") || text.contains("猫") || text.contains("狗") {
+        labels.push("pet");
+        "pet_detected"
+    } else {
+        "motion_like_scene"
+    };
+    json!({
+        "camera_id": camera_hint,
+        "event_type": event_type,
+        "labels": labels,
+        "min_confidence": 0.6,
+        "local_time_window": {
+            "start": "00:00",
+            "end": "23:59",
+        },
+        "metadata_only": true,
+    })
+}
+
+fn infer_camera_hint(text: &str) -> Value {
+    for hint in ["门口", "前门", "客厅", "车库", "院子"] {
+        if text.contains(hint) {
+            return json!(hint);
+        }
+    }
+    Value::Null
+}
+
+fn infer_semantic_router_home_assistant(text: &str, lower: &str) -> Option<Value> {
+    let mentions_light = contains_any(text, lower, &["灯", "light"]);
+    let service = if contains_any(text, lower, &["打开", "开灯", "开启", "turn on"])
+        || (mentions_light && text.contains('开'))
+    {
+        "turn_on"
+    } else if contains_any(text, lower, &["关闭", "关灯", "turn off"])
+        || (mentions_light && text.contains('关'))
+    {
+        "turn_off"
+    } else if contains_any(text, lower, &["切换", "toggle"]) {
+        "toggle"
+    } else if contains_any(text, lower, &["执行", "运行", "启动"]) {
+        "turn_on"
+    } else {
+        return None;
+    };
+
+    let (domain, hint) = if contains_any(text, lower, &["场景", "scene"]) {
+        ("scene", "测试")
+    } else if mentions_light {
+        ("light", "灯")
+    } else if contains_any(text, lower, &["input_boolean"]) {
+        ("input_boolean", "input_boolean")
+    } else if contains_any(text, lower, &["开关", "switch"]) {
+        ("switch", "开关")
+    } else {
+        return None;
+    };
+
+    Some(json!({
+        "domain": domain,
+        "service": if domain == "scene" { "turn_on" } else { service },
+        "entity_hint": hint,
+    }))
+}
+
+fn rough_token_count(text: &str) -> usize {
+    text.split_whitespace().count().max(1)
 }
 
 #[derive(Debug, Clone)]
@@ -2121,7 +2749,7 @@ fn fail(message: &str) -> ! {
 
 fn print_usage() {
     eprintln!(
-        "Usage: harbor-model-api [--bind ADDR] [--backend candle|openai_proxy] [--upstream-base-url URL] [--chat-model NAME] [--embedding-model NAME] [--request-timeout-ms N] [--candle-model-id ID] [--candle-chat-model-id ID] [--candle-embedding-model-id ID] [--candle-cache-dir DIR] [--candle-max-new-tokens N] [--candle-temperature F]"
+        "Usage: harbor-model-api [--bind ADDR] [--backend candle|openai_proxy|semantic_router] [--upstream-base-url URL] [--chat-model NAME] [--embedding-model NAME] [--request-timeout-ms N] [--candle-model-id ID] [--candle-chat-model-id ID] [--candle-embedding-model-id ID] [--candle-cache-dir DIR] [--candle-max-new-tokens N] [--candle-temperature F]"
     );
 }
 
@@ -2145,6 +2773,10 @@ pub fn print_startup_banner(config: &ModelApiConfig) {
             config.chat_model,
             config.embedding_model
         ),
+        BackendKind::SemanticRouter => println!(
+            "{} listening on http://{} (backend {}, local-only closed-decision NSP, chat model {})",
+            SERVICE_NAME, config.bind, config.backend, config.chat_model
+        ),
     }
 }
 
@@ -2166,7 +2798,12 @@ mod tests {
             "openai-proxy".parse::<BackendKind>().unwrap(),
             BackendKind::OpenAIProxy
         );
+        assert_eq!(
+            "semantic-router".parse::<BackendKind>().unwrap(),
+            BackendKind::SemanticRouter
+        );
         assert_eq!(BackendKind::OpenAIProxy.to_string(), "openai_proxy");
+        assert_eq!(BackendKind::SemanticRouter.to_string(), "semantic_router");
     }
 
     #[test]
@@ -2176,6 +2813,188 @@ mod tests {
         });
         normalize_model(&mut payload, "harbor-local-chat");
         assert_eq!(payload["model"], json!("harbor-local-chat"));
+    }
+
+    #[test]
+    fn semantic_router_backend_routes_evt_closed_decisions() {
+        for (message, expected) in [
+            ("User message: 压测前状态怎么样", "evt_readiness"),
+            ("User message: 帮我做一下EVT预检", "evt_preflight"),
+            ("User message: 生成压测证据", "evt_evidence_bundle"),
+            ("User message: 开始72小时压测", "conversation_boundary"),
+        ] {
+            let body = json!({
+                "messages": [
+                    {"role": "system", "content": "Return JSON only."},
+                    {"role": "user", "content": message}
+                ]
+            });
+            let request =
+                parse_semantic_router_request(serde_json::to_vec(&body).unwrap().as_slice())
+                    .expect("semantic router request");
+            let decision = semantic_router_decision(&request);
+            assert_eq!(decision["decision"], json!(expected));
+            assert!(decision["confidence"].as_f64().unwrap_or_default() >= 0.9);
+        }
+    }
+
+    #[test]
+    fn semantic_router_backend_extracts_safe_home_assistant_slots() {
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "User message: 执行测试场景"}
+            ]
+        });
+        let request = parse_semantic_router_request(serde_json::to_vec(&body).unwrap().as_slice())
+            .expect("semantic router request");
+        let decision = semantic_router_decision(&request);
+        assert_eq!(decision["decision"], json!("ha_service_action"));
+        assert_eq!(decision["home_assistant"]["domain"], json!("scene"));
+        assert_eq!(decision["home_assistant"]["service"], json!("turn_on"));
+    }
+
+    #[test]
+    fn semantic_router_backend_routes_family_guardian_decisions() {
+        for (message, expected) in [
+            (
+                "User message: 今天家里发生了什么",
+                "family_timeline_summary",
+            ),
+            ("User message: 门口今天有人来过吗", "family_timeline_query"),
+            ("User message: 家庭守护状态", "guardian_status"),
+            ("User message: 启用这个规则", "guardian_rule_enable"),
+        ] {
+            let body = json!({
+                "messages": [
+                    {"role": "user", "content": message}
+                ]
+            });
+            let request =
+                parse_semantic_router_request(serde_json::to_vec(&body).unwrap().as_slice())
+                    .expect("semantic router request");
+            let decision = semantic_router_decision(&request);
+            assert_eq!(decision["decision"], json!(expected));
+            assert!(decision["confidence"].as_f64().unwrap_or_default() >= 0.9);
+        }
+
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "User message: 以后门口有人就通知我"}
+            ]
+        });
+        let request = parse_semantic_router_request(serde_json::to_vec(&body).unwrap().as_slice())
+            .expect("semantic router request");
+        let decision = semantic_router_decision(&request);
+        assert_eq!(decision["decision"], json!("guardian_rule_proposal"));
+        assert_eq!(
+            decision["guardian_rule"]["action_plan"]["actions"][0]["kind"],
+            json!("notify_default_target")
+        );
+        assert_eq!(
+            decision["guardian_rule"]["trigger"]["event_type"],
+            json!("person_detected")
+        );
+
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "User message: 有人到门口就开门口灯"}
+            ]
+        });
+        let request = parse_semantic_router_request(serde_json::to_vec(&body).unwrap().as_slice())
+            .expect("semantic router request");
+        let decision = semantic_router_decision(&request);
+        assert_eq!(decision["decision"], json!("guardian_rule_proposal"));
+        assert_eq!(
+            decision["guardian_rule"]["action_plan"]["actions"][0]["kind"],
+            json!("ha_service_action")
+        );
+        assert_eq!(
+            decision["guardian_rule"]["action_plan"]["actions"][0]["domain"],
+            json!("light")
+        );
+        assert_eq!(
+            decision["guardian_rule"]["action_plan"]["actions"][0]["service"],
+            json!("turn_on")
+        );
+    }
+
+    #[test]
+    fn semantic_router_backend_routes_vlm_family_memory_decisions() {
+        for (message, expected) in [
+            (
+                "User message: 刚才门口发生了什么",
+                "vlm_describe_latest_event",
+            ),
+            (
+                "User message: 帮我看一下最新事件",
+                "vlm_describe_latest_event",
+            ),
+            (
+                "User message: 今天家里有什么值得注意的",
+                "family_memory_summary",
+            ),
+        ] {
+            let body = json!({
+                "messages": [
+                    {"role": "system", "content": "Return JSON only."},
+                    {"role": "user", "content": message}
+                ]
+            });
+            let request =
+                parse_semantic_router_request(serde_json::to_vec(&body).unwrap().as_slice())
+                    .expect("semantic router request");
+            let decision = semantic_router_decision(&request);
+            assert_eq!(decision["decision"], json!(expected));
+            assert!(decision["confidence"].as_f64().unwrap_or_default() >= 0.9);
+        }
+    }
+
+    #[test]
+    fn semantic_router_backend_routes_family_memory_feedback_decisions() {
+        for (message, expected) in [
+            ("User message: 收藏这个", "family_memory_favorite"),
+            ("User message: 隐藏这个事件", "family_memory_hide"),
+            ("User message: 这个有用", "family_memory_confirm"),
+            (
+                "User message: 看我收藏的家庭记忆",
+                "family_memory_show_favorites",
+            ),
+        ] {
+            let body = json!({
+                "messages": [
+                    {"role": "system", "content": "Return JSON only."},
+                    {"role": "user", "content": message}
+                ]
+            });
+            let request =
+                parse_semantic_router_request(serde_json::to_vec(&body).unwrap().as_slice())
+                    .expect("semantic router request");
+            let decision = semantic_router_decision(&request);
+            assert_eq!(decision["decision"], json!(expected));
+            assert!(decision["confidence"].as_f64().unwrap_or_default() >= 0.9);
+        }
+
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "User message: 这个不对，是快递"}
+            ]
+        });
+        let request = parse_semantic_router_request(serde_json::to_vec(&body).unwrap().as_slice())
+            .expect("semantic router request");
+        let decision = semantic_router_decision(&request);
+        assert_eq!(decision["decision"], json!("family_memory_correct_summary"));
+        assert_eq!(decision["corrected_summary"], json!("快递"));
+
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "User message: 标签改成 快递 门口"}
+            ]
+        });
+        let request = parse_semantic_router_request(serde_json::to_vec(&body).unwrap().as_slice())
+            .expect("semantic router request");
+        let decision = semantic_router_decision(&request);
+        assert_eq!(decision["decision"], json!("family_memory_correct_labels"));
+        assert_eq!(decision["corrected_labels"], json!(["快递", "门口"]));
     }
 
     #[test]

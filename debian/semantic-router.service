@@ -1,0 +1,19 @@
+[Unit]
+Description=HarborOS Semantic Router NSP Service
+After=network.target
+
+[Service]
+Type=simple
+Environment=HARBOR_MODEL_API_BIND=127.0.0.1:4176
+Environment=HARBOR_MODEL_API_BACKEND=semantic_router
+Environment=HARBOR_MODEL_API_CHAT_MODEL=Qwen/Qwen2.5-0.5B-Instruct
+Environment=HARBOR_MODEL_API_CANDLE_MAX_NEW_TOKENS=128
+Environment=HARBOR_MODEL_API_CANDLE_TEMPERATURE=0.1
+EnvironmentFile=-/etc/default/semantic-router
+ExecStart=/usr/bin/harbor-model-api
+Restart=always
+RestartSec=5s
+StateDirectory=semantic-router
+
+[Install]
+WantedBy=multi-user.target

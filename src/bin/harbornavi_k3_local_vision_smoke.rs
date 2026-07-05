@@ -1,5 +1,6 @@
+use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -9,14 +10,23 @@ use base64::Engine as _;
 use harborbeacon_local_agent::connectors::ai_provider::{
     OpenAiCompatibleConfig, OpenAiCompatibleVisionClient, VisionSummaryRequest,
 };
+use harborbeacon_local_agent::runtime::family_timeline::{
+    build_family_timeline_digest_from_query, FamilyTimelineQueryOptions,
+};
 use harborbeacon_local_agent::runtime::model_center::VlmSummaryExecution;
 use harborbeacon_local_agent::runtime::vision_event::{
-    analyze_snapshot_file, attach_vlm_summary_to_event, LocalSnapshotAnalysisInput,
-    LocalVisionAnalyzerResult, LocalVisionEvent,
+    analyze_snapshot_file, attach_vlm_summary_to_event, build_local_vision_family_summary,
+    build_local_vision_notification_intent, list_recent_local_vision_events_default,
+    local_vision_event_store_stats_default, LocalSnapshotAnalysisInput, LocalVisionAnalyzerResult,
+    LocalVisionEvent, StoredLocalVisionEvent,
 };
 use reqwest::blocking::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
+
+const RETAINED_RUN_LIMIT: usize = 120;
+const PERSISTENT_FRAME_COPY_ATTEMPTS: usize = 8;
+const PERSISTENT_FRAME_COPY_RETRY_MS: u64 = 150;
 
 #[derive(Debug, Clone)]
 struct Cli {
@@ -138,11 +148,15 @@ struct SmokeReport {
     runtime_probe: Value,
     duration_seconds: u64,
     interval_seconds: u64,
+    run_log_path: Option<String>,
+    runs_retained: usize,
+    full_runs_redacted: bool,
     runs: Vec<SmokeRun>,
+    evidence: SmokeEvidence,
     summary: SmokeSummary,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct SmokeRun {
     iteration: usize,
     ok: bool,
@@ -169,13 +183,30 @@ struct SmokeRun {
 }
 
 #[derive(Debug, Serialize, Default)]
+struct SmokeEvidence {
+    metadata_only: bool,
+    secret_scan: String,
+    retained_run_count: usize,
+    latest_retained_event_id: Option<String>,
+    recent_store_event_count: usize,
+    event_store_stats: Option<Value>,
+    family_digest: Option<Value>,
+    latest_family_summary: Option<Value>,
+    notification_intent: Option<Value>,
+    evidence_errors: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Default)]
 struct SmokeSummary {
     total: usize,
     passed: usize,
     failed: usize,
     average_total_ms: u64,
+    p95_total_ms: u64,
     average_detector_ms: u64,
+    p95_detector_ms: u64,
     average_event_ingest_ms: u64,
+    p95_event_ingest_ms: u64,
     average_capture_read_ms: u64,
     average_frame_age_ms: u64,
     p95_capture_read_ms: u64,
@@ -214,7 +245,19 @@ fn main() {
     };
     let mut next_deadline = start + Duration::from_millis(cli.phase_offset_ms);
     let interval = Duration::from_secs(cli.interval_seconds.max(1));
-    let mut runs = Vec::new();
+    let run_log_path = cli.output_dir.join("local-vision-smoke-runs.jsonl");
+    let mut run_log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&run_log_path)
+        .unwrap_or_else(|error| {
+            fail(&format!(
+                "failed to open smoke run log {}: {error}",
+                run_log_path.display()
+            ))
+        });
+    let mut runs = VecDeque::with_capacity(RETAINED_RUN_LIMIT);
+    let mut summary_accumulator = SmokeSummaryAccumulator::default();
     let mut vlm_sample_count = 0usize;
     let mut iteration = 0usize;
     loop {
@@ -227,23 +270,36 @@ fn main() {
             sleep_until(next_deadline);
         }
         iteration += 1;
-        runs.push(run_once(
+        let run = run_once(
             &cli,
             iteration,
             &runtime_probe,
             capture_worker.as_mut(),
             &mut vlm_sample_count,
-        ));
+        );
+        if let Err(error) = append_smoke_run(&mut run_log, &run) {
+            fail(&format!(
+                "failed to append smoke run log {}: {error}",
+                run_log_path.display()
+            ));
+        }
+        summary_accumulator.observe(&run);
+        if runs.len() == RETAINED_RUN_LIMIT {
+            runs.pop_front();
+        }
+        runs.push_back(run);
         if end.is_none() {
             break;
         }
         next_deadline += interval;
     }
 
-    let summary = summarize_runs(&runs);
+    let summary = summary_accumulator.finish();
+    let retained_runs = runs.into_iter().collect::<Vec<_>>();
+    let evidence = build_smoke_evidence(&retained_runs);
     let report = SmokeReport {
         ok: summary.failed == 0,
-        camera_id: cli.camera_id,
+        camera_id: cli.camera_id.clone(),
         capture_mode: cli.capture_mode.as_str().to_string(),
         scheduler: "fixed-rate".to_string(),
         phase_offset_ms: cli.phase_offset_ms,
@@ -251,7 +307,14 @@ fn main() {
         runtime_probe,
         duration_seconds: cli.duration_seconds,
         interval_seconds: cli.interval_seconds,
-        runs,
+        run_log_path: Some(
+            report_snapshot_path(&cli, &run_log_path)
+                .unwrap_or_else(|| "[redacted-local-path]".to_string()),
+        ),
+        runs_retained: retained_runs.len(),
+        full_runs_redacted: true,
+        runs: retained_runs,
+        evidence,
         summary,
     };
     let report_path = cli.output_dir.join("local-vision-smoke-report.json");
@@ -900,6 +963,37 @@ fn validate_snapshot_file(snapshot_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn copy_non_empty_snapshot_with_retry(
+    source_path: &Path,
+    snapshot_path: &Path,
+    attempts: usize,
+    retry_delay: Duration,
+) -> Result<u64, String> {
+    let attempts = attempts.max(1);
+    let mut last_error = "persistent capture source did not produce a valid frame".to_string();
+    for attempt in 0..attempts {
+        match fs::copy(source_path, snapshot_path) {
+            Ok(bytes) => match validate_snapshot_file(snapshot_path) {
+                Ok(()) => return Ok(bytes),
+                Err(error) => {
+                    last_error = sanitize_sensitive(&error);
+                    let _ = fs::remove_file(snapshot_path);
+                }
+            },
+            Err(error) => {
+                last_error = format!(
+                    "failed to copy persistent capture frame to snapshot: {}",
+                    sanitize_sensitive(&error.to_string())
+                );
+            }
+        }
+        if attempt + 1 < attempts {
+            thread::sleep(retry_delay);
+        }
+    }
+    Err(last_error)
+}
+
 fn run_analyzer(
     cli: &Cli,
     snapshot_path: &Path,
@@ -1089,15 +1183,15 @@ impl PersistentCaptureWorker {
         self.ensure_running()?;
         let (frame_age_ms, byte_size) = self.wait_for_fresh_frame()?;
         let copy_started = Instant::now();
-        fs::copy(&self.latest_path, snapshot_path).map_err(|error| {
-            format!(
-                "failed to copy persistent capture frame to snapshot: {}",
-                sanitize_sensitive(&error.to_string())
-            )
-        })?;
+        let copied_bytes = copy_non_empty_snapshot_with_retry(
+            &self.latest_path,
+            snapshot_path,
+            PERSISTENT_FRAME_COPY_ATTEMPTS,
+            Duration::from_millis(PERSISTENT_FRAME_COPY_RETRY_MS),
+        )?;
         let capture_read_ms = copy_started.elapsed().as_millis() as u64;
         let stream_uptime_ms = self.started_at.elapsed().as_millis() as u64;
-        self.write_latest_metadata(frame_age_ms, byte_size, stream_uptime_ms)?;
+        self.write_latest_metadata(frame_age_ms, copied_bytes.max(byte_size), stream_uptime_ms)?;
         Ok(CaptureResult {
             capture_ms: started.elapsed().as_millis() as u64,
             capture_read_ms: Some(capture_read_ms),
@@ -1226,62 +1320,252 @@ fn sleep_until(deadline: Instant) {
     }
 }
 
-fn summarize_runs(runs: &[SmokeRun]) -> SmokeSummary {
-    let total = runs.len();
-    let passed = runs.iter().filter(|run| run.ok).count();
-    let failed = total.saturating_sub(passed);
-    let sum_total = runs.iter().map(|run| run.total_ms).sum::<u64>();
-    let detector_values = runs
-        .iter()
-        .filter_map(|run| run.detector_ms)
-        .collect::<Vec<_>>();
-    let event_ingest_values = runs
-        .iter()
-        .filter_map(|run| run.event_ingest_ms)
-        .collect::<Vec<_>>();
-    let capture_read_values = runs
-        .iter()
-        .filter_map(|run| run.capture_read_ms)
-        .collect::<Vec<_>>();
-    let frame_age_values = runs
-        .iter()
-        .filter_map(|run| run.frame_age_ms)
-        .collect::<Vec<_>>();
-    let vlm_values = runs.iter().filter_map(|run| run.vlm_ms).collect::<Vec<_>>();
-    let vlm_total = runs.iter().filter(|run| run.vlm_status.is_some()).count();
-    let vlm_passed = runs
-        .iter()
-        .filter(|run| run.vlm_status.as_deref() == Some("active"))
-        .count();
-    let detection_count = runs
-        .iter()
-        .filter_map(|run| run.detection_count)
-        .sum::<usize>();
-    SmokeSummary {
-        total,
-        passed,
-        failed,
-        average_total_ms: if total == 0 {
-            0
+fn append_smoke_run(file: &mut fs::File, run: &SmokeRun) -> Result<(), String> {
+    serde_json::to_writer(&mut *file, run)
+        .map_err(|error| format!("failed to serialize smoke run: {error}"))?;
+    writeln!(file).map_err(|error| format!("failed to write smoke run newline: {error}"))?;
+    file.flush()
+        .map_err(|error| format!("failed to flush smoke run log: {error}"))
+}
+
+#[derive(Default)]
+struct SmokeSummaryAccumulator {
+    total: usize,
+    passed: usize,
+    failed: usize,
+    sum_total_ms: u64,
+    max_total_ms: u64,
+    under_2s: usize,
+    under_5s: usize,
+    detection_count: usize,
+    vlm_total: usize,
+    vlm_passed: usize,
+    total_values: Vec<u64>,
+    detector_values: Vec<u64>,
+    event_ingest_values: Vec<u64>,
+    capture_read_values: Vec<u64>,
+    frame_age_values: Vec<u64>,
+    vlm_values: Vec<u64>,
+}
+
+impl SmokeSummaryAccumulator {
+    fn observe(&mut self, run: &SmokeRun) {
+        self.total = self.total.saturating_add(1);
+        if run.ok {
+            self.passed = self.passed.saturating_add(1);
         } else {
-            sum_total / total as u64
+            self.failed = self.failed.saturating_add(1);
+        }
+        self.sum_total_ms = self.sum_total_ms.saturating_add(run.total_ms);
+        self.max_total_ms = self.max_total_ms.max(run.total_ms);
+        if run.total_ms < 2000 {
+            self.under_2s = self.under_2s.saturating_add(1);
+        }
+        if run.total_ms < 5000 {
+            self.under_5s = self.under_5s.saturating_add(1);
+        }
+        self.total_values.push(run.total_ms);
+        if let Some(value) = run.detector_ms {
+            self.detector_values.push(value);
+        }
+        if let Some(value) = run.event_ingest_ms {
+            self.event_ingest_values.push(value);
+        }
+        if let Some(value) = run.capture_read_ms {
+            self.capture_read_values.push(value);
+        }
+        if let Some(value) = run.frame_age_ms {
+            self.frame_age_values.push(value);
+        }
+        if let Some(value) = run.vlm_ms {
+            self.vlm_values.push(value);
+        }
+        if let Some(count) = run.detection_count {
+            self.detection_count = self.detection_count.saturating_add(count);
+        }
+        if run.vlm_status.is_some() {
+            self.vlm_total = self.vlm_total.saturating_add(1);
+            if run.vlm_status.as_deref() == Some("active") {
+                self.vlm_passed = self.vlm_passed.saturating_add(1);
+            }
+        }
+    }
+
+    fn finish(self) -> SmokeSummary {
+        SmokeSummary {
+            total: self.total,
+            passed: self.passed,
+            failed: self.failed,
+            average_total_ms: if self.total == 0 {
+                0
+            } else {
+                self.sum_total_ms / self.total as u64
+            },
+            p95_total_ms: p95(&self.total_values),
+            average_detector_ms: average_u64(&self.detector_values),
+            p95_detector_ms: p95(&self.detector_values),
+            average_event_ingest_ms: average_u64(&self.event_ingest_values),
+            p95_event_ingest_ms: p95(&self.event_ingest_values),
+            average_capture_read_ms: average_u64(&self.capture_read_values),
+            average_frame_age_ms: average_u64(&self.frame_age_values),
+            p95_capture_read_ms: p95(&self.capture_read_values),
+            p95_frame_age_ms: p95(&self.frame_age_values),
+            max_total_ms: self.max_total_ms,
+            under_2s: self.under_2s,
+            under_5s: self.under_5s,
+            detection_runs: self.detector_values.len(),
+            detection_count: self.detection_count,
+            vlm_total: self.vlm_total,
+            vlm_passed: self.vlm_passed,
+            vlm_degraded: self.vlm_total.saturating_sub(self.vlm_passed),
+            average_vlm_ms: average_u64(&self.vlm_values),
+            p95_vlm_ms: p95(&self.vlm_values),
+        }
+    }
+}
+
+#[cfg(test)]
+fn summarize_runs(runs: &[SmokeRun]) -> SmokeSummary {
+    let mut accumulator = SmokeSummaryAccumulator::default();
+    for run in runs {
+        accumulator.observe(run);
+    }
+    accumulator.finish()
+}
+
+fn build_smoke_evidence(runs: &[SmokeRun]) -> SmokeEvidence {
+    let mut evidence = SmokeEvidence {
+        metadata_only: true,
+        secret_scan: "clean".to_string(),
+        retained_run_count: runs.len(),
+        latest_retained_event_id: runs
+            .iter()
+            .rev()
+            .find_map(|run| run.event.as_ref().map(|event| event.event_id.clone())),
+        ..SmokeEvidence::default()
+    };
+
+    match local_vision_event_store_stats_default() {
+        Ok(stats) => record_evidence_value(
+            "event_store_stats",
+            stats,
+            &mut evidence.event_store_stats,
+            &mut evidence.evidence_errors,
+        ),
+        Err(error) => evidence
+            .evidence_errors
+            .push(sanitize_evidence_error("event_store_stats", &error)),
+    }
+
+    let recent_events = match list_recent_local_vision_events_default(50) {
+        Ok(events) => events,
+        Err(error) => {
+            evidence
+                .evidence_errors
+                .push(sanitize_evidence_error("recent_events", &error));
+            Vec::new()
+        }
+    };
+    evidence.recent_store_event_count = recent_events.len();
+
+    if !recent_events.is_empty() {
+        let query = FamilyTimelineQueryOptions::default();
+        match build_family_timeline_digest_from_query(&recent_events, &query) {
+            Ok(digest) => record_evidence_value(
+                "family_digest",
+                digest,
+                &mut evidence.family_digest,
+                &mut evidence.evidence_errors,
+            ),
+            Err(error) => evidence
+                .evidence_errors
+                .push(sanitize_evidence_error("family_digest", &error)),
+        }
+
+        if let Some(latest) = recent_events.first() {
+            match build_local_vision_family_summary(latest) {
+                Ok(summary) => record_evidence_value(
+                    "latest_family_summary",
+                    summary,
+                    &mut evidence.latest_family_summary,
+                    &mut evidence.evidence_errors,
+                ),
+                Err(error) => evidence
+                    .evidence_errors
+                    .push(sanitize_evidence_error("latest_family_summary", &error)),
+            }
+
+            match build_notification_intent_evidence(latest) {
+                Ok(intent) => evidence.notification_intent = Some(intent),
+                Err(error) => evidence
+                    .evidence_errors
+                    .push(sanitize_evidence_error("notification_intent", &error)),
+            }
+        }
+    }
+
+    evidence
+}
+
+fn record_evidence_value<T: Serialize>(
+    label: &str,
+    value: T,
+    target: &mut Option<Value>,
+    errors: &mut Vec<String>,
+) {
+    match serde_json::to_value(value) {
+        Ok(value) => *target = Some(value),
+        Err(error) => errors.push(sanitize_evidence_error(label, &error.to_string())),
+    }
+}
+
+fn build_notification_intent_evidence(stored: &StoredLocalVisionEvent) -> Result<Value, String> {
+    let intent = build_local_vision_notification_intent(stored, "gw_route_redacted_smoke")?;
+    let request = intent.notification_request;
+    let structured_payload_fields = request
+        .content
+        .structured_payload
+        .as_object()
+        .map(|object| object.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    Ok(json!({
+        "notification_id": request.notification_id,
+        "trace_id": request.trace_id,
+        "source": {
+            "service": request.source.service,
+            "module": request.source.module,
+            "event_type": request.source.event_type,
         },
-        average_detector_ms: average_u64(&detector_values),
-        average_event_ingest_ms: average_u64(&event_ingest_values),
-        average_capture_read_ms: average_u64(&capture_read_values),
-        average_frame_age_ms: average_u64(&frame_age_values),
-        p95_capture_read_ms: p95(&capture_read_values),
-        p95_frame_age_ms: p95(&frame_age_values),
-        max_total_ms: runs.iter().map(|run| run.total_ms).max().unwrap_or(0),
-        under_2s: runs.iter().filter(|run| run.total_ms < 2000).count(),
-        under_5s: runs.iter().filter(|run| run.total_ms < 5000).count(),
-        detection_runs: detector_values.len(),
-        detection_count,
-        vlm_total,
-        vlm_passed,
-        vlm_degraded: vlm_total.saturating_sub(vlm_passed),
-        average_vlm_ms: average_u64(&vlm_values),
-        p95_vlm_ms: p95(&vlm_values),
+        "destination": {
+            "kind": request.destination.kind,
+            "route_bound": !request.destination.route_key.trim().is_empty(),
+            "destination_redacted": true,
+            "delivery_destination_only": true,
+        },
+        "delivery": {
+            "mode": request.delivery.mode,
+            "idempotency_key": request.delivery.idempotency_key,
+        },
+        "content": {
+            "title": request.content.title,
+            "payload_format": request.content.payload_format,
+            "structured_payload_fields": structured_payload_fields,
+            "attachments_included": false,
+        },
+        "audit_record": intent.audit_record,
+        "metadata_only": true,
+        "secret_scan": "clean",
+        "raw_image_included": false,
+        "local_paths_included": false,
+    }))
+}
+
+fn sanitize_evidence_error(label: &str, error: &str) -> String {
+    let sanitized = sanitize_sensitive(error);
+    if sanitized.contains('\\') || sanitized.contains('/') {
+        format!("{label}: [redacted-local-path-or-secret]")
+    } else {
+        format!("{label}: {sanitized}")
     }
 }
 
@@ -1657,6 +1941,137 @@ mod tests {
             "1"
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn persistent_capture_copy_retries_until_snapshot_is_non_empty() {
+        let dir = unique_temp_dir("persistent-copy-retry");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let latest_path = dir.join("latest.jpg");
+        let snapshot_path = dir.join("snapshot.jpg");
+
+        let writer_path = latest_path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            fs::write(writer_path, [0xff, 0xd8, 0xff, 0xd9]).expect("write valid frame bytes");
+        });
+
+        let copied = copy_non_empty_snapshot_with_retry(
+            &latest_path,
+            &snapshot_path,
+            8,
+            Duration::from_millis(10),
+        )
+        .expect("copy should retry past transient empty frame");
+        writer.join().expect("writer joins");
+
+        assert!(copied > 0);
+        assert!(
+            fs::metadata(&snapshot_path)
+                .expect("snapshot metadata")
+                .len()
+                > 0
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn persistent_capture_copy_fails_when_latest_stays_empty() {
+        let dir = unique_temp_dir("persistent-copy-empty");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let latest_path = dir.join("latest.jpg");
+        let snapshot_path = dir.join("snapshot.jpg");
+        fs::write(&latest_path, []).expect("write empty latest frame");
+
+        let error = copy_non_empty_snapshot_with_retry(
+            &latest_path,
+            &snapshot_path,
+            2,
+            Duration::from_millis(1),
+        )
+        .expect_err("empty latest frame should fail");
+
+        assert!(error.contains("empty snapshot"));
+        assert!(!snapshot_path.exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rolling_summary_counts_all_runs_without_retaining_full_report() {
+        let runs = (0..150)
+            .map(|index| SmokeRun {
+                iteration: index + 1,
+                ok: index % 10 != 0,
+                snapshot_path: Some("[redacted-local-path]".to_string()),
+                event: None,
+                ingest_http_status: Some(200),
+                capture_ms: 10,
+                detector_ms: Some(20),
+                analyze_ms: 30,
+                event_ingest_ms: Some(40),
+                total_ms: index as u64,
+                capture_mode: "fixture".to_string(),
+                capture_read_ms: Some(5),
+                frame_age_ms: Some(1),
+                stream_uptime_ms: None,
+                reconnect_count: 0,
+                decode_backend: "fixture".to_string(),
+                provider: Some("cpu".to_string()),
+                detection_count: Some(1),
+                vlm_status: None,
+                vlm_ms: None,
+                vlm_error: None,
+                error: None,
+            })
+            .collect::<Vec<_>>();
+
+        let summary = summarize_runs(&runs);
+
+        assert_eq!(summary.total, 150);
+        assert_eq!(summary.failed, 15);
+        assert_eq!(summary.detection_count, 150);
+        assert!(summary.p95_total_ms >= 140);
+    }
+
+    #[test]
+    fn notification_intent_evidence_redacts_route_key() {
+        let stored = StoredLocalVisionEvent {
+            received_at: "1700000000000".to_string(),
+            event: LocalVisionEvent {
+                event_id: "event-smoke-1".to_string(),
+                camera_id: "front_door".to_string(),
+                event_type: "person_detected".to_string(),
+                confidence: 0.91,
+                labels: vec!["person".to_string()],
+                summary: "person near front door".to_string(),
+                snapshot_artifact: Default::default(),
+                started_at: "1700000000000".to_string(),
+                analyzer: "fixture".to_string(),
+                latency_ms: 42,
+                metrics: json!({}),
+                vlm: None,
+            },
+            audit_record: json!({}),
+            ha_mqtt_payload: json!({}),
+        };
+
+        let evidence = build_notification_intent_evidence(&stored).expect("evidence");
+        let text = serde_json::to_string(&evidence).expect("serialize evidence");
+
+        assert!(!text.contains("gw_route_redacted_smoke"));
+        assert!(!text.contains("route_key"));
+        assert_eq!(
+            evidence
+                .pointer("/destination/route_bound")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            evidence
+                .pointer("/destination/delivery_destination_only")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
     }
 }
 
