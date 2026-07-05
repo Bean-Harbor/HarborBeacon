@@ -38,6 +38,12 @@ use harborbeacon_local_agent::connectors::notifications::{
     NotificationDeliveryError, NotificationDeliveryRecord, NotificationDeliveryService,
 };
 use harborbeacon_local_agent::connectors::storage::StorageTarget;
+use harborbeacon_local_agent::control_plane::apps::{
+    build_harbor_app_registry_entry, validate_app_manifest, HarborAppExposure,
+    HarborAppExposureRequest, HarborAppHealthResponse, HarborAppInstallRequest,
+    HarborAppInstallResponse, HarborAppLifecycleRequest, HarborAppLifecycleResponse,
+    HarborAppListResponse, HarborAppLogsResponse, HarborAppPathRoots, HarborAppRuntimeStatus,
+};
 use harborbeacon_local_agent::control_plane::audit::{
     build_audit_summary, build_metadata_audit_record, query_audit_records, AuditActorKind,
     AuditRecord, AuditRecordQuery,
@@ -55,6 +61,10 @@ use harborbeacon_local_agent::control_plane::routing::{
 };
 use harborbeacon_local_agent::control_plane::tasks::TaskStepRun;
 use harborbeacon_local_agent::control_plane::users::{MembershipStatus, RoleKind};
+use harborbeacon_local_agent::orchestrator::executors::harbor_apps::{
+    build_harbor_app_execution_plan, harbor_app_execution_plan_snapshot, HarborAppExecutorConfig,
+    HarborAppLifecycleAction,
+};
 use harborbeacon_local_agent::runtime::access_control::{
     authorize_access, AccessAction, AccessIdentityHints, AccessPrincipal,
 };
@@ -2265,6 +2275,28 @@ impl AdminApi {
             Method::Get if path == "/api/audit/summary" => {
                 self.handle_audit_summary(&raw_url, &identity_hints).boxed()
             }
+            Method::Get if path == "/api/apps" => self.handle_harbor_apps(&identity_hints).boxed(),
+            Method::Post if path == "/api/apps/install" => self
+                .handle_harbor_app_install(&mut request, &identity_hints)
+                .boxed(),
+            Method::Post
+                if path.starts_with("/api/apps/")
+                    && (path.ends_with("/start")
+                        || path.ends_with("/stop")
+                        || path.ends_with("/restart")) =>
+            {
+                self.handle_harbor_app_lifecycle(&path, &mut request, &identity_hints)
+                    .boxed()
+            }
+            Method::Get if path.starts_with("/api/apps/") && path.ends_with("/health") => self
+                .handle_harbor_app_health(&path, &identity_hints)
+                .boxed(),
+            Method::Get if path.starts_with("/api/apps/") && path.ends_with("/logs") => {
+                self.handle_harbor_app_logs(&path, &identity_hints).boxed()
+            }
+            Method::Post if path.starts_with("/api/apps/") && path.ends_with("/exposure") => self
+                .handle_harbor_app_exposure(&path, &mut request, &identity_hints)
+                .boxed(),
             Method::Get if path == "/api/knowledge/settings" => {
                 self.handle_knowledge_settings(&identity_hints).boxed()
             }
@@ -3205,6 +3237,432 @@ impl AdminApi {
             Ok(records) => ok_json(&build_audit_summary(&records, window)),
             Err(error) => error_json(StatusCode(500), &error),
         }
+    }
+
+    fn handle_harbor_apps(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        match self.admin_store.harbor_apps() {
+            Ok(apps) => ok_json(&HarborAppListResponse {
+                apps,
+                metadata_only: true,
+            }),
+            Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
+    fn handle_harbor_app_install(
+        &self,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
+        let body: HarborAppInstallRequest = match read_json_body(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let validation = validate_app_manifest(&body.manifest);
+        if !validation.ok {
+            return error_json(StatusCode(400), &validation.errors.join("; "));
+        }
+        let plan = match build_harbor_app_execution_plan(
+            &body.manifest,
+            HarborAppLifecycleAction::Install,
+            &HarborAppExecutorConfig::default(),
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let plan_snapshot = harbor_app_execution_plan_snapshot(&plan);
+        let now = now_unix_string();
+        let (mut entry, validation) = match build_harbor_app_registry_entry(
+            body.manifest,
+            &HarborAppPathRoots::default(),
+            now.clone(),
+            now.clone(),
+        ) {
+            Ok(result) => result,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        entry.last_requested_action = Some("install".to_string());
+        entry.last_execution_plan = Some(plan_snapshot.clone());
+        let audit_id = if body.dry_run {
+            None
+        } else {
+            match self.append_harbor_app_audit(
+                &principal,
+                &entry.app_id,
+                "harbor_app.install.plan",
+                json!({
+                    "dry_run": false,
+                    "operator_note": body.operator_note.clone(),
+                    "manifest": entry.manifest.clone(),
+                }),
+                json!({
+                    "status": "registered",
+                    "metadata_only": true,
+                    "execution_plan": plan_snapshot,
+                }),
+            ) {
+                Ok(audit_id) => audit_id,
+                Err(error) => return error_json(StatusCode(500), &error),
+            }
+        };
+        entry.last_audit_id = audit_id.clone();
+        let entry = if body.dry_run {
+            entry
+        } else {
+            match self.admin_store.upsert_harbor_app(entry) {
+                Ok(entry) => entry,
+                Err(error) => return error_json(StatusCode(500), &error),
+            }
+        };
+        ok_json(&HarborAppInstallResponse {
+            app: entry,
+            dry_run: body.dry_run,
+            validation,
+            execution_plan: plan_snapshot,
+            audit_id,
+            metadata_only: true,
+        })
+    }
+
+    fn handle_harbor_app_lifecycle(
+        &self,
+        path: &str,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
+        let Some((app_id, action, action_label)) = parse_harbor_app_lifecycle_path(path) else {
+            return error_json(StatusCode(404), "Harbor app lifecycle route not found");
+        };
+        let body: HarborAppLifecycleRequest = match read_json_body_or_default(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let entry = match self.admin_store.harbor_app(&app_id) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => return error_json(StatusCode(404), "Harbor app is not registered"),
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let plan = match build_harbor_app_execution_plan(
+            &entry.manifest,
+            action,
+            &HarborAppExecutorConfig::default(),
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let plan_snapshot = harbor_app_execution_plan_snapshot(&plan);
+        let audit_id = if body.dry_run {
+            None
+        } else {
+            match self.append_harbor_app_audit(
+                &principal,
+                &entry.app_id,
+                &plan_snapshot.audit_action,
+                json!({
+                    "dry_run": false,
+                    "operator_note": body.operator_note.clone(),
+                    "action": action_label,
+                }),
+                json!({
+                    "status": "plan_ready",
+                    "metadata_only": true,
+                    "execution_plan": plan_snapshot,
+                }),
+            ) {
+                Ok(audit_id) => audit_id,
+                Err(error) => return error_json(StatusCode(500), &error),
+            }
+        };
+        let app = if body.dry_run {
+            let mut app = entry.clone();
+            app.status = HarborAppRuntimeStatus::PlanReady;
+            app.last_requested_action = Some(action_label.clone());
+            app.last_execution_plan = Some(plan_snapshot.clone());
+            app
+        } else {
+            match self.admin_store.record_harbor_app_plan(
+                &entry.app_id,
+                HarborAppRuntimeStatus::PlanReady,
+                action_label.clone(),
+                plan_snapshot.clone(),
+                audit_id.clone(),
+                now_unix_string(),
+            ) {
+                Ok(app) => app,
+                Err(error) => return error_json(StatusCode(500), &error),
+            }
+        };
+        ok_json(&HarborAppLifecycleResponse {
+            app,
+            action: action_label,
+            status: HarborAppRuntimeStatus::PlanReady,
+            dry_run: body.dry_run,
+            approval_required: plan_snapshot.requires_approval,
+            message: "Execution plan generated; no Docker command was executed.".to_string(),
+            execution_plan: plan_snapshot,
+            audit_id,
+            metadata_only: true,
+        })
+    }
+
+    fn handle_harbor_app_health(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let Some(app_id) = parse_harbor_app_path(path, "/health") else {
+            return error_json(StatusCode(404), "Harbor app health route not found");
+        };
+        let entry = match self.admin_store.harbor_app(&app_id) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => return error_json(StatusCode(404), "Harbor app is not registered"),
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        match build_harbor_app_execution_plan(
+            &entry.manifest,
+            HarborAppLifecycleAction::Health,
+            &HarborAppExecutorConfig::default(),
+        ) {
+            Ok(plan) => ok_json(&HarborAppHealthResponse {
+                app_id,
+                status: HarborAppRuntimeStatus::Unknown,
+                message: "Health is metadata-only in App Manager v1; materializer is not active."
+                    .to_string(),
+                execution_plan: harbor_app_execution_plan_snapshot(&plan),
+                metadata_only: true,
+            }),
+            Err(error) => error_json(StatusCode(400), &error),
+        }
+    }
+
+    fn handle_harbor_app_logs(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let Some(app_id) = parse_harbor_app_path(path, "/logs") else {
+            return error_json(StatusCode(404), "Harbor app logs route not found");
+        };
+        let entry = match self.admin_store.harbor_app(&app_id) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => return error_json(StatusCode(404), "Harbor app is not registered"),
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        match build_harbor_app_execution_plan(
+            &entry.manifest,
+            HarborAppLifecycleAction::Logs,
+            &HarborAppExecutorConfig::default(),
+        ) {
+            Ok(plan) => ok_json(&HarborAppLogsResponse {
+                app_id,
+                status: HarborAppRuntimeStatus::Unknown,
+                lines: Vec::new(),
+                message: "Logs are metadata-only in App Manager v1; materializer is not active."
+                    .to_string(),
+                execution_plan: harbor_app_execution_plan_snapshot(&plan),
+                metadata_only: true,
+            }),
+            Err(error) => error_json(StatusCode(400), &error),
+        }
+    }
+
+    fn handle_harbor_app_exposure(
+        &self,
+        path: &str,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
+        let Some(app_id) = parse_harbor_app_path(path, "/exposure") else {
+            return error_json(StatusCode(404), "Harbor app exposure route not found");
+        };
+        let body: HarborAppExposureRequest = match read_json_body(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let entry = match self.admin_store.harbor_app(&app_id) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => return error_json(StatusCode(404), "Harbor app is not registered"),
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let action = if body.exposure == HarborAppExposure::None {
+            HarborAppLifecycleAction::DisableExposure
+        } else {
+            HarborAppLifecycleAction::EnableExposure
+        };
+        let plan = match build_harbor_app_execution_plan(
+            &entry.manifest,
+            action,
+            &HarborAppExecutorConfig::default(),
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let plan_snapshot = harbor_app_execution_plan_snapshot(&plan);
+        if body.exposure == HarborAppExposure::Tunnel {
+            let audit_id = if body.dry_run {
+                None
+            } else {
+                match self.append_harbor_app_audit(
+                    &principal,
+                    &entry.app_id,
+                    "harbor_app.exposure.approval_required",
+                    json!({
+                        "dry_run": false,
+                        "operator_note": body.operator_note.clone(),
+                        "requested_exposure": body.exposure,
+                    }),
+                    json!({
+                        "status": "approval_required",
+                        "metadata_only": true,
+                        "execution_plan": plan_snapshot,
+                    }),
+                ) {
+                    Ok(audit_id) => audit_id,
+                    Err(error) => return error_json(StatusCode(500), &error),
+                }
+            };
+            let app = if body.dry_run {
+                let mut app = entry.clone();
+                app.status = HarborAppRuntimeStatus::ApprovalRequired;
+                app.last_requested_action = Some("exposure".to_string());
+                app.last_execution_plan = Some(plan_snapshot.clone());
+                app
+            } else {
+                match self.admin_store.record_harbor_app_plan(
+                    &entry.app_id,
+                    HarborAppRuntimeStatus::ApprovalRequired,
+                    "exposure",
+                    plan_snapshot.clone(),
+                    audit_id.clone(),
+                    now_unix_string(),
+                ) {
+                    Ok(app) => app,
+                    Err(error) => return error_json(StatusCode(500), &error),
+                }
+            };
+            return json_response(
+                StatusCode(409),
+                &HarborAppLifecycleResponse {
+                    app,
+                    action: "exposure".to_string(),
+                    status: HarborAppRuntimeStatus::ApprovalRequired,
+                    dry_run: body.dry_run,
+                    approval_required: true,
+                    message: "Tunnel exposure requires an approval ticket; no tunnel was opened."
+                        .to_string(),
+                    execution_plan: plan_snapshot,
+                    audit_id,
+                    metadata_only: true,
+                },
+            );
+        }
+        let audit_id = if body.dry_run {
+            None
+        } else {
+            match self.append_harbor_app_audit(
+                &principal,
+                &entry.app_id,
+                &plan_snapshot.audit_action,
+                json!({
+                    "dry_run": false,
+                    "operator_note": body.operator_note.clone(),
+                    "requested_exposure": body.exposure,
+                }),
+                json!({
+                    "status": "plan_ready",
+                    "metadata_only": true,
+                    "execution_plan": plan_snapshot,
+                }),
+            ) {
+                Ok(audit_id) => audit_id,
+                Err(error) => return error_json(StatusCode(500), &error),
+            }
+        };
+        let app = if body.dry_run {
+            let mut app = entry.clone();
+            app.exposure = body.exposure;
+            app.manifest.exposure = body.exposure;
+            app.status = HarborAppRuntimeStatus::PlanReady;
+            app.last_requested_action = Some("exposure".to_string());
+            app.last_execution_plan = Some(plan_snapshot.clone());
+            app
+        } else {
+            match self.admin_store.update_harbor_app_exposure(
+                &entry.app_id,
+                body.exposure,
+                HarborAppRuntimeStatus::PlanReady,
+                plan_snapshot.clone(),
+                audit_id.clone(),
+                now_unix_string(),
+            ) {
+                Ok(app) => app,
+                Err(error) => return error_json(StatusCode(500), &error),
+            }
+        };
+        ok_json(&HarborAppLifecycleResponse {
+            app,
+            action: "exposure".to_string(),
+            status: HarborAppRuntimeStatus::PlanReady,
+            dry_run: body.dry_run,
+            approval_required: plan_snapshot.requires_approval,
+            message: "Exposure plan generated; no nginx or tunnel command was executed."
+                .to_string(),
+            execution_plan: plan_snapshot,
+            audit_id,
+            metadata_only: true,
+        })
+    }
+
+    fn append_harbor_app_audit(
+        &self,
+        principal: &AccessPrincipal,
+        app_id: &str,
+        action: &str,
+        request_snapshot: Value,
+        result_snapshot: Value,
+    ) -> Result<Option<String>, String> {
+        let actor_kind = if principal.user_id == "system" {
+            AuditActorKind::System
+        } else {
+            AuditActorKind::User
+        };
+        let record = build_metadata_audit_record(
+            principal.workspace_id.clone(),
+            "harbor_app",
+            app_id,
+            action,
+            actor_kind,
+            principal.user_id.clone(),
+            request_snapshot,
+            result_snapshot,
+        );
+        self.admin_store
+            .append_audit_record(record)
+            .map(|record| Some(record.audit_id))
     }
 
     fn handle_knowledge_settings(
@@ -8145,6 +8603,28 @@ fn parse_query_bool(url: &str, key: &str) -> Option<bool> {
     })
 }
 
+fn parse_harbor_app_path(path: &str, suffix: &str) -> Option<String> {
+    path.strip_prefix("/api/apps/")
+        .and_then(|tail| tail.strip_suffix(suffix))
+        .map(|app_id| app_id.trim_matches('/').to_string())
+        .filter(|app_id| !app_id.is_empty() && !app_id.contains('/'))
+}
+
+fn parse_harbor_app_lifecycle_path(
+    path: &str,
+) -> Option<(String, HarborAppLifecycleAction, String)> {
+    for (suffix, action, label) in [
+        ("/start", HarborAppLifecycleAction::Start, "start"),
+        ("/stop", HarborAppLifecycleAction::Stop, "stop"),
+        ("/restart", HarborAppLifecycleAction::Restart, "restart"),
+    ] {
+        if let Some(app_id) = parse_harbor_app_path(path, suffix) {
+            return Some((app_id, action, label.to_string()));
+        }
+    }
+    None
+}
+
 fn parse_automation_review_action_path(path: &str) -> Option<String> {
     let trimmed = path.strip_prefix("/api/automation/reviews/")?;
     let (review_id, action) = trimmed.rsplit_once('/')?;
@@ -9415,6 +9895,9 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/routing/status"
         || path == "/api/audit/records"
         || path == "/api/audit/summary"
+        || path == "/api/apps"
+        || path == "/api/apps/install"
+        || path.starts_with("/api/apps/")
         || path == "/api/family/timeline"
         || path == "/api/family/timeline/digest"
         || path == "/api/family/memory/events"
@@ -18561,16 +19044,16 @@ mod tests {
         parse_camera_task_snapshot_path, parse_device_credential_status_path,
         parse_device_credentials_path, parse_device_evidence_path,
         parse_device_metadata_patch_path, parse_device_rtsp_check_path,
-        parse_device_validation_run_path, parse_json_body_limited,
-        parse_knowledge_index_job_cancel_path, parse_local_vision_event_notify_path,
-        parse_member_default_delivery_surface_update_path, parse_member_role_update_path,
-        parse_model_download_cancel_path, parse_model_download_job_path, parse_model_endpoint_path,
-        parse_model_endpoint_test_path, parse_model_runtime_install_path,
-        parse_notification_target_delete_path, parse_optional_unix_seconds,
-        parse_share_link_revoke_path, parse_shared_camera_live_page_path,
-        parse_shared_camera_live_stream_path, percent_decode_path_segment,
-        probe_local_model_runtime, redact_account_management_snapshot, redact_admin_string,
-        redact_bridge_provider_config, redact_camera_device_projection,
+        parse_device_validation_run_path, parse_harbor_app_lifecycle_path, parse_harbor_app_path,
+        parse_json_body_limited, parse_knowledge_index_job_cancel_path,
+        parse_local_vision_event_notify_path, parse_member_default_delivery_surface_update_path,
+        parse_member_role_update_path, parse_model_download_cancel_path,
+        parse_model_download_job_path, parse_model_endpoint_path, parse_model_endpoint_test_path,
+        parse_model_runtime_install_path, parse_notification_target_delete_path,
+        parse_optional_unix_seconds, parse_share_link_revoke_path,
+        parse_shared_camera_live_page_path, parse_shared_camera_live_stream_path,
+        percent_decode_path_segment, probe_local_model_runtime, redact_account_management_snapshot,
+        redact_admin_string, redact_bridge_provider_config, redact_camera_device_projection,
         redact_model_endpoint_response, redact_state_snapshot, redact_stream_url_credentials,
         redact_value_stream_credentials, redacted_general_message_nsp_route_summary,
         redacted_home_assistant_task_api_event_summary, release_item, request_identity_hints,
@@ -18596,6 +19079,7 @@ mod tests {
         ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, PrivacyLevel,
     };
     use harborbeacon_local_agent::control_plane::users::{MembershipStatus, RoleKind};
+    use harborbeacon_local_agent::orchestrator::executors::harbor_apps::HarborAppLifecycleAction;
     use harborbeacon_local_agent::runtime::access_control::{
         AccessAction, AccessIdentityHints, AccessPrincipal,
     };
@@ -20255,7 +20739,28 @@ mod tests {
         assert!(is_admin_surface_path(
             "/api/harboros/apps/home-assistant/install"
         ));
+        assert!(is_admin_surface_path("/api/apps"));
+        assert!(is_admin_surface_path("/api/apps/install"));
+        assert!(is_admin_surface_path("/api/apps/finance-audit/start"));
+        assert!(is_admin_surface_path("/api/apps/finance-audit/health"));
         assert!(is_admin_surface_path("/api/models/capabilities"));
+    }
+
+    #[test]
+    fn harbor_app_paths_parse_lifecycle_and_status_routes() {
+        assert_eq!(
+            parse_harbor_app_lifecycle_path("/api/apps/finance-audit/start"),
+            Some((
+                "finance-audit".to_string(),
+                HarborAppLifecycleAction::Start,
+                "start".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_harbor_app_path("/api/apps/finance-audit/logs", "/logs"),
+            Some("finance-audit".to_string())
+        );
+        assert_eq!(parse_harbor_app_path("/api/apps/a/b/logs", "/logs"), None);
     }
 
     #[test]
@@ -20279,6 +20784,10 @@ mod tests {
         assert_eq!(
             normalize_unified_admin_path("/api/beacon/harboros/apps/home-assistant/install"),
             "/api/harboros/apps/home-assistant/install"
+        );
+        assert_eq!(
+            normalize_unified_admin_path("/api/beacon/apps/finance-audit/start"),
+            "/api/apps/finance-audit/start"
         );
         assert_eq!(normalize_unified_admin_path("/api/beacon"), "/api/state");
     }
