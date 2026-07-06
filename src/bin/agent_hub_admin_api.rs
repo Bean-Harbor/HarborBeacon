@@ -3718,11 +3718,11 @@ impl AdminApi {
         let Some(app_id) = parse_harbor_app_path(path, "/delivery-requests") else {
             return error_json(StatusCode(404), "Harbor app delivery route not found");
         };
-        if app_id != "outreach" {
+        if app_id != "ops" {
             return harbor_app_delivery_error_json(
                 StatusCode(404),
                 "APP_DELIVERY_NOT_SUPPORTED",
-                "Delivery handoff is only enabled for outreach in this release.",
+                "Delivery handoff is only enabled for ops in this release.",
                 None,
             );
         }
@@ -3759,7 +3759,7 @@ impl AdminApi {
             let audit_id = match self.append_harbor_app_audit(
                 &principal,
                 &entry.app_id,
-                "harbor_app.outreach.delivery_request.blocked",
+                "harbor_app.ops.delivery_request.blocked",
                 sanitized_outreach_delivery_request_audit(&body),
                 json!({
                     "status": "blocked",
@@ -3784,7 +3784,7 @@ impl AdminApi {
                 let audit_id = match self.append_harbor_app_audit(
                     &principal,
                     &entry.app_id,
-                    "harbor_app.outreach.delivery_request.blocked",
+                    "harbor_app.ops.delivery_request.blocked",
                     sanitized_outreach_delivery_request_audit(&body),
                     json!({
                         "status": "blocked",
@@ -3810,7 +3810,7 @@ impl AdminApi {
                 let audit_id = match self.append_harbor_app_audit(
                     &principal,
                     &entry.app_id,
-                    "harbor_app.outreach.delivery_request.submitted",
+                    "harbor_app.ops.delivery_request.submitted",
                     sanitized_outreach_delivery_request_audit(&body),
                     json!({
                         "status": status,
@@ -3836,7 +3836,7 @@ impl AdminApi {
                 let audit_id = match self.append_harbor_app_audit(
                     &principal,
                     &entry.app_id,
-                    "harbor_app.outreach.delivery_request.rejected",
+                    "harbor_app.ops.delivery_request.rejected",
                     sanitized_outreach_delivery_request_audit(&body),
                     json!({
                         "status": "rejected",
@@ -13597,8 +13597,8 @@ fn build_outreach_delivery_notification_request(
         trace_id: trace_id.clone(),
         source: NotificationSource {
             service: "harborbeacon".to_string(),
-            module: "harbor_app.outreach".to_string(),
-            event_type: "outreach.delivery_request".to_string(),
+            module: "harbor_app.ops".to_string(),
+            event_type: "ops.marketing_outreach.delivery_request".to_string(),
         },
         destination,
         content: NotificationContent {
@@ -13606,7 +13606,7 @@ fn build_outreach_delivery_notification_request(
             body: outreach_delivery_notification_body(request),
             payload_format: NotificationPayloadFormat::PlainText,
             structured_payload: json!({
-                "app_id": "outreach",
+                "app_id": "ops",
                 "product_id": request.product_id,
                 "project_id": request.project_id,
                 "batch_id": request.batch_id,
@@ -13672,7 +13672,7 @@ fn outreach_delivery_destination(
 
 fn outreach_delivery_notification_body(request: &OutreachDeliveryRequest) -> String {
     let mut lines = vec![
-        "Harbor Creator Outreach delivery request".to_string(),
+        "HarborOps marketing outreach delivery request".to_string(),
         format!("Subject: {}", request.subject.trim()),
         String::new(),
         request.body.trim().to_string(),
@@ -13690,14 +13690,14 @@ fn outreach_delivery_notification_body(request: &OutreachDeliveryRequest) -> Str
         format!("Idempotency: {}", request.idempotency_key.trim()),
     ];
     if !request.recipient.contact_email.trim().is_empty() {
-        lines.push("Contact email: configured in outreach envelope".to_string());
+        lines.push("Contact email: configured in delivery envelope".to_string());
     }
     lines.join("\n")
 }
 
 fn sanitized_outreach_delivery_request_audit(request: &OutreachDeliveryRequest) -> Value {
     json!({
-        "app_id": "outreach",
+        "app_id": "ops",
         "product_id": request.product_id,
         "project_id": request.project_id,
         "batch_id": request.batch_id,
@@ -13819,7 +13819,7 @@ fn harbor_app_delivery_error_json(
 
 fn stable_outreach_notification_id(request: &OutreachDeliveryRequest) -> String {
     format!(
-        "notif_outreach_{}_{}",
+        "notif_ops_{}_{}",
         delivery_id_segment(&request.draft_id),
         delivery_id_segment(&request.body_hash)
     )
@@ -19696,7 +19696,7 @@ mod tests {
             subject: "Paper7 collaboration idea".to_string(),
             body_hash: "abcdef1234567890".to_string(),
             body: "Hi Creator,\nWould you be open to a short demo?".to_string(),
-            idempotency_key: "outreach:draft_123:abcdef1234567890".to_string(),
+            idempotency_key: "ops:draft_123:abcdef1234567890".to_string(),
             recipient: OutreachDeliveryRecipientRequest {
                 name: "Home AI Field Notes".to_string(),
                 handle: "@example-home-ai".to_string(),
@@ -19740,8 +19740,11 @@ mod tests {
         let structured_payload =
             serde_json::to_string(&payload["content"]["structured_payload"]).expect("structured");
 
-        assert_eq!(notification.source.module, "harbor_app.outreach");
-        assert_eq!(notification.source.event_type, "outreach.delivery_request");
+        assert_eq!(notification.source.module, "harbor_app.ops");
+        assert_eq!(
+            notification.source.event_type,
+            "ops.marketing_outreach.delivery_request"
+        );
         assert_eq!(
             notification.destination.kind,
             NotificationDestinationKind::Recipient
@@ -19759,12 +19762,13 @@ mod tests {
         );
         assert_eq!(
             notification.delivery.idempotency_key,
-            "outreach:draft_123:abcdef1234567890"
+            "ops:draft_123:abcdef1234567890"
         );
         assert_eq!(
             payload["content"]["structured_payload"]["recipient"]["contact_email_configured"],
             json!(true)
         );
+        assert_eq!(payload["content"]["structured_payload"]["app_id"], json!("ops"));
         assert!(encoded.contains("creator@example.com"));
         assert!(!encoded.contains("gw_route_feishu_mail_default"));
         assert!(!structured_payload.contains("creator@example.com"));
@@ -19796,6 +19800,7 @@ mod tests {
         let encoded = serde_json::to_string(&audit).expect("audit json");
 
         assert_eq!(audit["route_key_included"], json!(false));
+        assert_eq!(audit["app_id"], json!("ops"));
         assert_eq!(audit["platform_credentials_included"], json!(false));
         assert_eq!(audit["recipient"]["contact_email_configured"], json!(true));
         assert_eq!(
