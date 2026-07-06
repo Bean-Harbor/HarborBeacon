@@ -39,7 +39,8 @@ use harborbeacon_local_agent::connectors::notifications::{
     NotificationContent, NotificationDelivery, NotificationDeliveryError, NotificationDeliveryMode,
     NotificationDeliveryRecord, NotificationDeliveryService, NotificationDeliveryStatus,
     NotificationDestination, NotificationDestinationKind, NotificationMetadata,
-    NotificationPayloadFormat, NotificationRequest, NotificationSource,
+    NotificationPayloadFormat, NotificationRecipient, NotificationRecipientIdType,
+    NotificationRequest, NotificationSource,
 };
 use harborbeacon_local_agent::connectors::storage::StorageTarget;
 use harborbeacon_local_agent::control_plane::apps::{
@@ -3776,8 +3777,7 @@ impl AdminApi {
                 audit_id,
             );
         };
-        let notification_request =
-            build_outreach_delivery_notification_request(&body, &target.route_key);
+        let notification_request = build_outreach_delivery_notification_request(&body, &target);
         let service = match NotificationDeliveryService::new() {
             Ok(service) => service,
             Err(error) => {
@@ -13579,15 +13579,19 @@ fn validate_outreach_delivery_request(request: &OutreachDeliveryRequest) -> Resu
     if request.channel.trim() != "feishu_mail" {
         return Err("unsupported delivery channel".to_string());
     }
+    if request.recipient.contact_email.trim().is_empty() {
+        return Err("recipient.contact_email is required for feishu_mail delivery".to_string());
+    }
     Ok(())
 }
 
 fn build_outreach_delivery_notification_request(
     request: &OutreachDeliveryRequest,
-    route_key: &str,
+    target: &NotificationTargetRecord,
 ) -> NotificationRequest {
     let notification_id = stable_outreach_notification_id(request);
     let trace_id = format!("trace_{notification_id}");
+    let destination = outreach_delivery_destination(request, target);
     NotificationRequest {
         notification_id: notification_id.clone(),
         trace_id: trace_id.clone(),
@@ -13596,13 +13600,7 @@ fn build_outreach_delivery_notification_request(
             module: "harbor_app.outreach".to_string(),
             event_type: "outreach.delivery_request".to_string(),
         },
-        destination: NotificationDestination {
-            kind: NotificationDestinationKind::Conversation,
-            route_key: route_key.to_string(),
-            id: String::new(),
-            platform: String::new(),
-            recipient: None,
-        },
+        destination,
         content: NotificationContent {
             title: request.subject.trim().to_string(),
             body: outreach_delivery_notification_body(request),
@@ -13621,6 +13619,8 @@ fn build_outreach_delivery_notification_request(
                     "handle": request.recipient.handle,
                     "platform": request.recipient.platform,
                     "contact_email_configured": !request.recipient.contact_email.trim().is_empty(),
+                    "contact_email_hash": contact_email_hash(&request.recipient.contact_email),
+                    "contact_email_domain": contact_email_domain(&request.recipient.contact_email),
                     "evidence_type": request.recipient.evidence_type,
                     "evidence_url_hash": short_sha256(&request.recipient.evidence_url),
                 },
@@ -13637,6 +13637,36 @@ fn build_outreach_delivery_notification_request(
         metadata: NotificationMetadata {
             correlation_id: trace_id,
         },
+    }
+}
+
+fn outreach_delivery_destination(
+    request: &OutreachDeliveryRequest,
+    target: &NotificationTargetRecord,
+) -> NotificationDestination {
+    if target
+        .platform_hint
+        .trim()
+        .eq_ignore_ascii_case("feishu_mail")
+    {
+        let email = request.recipient.contact_email.trim().to_ascii_lowercase();
+        return NotificationDestination {
+            kind: NotificationDestinationKind::Recipient,
+            route_key: String::new(),
+            id: email.clone(),
+            platform: "feishu_mail".to_string(),
+            recipient: Some(NotificationRecipient {
+                recipient_id: email,
+                recipient_type: NotificationRecipientIdType::Email,
+            }),
+        };
+    }
+    NotificationDestination {
+        kind: NotificationDestinationKind::Conversation,
+        route_key: target.route_key.trim().to_string(),
+        id: String::new(),
+        platform: String::new(),
+        recipient: None,
     }
 }
 
@@ -13682,6 +13712,8 @@ fn sanitized_outreach_delivery_request_audit(request: &OutreachDeliveryRequest) 
             "handle": request.recipient.handle,
             "platform": request.recipient.platform,
             "contact_email_configured": !request.recipient.contact_email.trim().is_empty(),
+            "contact_email_hash": contact_email_hash(&request.recipient.contact_email),
+            "contact_email_domain": contact_email_domain(&request.recipient.contact_email),
             "evidence_type": request.recipient.evidence_type,
             "evidence_url_hash": short_sha256(&request.recipient.evidence_url),
         },
@@ -13689,6 +13721,19 @@ fn sanitized_outreach_delivery_request_audit(request: &OutreachDeliveryRequest) 
         "platform_credentials_included": false,
         "metadata_only": false,
     })
+}
+
+fn contact_email_hash(email: &str) -> Option<String> {
+    let normalized = email.trim().to_ascii_lowercase();
+    (!normalized.is_empty()).then(|| short_sha256(&normalized))
+}
+
+fn contact_email_domain(email: &str) -> Option<String> {
+    email
+        .trim()
+        .rsplit_once('@')
+        .map(|(_, domain)| domain.trim().to_ascii_lowercase())
+        .filter(|domain| !domain.is_empty())
 }
 
 fn harbor_app_delivery_response(
@@ -19530,7 +19575,8 @@ mod tests {
         PRIVACY_GATEWAY_AUDIT_ACTION,
     };
     use harborbeacon_local_agent::connectors::notifications::{
-        NotificationDeliveryError, SharedHttpErrorDetail, SharedHttpErrorEnvelope,
+        NotificationDeliveryError, NotificationDestinationKind, NotificationRecipientIdType,
+        SharedHttpErrorDetail, SharedHttpErrorEnvelope,
     };
     use harborbeacon_local_agent::control_plane::audit::{
         build_metadata_audit_record, AuditActorKind,
@@ -19662,21 +19708,54 @@ mod tests {
         }
     }
 
+    fn sample_feishu_mail_target() -> NotificationTargetRecord {
+        NotificationTargetRecord {
+            target_id: "target-feishu-mail".to_string(),
+            label: "Outreach Mail".to_string(),
+            route_key: "gw_route_feishu_mail_default".to_string(),
+            platform_hint: "feishu_mail".to_string(),
+            is_default: true,
+        }
+    }
+
+    fn sample_route_bound_target() -> NotificationTargetRecord {
+        NotificationTargetRecord {
+            target_id: "target-weixin".to_string(),
+            label: "Weixin".to_string(),
+            route_key: "gw_route_weixin_default".to_string(),
+            platform_hint: "weixin".to_string(),
+            is_default: true,
+        }
+    }
+
     #[test]
-    fn outreach_delivery_request_builds_gate_notification_without_route_leak() {
+    fn outreach_delivery_request_builds_feishu_mail_gate_notification() {
         let request = sample_outreach_delivery_request();
 
         validate_outreach_delivery_request(&request).expect("valid request");
         let notification =
-            build_outreach_delivery_notification_request(&request, "gw_route_feishu_default");
+            build_outreach_delivery_notification_request(&request, &sample_feishu_mail_target());
         let payload = serde_json::to_value(&notification).expect("notification json");
         let encoded = serde_json::to_string(&payload).expect("encoded notification");
+        let structured_payload =
+            serde_json::to_string(&payload["content"]["structured_payload"]).expect("structured");
 
         assert_eq!(notification.source.module, "harbor_app.outreach");
         assert_eq!(notification.source.event_type, "outreach.delivery_request");
         assert_eq!(
-            notification.destination.route_key,
-            "gw_route_feishu_default"
+            notification.destination.kind,
+            NotificationDestinationKind::Recipient
+        );
+        assert_eq!(notification.destination.platform, "feishu_mail");
+        assert_eq!(notification.destination.route_key, "");
+        assert_eq!(notification.destination.id, "creator@example.com");
+        assert_eq!(
+            notification
+                .destination
+                .recipient
+                .as_ref()
+                .map(|recipient| recipient.recipient_type),
+            Some(NotificationRecipientIdType::Email)
         );
         assert_eq!(
             notification.delivery.idempotency_key,
@@ -19686,8 +19765,28 @@ mod tests {
             payload["content"]["structured_payload"]["recipient"]["contact_email_configured"],
             json!(true)
         );
-        assert!(encoded.contains("gw_route_feishu_default"));
-        assert!(!encoded.contains("creator@example.com"));
+        assert!(encoded.contains("creator@example.com"));
+        assert!(!encoded.contains("gw_route_feishu_mail_default"));
+        assert!(!structured_payload.contains("creator@example.com"));
+    }
+
+    #[test]
+    fn outreach_delivery_request_preserves_route_bound_target_for_legacy_surfaces() {
+        let request = sample_outreach_delivery_request();
+
+        let notification =
+            build_outreach_delivery_notification_request(&request, &sample_route_bound_target());
+
+        assert_eq!(
+            notification.destination.kind,
+            NotificationDestinationKind::Conversation
+        );
+        assert_eq!(
+            notification.destination.route_key,
+            "gw_route_weixin_default"
+        );
+        assert_eq!(notification.destination.platform, "");
+        assert!(notification.destination.recipient.is_none());
     }
 
     #[test]
@@ -19699,6 +19798,11 @@ mod tests {
         assert_eq!(audit["route_key_included"], json!(false));
         assert_eq!(audit["platform_credentials_included"], json!(false));
         assert_eq!(audit["recipient"]["contact_email_configured"], json!(true));
+        assert_eq!(
+            audit["recipient"]["contact_email_domain"],
+            json!("example.com")
+        );
+        assert!(audit["recipient"]["contact_email_hash"].as_str().is_some());
         assert_eq!(audit["body_hash"], json!("abcdef1234567890"));
         assert!(!encoded.contains("Paper7 collaboration idea"));
         assert!(!encoded.contains("Would you be open"));

@@ -55,6 +55,7 @@ pub enum NotificationDeliveryMode {
 pub enum NotificationRecipientIdType {
     ChatId,
     OpenId,
+    Email,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
