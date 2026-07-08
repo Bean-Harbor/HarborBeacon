@@ -5065,10 +5065,13 @@ impl AdminApi {
                 Err(error) => return error_json(StatusCode(422), &error).boxed(),
             };
 
-        let file = match fs::File::open(&asset_path) {
-            Ok(file) => file,
+        let (file, metadata) = match open_hls_live_asset_file(&asset_path, &asset_name) {
+            Ok(value) => value,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return error_json(StatusCode(404), "live asset not found").boxed()
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return error_json(StatusCode(503), "live asset is not ready").boxed()
             }
             Err(error) => {
                 return error_json(
@@ -5079,7 +5082,6 @@ impl AdminApi {
             }
         };
 
-        let metadata = file.metadata().ok();
         let headers = vec![
             Header::from_bytes(
                 b"Content-Type".as_slice(),
@@ -15303,12 +15305,17 @@ struct HlsLiveSessionProjection {
 }
 
 const HLS_LIVE_CODEC: &str = "h264_low_latency";
-const HLS_LIVE_TARGET_FPS: &str = "20";
-const HLS_LIVE_SEGMENT_SECONDS: &str = "1";
-const HLS_LIVE_WINDOW_SEGMENTS: &str = "4";
-const HLS_LIVE_VIDEO_BITRATE: &str = "1200k";
-const HLS_LIVE_VIDEO_MAXRATE: &str = "1500k";
-const HLS_LIVE_VIDEO_BUFSIZE: &str = "2400k";
+const HLS_LIVE_TARGET_FPS: &str = "15";
+const HLS_LIVE_SEGMENT_SECONDS: &str = "2";
+const HLS_LIVE_WINDOW_SEGMENTS: &str = "10";
+const HLS_LIVE_VIDEO_BITRATE: &str = "800k";
+const HLS_LIVE_VIDEO_MAXRATE: &str = "1000k";
+const HLS_LIVE_VIDEO_BUFSIZE: &str = "1600k";
+const HLS_LIVE_AUDIO_BITRATE: &str = "64k";
+const HLS_LIVE_FFMPEG_STDERR_LOG: &str = "ffmpeg.stderr.log";
+const HLS_LIVE_ASSET_READY_ATTEMPTS: usize = 8;
+const HLS_LIVE_ASSET_RETRY_DELAY_MS: u64 = 75;
+const HLS_LIVE_START_TIMEOUT_SECONDS: u64 = 24;
 
 impl HlsLiveSessionProjection {
     fn stopped(device_id: &str, message: impl Into<String>) -> Self {
@@ -15350,6 +15357,7 @@ struct HlsLiveRuntime {
 struct HlsLiveRuntimeInner {
     sessions: HashMap<String, HlsLiveSession>,
     device_sessions: HashMap<String, String>,
+    starting_devices: HashSet<String>,
 }
 
 impl HlsLiveRuntime {
@@ -15364,26 +15372,70 @@ impl HlsLiveRuntime {
         }
         let ffmpeg_bin = resolve_ffmpeg_bin()
             .ok_or_else(|| format!("当前机器缺少 ffmpeg，{}", ffmpeg_resolution_hint()))?;
-        let session_id = format!("live-{}", Uuid::new_v4().as_simple());
-        let root = hls_live_root()
-            .join(safe_live_path_segment(device_id))
-            .join(&session_id);
-        if root.exists() {
-            fs::remove_dir_all(&root)
-                .map_err(|error| format!("failed to reset live session directory: {error}"))?;
+        let device_root = hls_live_root().join(safe_live_path_segment(device_id));
+        let existing_session = {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| "live session lock is poisoned".to_string())?;
+            if inner.starting_devices.contains(device_id) {
+                if let Some(existing_session_id) = inner.device_sessions.get(device_id).cloned() {
+                    return Ok(self.projection_locked(
+                        &mut inner,
+                        device_id,
+                        Some(&existing_session_id),
+                    ));
+                }
+                return Err("live session is already starting for camera".to_string());
+            }
+            inner.starting_devices.insert(device_id.to_string());
+            inner
+                .device_sessions
+                .remove(device_id)
+                .and_then(|session_id| inner.sessions.remove(&session_id))
+        };
+        if let Some(mut existing_session) = existing_session {
+            stop_hls_live_session(&mut existing_session);
         }
-        fs::create_dir_all(&root)
-            .map_err(|error| format!("failed to create live session directory: {error}"))?;
+        if let Err(error) = cleanup_stale_hls_live_dirs(&device_root, None) {
+            self.clear_starting_device(device_id);
+            return Err(format!("failed to clean stale live sessions: {error}"));
+        }
+
+        let session_id = format!("live-{}", Uuid::new_v4().as_simple());
+        let root = device_root.join(&session_id);
+        if root.exists() {
+            if let Err(error) = fs::remove_dir_all(&root) {
+                self.clear_starting_device(device_id);
+                return Err(format!("failed to reset live session directory: {error}"));
+            }
+        }
+        if let Err(error) = fs::create_dir_all(&root) {
+            self.clear_starting_device(device_id);
+            return Err(format!("failed to create live session directory: {error}"));
+        }
 
         let playlist_path = root.join("index.m3u8");
+        let stderr_log = match fs::File::create(root.join(HLS_LIVE_FFMPEG_STDERR_LOG)) {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                self.clear_starting_device(device_id);
+                return Err(format!("failed to create live ffmpeg stderr log: {error}"));
+            }
+        };
         let mut child = Command::new(&ffmpeg_bin)
             .current_dir(&root)
             .args(hls_live_ffmpeg_args(stream_url))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr_log))
             .spawn()
-            .map_err(|error| format!("failed to start low-latency H.264 live ffmpeg: {error}"))?;
+            .map_err(|error| {
+                let _ = fs::remove_dir_all(&root);
+                self.clear_starting_device(device_id);
+                format!("failed to start stable H.264 live ffmpeg: {error}")
+            })?;
 
         for _ in 0..20 {
             if playlist_path.exists() {
@@ -15392,13 +15444,17 @@ impl HlsLiveRuntime {
             match child.try_wait() {
                 Ok(Some(status)) => {
                     let _ = fs::remove_dir_all(&root);
+                    self.clear_starting_device(device_id);
                     return Err(format!(
                         "H.264 live remux exited before playlist was ready: {status}"
                     ));
                 }
                 Ok(None) => thread::sleep(Duration::from_millis(100)),
                 Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
                     let _ = fs::remove_dir_all(&root);
+                    self.clear_starting_device(device_id);
                     return Err(format!("failed to check live remux process: {error}"));
                 }
             }
@@ -15413,20 +15469,27 @@ impl HlsLiveRuntime {
             child,
         };
 
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| "live session lock is poisoned".to_string())?;
-        if let Some(existing_session_id) = inner.device_sessions.remove(device_id) {
-            if let Some(mut existing) = inner.sessions.remove(&existing_session_id) {
-                stop_hls_live_session(&mut existing);
+        let mut inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(_) => {
+                let mut session = session;
+                stop_hls_live_session(&mut session);
+                self.clear_starting_device(device_id);
+                return Err("live session lock is poisoned".to_string());
             }
-        }
+        };
+        inner.starting_devices.remove(device_id);
         inner
             .device_sessions
             .insert(device_id.to_string(), session_id.clone());
         inner.sessions.insert(session_id.clone(), session);
         Ok(self.projection_locked(&mut inner, device_id, Some(&session_id)))
+    }
+
+    fn clear_starting_device(&self, device_id: &str) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.starting_devices.remove(device_id);
+        }
     }
 
     fn status(&self, device_id: &str, session_id: Option<&str>) -> HlsLiveSessionProjection {
@@ -15566,7 +15629,31 @@ impl HlsLiveRuntime {
             }
         }
 
-        let playlist_ready = session.root.join("index.m3u8").exists();
+        let playlist_state = hls_live_playlist_state(&session.root);
+        if !playlist_state.has_readable_segment
+            && hls_live_session_start_timed_out(&session.started_at)
+        {
+            let mut session = inner
+                .sessions
+                .remove(&session_id)
+                .expect("session exists after get_mut");
+            inner.device_sessions.remove(&session.device_id);
+            stop_hls_live_session(&mut session);
+            return HlsLiveSessionProjection {
+                device_id: session.device_id,
+                session_id: Some(session.session_id),
+                status: "failed".to_string(),
+                playlist_url: None,
+                playlist_ready: false,
+                mode: "hls_fmp4".to_string(),
+                codec: HLS_LIVE_CODEC.to_string(),
+                stream_profile: session.stream_profile.as_str().to_string(),
+                started_at: Some(session.started_at),
+                updated_at: current_unix_secs().to_string(),
+                message: "live playlist did not become ready before timeout".to_string(),
+            };
+        }
+        let playlist_ready = playlist_state.has_readable_segment;
         HlsLiveSessionProjection {
             device_id: session.device_id.clone(),
             session_id: Some(session.session_id.clone()),
@@ -15588,13 +15675,46 @@ impl HlsLiveRuntime {
             started_at: Some(session.started_at.clone()),
             updated_at: current_unix_secs().to_string(),
             message: if playlist_ready {
-                "low-latency H.264 live stream is running"
+                "stable H.264 live stream is running"
+            } else if playlist_state.playlist_exists {
+                "stable H.264 live stream is waiting for media segments"
             } else {
-                "low-latency H.264 live stream is starting"
+                "stable H.264 live stream is starting"
             }
             .to_string(),
         }
     }
+}
+
+fn hls_live_session_start_timed_out(started_at: &str) -> bool {
+    let Ok(started_at) = started_at.parse::<u64>() else {
+        return false;
+    };
+    current_unix_secs().saturating_sub(started_at) > HLS_LIVE_START_TIMEOUT_SECONDS
+}
+
+fn cleanup_stale_hls_live_dirs(
+    device_root: &Path,
+    keep_session_id: Option<&str>,
+) -> std::io::Result<()> {
+    if !device_root.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(device_root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("live-") || keep_session_id == Some(name) {
+            continue;
+        }
+        fs::remove_dir_all(path)?;
+    }
+    Ok(())
 }
 
 fn hls_live_ffmpeg_args(stream_url: &str) -> Vec<String> {
@@ -15606,14 +15726,17 @@ fn hls_live_ffmpeg_args(stream_url: &str) -> Vec<String> {
         "-rtsp_transport",
         "tcp",
         "-fflags",
-        "nobuffer",
+        "+genpts+nobuffer",
         "-flags",
         "low_delay",
+        "-use_wallclock_as_timestamps",
+        "1",
         "-i",
         stream_url,
         "-map",
         "0:v:0",
-        "-an",
+        "-map",
+        "0:a:0?",
     ]
     .into_iter()
     .map(str::to_string)
@@ -15649,6 +15772,16 @@ fn hls_live_ffmpeg_args(stream_url: &str) -> Vec<String> {
             HLS_LIVE_VIDEO_MAXRATE,
             "-bufsize",
             HLS_LIVE_VIDEO_BUFSIZE,
+            "-c:a",
+            "aac",
+            "-b:a",
+            HLS_LIVE_AUDIO_BITRATE,
+            "-ac",
+            "1",
+            "-ar",
+            "48000",
+            "-avoid_negative_ts",
+            "make_zero",
             "-f",
             "hls",
             "-hls_time",
@@ -15656,7 +15789,7 @@ fn hls_live_ffmpeg_args(stream_url: &str) -> Vec<String> {
             "-hls_list_size",
             HLS_LIVE_WINDOW_SEGMENTS,
             "-hls_flags",
-            "delete_segments+omit_endlist+independent_segments",
+            "omit_endlist+independent_segments+temp_file",
             "-hls_segment_type",
             "fmp4",
             "-hls_fmp4_init_filename",
@@ -15669,6 +15802,92 @@ fn hls_live_ffmpeg_args(stream_url: &str) -> Vec<String> {
         .map(str::to_string),
     );
     args
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HlsLivePlaylistState {
+    playlist_exists: bool,
+    has_readable_segment: bool,
+}
+
+fn hls_live_playlist_state(root: &Path) -> HlsLivePlaylistState {
+    let playlist_path = root.join("index.m3u8");
+    let Ok(playlist) = fs::read_to_string(&playlist_path) else {
+        return HlsLivePlaylistState {
+            playlist_exists: false,
+            has_readable_segment: false,
+        };
+    };
+
+    let has_readable_segment = hls_live_playlist_segment_names(&playlist)
+        .iter()
+        .any(|segment_name| live_asset_has_bytes(&root.join(segment_name)));
+    HlsLivePlaylistState {
+        playlist_exists: true,
+        has_readable_segment,
+    }
+}
+
+fn hls_live_playlist_segment_names(playlist: &str) -> Vec<String> {
+    playlist
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter(|line| is_safe_live_media_segment_name(line))
+        .map(str::to_string)
+        .collect()
+}
+
+fn live_asset_has_bytes(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.len() > 0)
+        .unwrap_or(false)
+}
+
+fn open_hls_live_asset_file(
+    asset_path: &Path,
+    asset_name: &str,
+) -> std::io::Result<(fs::File, Option<fs::Metadata>)> {
+    let retry_media_segment = is_safe_live_media_segment_name(asset_name);
+    let attempts = if retry_media_segment {
+        HLS_LIVE_ASSET_READY_ATTEMPTS
+    } else {
+        1
+    };
+    let mut last_error = None;
+
+    for attempt in 0..attempts {
+        match fs::File::open(asset_path) {
+            Ok(file) => {
+                let metadata = file.metadata().ok();
+                let is_empty = metadata
+                    .as_ref()
+                    .map(|metadata| metadata.len() == 0)
+                    .unwrap_or(false);
+                if !retry_media_segment || !is_empty {
+                    return Ok((file, metadata));
+                }
+                last_error = Some(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "live asset is not ready",
+                ));
+            }
+            Err(error) => {
+                if !retry_media_segment || error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(error);
+                }
+                last_error = Some(error);
+            }
+        }
+
+        if attempt + 1 < attempts {
+            thread::sleep(Duration::from_millis(HLS_LIVE_ASSET_RETRY_DELAY_MS));
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::WouldBlock, "live asset is not ready")
+    }))
 }
 
 fn stop_hls_live_session(session: &mut HlsLiveSession) {
@@ -15707,6 +15926,17 @@ fn is_safe_live_asset_name(value: &str) -> bool {
         && matches!(
             Path::new(value).extension().and_then(|ext| ext.to_str()),
             Some("m3u8" | "m4s" | "mp4" | "ts")
+        )
+}
+
+fn is_safe_live_media_segment_name(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains('/')
+        && !value.contains('\\')
+        && !value.contains("..")
+        && matches!(
+            Path::new(value).extension().and_then(|ext| ext.to_str()),
+            Some("m4s" | "ts")
         )
 }
 
@@ -16409,7 +16639,7 @@ mod tests {
     }
 
     #[test]
-    fn hls_live_ffmpeg_args_use_low_latency_h264_segments() {
+    fn hls_live_ffmpeg_args_use_stable_h264_segments() {
         let args = hls_live_ffmpeg_args("rtsp://camera.local/ch01_sub.264");
         let has_pair = |left: &str, right: &str| {
             args.windows(2)
@@ -16417,15 +16647,94 @@ mod tests {
         };
 
         assert!(has_pair("-c:v", "libx264"));
-        assert!(has_pair("-vf", "fps=20"));
-        assert!(has_pair("-g", "20"));
-        assert!(has_pair("-hls_time", "1"));
-        assert!(has_pair("-hls_list_size", "4"));
+        assert!(has_pair("-map", "0:v:0"));
+        assert!(has_pair("-map", "0:a:0?"));
+        assert!(has_pair("-c:a", "aac"));
+        assert!(has_pair("-b:a", "64k"));
+        assert!(has_pair("-ac", "1"));
+        assert!(has_pair("-ar", "48000"));
+        assert!(has_pair("-fflags", "+genpts+nobuffer"));
+        assert!(has_pair("-use_wallclock_as_timestamps", "1"));
+        assert!(has_pair("-avoid_negative_ts", "make_zero"));
+        assert!(has_pair("-vf", "fps=15"));
+        assert!(has_pair("-g", "15"));
+        assert!(has_pair("-hls_time", "2"));
+        assert!(has_pair("-hls_list_size", "10"));
         assert!(has_pair(
             "-hls_flags",
-            "delete_segments+omit_endlist+independent_segments"
+            "omit_endlist+independent_segments+temp_file"
         ));
         assert!(!has_pair("-c:v", "copy"));
+        assert!(!args.iter().any(|arg| arg.contains("delete_segments")));
+        assert!(!args.iter().any(|arg| arg == "-an"));
+    }
+
+    #[test]
+    fn hls_live_cleanup_removes_stale_session_dirs() {
+        let root = unique_store_path("harborbeacon-hls-live-cleanup");
+        let current = root.join("live-current");
+        let stale = root.join("live-stale");
+        let unrelated = root.join("notes");
+        fs::create_dir_all(&current).expect("create current session");
+        fs::create_dir_all(&stale).expect("create stale session");
+        fs::create_dir_all(&unrelated).expect("create unrelated directory");
+        fs::write(stale.join("index.m3u8"), b"#EXTM3U").expect("write stale file");
+
+        super::cleanup_stale_hls_live_dirs(&root, Some("live-current"))
+            .expect("cleanup stale sessions");
+
+        assert!(current.exists());
+        assert!(!stale.exists());
+        assert!(unrelated.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hls_live_playlist_segments_only_accept_media_files() {
+        let segments = super::hls_live_playlist_segment_names(
+            "#EXTM3U\n\
+             #EXT-X-MAP:URI=\"init.mp4\"\n\
+             init.mp4\n\
+             segment_00001.m4s\n\
+             nested/segment_00002.m4s\n\
+             ../bad.ts\n\
+             segment_00003.ts\n",
+        );
+
+        assert_eq!(
+            segments,
+            vec![
+                "segment_00001.m4s".to_string(),
+                "segment_00003.ts".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn hls_live_playlist_state_requires_readable_media_segment() {
+        let root = unique_store_path("harborbeacon-hls-live-playlist");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create hls live root");
+
+        let state = super::hls_live_playlist_state(&root);
+        assert!(!state.playlist_exists);
+        assert!(!state.has_readable_segment);
+
+        fs::write(
+            root.join("index.m3u8"),
+            "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:1.0,\nsegment_00001.m4s\n",
+        )
+        .expect("write playlist");
+        let state = super::hls_live_playlist_state(&root);
+        assert!(state.playlist_exists);
+        assert!(!state.has_readable_segment);
+
+        fs::write(root.join("segment_00001.m4s"), b"segment").expect("write segment");
+        let state = super::hls_live_playlist_state(&root);
+        assert!(state.playlist_exists);
+        assert!(state.has_readable_segment);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
