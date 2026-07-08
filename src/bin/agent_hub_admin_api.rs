@@ -15302,12 +15302,24 @@ struct HlsLiveSessionProjection {
     started_at: Option<String>,
     updated_at: String,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostics: Option<HlsLiveDiagnostics>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HlsLiveDiagnostics {
+    playlist_exists: bool,
+    segment_count: usize,
+    latest_segment_name: Option<String>,
+    latest_segment_size_bytes: Option<u64>,
+    latest_segment_modified_at: Option<String>,
+    ffmpeg_running: bool,
 }
 
 const HLS_LIVE_CODEC: &str = "h264_low_latency";
 const HLS_LIVE_TARGET_FPS: &str = "15";
-const HLS_LIVE_SEGMENT_SECONDS: &str = "2";
-const HLS_LIVE_WINDOW_SEGMENTS: &str = "10";
+const HLS_LIVE_SEGMENT_SECONDS: &str = "3";
+const HLS_LIVE_WINDOW_SEGMENTS: &str = "12";
 const HLS_LIVE_VIDEO_BITRATE: &str = "800k";
 const HLS_LIVE_VIDEO_MAXRATE: &str = "1000k";
 const HLS_LIVE_VIDEO_BUFSIZE: &str = "1600k";
@@ -15331,6 +15343,7 @@ impl HlsLiveSessionProjection {
             started_at: None,
             updated_at: current_unix_secs().to_string(),
             message: message.into(),
+            diagnostics: None,
         }
     }
 
@@ -15536,6 +15549,7 @@ impl HlsLiveRuntime {
             started_at: Some(session.started_at),
             updated_at: current_unix_secs().to_string(),
             message: "live session stopped".to_string(),
+            diagnostics: None,
         }
     }
 
@@ -15609,6 +15623,7 @@ impl HlsLiveRuntime {
                     started_at: Some(session.started_at),
                     updated_at: current_unix_secs().to_string(),
                     message: format!("live ffmpeg process exited: {status}"),
+                    diagnostics: None,
                 };
             }
             Ok(None) => {}
@@ -15625,6 +15640,7 @@ impl HlsLiveRuntime {
                     started_at: Some(session.started_at.clone()),
                     updated_at: current_unix_secs().to_string(),
                     message: format!("failed to inspect live ffmpeg process: {error}"),
+                    diagnostics: None,
                 };
             }
         }
@@ -15651,9 +15667,11 @@ impl HlsLiveRuntime {
                 started_at: Some(session.started_at),
                 updated_at: current_unix_secs().to_string(),
                 message: "live playlist did not become ready before timeout".to_string(),
+                diagnostics: None,
             };
         }
         let playlist_ready = playlist_state.has_readable_segment;
+        let diagnostics = hls_live_diagnostics(&playlist_state, true);
         HlsLiveSessionProjection {
             device_id: session.device_id.clone(),
             session_id: Some(session.session_id.clone()),
@@ -15663,10 +15681,9 @@ impl HlsLiveRuntime {
                 "starting"
             }
             .to_string(),
-            playlist_url: Some(format!(
-                "/api/beacon/cameras/{}/live/{}/index.m3u8",
-                url_encode_path_segment(&session.device_id),
-                url_encode_path_segment(&session.session_id)
+            playlist_url: Some(hls_live_static_playlist_url(
+                &session.device_id,
+                &session.session_id,
             )),
             playlist_ready,
             mode: "hls_fmp4".to_string(),
@@ -15682,8 +15699,17 @@ impl HlsLiveRuntime {
                 "stable H.264 live stream is starting"
             }
             .to_string(),
+            diagnostics: Some(diagnostics),
         }
     }
+}
+
+fn hls_live_static_playlist_url(device_id: &str, session_id: &str) -> String {
+    format!(
+        "/api/beacon-live/cameras/{}/live/{}/index.m3u8",
+        url_encode_path_segment(&safe_live_path_segment(device_id)),
+        url_encode_path_segment(session_id)
+    )
 }
 
 fn hls_live_session_start_timed_out(started_at: &str) -> bool {
@@ -15804,10 +15830,14 @@ fn hls_live_ffmpeg_args(stream_url: &str) -> Vec<String> {
     args
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct HlsLivePlaylistState {
     playlist_exists: bool,
     has_readable_segment: bool,
+    segment_count: usize,
+    latest_segment_size_bytes: Option<u64>,
+    latest_segment_modified_at: Option<u64>,
+    latest_segment_name: Option<String>,
 }
 
 fn hls_live_playlist_state(root: &Path) -> HlsLivePlaylistState {
@@ -15816,15 +15846,47 @@ fn hls_live_playlist_state(root: &Path) -> HlsLivePlaylistState {
         return HlsLivePlaylistState {
             playlist_exists: false,
             has_readable_segment: false,
+            segment_count: 0,
+            latest_segment_size_bytes: None,
+            latest_segment_modified_at: None,
+            latest_segment_name: None,
         };
     };
 
-    let has_readable_segment = hls_live_playlist_segment_names(&playlist)
+    let segment_names = hls_live_playlist_segment_names(&playlist);
+    let has_readable_segment = segment_names
         .iter()
         .any(|segment_name| live_asset_has_bytes(&root.join(segment_name)));
+    let latest_segment_name = segment_names.last().cloned();
+    let latest_segment_metadata = latest_segment_name
+        .as_ref()
+        .and_then(|segment_name| fs::metadata(root.join(segment_name)).ok())
+        .filter(|metadata| metadata.is_file());
     HlsLivePlaylistState {
         playlist_exists: true,
         has_readable_segment,
+        segment_count: segment_names.len(),
+        latest_segment_size_bytes: latest_segment_metadata.as_ref().map(fs::Metadata::len),
+        latest_segment_modified_at: latest_segment_metadata
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(system_time_unix_secs),
+        latest_segment_name,
+    }
+}
+
+fn hls_live_diagnostics(
+    playlist_state: &HlsLivePlaylistState,
+    ffmpeg_running: bool,
+) -> HlsLiveDiagnostics {
+    HlsLiveDiagnostics {
+        playlist_exists: playlist_state.playlist_exists,
+        segment_count: playlist_state.segment_count,
+        latest_segment_name: playlist_state.latest_segment_name.clone(),
+        latest_segment_size_bytes: playlist_state.latest_segment_size_bytes,
+        latest_segment_modified_at: playlist_state
+            .latest_segment_modified_at
+            .map(|value| value.to_string()),
+        ffmpeg_running,
     }
 }
 
@@ -15955,6 +16017,13 @@ fn current_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::from_secs(0))
         .as_secs()
+}
+
+fn system_time_unix_secs(value: SystemTime) -> Option<u64> {
+    value
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|value| value.as_secs())
 }
 
 struct FfmpegMjpegStream {
@@ -16658,8 +16727,8 @@ mod tests {
         assert!(has_pair("-avoid_negative_ts", "make_zero"));
         assert!(has_pair("-vf", "fps=15"));
         assert!(has_pair("-g", "15"));
-        assert!(has_pair("-hls_time", "2"));
-        assert!(has_pair("-hls_list_size", "10"));
+        assert!(has_pair("-hls_time", "3"));
+        assert!(has_pair("-hls_list_size", "12"));
         assert!(has_pair(
             "-hls_flags",
             "omit_endlist+independent_segments+temp_file"
@@ -16687,6 +16756,14 @@ mod tests {
         assert!(!stale.exists());
         assert!(unrelated.exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hls_live_static_playlist_url_uses_safe_live_directory_segment() {
+        assert_eq!(
+            super::hls_live_static_playlist_url("camera/main room", "live-abc123"),
+            "/api/beacon-live/cameras/camera_main_room/live/live-abc123/index.m3u8"
+        );
     }
 
     #[test]
@@ -16719,6 +16796,8 @@ mod tests {
         let state = super::hls_live_playlist_state(&root);
         assert!(!state.playlist_exists);
         assert!(!state.has_readable_segment);
+        assert_eq!(state.segment_count, 0);
+        assert_eq!(state.latest_segment_name, None);
 
         fs::write(
             root.join("index.m3u8"),
@@ -16728,11 +16807,20 @@ mod tests {
         let state = super::hls_live_playlist_state(&root);
         assert!(state.playlist_exists);
         assert!(!state.has_readable_segment);
+        assert_eq!(state.segment_count, 1);
+        assert_eq!(
+            state.latest_segment_name.as_deref(),
+            Some("segment_00001.m4s")
+        );
+        assert_eq!(state.latest_segment_size_bytes, None);
 
         fs::write(root.join("segment_00001.m4s"), b"segment").expect("write segment");
         let state = super::hls_live_playlist_state(&root);
         assert!(state.playlist_exists);
         assert!(state.has_readable_segment);
+        assert_eq!(state.segment_count, 1);
+        assert_eq!(state.latest_segment_size_bytes, Some(7));
+        assert!(state.latest_segment_modified_at.is_some());
 
         let _ = fs::remove_dir_all(root);
     }
