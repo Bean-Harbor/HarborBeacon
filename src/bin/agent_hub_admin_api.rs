@@ -4782,15 +4782,19 @@ impl AdminApi {
         {
             settings.enabled_device_ids.push(device_id.clone());
         }
-        let settings = match self.admin_store.save_dvr_recording_settings(settings) {
-            Ok(state) => state.dvr,
-            Err(error) => return error_json(StatusCode(422), &error),
-        };
         match self
             .dvr_runtime
             .start_recording(&device, &settings, Some(&self.public_origin))
         {
-            Ok(status) => ok_json(&status),
+            Ok(status) => match self.admin_store.save_dvr_recording_settings(settings) {
+                Ok(_) => ok_json(&status),
+                Err(error) => {
+                    let _ = self
+                        .dvr_runtime
+                        .stop_recording(&device_id, Some(&self.public_origin));
+                    error_json(StatusCode(422), &error)
+                }
+            },
             Err(error) => error_json(StatusCode(422), &error),
         }
     }
@@ -13188,13 +13192,15 @@ fn camera_stream_url_with_credentials_for_profile(
         .and_then(|credential| credential.rtsp_port)
         .or_else(|| rtsp_port_from_url(&device.primary_stream.url))
         .unwrap_or(state.defaults.rtsp_port);
-    let mut path_candidates = credential
-        .map(|credential| credential.rtsp_paths.clone())
-        .filter(|paths| !paths.is_empty())
-        .unwrap_or_else(|| state.defaults.rtsp_paths.clone());
-    if let Some(path) = rtsp_path_from_url(&device.primary_stream.url) {
-        path_candidates.push(path);
-    }
+    let mut path_candidates = rtsp_path_from_url(&device.primary_stream.url)
+        .map(|path| vec![path])
+        .unwrap_or_default();
+    path_candidates.extend(
+        credential
+            .map(|credential| credential.rtsp_paths.clone())
+            .filter(|paths| !paths.is_empty())
+            .unwrap_or_else(|| state.defaults.rtsp_paths.clone()),
+    );
     let path = preferred_rtsp_path_for_live_profile(&path_candidates, stream_profile)
         .unwrap_or_else(|| "/stream1".to_string());
     let path = if path.starts_with('/') {
@@ -13227,11 +13233,13 @@ fn preferred_rtsp_path_for_live_profile(
     let selected = match stream_profile {
         LiveStreamProfile::Sub => candidates
             .iter()
-            .find(|path| rtsp_path_is_substream(path))
+            .find(|path| rtsp_path_is_explicit_substream(path))
+            .or_else(|| candidates.iter().find(|path| rtsp_path_is_generic_substream(path)))
             .or_else(|| candidates.first()),
         LiveStreamProfile::Main => candidates
             .iter()
-            .find(|path| rtsp_path_is_mainstream(path))
+            .find(|path| rtsp_path_is_explicit_mainstream(path))
+            .or_else(|| candidates.iter().find(|path| rtsp_path_is_generic_mainstream(path)))
             .or_else(|| candidates.iter().find(|path| !rtsp_path_is_substream(path)))
             .or_else(|| candidates.first()),
     };
@@ -13239,21 +13247,35 @@ fn preferred_rtsp_path_for_live_profile(
 }
 
 fn rtsp_path_is_substream(path: &str) -> bool {
+    rtsp_path_is_explicit_substream(path) || rtsp_path_is_generic_substream(path)
+}
+
+fn rtsp_path_is_explicit_substream(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     lower.contains("sub")
-        || lower.contains("stream2")
         || lower.contains("minor")
         || lower.contains("low")
         || lower.contains("secondary")
+        || lower.contains("channels/102")
 }
 
-fn rtsp_path_is_mainstream(path: &str) -> bool {
+fn rtsp_path_is_generic_substream(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("stream2")
+}
+
+fn rtsp_path_is_explicit_mainstream(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     lower.contains("main")
-        || lower.contains("stream1")
         || lower.contains("ch01.264")
         || lower.contains("primary")
         || lower.contains("high")
+        || lower.contains("channels/101")
+}
+
+fn rtsp_path_is_generic_mainstream(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("stream1")
 }
 
 fn redact_secret_json_value(mut value: Value) -> Value {
@@ -15318,8 +15340,9 @@ struct HlsLiveDiagnostics {
 
 const HLS_LIVE_CODEC: &str = "h264_low_latency";
 const HLS_LIVE_TARGET_FPS: &str = "15";
-const HLS_LIVE_SEGMENT_SECONDS: &str = "3";
-const HLS_LIVE_WINDOW_SEGMENTS: &str = "12";
+const HLS_LIVE_SEGMENT_SECONDS: &str = "1";
+// Keep paused live positions in the playlist so native video controls do not clamp them forward.
+const HLS_LIVE_WINDOW_SEGMENTS: &str = "0";
 const HLS_LIVE_VIDEO_BITRATE: &str = "800k";
 const HLS_LIVE_VIDEO_MAXRATE: &str = "1000k";
 const HLS_LIVE_VIDEO_BUFSIZE: &str = "1600k";
@@ -16727,8 +16750,8 @@ mod tests {
         assert!(has_pair("-avoid_negative_ts", "make_zero"));
         assert!(has_pair("-vf", "fps=15"));
         assert!(has_pair("-g", "15"));
-        assert!(has_pair("-hls_time", "3"));
-        assert!(has_pair("-hls_list_size", "12"));
+        assert!(has_pair("-hls_time", "1"));
+        assert!(has_pair("-hls_list_size", "0"));
         assert!(has_pair(
             "-hls_flags",
             "omit_endlist+independent_segments+temp_file"
@@ -16939,6 +16962,75 @@ mod tests {
             "rtsp://admin:secret@192.168.3.252:554/ch01_sub.264"
         );
         assert_eq!(main_url, "rtsp://admin:secret@192.168.3.252:554/ch01.264");
+    }
+
+    #[test]
+    fn camera_stream_url_prefers_selected_hikvision_substream_path() {
+        let mut state = AdminConsoleState::default();
+        state.device_credentials.push(DeviceCredentialSecret {
+            device_id: "cam-1".to_string(),
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+            rtsp_port: Some(554),
+            rtsp_paths: vec!["/stream2".to_string(), "/stream1".to_string()],
+            updated_at: Some("123".to_string()),
+            last_verified_at: None,
+        });
+        let mut device = CameraDevice::new(
+            "cam-1",
+            "Living Room",
+            "rtsp://192.168.3.252/h264/ch1/sub/av_stream",
+        );
+        device.ip_address = Some("192.168.3.252".to_string());
+
+        let url =
+            camera_stream_url_with_credentials_for_profile(&device, &state, LiveStreamProfile::Sub)
+                .expect("sub stream url");
+
+        assert_eq!(
+            url,
+            "rtsp://admin:secret@192.168.3.252:554/h264/ch1/sub/av_stream"
+        );
+    }
+
+    #[test]
+    fn camera_stream_url_prefers_explicit_vendor_main_and_sub_paths() {
+        let mut state = AdminConsoleState::default();
+        state.device_credentials.push(DeviceCredentialSecret {
+            device_id: "cam-1".to_string(),
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+            rtsp_port: Some(554),
+            rtsp_paths: vec![
+                "/stream1".to_string(),
+                "/stream2".to_string(),
+                "/h264/ch1/main/av_stream".to_string(),
+                "/h264/ch1/sub/av_stream".to_string(),
+            ],
+            updated_at: Some("123".to_string()),
+            last_verified_at: None,
+        });
+        let mut device = CameraDevice::new("cam-1", "Living Room", "rtsp://192.168.3.252/stream1");
+        device.ip_address = Some("192.168.3.252".to_string());
+
+        let main_url = camera_stream_url_with_credentials_for_profile(
+            &device,
+            &state,
+            LiveStreamProfile::Main,
+        )
+        .expect("main stream url");
+        let sub_url =
+            camera_stream_url_with_credentials_for_profile(&device, &state, LiveStreamProfile::Sub)
+                .expect("sub stream url");
+
+        assert_eq!(
+            main_url,
+            "rtsp://admin:secret@192.168.3.252:554/h264/ch1/main/av_stream"
+        );
+        assert_eq!(
+            sub_url,
+            "rtsp://admin:secret@192.168.3.252:554/h264/ch1/sub/av_stream"
+        );
     }
 
     #[test]

@@ -23,6 +23,7 @@ const HARBOROS_WRITABLE_ROOT_ENV: &str = "HARBOR_HARBOROS_WRITABLE_ROOT";
 const DVR_KNOWLEDGE_ROOT_ID: &str = "camera-dvr-recordings";
 const MIN_PLAYABLE_MP4_BYTES: u64 = 4096;
 const FFMPEG_GRACEFUL_STOP_TIMEOUT_MS: u64 = 5_000;
+const FFMPEG_START_SETTLE_MS: u64 = 500;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DvrRecordingSettings {
@@ -167,6 +168,7 @@ struct DvrProcess {
 #[derive(Debug, Clone, Default)]
 pub struct DvrRuntime {
     processes: Arc<Mutex<HashMap<String, DvrProcess>>>,
+    last_failures: Arc<Mutex<HashMap<String, DvrRecordingStatus>>>,
 }
 
 impl DvrRuntime {
@@ -220,9 +222,17 @@ impl DvrRuntime {
             .arg("-map")
             .arg("0:v:0")
             .arg("-map")
-            .arg("0:a?")
-            .arg("-c")
+            .arg("0:a:0?")
+            .arg("-c:v")
             .arg("copy")
+            .arg("-c:a")
+            .arg("aac")
+            .arg("-b:a")
+            .arg("64k")
+            .arg("-ac")
+            .arg("1")
+            .arg("-ar")
+            .arg("48000")
             .arg("-f")
             .arg("segment")
             .arg("-segment_time")
@@ -239,9 +249,19 @@ impl DvrRuntime {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        let child = command
+        let mut child = command
             .spawn()
             .map_err(|error| format!("failed to start DVR ffmpeg process: {error}"))?;
+        thread::sleep(Duration::from_millis(FFMPEG_START_SETTLE_MS));
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("failed to inspect DVR ffmpeg process: {error}"))?
+        {
+            return Err(format!(
+                "DVR ffmpeg process exited during start with status {}",
+                process_status_label(status)
+            ));
+        }
         let started_at = now_unix_secs().to_string();
         let stream_kind = if settings.low_bitrate_stream_preferred {
             "substream"
@@ -266,6 +286,10 @@ impl DvrRuntime {
                 pattern,
             },
         );
+        self.last_failures
+            .lock()
+            .map_err(|_| "DVR runtime failure lock is poisoned".to_string())?
+            .remove(&device.device_id);
 
         Ok(DvrRecordingStatus {
             device_id: device.device_id.clone(),
@@ -295,6 +319,10 @@ impl DvrRuntime {
             .lock()
             .map_err(|_| "DVR runtime process lock is poisoned".to_string())?;
         let Some(process) = processes.remove(device_id) else {
+            self.last_failures
+                .lock()
+                .map_err(|_| "DVR runtime failure lock is poisoned".to_string())?
+                .remove(device_id);
             return Ok(DvrRecordingStatus {
                 device_id: device_id.to_string(),
                 status: "stopped".to_string(),
@@ -312,6 +340,10 @@ impl DvrRuntime {
                 message: "DVR recording was not running".to_string(),
             });
         };
+        self.last_failures
+            .lock()
+            .map_err(|_| "DVR runtime failure lock is poisoned".to_string())?
+            .remove(device_id);
         let _ = gracefully_stop_ffmpeg(process.child);
         let last_segment_path = latest_segment_path_for_pattern(&process.pattern);
         Ok(DvrRecordingStatus {
@@ -343,8 +375,14 @@ impl DvrRuntime {
             .processes
             .lock()
             .map_err(|_| "DVR runtime process lock is poisoned".to_string())?;
+        let previous_failures = self
+            .last_failures
+            .lock()
+            .map_err(|_| "DVR runtime failure lock is poisoned".to_string())?
+            .clone();
         let mut statuses = Vec::new();
         let mut exited = Vec::new();
+        let mut new_failures = Vec::new();
         for device in devices {
             let live_mjpeg_url = public_origin.map(|origin| {
                 format!(
@@ -356,11 +394,7 @@ impl DvrRuntime {
             if let Some(process) = processes.get_mut(&device.device_id) {
                 match process.child.try_wait() {
                     Ok(Some(status)) => {
-                        let code = status
-                            .code()
-                            .map(|value| value.to_string())
-                            .unwrap_or_else(|| "signal".to_string());
-                        statuses.push(DvrRecordingStatus {
+                        let failed = DvrRecordingStatus {
                             device_id: device.device_id.clone(),
                             status: "failed".to_string(),
                             started_at: Some(process.started_at.clone()),
@@ -368,8 +402,13 @@ impl DvrRuntime {
                             stream_kind: process.stream_kind.clone(),
                             last_segment_path: latest_segment_path(&settings, &device.device_id),
                             live_mjpeg_url,
-                            message: format!("DVR ffmpeg process exited with status {code}"),
-                        });
+                            message: format!(
+                                "DVR ffmpeg process exited with status {}",
+                                process_status_label(status)
+                            ),
+                        };
+                        new_failures.push(failed.clone());
+                        statuses.push(failed);
                         exited.push(device.device_id.clone());
                     }
                     Ok(None) => statuses.push(DvrRecordingStatus {
@@ -399,6 +438,8 @@ impl DvrRuntime {
                         exited.push(device.device_id.clone());
                     }
                 }
+            } else if let Some(failed) = previous_failures.get(&device.device_id) {
+                statuses.push(failed.clone());
             } else {
                 statuses.push(DvrRecordingStatus {
                     device_id: device.device_id.clone(),
@@ -418,6 +459,15 @@ impl DvrRuntime {
         }
         for device_id in exited {
             processes.remove(&device_id);
+        }
+        if !new_failures.is_empty() {
+            let mut failures = self
+                .last_failures
+                .lock()
+                .map_err(|_| "DVR runtime failure lock is poisoned".to_string())?;
+            for failure in new_failures {
+                failures.insert(failure.device_id.clone(), failure);
+            }
         }
         Ok(statuses)
     }
@@ -632,7 +682,9 @@ pub fn build_status_response(
 }
 
 pub fn recording_stream_url(device: &CameraDevice, settings: &DvrRecordingSettings) -> String {
-    if !settings.low_bitrate_stream_preferred {
+    if !settings.low_bitrate_stream_preferred
+        || rtsp_url_uses_low_bitrate_stream(&device.primary_stream.url)
+    {
         return device.primary_stream.url.clone();
     }
     replace_rtsp_path(
@@ -1291,6 +1343,13 @@ fn gracefully_stop_ffmpeg(mut child: Child) -> std::io::Result<()> {
     }
 }
 
+fn process_status_label(status: std::process::ExitStatus) -> String {
+    status
+        .code()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "signal".to_string())
+}
+
 fn path_is_same_or_inside_path(candidate: &Path, root: &Path) -> bool {
     candidate == root || candidate.starts_with(root)
 }
@@ -1394,6 +1453,22 @@ fn replace_rtsp_path(stream_url: &str, path_hint: &str) -> Option<String> {
     }
     url.set_path(path_hint);
     Some(url.to_string())
+}
+
+fn rtsp_url_uses_low_bitrate_stream(stream_url: &str) -> bool {
+    let Ok(url) = Url::parse(stream_url) else {
+        return false;
+    };
+    rtsp_path_uses_low_bitrate_stream(url.path())
+}
+
+fn rtsp_path_uses_low_bitrate_stream(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("sub")
+        || lower.contains("stream2")
+        || lower.contains("minor")
+        || lower.contains("low")
+        || lower.contains("secondary")
 }
 
 fn normalize_rtsp_path_hint(value: &str, fallback: &str) -> String {
@@ -1699,6 +1774,21 @@ mod tests {
         assert_eq!(
             recording_stream_url(&device, &settings),
             "rtsp://user:pass@192.168.3.231:554/stream2"
+        );
+    }
+
+    #[test]
+    fn recording_stream_url_keeps_selected_substream_path() {
+        let device = CameraDevice::new(
+            "camera-main",
+            "Main",
+            "rtsp://user:pass@192.168.3.252:554/h264/ch1/sub/av_stream",
+        );
+        let settings = DvrRecordingSettings::default();
+
+        assert_eq!(
+            recording_stream_url(&device, &settings),
+            "rtsp://user:pass@192.168.3.252:554/h264/ch1/sub/av_stream"
         );
     }
 }

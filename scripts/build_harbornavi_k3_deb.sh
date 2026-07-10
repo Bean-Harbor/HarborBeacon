@@ -10,11 +10,23 @@ date_stamp="${HARBORNAVI_BUILD_DATE:-$(date +%Y%m%d)}"
 release_label="${RELEASE_VERSION:-harbornavi-p1-capture-opt-${date_stamp}+riscv64}"
 debian_version="${DEBIAN_VERSION:-0.1.0+harbornavi.p1.captureopt.${date_stamp}.riscv64}"
 out_dir="${OUT_DIR:-${repo_root}/dist/harbornavi-k3-debs}"
-build_root="${repo_root}/target/harbornavi-k3-deb"
 pkg_name="harboros-beacon_${release_label}_${deb_arch}"
+package_work_parent="${PACKAGE_WORK_ROOT:-${TMPDIR:-/tmp}}"
+if [[ "$package_work_parent" =~ ^/mnt/[[:alpha:]](/|$) ]]; then
+  echo "warning: PACKAGE_WORK_ROOT is on a Windows mount; using /tmp for dpkg work files" >&2
+  package_work_parent="/tmp"
+fi
+mkdir -p "$package_work_parent"
+build_root="$(mktemp -d "${package_work_parent%/}/harboros-beacon-k3-deb.XXXXXX")"
 pkg_dir="${build_root}/${pkg_name}"
 cargo_target_root="${CARGO_TARGET_DIR:-${repo_root}/target}"
 cargo_release_dir="${cargo_target_root}/${target}/release"
+
+cleanup_build_root() {
+  rm -rf "$build_root"
+}
+
+trap cleanup_build_root EXIT
 
 if [[ "$target" != "riscv64gc-unknown-linux-gnu" ]]; then
   echo "error: K3 package target must be riscv64gc-unknown-linux-gnu, got ${target}" >&2
@@ -43,7 +55,6 @@ cargo build --release --target "$target" --bin harbornavi-k3-local-vision-smoke
 cargo build --release --target "$target" --bin harbornavi-k3-multi-vision-smoke
 cargo build --release --target "$target" --bin harbornavi-ha-mqtt-event-contract-smoke
 
-rm -rf "$build_root"
 mkdir -p "$pkg_dir/DEBIAN"
 mkdir -p "$pkg_dir/usr/bin"
 mkdir -p "$pkg_dir/etc/systemd/system"
