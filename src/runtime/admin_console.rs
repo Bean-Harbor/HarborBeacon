@@ -4044,7 +4044,7 @@ fn sync_platform_from_legacy(state: &AdminConsoleState) -> AdminPlatformState {
 
     platform
         .credentials
-        .retain(|credential| credential.credential_id != LOCAL_RTSP_CREDENTIAL_ID);
+        .retain(|credential| credential.provider_account_id != LOCAL_RTSP_PROVIDER_ACCOUNT_ID);
     platform.credentials.extend(build_credentials(state));
 
     platform
@@ -5589,6 +5589,59 @@ mod tests {
         assert_eq!(credential.metadata["redacted"], json!(true));
         assert_eq!(credential.metadata["path_count"], json!(1));
         assert!(!format!("{credential:?}").contains("secret"));
+
+        let _ = std::fs::remove_file(admin_path);
+        let _ = std::fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn load_or_create_state_compacts_duplicate_device_credentials() {
+        let registry_path = temp_path("registry-duplicate-device-credentials");
+        let admin_path = temp_path("admin-duplicate-device-credentials");
+        let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
+        let store = AdminConsoleStore::new(admin_path.clone(), registry);
+
+        let mut state = store
+            .save_device_credential(DeviceCredentialSecret {
+                device_id: "cam-1".to_string(),
+                username: "admin".to_string(),
+                password: "secret".to_string(),
+                rtsp_port: Some(554),
+                rtsp_paths: vec!["/stream1".to_string()],
+                updated_at: Some("123".to_string()),
+                last_verified_at: None,
+            })
+            .expect("save device credential");
+        let projected = state
+            .platform
+            .credentials
+            .iter()
+            .find(|credential| credential.provider_account_id == LOCAL_RTSP_PROVIDER_ACCOUNT_ID)
+            .cloned()
+            .expect("projected device credential");
+        for _ in 0..100 {
+            state.platform.credentials.push(projected.clone());
+        }
+        std::fs::write(
+            &admin_path,
+            serde_json::to_string_pretty(&state).expect("serialize duplicate state"),
+        )
+        .expect("write duplicate state");
+
+        let compacted = store.load_or_create_state().expect("compact state");
+        let compacted_count = compacted
+            .platform
+            .credentials
+            .iter()
+            .filter(|credential| credential.provider_account_id == LOCAL_RTSP_PROVIDER_ACCOUNT_ID)
+            .count();
+        assert_eq!(compacted_count, 1);
+
+        let reloaded = store.load_or_create_state().expect("reload compact state");
+        assert_eq!(
+            reloaded.platform.credentials,
+            compacted.platform.credentials
+        );
 
         let _ = std::fs::remove_file(admin_path);
         let _ = std::fs::remove_file(registry_path);

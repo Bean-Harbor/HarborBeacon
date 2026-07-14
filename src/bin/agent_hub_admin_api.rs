@@ -4949,9 +4949,17 @@ impl AdminApi {
             return ok_json(&session.to_response(&self.public_origin));
         }
 
-        if let Err(error) =
-            self.authorize_camera_action(hints, &device_id, AccessAction::CameraView)
-        {
+        let state = match self.admin_store.load_or_create_state() {
+            Ok(state) => state,
+            Err(error) => return error_json(StatusCode(422), &error),
+        };
+        if let Err(error) = authorize_access(
+            &state,
+            hints,
+            AccessAction::CameraView,
+            &format!("camera:{device_id}"),
+            true,
+        ) {
             return error_json(StatusCode(403), &error);
         }
 
@@ -4963,10 +4971,6 @@ impl AdminApi {
             Err(error) => return error_json(StatusCode(422), &error),
         };
 
-        let state = match self.admin_store.load_or_create_state() {
-            Ok(state) => state,
-            Err(error) => return error_json(StatusCode(422), &error),
-        };
         let stream_url =
             match camera_stream_url_with_credentials_for_profile(&device, &state, stream_profile) {
                 Some(url) => url,
@@ -15542,12 +15546,13 @@ const HLS_LIVE_VIDEO_BITRATE: &str = "800k";
 const HLS_LIVE_VIDEO_MAXRATE: &str = "1000k";
 const HLS_LIVE_VIDEO_BUFSIZE: &str = "1600k";
 const HLS_LIVE_AUDIO_BITRATE: &str = "64k";
-const HLS_LIVE_INPUT_PROBESIZE_BYTES: &str = "1048576";
-const HLS_LIVE_INPUT_ANALYZE_DURATION_US: &str = "3000000";
+const HLS_LIVE_INPUT_PROBESIZE_BYTES: &str = "65536";
+const HLS_LIVE_INPUT_ANALYZE_DURATION_US: &str = "500000";
 const HLS_LIVE_FFMPEG_STDERR_LOG: &str = "ffmpeg.stderr.log";
 const HLS_LIVE_FFMPEG_ERROR_TAIL_BYTES: usize = 4096;
 const HLS_LIVE_ASSET_READY_ATTEMPTS: usize = 8;
 const HLS_LIVE_ASSET_RETRY_DELAY_MS: u64 = 75;
+const HLS_LIVE_START_WAIT_ATTEMPTS: usize = 5;
 const HLS_LIVE_START_TIMEOUT_SECONDS: u64 = 24;
 const HLS_LIVE_IDLE_KEEPALIVE_SECONDS: u64 = 90;
 
@@ -15679,7 +15684,7 @@ impl HlsLiveRuntime {
                 format!("failed to start stable H.264 live ffmpeg: {error}")
             })?;
 
-        for _ in 0..20 {
+        for _ in 0..HLS_LIVE_START_WAIT_ATTEMPTS {
             if playlist_path.exists() {
                 break;
             }
@@ -17167,8 +17172,8 @@ sleep 120
         assert!(has_pair("-b:a", "64k"));
         assert!(has_pair("-ac", "1"));
         assert!(has_pair("-ar", "48000"));
-        assert!(has_pair("-probesize", "1048576"));
-        assert!(has_pair("-analyzeduration", "3000000"));
+        assert!(has_pair("-probesize", "65536"));
+        assert!(has_pair("-analyzeduration", "500000"));
         assert!(has_pair("-fflags", "+genpts+nobuffer"));
         assert!(has_pair("-use_wallclock_as_timestamps", "1"));
         assert!(has_pair("-avoid_negative_ts", "make_zero"));
