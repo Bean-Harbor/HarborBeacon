@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -1519,7 +1519,7 @@ impl AdminApi {
                 .handle_knowledge_search(&mut request, &identity_hints)
                 .boxed(),
             Method::Get if path == "/api/knowledge/preview" => self
-                .handle_knowledge_preview(&raw_url, &identity_hints)
+                .handle_knowledge_preview(&raw_url, &headers, &identity_hints)
                 .boxed(),
             Method::Post if path == "/api/knowledge/index/run" => {
                 self.handle_run_knowledge_index(&identity_hints).boxed()
@@ -2317,6 +2317,7 @@ impl AdminApi {
     fn handle_knowledge_preview(
         &self,
         raw_url: &str,
+        headers: &[Header],
         hints: &AccessIdentityHints,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
@@ -2345,7 +2346,7 @@ impl AdminApi {
                 None => return error_json(error.status, &error.message),
             },
         };
-        static_file_response(&preview_path)
+        preview_static_file_response(&preview_path, header_value(headers, "Range").as_deref())
     }
 
     fn handle_dvr_recording_settings(
@@ -4932,19 +4933,6 @@ impl AdminApi {
             Some(device_id) => device_id,
             None => return error_json(StatusCode(400), "invalid live start path"),
         };
-        if let Err(error) =
-            self.authorize_camera_action(hints, &device_id, AccessAction::CameraView)
-        {
-            return error_json(StatusCode(403), &error);
-        }
-
-        let device = match self.load_camera_device(&device_id) {
-            Ok(device) => self.camera_device_with_runtime_credentials(&device),
-            Err(error) if error.contains("device not found") => {
-                return error_json(StatusCode(404), &error)
-            }
-            Err(error) => return error_json(StatusCode(422), &error),
-        };
 
         let body: LiveStartRequest = match read_json_body_or_default(request) {
             Ok(body) => body,
@@ -4954,6 +4942,27 @@ impl AdminApi {
             Ok(profile) => profile,
             Err(error) => return error_json(StatusCode(400), &error),
         };
+        if let Some(session) = self
+            .hls_live_runtime
+            .resume_session(&device_id, stream_profile)
+        {
+            return ok_json(&session.to_response(&self.public_origin));
+        }
+
+        if let Err(error) =
+            self.authorize_camera_action(hints, &device_id, AccessAction::CameraView)
+        {
+            return error_json(StatusCode(403), &error);
+        }
+
+        let device = match self.load_camera_device(&device_id) {
+            Ok(device) => device,
+            Err(error) if error.contains("device not found") => {
+                return error_json(StatusCode(404), &error)
+            }
+            Err(error) => return error_json(StatusCode(422), &error),
+        };
+
         let state = match self.admin_store.load_or_create_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(422), &error),
@@ -4979,7 +4988,7 @@ impl AdminApi {
         path: &str,
         remote_addr: Option<SocketAddr>,
         headers: &[Header],
-        hints: &AccessIdentityHints,
+        _hints: &AccessIdentityHints,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
         if let Err(error) = ensure_local_camera_access(remote_addr, headers) {
             return error_json(StatusCode(403), &error);
@@ -4989,11 +4998,6 @@ impl AdminApi {
             Some(device_id) => device_id,
             None => return error_json(StatusCode(400), "invalid live status path"),
         };
-        if let Err(error) =
-            self.authorize_camera_action(hints, &device_id, AccessAction::CameraView)
-        {
-            return error_json(StatusCode(403), &error);
-        }
         let session_id = parse_query_param(raw_url, "session_id");
         ok_json(
             &self
@@ -5009,7 +5013,7 @@ impl AdminApi {
         request: &mut Request,
         remote_addr: Option<SocketAddr>,
         headers: &[Header],
-        hints: &AccessIdentityHints,
+        _hints: &AccessIdentityHints,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
         if let Err(error) = ensure_local_camera_access(remote_addr, headers) {
             return error_json(StatusCode(403), &error);
@@ -5019,11 +5023,6 @@ impl AdminApi {
             Some(device_id) => device_id,
             None => return error_json(StatusCode(400), "invalid live stop path"),
         };
-        if let Err(error) =
-            self.authorize_camera_action(hints, &device_id, AccessAction::CameraView)
-        {
-            return error_json(StatusCode(403), &error);
-        }
         let payload = match read_json_body_or_default::<LiveStopRequest>(request) {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
@@ -7361,17 +7360,76 @@ fn mime_type_for_path(path: &Path) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StaticByteRange {
+    start: u64,
+    end: u64,
+}
+
 fn static_file_response(path: &Path) -> Response<std::io::Cursor<Vec<u8>>> {
-    let body = match fs::read(path) {
-        Ok(payload) => payload,
+    static_file_response_with_options(path, None, false)
+}
+
+fn preview_static_file_response(
+    path: &Path,
+    range_header: Option<&str>,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    static_file_response_with_options(path, range_header, true)
+}
+
+fn static_file_response_with_options(
+    path: &Path,
+    range_header: Option<&str>,
+    include_download_filename: bool,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let file_size = match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
+        Ok(_) => return error_json(StatusCode(404), "static file path is not a file"),
         Err(error) => {
             return error_json(
                 StatusCode(500),
-                &format!("failed to read static file {}: {error}", path.display()),
+                &format!("failed to inspect static file {}: {error}", path.display()),
             )
         }
     };
-    let mut response = Response::from_data(body).with_status_code(StatusCode(200));
+    let requested_range = match range_header.map(|value| parse_static_byte_range(value, file_size))
+    {
+        Some(Ok(range)) => Some(range),
+        Some(Err(())) => return range_not_satisfiable_response(path, file_size),
+        None => None,
+    };
+    let (body, status, content_range) = match requested_range {
+        Some(range) => {
+            let body = match read_static_file_range(path, range) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return error_json(
+                        StatusCode(500),
+                        &format!(
+                            "failed to read static file range {}: {error}",
+                            path.display()
+                        ),
+                    )
+                }
+            };
+            (
+                body,
+                StatusCode(206),
+                Some(format!("bytes {}-{}/{}", range.start, range.end, file_size)),
+            )
+        }
+        None => match fs::read(path) {
+            Ok(payload) => (payload, StatusCode(200), None),
+            Err(error) => {
+                return error_json(
+                    StatusCode(500),
+                    &format!("failed to read static file {}: {error}", path.display()),
+                )
+            }
+        },
+    };
+    let body_len = body.len().to_string();
+    let mut response = Response::from_data(body).with_status_code(status);
     add_common_headers(&mut response);
     response.add_header(
         Header::from_bytes(
@@ -7380,7 +7438,131 @@ fn static_file_response(path: &Path) -> Response<std::io::Cursor<Vec<u8>>> {
         )
         .expect("header"),
     );
+    response.add_header(
+        Header::from_bytes(b"Content-Length".as_slice(), body_len.as_bytes()).expect("header"),
+    );
+    if include_download_filename {
+        response.add_header(
+            Header::from_bytes(b"Accept-Ranges".as_slice(), b"bytes".as_slice()).expect("header"),
+        );
+        response.add_header(
+            Header::from_bytes(
+                b"Content-Disposition".as_slice(),
+                inline_content_disposition(path).as_bytes(),
+            )
+            .expect("header"),
+        );
+    }
+    if let Some(value) = content_range {
+        response.add_header(
+            Header::from_bytes(b"Content-Range".as_slice(), value.as_bytes()).expect("header"),
+        );
+    }
     response
+}
+
+fn range_not_satisfiable_response(
+    path: &Path,
+    file_size: u64,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let mut response = Response::from_data(Vec::new()).with_status_code(StatusCode(416));
+    add_common_headers(&mut response);
+    response.add_header(
+        Header::from_bytes(
+            b"Content-Type".as_slice(),
+            mime_type_for_path(path).as_bytes(),
+        )
+        .expect("header"),
+    );
+    response.add_header(
+        Header::from_bytes(b"Content-Length".as_slice(), b"0".as_slice()).expect("header"),
+    );
+    response.add_header(
+        Header::from_bytes(b"Accept-Ranges".as_slice(), b"bytes".as_slice()).expect("header"),
+    );
+    response.add_header(
+        Header::from_bytes(
+            b"Content-Range".as_slice(),
+            format!("bytes */{file_size}").as_bytes(),
+        )
+        .expect("header"),
+    );
+    response.add_header(
+        Header::from_bytes(
+            b"Content-Disposition".as_slice(),
+            inline_content_disposition(path).as_bytes(),
+        )
+        .expect("header"),
+    );
+    response
+}
+
+fn parse_static_byte_range(header_value: &str, file_size: u64) -> Result<StaticByteRange, ()> {
+    if file_size == 0 {
+        return Err(());
+    }
+    let range_spec = header_value.trim().strip_prefix("bytes=").ok_or(())?.trim();
+    if range_spec.contains(',') {
+        return Err(());
+    }
+    let (start_raw, end_raw) = range_spec.split_once('-').ok_or(())?;
+    if start_raw.is_empty() {
+        let suffix_len = end_raw.trim().parse::<u64>().map_err(|_| ())?;
+        if suffix_len == 0 {
+            return Err(());
+        }
+        let start = file_size.saturating_sub(suffix_len);
+        return Ok(StaticByteRange {
+            start,
+            end: file_size - 1,
+        });
+    }
+    let start = start_raw.trim().parse::<u64>().map_err(|_| ())?;
+    if start >= file_size {
+        return Err(());
+    }
+    let end = if end_raw.trim().is_empty() {
+        file_size - 1
+    } else {
+        end_raw.trim().parse::<u64>().map_err(|_| ())?
+    };
+    if end < start {
+        return Err(());
+    }
+    Ok(StaticByteRange {
+        start,
+        end: end.min(file_size - 1),
+    })
+}
+
+fn read_static_file_range(path: &Path, range: StaticByteRange) -> std::io::Result<Vec<u8>> {
+    let mut file = fs::File::open(path)?;
+    file.seek(SeekFrom::Start(range.start))?;
+    let byte_count = range.end - range.start + 1;
+    let mut body = vec![0_u8; byte_count as usize];
+    file.read_exact(&mut body)?;
+    Ok(body)
+}
+
+fn inline_content_disposition(path: &Path) -> String {
+    let filename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("media");
+    format!(
+        "inline; filename=\"{}\"",
+        sanitize_header_filename(filename)
+    )
+}
+
+fn sanitize_header_filename(filename: &str) -> String {
+    filename
+        .chars()
+        .map(|value| match value {
+            '"' | '\\' | '\r' | '\n' => '_',
+            _ => value,
+        })
+        .collect()
 }
 
 fn harbor_assistant_build_missing_response(dist_root: &Path) -> Response<std::io::Cursor<Vec<u8>>> {
@@ -13234,12 +13416,20 @@ fn preferred_rtsp_path_for_live_profile(
         LiveStreamProfile::Sub => candidates
             .iter()
             .find(|path| rtsp_path_is_explicit_substream(path))
-            .or_else(|| candidates.iter().find(|path| rtsp_path_is_generic_substream(path)))
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .find(|path| rtsp_path_is_generic_substream(path))
+            })
             .or_else(|| candidates.first()),
         LiveStreamProfile::Main => candidates
             .iter()
             .find(|path| rtsp_path_is_explicit_mainstream(path))
-            .or_else(|| candidates.iter().find(|path| rtsp_path_is_generic_mainstream(path)))
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .find(|path| rtsp_path_is_generic_mainstream(path))
+            })
             .or_else(|| candidates.iter().find(|path| !rtsp_path_is_substream(path)))
             .or_else(|| candidates.first()),
     };
@@ -15332,9 +15522,14 @@ struct HlsLiveSessionProjection {
 struct HlsLiveDiagnostics {
     playlist_exists: bool,
     segment_count: usize,
+    startup_elapsed_seconds: u64,
+    playlist_modified_at: Option<String>,
+    playlist_created_after_seconds: Option<u64>,
     latest_segment_name: Option<String>,
     latest_segment_size_bytes: Option<u64>,
     latest_segment_modified_at: Option<String>,
+    latest_segment_created_after_seconds: Option<u64>,
+    ready_after_seconds: Option<u64>,
     ffmpeg_running: bool,
 }
 
@@ -15347,10 +15542,14 @@ const HLS_LIVE_VIDEO_BITRATE: &str = "800k";
 const HLS_LIVE_VIDEO_MAXRATE: &str = "1000k";
 const HLS_LIVE_VIDEO_BUFSIZE: &str = "1600k";
 const HLS_LIVE_AUDIO_BITRATE: &str = "64k";
+const HLS_LIVE_INPUT_PROBESIZE_BYTES: &str = "1048576";
+const HLS_LIVE_INPUT_ANALYZE_DURATION_US: &str = "3000000";
 const HLS_LIVE_FFMPEG_STDERR_LOG: &str = "ffmpeg.stderr.log";
+const HLS_LIVE_FFMPEG_ERROR_TAIL_BYTES: usize = 4096;
 const HLS_LIVE_ASSET_READY_ATTEMPTS: usize = 8;
 const HLS_LIVE_ASSET_RETRY_DELAY_MS: u64 = 75;
 const HLS_LIVE_START_TIMEOUT_SECONDS: u64 = 24;
+const HLS_LIVE_IDLE_KEEPALIVE_SECONDS: u64 = 90;
 
 impl HlsLiveSessionProjection {
     fn stopped(device_id: &str, message: impl Into<String>) -> Self {
@@ -15381,6 +15580,8 @@ struct HlsLiveSession {
     stream_profile: LiveStreamProfile,
     root: PathBuf,
     started_at: String,
+    started_at_unix_seconds: u64,
+    idle_stop_at_unix_seconds: Option<u64>,
     child: Child,
 }
 
@@ -15406,9 +15607,10 @@ impl HlsLiveRuntime {
         if stream_url.trim().is_empty() {
             return Err("camera RTSP stream is not configured".to_string());
         }
-        let ffmpeg_bin = resolve_ffmpeg_bin()
-            .ok_or_else(|| format!("当前机器缺少 ffmpeg，{}", ffmpeg_resolution_hint()))?;
         let device_root = hls_live_root().join(safe_live_path_segment(device_id));
+        if let Some(session) = self.resume_session(device_id, stream_profile) {
+            return Ok(session);
+        }
         let existing_session = {
             let mut inner = self
                 .inner
@@ -15424,11 +15626,12 @@ impl HlsLiveRuntime {
                 }
                 return Err("live session is already starting for camera".to_string());
             }
-            inner.starting_devices.insert(device_id.to_string());
-            inner
+            let existing_session = inner
                 .device_sessions
                 .remove(device_id)
-                .and_then(|session_id| inner.sessions.remove(&session_id))
+                .and_then(|session_id| inner.sessions.remove(&session_id));
+            inner.starting_devices.insert(device_id.to_string());
+            existing_session
         };
         if let Some(mut existing_session) = existing_session {
             stop_hls_live_session(&mut existing_session);
@@ -15438,6 +15641,9 @@ impl HlsLiveRuntime {
             return Err(format!("failed to clean stale live sessions: {error}"));
         }
 
+        let ffmpeg_bin = resolve_ffmpeg_bin()
+            .ok_or_else(|| format!("当前机器缺少 ffmpeg，{}", ffmpeg_resolution_hint()))?;
+        let started_at_unix_seconds = current_unix_secs();
         let session_id = format!("live-{}", Uuid::new_v4().as_simple());
         let root = device_root.join(&session_id);
         if root.exists() {
@@ -15479,11 +15685,10 @@ impl HlsLiveRuntime {
             }
             match child.try_wait() {
                 Ok(Some(status)) => {
+                    let message = hls_live_remux_exit_error(&status, &root);
                     let _ = fs::remove_dir_all(&root);
                     self.clear_starting_device(device_id);
-                    return Err(format!(
-                        "H.264 live remux exited before playlist was ready: {status}"
-                    ));
+                    return Err(message);
                 }
                 Ok(None) => thread::sleep(Duration::from_millis(100)),
                 Err(error) => {
@@ -15501,7 +15706,9 @@ impl HlsLiveRuntime {
             session_id: session_id.clone(),
             stream_profile,
             root,
-            started_at: current_unix_secs().to_string(),
+            started_at: started_at_unix_seconds.to_string(),
+            started_at_unix_seconds,
+            idle_stop_at_unix_seconds: None,
             child,
         };
 
@@ -15520,6 +15727,35 @@ impl HlsLiveRuntime {
             .insert(device_id.to_string(), session_id.clone());
         inner.sessions.insert(session_id.clone(), session);
         Ok(self.projection_locked(&mut inner, device_id, Some(&session_id)))
+    }
+
+    fn resume_session(
+        &self,
+        device_id: &str,
+        stream_profile: LiveStreamProfile,
+    ) -> Option<HlsLiveSessionProjection> {
+        let Ok(mut inner) = self.inner.lock() else {
+            return None;
+        };
+        let existing_session_id = inner.device_sessions.get(device_id).cloned()?;
+        let existing_profile = inner
+            .sessions
+            .get(&existing_session_id)
+            .map(|session| session.stream_profile);
+        if existing_profile != Some(stream_profile) {
+            return None;
+        }
+        if let Some(session) = inner.sessions.get_mut(&existing_session_id) {
+            session.idle_stop_at_unix_seconds = None;
+        }
+        let projection = self.projection_locked(&mut inner, device_id, Some(&existing_session_id));
+        if projection.session_id.is_some()
+            && matches!(projection.status.as_str(), "starting" | "running")
+        {
+            Some(projection)
+        } else {
+            None
+        }
     }
 
     fn clear_starting_device(&self, device_id: &str) {
@@ -15551,27 +15787,87 @@ impl HlsLiveRuntime {
         else {
             return HlsLiveSessionProjection::stopped(device_id, "no live session is running");
         };
-        let Some(mut session) = inner.sessions.remove(&session_id) else {
+        let Some(session) = inner.sessions.get_mut(&session_id) else {
             inner.device_sessions.remove(device_id);
             return HlsLiveSessionProjection::stopped(
                 device_id,
                 "live session was already stopped",
             );
         };
-        inner.device_sessions.remove(&session.device_id);
-        stop_hls_live_session(&mut session);
-        HlsLiveSessionProjection {
-            device_id: session.device_id,
-            session_id: Some(session.session_id),
+        if session.device_id != device_id {
+            return HlsLiveSessionProjection::stopped(
+                device_id,
+                "live session not found for camera",
+            );
+        }
+        let idle_stop_at = current_unix_secs().saturating_add(HLS_LIVE_IDLE_KEEPALIVE_SECONDS);
+        session.idle_stop_at_unix_seconds = Some(idle_stop_at);
+        let stopped = HlsLiveSessionProjection {
+            device_id: session.device_id.clone(),
+            session_id: Some(session.session_id.clone()),
             status: "stopped".to_string(),
             playlist_url: None,
             playlist_ready: false,
             mode: "hls_fmp4".to_string(),
             codec: HLS_LIVE_CODEC.to_string(),
             stream_profile: session.stream_profile.as_str().to_string(),
-            started_at: Some(session.started_at),
+            started_at: Some(session.started_at.clone()),
             updated_at: current_unix_secs().to_string(),
-            message: "live session stopped".to_string(),
+            message: format!(
+                "live session stopped; warm stream will be released after {HLS_LIVE_IDLE_KEEPALIVE_SECONDS}s idle"
+            ),
+            diagnostics: None,
+        };
+        let runtime = self.clone();
+        let idle_device_id = device_id.to_string();
+        let idle_session_id = session_id.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(
+                HLS_LIVE_IDLE_KEEPALIVE_SECONDS.saturating_add(1),
+            ));
+            runtime.stop_idle_session(&idle_device_id, &idle_session_id, idle_stop_at);
+        });
+        stopped
+    }
+
+    fn stop_idle_session(&self, device_id: &str, session_id: &str, idle_stop_at: u64) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        let should_stop = inner
+            .sessions
+            .get(session_id)
+            .map(|session| {
+                session.device_id == device_id
+                    && session.idle_stop_at_unix_seconds == Some(idle_stop_at)
+                    && current_unix_secs() >= idle_stop_at
+            })
+            .unwrap_or(false);
+        if !should_stop {
+            return;
+        }
+        let Some(mut session) = inner.sessions.remove(session_id) else {
+            return;
+        };
+        if inner.device_sessions.get(device_id).map(String::as_str) == Some(session_id) {
+            inner.device_sessions.remove(device_id);
+        }
+        stop_hls_live_session(&mut session);
+    }
+
+    fn stopped_idle_projection(session: &HlsLiveSession) -> HlsLiveSessionProjection {
+        HlsLiveSessionProjection {
+            device_id: session.device_id.clone(),
+            session_id: Some(session.session_id.clone()),
+            status: "stopped".to_string(),
+            playlist_url: None,
+            playlist_ready: false,
+            mode: "hls_fmp4".to_string(),
+            codec: HLS_LIVE_CODEC.to_string(),
+            stream_profile: session.stream_profile.as_str().to_string(),
+            started_at: Some(session.started_at.clone()),
+            updated_at: current_unix_secs().to_string(),
+            message: "live session is kept warm for quick restart".to_string(),
             diagnostics: None,
         }
     }
@@ -15626,6 +15922,21 @@ impl HlsLiveRuntime {
                 "live session belongs to another camera",
             );
         }
+        if let Some(idle_stop_at) = session.idle_stop_at_unix_seconds {
+            if current_unix_secs() < idle_stop_at {
+                return Self::stopped_idle_projection(session);
+            }
+            let mut session = inner
+                .sessions
+                .remove(&session_id)
+                .expect("session exists after get_mut");
+            if inner.device_sessions.get(device_id).map(String::as_str) == Some(session_id.as_str())
+            {
+                inner.device_sessions.remove(device_id);
+            }
+            stop_hls_live_session(&mut session);
+            return HlsLiveSessionProjection::stopped(device_id, "idle live session expired");
+        }
         match session.child.try_wait() {
             Ok(Some(status)) => {
                 let mut session = inner
@@ -15670,7 +15981,7 @@ impl HlsLiveRuntime {
 
         let playlist_state = hls_live_playlist_state(&session.root);
         if !playlist_state.has_readable_segment
-            && hls_live_session_start_timed_out(&session.started_at)
+            && hls_live_session_start_timed_out(session.started_at_unix_seconds)
         {
             let mut session = inner
                 .sessions
@@ -15694,7 +16005,8 @@ impl HlsLiveRuntime {
             };
         }
         let playlist_ready = playlist_state.has_readable_segment;
-        let diagnostics = hls_live_diagnostics(&playlist_state, true);
+        let diagnostics =
+            hls_live_diagnostics(&playlist_state, true, session.started_at_unix_seconds);
         HlsLiveSessionProjection {
             device_id: session.device_id.clone(),
             session_id: Some(session.session_id.clone()),
@@ -15735,10 +16047,7 @@ fn hls_live_static_playlist_url(device_id: &str, session_id: &str) -> String {
     )
 }
 
-fn hls_live_session_start_timed_out(started_at: &str) -> bool {
-    let Ok(started_at) = started_at.parse::<u64>() else {
-        return false;
-    };
+fn hls_live_session_start_timed_out(started_at: u64) -> bool {
     current_unix_secs().saturating_sub(started_at) > HLS_LIVE_START_TIMEOUT_SECONDS
 }
 
@@ -15774,6 +16083,10 @@ fn hls_live_ffmpeg_args(stream_url: &str) -> Vec<String> {
         "-nostdin",
         "-rtsp_transport",
         "tcp",
+        "-probesize",
+        HLS_LIVE_INPUT_PROBESIZE_BYTES,
+        "-analyzeduration",
+        HLS_LIVE_INPUT_ANALYZE_DURATION_US,
         "-fflags",
         "+genpts+nobuffer",
         "-flags",
@@ -15831,6 +16144,8 @@ fn hls_live_ffmpeg_args(stream_url: &str) -> Vec<String> {
             "48000",
             "-avoid_negative_ts",
             "make_zero",
+            "-flush_packets",
+            "1",
             "-f",
             "hls",
             "-hls_time",
@@ -15853,11 +16168,36 @@ fn hls_live_ffmpeg_args(stream_url: &str) -> Vec<String> {
     args
 }
 
+fn hls_live_remux_exit_error(status: &std::process::ExitStatus, root: &Path) -> String {
+    let mut message = format!("H.264 live remux exited before playlist was ready: {status}");
+    if let Some(stderr_tail) = hls_live_ffmpeg_stderr_tail(root) {
+        let _ = write!(message, "; ffmpeg stderr tail: {stderr_tail}");
+    }
+    message
+}
+
+fn hls_live_ffmpeg_stderr_tail(root: &Path) -> Option<String> {
+    let bytes = fs::read(root.join(HLS_LIVE_FFMPEG_STDERR_LOG)).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let start = bytes.len().saturating_sub(HLS_LIVE_FFMPEG_ERROR_TAIL_BYTES);
+    let raw_tail = String::from_utf8_lossy(&bytes[start..]);
+    let trimmed = raw_tail.trim_matches(char::from(0)).trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lines = trimmed.lines().rev().take(12).collect::<Vec<_>>();
+    let tail = lines.into_iter().rev().collect::<Vec<_>>().join("\n");
+    Some(redact_admin_string(&tail))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HlsLivePlaylistState {
     playlist_exists: bool,
     has_readable_segment: bool,
     segment_count: usize,
+    playlist_modified_at: Option<u64>,
     latest_segment_size_bytes: Option<u64>,
     latest_segment_modified_at: Option<u64>,
     latest_segment_name: Option<String>,
@@ -15870,11 +16210,16 @@ fn hls_live_playlist_state(root: &Path) -> HlsLivePlaylistState {
             playlist_exists: false,
             has_readable_segment: false,
             segment_count: 0,
+            playlist_modified_at: None,
             latest_segment_size_bytes: None,
             latest_segment_modified_at: None,
             latest_segment_name: None,
         };
     };
+    let playlist_modified_at = fs::metadata(&playlist_path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(system_time_unix_secs);
 
     let segment_names = hls_live_playlist_segment_names(&playlist);
     let has_readable_segment = segment_names
@@ -15889,6 +16234,7 @@ fn hls_live_playlist_state(root: &Path) -> HlsLivePlaylistState {
         playlist_exists: true,
         has_readable_segment,
         segment_count: segment_names.len(),
+        playlist_modified_at,
         latest_segment_size_bytes: latest_segment_metadata.as_ref().map(fs::Metadata::len),
         latest_segment_modified_at: latest_segment_metadata
             .and_then(|metadata| metadata.modified().ok())
@@ -15900,15 +16246,31 @@ fn hls_live_playlist_state(root: &Path) -> HlsLivePlaylistState {
 fn hls_live_diagnostics(
     playlist_state: &HlsLivePlaylistState,
     ffmpeg_running: bool,
+    started_at: u64,
 ) -> HlsLiveDiagnostics {
+    let offset_from_start =
+        |timestamp: Option<u64>| timestamp.map(|value| value.saturating_sub(started_at));
+    let latest_segment_created_after_seconds =
+        offset_from_start(playlist_state.latest_segment_modified_at);
     HlsLiveDiagnostics {
         playlist_exists: playlist_state.playlist_exists,
         segment_count: playlist_state.segment_count,
+        startup_elapsed_seconds: current_unix_secs().saturating_sub(started_at),
+        playlist_modified_at: playlist_state
+            .playlist_modified_at
+            .map(|value| value.to_string()),
+        playlist_created_after_seconds: offset_from_start(playlist_state.playlist_modified_at),
         latest_segment_name: playlist_state.latest_segment_name.clone(),
         latest_segment_size_bytes: playlist_state.latest_segment_size_bytes,
         latest_segment_modified_at: playlist_state
             .latest_segment_modified_at
             .map(|value| value.to_string()),
+        latest_segment_created_after_seconds,
+        ready_after_seconds: if playlist_state.has_readable_segment {
+            latest_segment_created_after_seconds
+        } else {
+            None
+        },
         ffmpeg_running,
     }
 }
@@ -16153,17 +16515,18 @@ mod tests {
         parse_model_runtime_install_path, parse_notification_target_delete_path,
         parse_optional_unix_seconds, parse_share_link_revoke_path,
         parse_shared_camera_live_page_path, parse_shared_camera_live_stream_path,
-        percent_decode_path_segment, probe_local_model_runtime, redact_account_management_snapshot,
-        redact_bridge_provider_config, redact_camera_device_projection,
-        redact_model_endpoint_response, redact_state_snapshot, redact_stream_url_credentials,
-        redact_value_stream_credentials, redacted_home_assistant_task_api_event_summary,
-        release_item, request_identity_hints, resolve_harbor_assistant_asset_path,
-        resolve_knowledge_preview_path, run_knowledge_index_jobs, run_model_download_job,
-        run_model_download_transfer, scan_request_task_args, url_encode_path_segment,
-        validate_home_assistant_service_fields, validate_home_assistant_service_smoke, AdminApi,
-        HomeAssistantServiceSmokeRequest, KnowledgeSearchApiRequest, LiveStreamProfile,
-        LocalModelRuntimeProjection, ManualAddRequest, ModelRuntimeActivationRequest,
-        ModelRuntimeActivationResult, DEFAULT_HF_ENDPOINT,
+        parse_static_byte_range, percent_decode_path_segment, probe_local_model_runtime,
+        read_static_file_range, redact_account_management_snapshot, redact_bridge_provider_config,
+        redact_camera_device_projection, redact_model_endpoint_response, redact_state_snapshot,
+        redact_stream_url_credentials, redact_value_stream_credentials,
+        redacted_home_assistant_task_api_event_summary, release_item, request_identity_hints,
+        resolve_harbor_assistant_asset_path, resolve_knowledge_preview_path,
+        run_knowledge_index_jobs, run_model_download_job, run_model_download_transfer,
+        scan_request_task_args, url_encode_path_segment, validate_home_assistant_service_fields,
+        validate_home_assistant_service_smoke, AdminApi, HomeAssistantServiceSmokeRequest,
+        KnowledgeSearchApiRequest, LiveStreamProfile, LocalModelRuntimeProjection,
+        ManualAddRequest, ModelRuntimeActivationRequest, ModelRuntimeActivationResult,
+        StaticByteRange, DEFAULT_HF_ENDPOINT,
     };
     use harborbeacon_local_agent::control_plane::events::EventRecord;
     use harborbeacon_local_agent::control_plane::media::{
@@ -16213,6 +16576,65 @@ mod tests {
             .expect("clock")
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{unique}.json"))
+    }
+
+    fn fake_hls_ffmpeg_script(prefix: &str) -> PathBuf {
+        let extension = if cfg!(windows) { "cmd" } else { "sh" };
+        let path = unique_store_path(prefix).with_extension(extension);
+        if cfg!(windows) {
+            fs::write(
+                &path,
+                "@echo off\r\n\
+                 echo #EXTM3U>index.m3u8\r\n\
+                 echo #EXT-X-TARGETDURATION:1>>index.m3u8\r\n\
+                 echo #EXT-X-MAP:URI=\"init.mp4\">>index.m3u8\r\n\
+                 echo #EXTINF:1.000,>>index.m3u8\r\n\
+                 echo segment_00000.m4s>>index.m3u8\r\n\
+                 echo init>init.mp4\r\n\
+                 echo segment>segment_00000.m4s\r\n\
+                 ping -n 120 127.0.0.1 >nul\r\n",
+            )
+            .expect("write fake ffmpeg cmd");
+        } else {
+            fs::write(
+                &path,
+                r#"#!/bin/sh
+cat > index.m3u8 <<'EOF'
+#EXTM3U
+#EXT-X-TARGETDURATION:1
+#EXT-X-MAP:URI="init.mp4"
+#EXTINF:1.000,
+segment_00000.m4s
+EOF
+printf init > init.mp4
+printf segment > segment_00000.m4s
+sleep 120
+"#,
+            )
+            .expect("write fake ffmpeg shell");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+
+                let mut permissions = fs::metadata(&path)
+                    .expect("fake ffmpeg metadata")
+                    .permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(&path, permissions).expect("set fake ffmpeg executable");
+            }
+        }
+        path
+    }
+
+    fn stop_all_hls_test_sessions(runtime: &super::HlsLiveRuntime) {
+        let Ok(mut inner) = runtime.inner.lock() else {
+            return;
+        };
+        for (_, mut session) in inner.sessions.drain() {
+            super::stop_hls_live_session(&mut session);
+        }
+        inner.device_sessions.clear();
+        inner.starting_devices.clear();
     }
 
     struct EnvGuard {
@@ -16745,9 +17167,12 @@ mod tests {
         assert!(has_pair("-b:a", "64k"));
         assert!(has_pair("-ac", "1"));
         assert!(has_pair("-ar", "48000"));
+        assert!(has_pair("-probesize", "1048576"));
+        assert!(has_pair("-analyzeduration", "3000000"));
         assert!(has_pair("-fflags", "+genpts+nobuffer"));
         assert!(has_pair("-use_wallclock_as_timestamps", "1"));
         assert!(has_pair("-avoid_negative_ts", "make_zero"));
+        assert!(has_pair("-flush_packets", "1"));
         assert!(has_pair("-vf", "fps=15"));
         assert!(has_pair("-g", "15"));
         assert!(has_pair("-hls_time", "1"));
@@ -16757,8 +17182,60 @@ mod tests {
             "omit_endlist+independent_segments+temp_file"
         ));
         assert!(!has_pair("-c:v", "copy"));
+        assert!(!args.iter().any(|arg| arg == "-rw_timeout"));
         assert!(!args.iter().any(|arg| arg.contains("delete_segments")));
         assert!(!args.iter().any(|arg| arg == "-an"));
+    }
+
+    #[test]
+    fn hls_live_ffmpeg_stderr_tail_redacts_credentials() {
+        let root = unique_store_path("harborbeacon-hls-live-stderr");
+        fs::create_dir_all(&root).expect("create live root");
+        fs::write(
+            root.join(super::HLS_LIVE_FFMPEG_STDERR_LOG),
+            "Input #0, rtsp, from 'rtsp://admin:secret@192.168.3.252/ch01_sub.264'\n\
+             password=secret\n\
+             conversion failed",
+        )
+        .expect("write stderr log");
+
+        let tail = super::hls_live_ffmpeg_stderr_tail(&root).expect("stderr tail");
+
+        assert!(tail.contains("rtsp://redacted:redacted@192.168.3.252/ch01_sub.264"));
+        assert!(tail.contains("password=redacted"));
+        assert!(!tail.contains("admin:secret"));
+        assert!(!tail.contains("password=secret"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hls_live_start_reuses_idle_warm_session_for_same_profile() {
+        let live_root = unique_store_path("harborbeacon-hls-live-root").with_extension("");
+        let fake_ffmpeg = fake_hls_ffmpeg_script("harborbeacon-hls-live-ffmpeg");
+        let _live_root_guard =
+            EnvGuard::set("HARBORNAVI_LIVE_ROOT", live_root.to_string_lossy().as_ref());
+        let _ffmpeg_guard =
+            EnvGuard::set("HARBOR_FFMPEG_BIN", fake_ffmpeg.to_string_lossy().as_ref());
+        let runtime = super::HlsLiveRuntime::default();
+
+        let first = runtime
+            .start_session("cam-1", "rtsp://camera/sub", LiveStreamProfile::Sub)
+            .expect("start first live session");
+        let session_id = first.session_id.clone().expect("first session id");
+
+        let stopped = runtime.stop_session("cam-1", Some(&session_id));
+        let second = runtime
+            .start_session("cam-1", "rtsp://camera/sub", LiveStreamProfile::Sub)
+            .expect("restart warm live session");
+
+        assert_eq!(stopped.status, "stopped");
+        assert_eq!(second.session_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(second.status, "running");
+        assert!(second.playlist_ready);
+
+        stop_all_hls_test_sessions(&runtime);
+        let _ = fs::remove_dir_all(live_root);
+        let _ = fs::remove_file(fake_ffmpeg);
     }
 
     #[test]
@@ -16820,6 +17297,7 @@ mod tests {
         assert!(!state.playlist_exists);
         assert!(!state.has_readable_segment);
         assert_eq!(state.segment_count, 0);
+        assert_eq!(state.playlist_modified_at, None);
         assert_eq!(state.latest_segment_name, None);
 
         fs::write(
@@ -16831,6 +17309,7 @@ mod tests {
         assert!(state.playlist_exists);
         assert!(!state.has_readable_segment);
         assert_eq!(state.segment_count, 1);
+        assert!(state.playlist_modified_at.is_some());
         assert_eq!(
             state.latest_segment_name.as_deref(),
             Some("segment_00001.m4s")
@@ -17530,6 +18009,41 @@ mod tests {
             "frontend/harbor-assistant/dist/harbor-assistant",
         ));
         assert_eq!(response.status_code(), StatusCode(503));
+    }
+
+    #[test]
+    fn static_byte_range_parser_supports_browser_seek_forms() {
+        assert_eq!(
+            parse_static_byte_range("bytes=10-19", 100),
+            Ok(StaticByteRange { start: 10, end: 19 })
+        );
+        assert_eq!(
+            parse_static_byte_range("bytes=10-", 100),
+            Ok(StaticByteRange { start: 10, end: 99 })
+        );
+        assert_eq!(
+            parse_static_byte_range("bytes=-8", 100),
+            Ok(StaticByteRange { start: 92, end: 99 })
+        );
+        assert_eq!(
+            parse_static_byte_range("bytes=90-120", 100),
+            Ok(StaticByteRange { start: 90, end: 99 })
+        );
+        assert!(parse_static_byte_range("bytes=100-101", 100).is_err());
+        assert!(parse_static_byte_range("bytes=20-10", 100).is_err());
+        assert!(parse_static_byte_range("bytes=0-1,4-5", 100).is_err());
+    }
+
+    #[test]
+    fn static_file_range_reader_returns_requested_bytes() {
+        let path = unique_store_path("harborbeacon-static-range").with_extension("mp4");
+        fs::write(&path, b"0123456789").expect("write static range fixture");
+
+        let body = read_static_file_range(&path, StaticByteRange { start: 2, end: 5 })
+            .expect("read static range");
+
+        assert_eq!(body, b"2345");
+        let _ = fs::remove_file(path);
     }
 
     #[test]
