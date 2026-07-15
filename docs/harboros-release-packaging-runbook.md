@@ -474,6 +474,28 @@ bash ./tools/run_harboros_vm_smoke.sh \
 
 它只负责把现有 v1 能力收成正式安装形态。
 
+## 8.1 Harbor App Layer Boundary
+
+HarborOS multi-app dogfood adds a separate application layer without changing
+the core release lane:
+
+- `harboros-beacon` and `harboros-im-gate` remain deb/systemd core services.
+- Business apps run through Docker Compose and are managed by the Harbor App
+  Manager lane.
+- App manifests follow `docs/Harbor-App-Contract-v1.md`.
+- App install/start/stop/health/log/exposure operations are HarborOS System
+  Domain actions, not IM or Home Device Domain actions.
+- App registry, app capability grants, approval, and audit truth remain
+  HarborBeacon control-plane state.
+- App compose/spec roots default to `/var/lib/harbor/apps/<app_id>/`.
+- App data roots default to `/mnt/software/harbor-apps/<app_id>/`.
+- App env/secrets default to `/etc/harbor/apps/<app_id>.env`.
+- HA Bridge / `home-event-rule-bridge` remains outside the first Harbor App
+  batch so its public GitHub-first positioning is not tied to HarborOS.
+
+The release lane may package App Manager helpers later, but ordinary Beacon/Gate
+rollback must not depend on a business app container rollback.
+
 ## 9. 当前已知 blocker 口径
 
 如果发布安装失败，优先按下面口径归因：
