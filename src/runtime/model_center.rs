@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use crate::connectors::ai_provider::{
     EmbeddingRequest, OpenAiCompatibleConfig, OpenAiCompatibleEmbeddingClient,
     OpenAiCompatibleTextClient, OpenAiCompatibleVisionClient, RerankCompatibleClient,
-    RerankCompatibleConfig, RerankRequest, RerankScore, TextCompletionRequest,
+    RerankCompatibleConfig, RerankRequest, RerankRequestFormat, RerankScore, TextCompletionRequest,
     VisionSummaryRequest,
 };
 use crate::control_plane::models::{
@@ -226,6 +226,14 @@ pub fn test_model_endpoint(endpoint: &ModelEndpoint) -> ModelEndpointTestResult 
         && endpoint.provider_key.eq_ignore_ascii_case("tesseract")
     {
         return test_tesseract_endpoint(&endpoint);
+    }
+
+    if endpoint.model_kind == ModelKind::Reranker
+        && endpoint
+            .provider_key
+            .eq_ignore_ascii_case("rerank_compatible")
+    {
+        return test_rerank_compatible_endpoint(endpoint);
     }
 
     test_http_endpoint(&endpoint)
@@ -1961,6 +1969,87 @@ fn test_http_endpoint(endpoint: &ModelEndpoint) -> ModelEndpointTestResult {
     }
 }
 
+fn test_rerank_compatible_endpoint(endpoint: &ModelEndpoint) -> ModelEndpointTestResult {
+    if endpoint.endpoint_kind == ModelEndpointKind::Cloud {
+        return ModelEndpointTestResult {
+            ok: false,
+            status: "blocked".to_string(),
+            summary: "Cloud reranker endpoints are not allowed for retrieval.rerank.".to_string(),
+            endpoint: redact_model_endpoint(endpoint),
+            details: json!({
+                "local_only": true,
+                "fallback_allowed": false,
+            }),
+        };
+    }
+    let Some(config) = rerank_compatible_config_from_endpoint(endpoint) else {
+        return ModelEndpointTestResult {
+            ok: false,
+            status: "degraded".to_string(),
+            summary: "Rerank endpoint base_url / model_name are not configured.".to_string(),
+            endpoint: redact_model_endpoint(endpoint),
+            details: json!({}),
+        };
+    };
+    let request_format = rerank_request_format_name(config.request_format);
+    let batch_size = config.batch_size;
+    let timeout_seconds = config.timeout.map(|timeout| timeout.as_secs());
+    let client = match RerankCompatibleClient::new(config) {
+        Ok(client) => client,
+        Err(error) => {
+            return ModelEndpointTestResult {
+                ok: false,
+                status: "degraded".to_string(),
+                summary: format!("Failed to build rerank client: {error}"),
+                endpoint: redact_model_endpoint(endpoint),
+                details: json!({
+                    "request_format": request_format,
+                    "batch_size": batch_size,
+                    "timeout_seconds": timeout_seconds,
+                }),
+            }
+        }
+    };
+    let probe = RerankRequest {
+        query: "harbor rerank smoke".to_string(),
+        documents: vec![
+            "HarborBeacon reranker smoke document".to_string(),
+            "Unrelated local model probe".to_string(),
+        ],
+        top_n: 2,
+    };
+    match client.rerank(&probe) {
+        Ok(response) => ModelEndpointTestResult {
+            ok: !response.scores.is_empty(),
+            status: "active".to_string(),
+            summary: "Rerank endpoint completed POST /rerank smoke test.".to_string(),
+            endpoint: redact_model_endpoint(endpoint),
+            details: json!({
+                "request_format": request_format,
+                "batch_size": batch_size,
+                "timeout_seconds": timeout_seconds,
+                "score_count": response.scores.len(),
+                "top_index": response.scores.first().map(|score| score.index),
+                "local_only": true,
+                "fallback_allowed": false,
+            }),
+        },
+        Err(error) => ModelEndpointTestResult {
+            ok: false,
+            status: "degraded".to_string(),
+            summary: format!("Rerank smoke test failed: {error}"),
+            endpoint: redact_model_endpoint(endpoint),
+            details: json!({
+                "request_format": request_format,
+                "batch_size": batch_size,
+                "timeout_seconds": timeout_seconds,
+                "local_only": true,
+                "fallback_allowed": false,
+            }),
+        },
+    }
+}
+
 fn connectivity_url(endpoint: &ModelEndpoint, base_url: &str) -> String {
     if let Some(healthz_url) = metadata_string(&endpoint.metadata, "healthz_url") {
         return healthz_url;
@@ -2031,12 +2120,42 @@ fn rerank_compatible_config_from_endpoint(
     })?;
     let rerank_path =
         metadata_string(&endpoint.metadata, "rerank_path").unwrap_or_else(|| "/rerank".to_string());
+    let request_format = rerank_request_format_from_endpoint(endpoint);
+    let batch_size = metadata_usize(&endpoint.metadata, "rerank_batch_size")
+        .or_else(|| metadata_usize(&endpoint.metadata, "batch_size"))
+        .filter(|value| *value > 0);
+    let timeout = metadata_u64(&endpoint.metadata, "rerank_timeout_seconds")
+        .or_else(|| metadata_u64(&endpoint.metadata, "timeout_seconds"))
+        .filter(|value| *value > 0)
+        .map(Duration::from_secs);
     Some(RerankCompatibleConfig {
         base_url: base_url.trim_end_matches('/').to_string(),
         api_key,
         model,
         rerank_path,
+        request_format,
+        batch_size,
+        timeout,
     })
+}
+
+fn rerank_request_format_from_endpoint(endpoint: &ModelEndpoint) -> RerankRequestFormat {
+    match metadata_string(&endpoint.metadata, "rerank_request_format")
+        .or_else(|| metadata_string(&endpoint.metadata, "request_format"))
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "tei" | "text_embeddings_inference" => RerankRequestFormat::Tei,
+        _ => RerankRequestFormat::Documents,
+    }
+}
+
+fn rerank_request_format_name(request_format: RerankRequestFormat) -> &'static str {
+    match request_format {
+        RerankRequestFormat::Documents => "documents",
+        RerankRequestFormat::Tei => "tei",
+    }
 }
 
 fn build_image_data_url(image_path: &Path) -> Result<String, String> {
@@ -2074,6 +2193,18 @@ fn metadata_string(metadata: &Value, key: &str) -> Option<String> {
 
 fn metadata_bool(metadata: &Value, key: &str) -> bool {
     metadata.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn metadata_u64(metadata: &Value, key: &str) -> Option<u64> {
+    metadata.get(key).and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+    })
+}
+
+fn metadata_usize(metadata: &Value, key: &str) -> Option<usize> {
+    metadata_u64(metadata, key).and_then(|value| usize::try_from(value).ok())
 }
 
 fn metadata_missing_or_empty(metadata: &Value, key: &str) -> bool {
@@ -2298,11 +2429,13 @@ mod tests {
 
     use super::{
         clear_local_runtime_projection_cache, connectivity_url,
-        openai_compatible_config_from_endpoint, redact_model_endpoint, run_embedding_with_state,
-        run_llm_text_with_state, run_llm_text_with_state_and_options, run_rerank_with_state,
-        run_vlm_summary_with_state, semantic_router_local_only_model_state, test_model_endpoint,
-        vlm_endpoint_readiness, LlmTextOptions, RERANK_POLICY_ID,
+        openai_compatible_config_from_endpoint, redact_model_endpoint,
+        rerank_compatible_config_from_endpoint, run_embedding_with_state, run_llm_text_with_state,
+        run_llm_text_with_state_and_options, run_rerank_with_state, run_vlm_summary_with_state,
+        semantic_router_local_only_model_state, test_model_endpoint, vlm_endpoint_readiness,
+        LlmTextOptions, RERANK_POLICY_ID,
     };
+    use crate::connectors::ai_provider::RerankRequestFormat;
     use crate::control_plane::models::{
         ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, ModelRoutePolicy,
         PrivacyLevel,
@@ -2598,6 +2731,127 @@ mod tests {
         assert!(result.ok);
         assert_eq!(result.status, "active");
         assert_eq!(result.details["mock_text_length"], json!(17));
+    }
+
+    #[test]
+    fn rerank_config_reads_tei_metadata() {
+        let endpoint = ModelEndpoint {
+            model_endpoint_id: "rerank-local-tei".to_string(),
+            workspace_id: Some("home-1".to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Reranker,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "rerank_compatible".to_string(),
+            model_name: "BAAI/bge-reranker-base".to_string(),
+            capability_tags: vec!["rerank".to_string()],
+            cost_policy: json!({}),
+            status: ModelEndpointStatus::Active,
+            metadata: json!({
+                "base_url": "http://127.0.0.1:8809",
+                "rerank_path": "/rerank",
+                "rerank_request_format": "tei",
+                "rerank_batch_size": "4",
+                "rerank_timeout_seconds": 7,
+            }),
+        };
+
+        let config = rerank_compatible_config_from_endpoint(&endpoint).expect("config");
+
+        assert_eq!(config.base_url, "http://127.0.0.1:8809");
+        assert_eq!(config.request_format, RerankRequestFormat::Tei);
+        assert_eq!(config.batch_size, Some(4));
+        assert_eq!(config.timeout, Some(std::time::Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn test_model_endpoint_posts_rerank_smoke_request() {
+        let server = Server::http("127.0.0.1:0").expect("test server");
+        let base_url = format!("http://{}", server.server_addr());
+        let seen_payload = std::sync::Arc::new(Mutex::new(None));
+        let seen_payload_for_server = std::sync::Arc::clone(&seen_payload);
+        let server_thread = thread::spawn(move || {
+            let mut request = server.recv().expect("request");
+            assert_eq!(request.method(), &Method::Post);
+            assert_eq!(request.url(), "/rerank");
+            let mut body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut body)
+                .expect("read body");
+            let payload: serde_json::Value = serde_json::from_str(&body).expect("payload");
+            *seen_payload_for_server.lock().expect("payload lock") = Some(payload);
+            let response = Response::from_string(
+                json!([
+                    {"index": 0, "score": 0.91},
+                    {"index": 1, "score": 0.12}
+                ])
+                .to_string(),
+            )
+            .with_header(
+                Header::from_bytes("Content-Type", "application/json")
+                    .expect("content-type header"),
+            );
+            request.respond(response).expect("respond");
+        });
+        let endpoint = ModelEndpoint {
+            model_endpoint_id: "rerank-local-tei".to_string(),
+            workspace_id: Some("home-1".to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Reranker,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "rerank_compatible".to_string(),
+            model_name: "BAAI/bge-reranker-base".to_string(),
+            capability_tags: vec!["rerank".to_string()],
+            cost_policy: json!({}),
+            status: ModelEndpointStatus::Active,
+            metadata: json!({
+                "base_url": base_url,
+                "rerank_path": "/rerank",
+                "rerank_request_format": "tei",
+                "rerank_timeout_seconds": 2,
+            }),
+        };
+
+        let result = test_model_endpoint(&endpoint);
+
+        assert!(result.ok, "{:?}", result);
+        assert_eq!(result.status, "active");
+        assert_eq!(result.details["request_format"], json!("tei"));
+        assert_eq!(result.details["score_count"], json!(2));
+        server_thread.join().expect("server join");
+        let payload = seen_payload
+            .lock()
+            .expect("payload lock")
+            .clone()
+            .expect("seen payload");
+        assert_eq!(payload["texts"].as_array().expect("texts").len(), 2);
+        assert!(payload.get("documents").is_none());
+    }
+
+    #[test]
+    fn test_model_endpoint_blocks_cloud_reranker() {
+        let endpoint = ModelEndpoint {
+            model_endpoint_id: "rerank-cloud".to_string(),
+            workspace_id: Some("home-1".to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Reranker,
+            endpoint_kind: ModelEndpointKind::Cloud,
+            provider_key: "rerank_compatible".to_string(),
+            model_name: "cloud-reranker".to_string(),
+            capability_tags: vec!["rerank".to_string()],
+            cost_policy: json!({}),
+            status: ModelEndpointStatus::Active,
+            metadata: json!({
+                "base_url": "https://example.invalid",
+                "api_key": "secret",
+            }),
+        };
+
+        let result = test_model_endpoint(&endpoint);
+
+        assert!(!result.ok);
+        assert_eq!(result.status, "blocked");
+        assert!(result.summary.contains("Cloud reranker"));
     }
 
     #[test]

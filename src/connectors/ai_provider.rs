@@ -79,6 +79,21 @@ pub struct RerankCompatibleConfig {
     pub api_key: String,
     pub model: String,
     pub rerank_path: String,
+    pub request_format: RerankRequestFormat,
+    pub batch_size: Option<usize>,
+    pub timeout: Option<std::time::Duration>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RerankRequestFormat {
+    Documents,
+    Tei,
+}
+
+impl Default for RerankRequestFormat {
+    fn default() -> Self {
+        Self::Documents
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,7 +419,7 @@ impl OpenAiCompatibleEmbeddingClient {
 impl RerankCompatibleClient {
     pub fn new(config: RerankCompatibleConfig) -> Result<Self, String> {
         let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(config.timeout.unwrap_or(std::time::Duration::from_secs(30)))
             .build()
             .map_err(|e| format!("failed to build rerank-compatible client: {e}"))?;
         Ok(Self { client, config })
@@ -417,12 +432,19 @@ impl RerankCompatibleClient {
         if request.documents.is_empty() {
             return Err("rerank documents are empty".to_string());
         }
-        let payload = json!({
-            "model": self.config.model,
-            "query": request.query,
-            "documents": request.documents,
-            "top_n": request.top_n.max(1),
-        });
+        let top_n = request.top_n.max(1);
+        if let Some(batch_size) = self.config.batch_size.filter(|value| *value > 0) {
+            if batch_size < request.documents.len() {
+                return self.rerank_batched(request, batch_size, top_n);
+            }
+        }
+        let payload = rerank_payload(
+            self.config.request_format,
+            &self.config.model,
+            &request.query,
+            &request.documents,
+            top_n,
+        );
 
         let response = self
             .client
@@ -450,6 +472,73 @@ impl RerankCompatibleClient {
         Ok(RerankResponse {
             scores,
             raw_response,
+        })
+    }
+
+    fn rerank_batched(
+        &self,
+        request: &RerankRequest,
+        batch_size: usize,
+        top_n: usize,
+    ) -> Result<RerankResponse, String> {
+        let mut merged_scores = Vec::new();
+        let mut raw_batches = Vec::new();
+        for (batch_index, chunk) in request.documents.chunks(batch_size).enumerate() {
+            let offset = batch_index * batch_size;
+            let chunk_documents = chunk.to_vec();
+            let payload = rerank_payload(
+                self.config.request_format,
+                &self.config.model,
+                &request.query,
+                &chunk_documents,
+                chunk_documents.len().max(1),
+            );
+            let response = self
+                .client
+                .post(rerank_url(&self.config.base_url, &self.config.rerank_path))
+                .headers(openai_compatible_headers(&self.config.api_key)?)
+                .json(&payload)
+                .send()
+                .map_err(|e| format!("rerank-compatible request failed: {e}"))?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response
+                    .text()
+                    .unwrap_or_else(|_| "<body unavailable>".to_string());
+                return Err(format!("rerank-compatible API error {status}: {body}"));
+            }
+
+            let raw_response: Value = response
+                .json()
+                .map_err(|e| format!("failed to parse rerank-compatible response: {e}"))?;
+            for score in extract_rerank_scores(&raw_response) {
+                if score.index < chunk_documents.len() {
+                    merged_scores.push(RerankScore {
+                        index: offset + score.index,
+                        score: score.score,
+                    });
+                }
+            }
+            raw_batches.push(raw_response);
+        }
+        merged_scores.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.index.cmp(&right.index))
+        });
+        merged_scores.truncate(top_n);
+        if merged_scores.is_empty() {
+            return Err("rerank-compatible response did not contain scores".to_string());
+        }
+        Ok(RerankResponse {
+            scores: merged_scores,
+            raw_response: json!({
+                "batches": raw_batches,
+                "batch_size": batch_size,
+                "request_format": rerank_request_format_name(self.config.request_format),
+            }),
         })
     }
 }
@@ -518,8 +607,40 @@ fn rerank_url(base_url: &str, rerank_path: &str) -> String {
     }
 }
 
+fn rerank_payload(
+    request_format: RerankRequestFormat,
+    model: &str,
+    query: &str,
+    documents: &[String],
+    top_n: usize,
+) -> Value {
+    match request_format {
+        RerankRequestFormat::Documents => json!({
+            "model": model,
+            "query": query,
+            "documents": documents,
+            "top_n": top_n.max(1),
+        }),
+        RerankRequestFormat::Tei => json!({
+            "query": query,
+            "texts": documents,
+            "raw_scores": true,
+        }),
+    }
+}
+
+fn rerank_request_format_name(request_format: RerankRequestFormat) -> &'static str {
+    match request_format {
+        RerankRequestFormat::Documents => "documents",
+        RerankRequestFormat::Tei => "tei",
+    }
+}
+
 fn extract_rerank_scores(value: &Value) -> Vec<RerankScore> {
-    let Some(results) = value.get("results").and_then(Value::as_array) else {
+    let Some(results) = value
+        .as_array()
+        .or_else(|| value.get("results").and_then(Value::as_array))
+    else {
         return Vec::new();
     };
     let mut scores = results
@@ -544,8 +665,16 @@ fn extract_rerank_scores(value: &Value) -> Vec<RerankScore> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_embedding_vector, extract_message_text, extract_rerank_scores};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
+
+    use super::{
+        extract_embedding_vector, extract_message_text, extract_rerank_scores, rerank_payload,
+        RerankCompatibleClient, RerankCompatibleConfig, RerankRequest, RerankRequestFormat,
+    };
     use serde_json::json;
+    use tiny_http::{Header, Method, Response, Server};
 
     #[test]
     fn extract_message_text_supports_string_content() {
@@ -623,5 +752,116 @@ mod tests {
         let scores = extract_rerank_scores(&response);
         assert_eq!(scores[0].index, 2);
         assert!((scores[0].score - 0.7).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn extract_rerank_scores_supports_tei_array_response() {
+        let response = json!([
+            {"index": 0, "score": 0.4},
+            {"index": 2, "score": 0.7}
+        ]);
+
+        let scores = extract_rerank_scores(&response);
+        assert_eq!(scores[0].index, 2);
+        assert!((scores[0].score - 0.7).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn rerank_payload_supports_tei_texts_shape() {
+        let payload = rerank_payload(
+            RerankRequestFormat::Tei,
+            "BAAI/bge-reranker-base",
+            "hybrid retrieval",
+            &["alpha".to_string(), "beta".to_string()],
+            2,
+        );
+
+        assert_eq!(payload["query"], json!("hybrid retrieval"));
+        assert_eq!(payload["texts"], json!(["alpha", "beta"]));
+        assert_eq!(payload["raw_scores"], json!(true));
+        assert!(payload.get("documents").is_none());
+        assert!(payload.get("top_n").is_none());
+        assert!(payload.get("model").is_none());
+    }
+
+    #[test]
+    fn rerank_client_batches_and_offsets_tei_scores() {
+        let server = Server::http("127.0.0.1:0").expect("test server");
+        let base_url = format!("http://{}", server.server_addr());
+        let seen_payloads = Arc::new(Mutex::new(Vec::new()));
+        let seen_payloads_for_server = Arc::clone(&seen_payloads);
+        let server_thread = thread::spawn(move || {
+            for batch_index in 0..2 {
+                let mut request = server.recv().expect("request");
+                assert_eq!(request.method(), &Method::Post);
+                let mut body = String::new();
+                request
+                    .as_reader()
+                    .read_to_string(&mut body)
+                    .expect("read request body");
+                let payload: serde_json::Value = serde_json::from_str(&body).expect("payload json");
+                seen_payloads_for_server
+                    .lock()
+                    .expect("payload lock")
+                    .push(payload);
+                let response_body = if batch_index == 0 {
+                    json!([
+                        {"index": 0, "score": 0.1},
+                        {"index": 1, "score": 0.9}
+                    ])
+                } else {
+                    json!([
+                        {"index": 0, "score": 0.8},
+                        {"index": 1, "score": 0.2}
+                    ])
+                }
+                .to_string();
+                let response = Response::from_string(response_body).with_header(
+                    Header::from_bytes("Content-Type", "application/json")
+                        .expect("content-type header"),
+                );
+                request.respond(response).expect("respond");
+            }
+        });
+
+        let client = RerankCompatibleClient::new(RerankCompatibleConfig {
+            base_url,
+            api_key: String::new(),
+            model: "BAAI/bge-reranker-base".to_string(),
+            rerank_path: "/rerank".to_string(),
+            request_format: RerankRequestFormat::Tei,
+            batch_size: Some(2),
+            timeout: Some(Duration::from_secs(2)),
+        })
+        .expect("client");
+        let response = client
+            .rerank(&RerankRequest {
+                query: "query".to_string(),
+                documents: vec![
+                    "doc0".to_string(),
+                    "doc1".to_string(),
+                    "doc2".to_string(),
+                    "doc3".to_string(),
+                ],
+                top_n: 3,
+            })
+            .expect("rerank response");
+
+        assert_eq!(
+            response
+                .scores
+                .iter()
+                .map(|score| score.index)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(response.raw_response["batch_size"], json!(2));
+        assert_eq!(response.raw_response["request_format"], json!("tei"));
+        server_thread.join().expect("server join");
+
+        let payloads = seen_payloads.lock().expect("payload lock");
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0]["texts"], json!(["doc0", "doc1"]));
+        assert_eq!(payloads[1]["texts"], json!(["doc2", "doc3"]));
     }
 }

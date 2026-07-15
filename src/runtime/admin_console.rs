@@ -3630,6 +3630,36 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
                 "api_key": local_api_key.clone(),
                 "api_key_configured": true,
                 "rerank_path": "/rerank",
+                "rerank_request_format": "documents",
+                "cloud_fallback_allowed": false,
+            }),
+        },
+        ModelEndpoint {
+            model_endpoint_id: "rerank-local-tei".to_string(),
+            workspace_id: Some(DEFAULT_MODEL_WORKSPACE_ID.to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Reranker,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "rerank_compatible".to_string(),
+            model_name: "BAAI/bge-reranker-base".to_string(),
+            capability_tags: vec![
+                "local_first".to_string(),
+                "rerank".to_string(),
+                "tei".to_string(),
+            ],
+            cost_policy: json!({"cost_hint": "local_cpu_or_gpu"}),
+            status: ModelEndpointStatus::Disabled,
+            metadata: json!({
+                "builtin": true,
+                "base_url": "http://127.0.0.1:8809",
+                "healthz_url": "http://127.0.0.1:8809/health",
+                "api_key": "",
+                "api_key_configured": false,
+                "model": "BAAI/bge-reranker-base",
+                "rerank_path": "/rerank",
+                "rerank_request_format": "tei",
+                "rerank_batch_size": 4,
+                "rerank_timeout_seconds": 30,
                 "cloud_fallback_allowed": false,
             }),
         },
@@ -5993,6 +6023,22 @@ mod tests {
         assert_eq!(endpoint.endpoint_kind, ModelEndpointKind::Local);
         assert_eq!(endpoint.provider_key, "rerank_compatible");
         assert_eq!(endpoint.status, ModelEndpointStatus::Disabled);
+        assert_eq!(
+            endpoint.metadata["rerank_request_format"],
+            json!("documents")
+        );
+
+        let tei_endpoint = default_model_endpoints()
+            .into_iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "rerank-local-tei")
+            .expect("default TEI rerank endpoint");
+        assert_eq!(tei_endpoint.model_kind, ModelKind::Reranker);
+        assert_eq!(tei_endpoint.endpoint_kind, ModelEndpointKind::Local);
+        assert_eq!(tei_endpoint.provider_key, "rerank_compatible");
+        assert_eq!(tei_endpoint.model_name, "BAAI/bge-reranker-base");
+        assert_eq!(tei_endpoint.status, ModelEndpointStatus::Disabled);
+        assert_eq!(tei_endpoint.metadata["rerank_request_format"], json!("tei"));
+        assert_eq!(tei_endpoint.metadata["rerank_batch_size"], json!(4));
 
         let policy = default_model_route_policies()
             .into_iter()

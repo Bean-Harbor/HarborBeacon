@@ -14656,6 +14656,21 @@ fn local_model_catalog_specs() -> Vec<LocalModelCatalogSpec> {
             acceptance_note: Some("legacy-catalog"),
         },
         LocalModelCatalogSpec {
+            model_id: "BAAI/bge-reranker-base",
+            display_name: "BGE Reranker Base",
+            provider_key: "bge",
+            model_kind: "reranker",
+            recommended_hardware: "CPU or GPU; TEI sidecar compatible",
+            download_size_hint: "1-2 GB",
+            source_kind: "huggingface",
+            repo_id: Some("BAAI/bge-reranker-base"),
+            revision: "main",
+            file_policy: "runtime_snapshot",
+            runtime_profiles: &["tei-rerank", "rerank-compatible"],
+            expected_capabilities: &["rerank"],
+            acceptance_note: Some("hybrid-rerank"),
+        },
+        LocalModelCatalogSpec {
             model_id: "HuggingFaceTB/SmolVLM-256M-Instruct",
             display_name: "SmolVLM 256M Instruct",
             provider_key: "huggingfacetb",
@@ -21509,6 +21524,27 @@ mod tests {
         assert_eq!(bge.file_policy, "runtime_snapshot");
         assert!(bge.installable);
         assert!(!bge.manual_only);
+
+        let reranker = catalog
+            .models
+            .iter()
+            .find(|item| item.model_id == "BAAI/bge-reranker-base")
+            .expect("bge reranker catalog model");
+        assert_eq!(reranker.source_kind, "huggingface");
+        assert_eq!(reranker.repo_id.as_deref(), Some("BAAI/bge-reranker-base"));
+        assert_eq!(reranker.model_kind, "reranker");
+        assert_eq!(reranker.file_policy, "runtime_snapshot");
+        assert!(reranker.installable);
+        assert!(!reranker.manual_only);
+        assert!(reranker
+            .runtime_profiles
+            .iter()
+            .any(|profile| profile == "tei-rerank"));
+        assert!(reranker
+            .expected_capabilities
+            .iter()
+            .any(|capability| capability == "rerank"));
+        assert_eq!(reranker.acceptance_note.as_deref(), Some("hybrid-rerank"));
     }
 
     #[test]
