@@ -14,3 +14,5 @@ dist/deb/
 tmp-hos*-snapshot.jpg
 .codex_tmp/
 .codex_tmp_*.png
+outputs/
+temp/
