@@ -299,7 +299,7 @@ API Key / Token / Secret 加密托管"]
 - 管理员后台 WebUI
 - IM 入口
 - Open API
-- 后续语音入口
+- 后续语音入口。HarborNavi 本体不假设内置麦克风；语音来自外部 capture source，可信决策见 [harbornavi-voice-trust-model.md](./harbornavi-voice-trust-model.md)。
 
 这一层只负责“进入系统”，不负责核心执行。
 
@@ -653,7 +653,7 @@ Rust Runtime 负责：
 
 建议最少角色：
 
-- `owner`
+- `owner`（产品上可呈现为 HarborNavi `root` / 家庭空间拥有者，不等同于 Linux root）
 - `admin`
 - `operator`
 - `member`
@@ -692,6 +692,18 @@ Rust Runtime 负责：
 - 删除工作流
 - 切换模型提供者
 - 控制门锁 / 安防类设备
+
+## 11.8 家庭账号分组与信息分享
+
+HarborNavi 需要一层轻量家庭账号分组，不做企业 IAM，但必须区分：
+
+- HarborNavi `root` / owner：首次初始化、设备归属、恢复、迁移、核心安全策略。
+- `admin`：家庭管理员，负责设备、成员、分享范围和高风险审批。
+- `member`：普通家庭成员，默认拥有自己的私有信息。
+- `guest`：临时访客，只访问被授权的场景或设备。
+- `system`：系统服务、自动化和设备事件，不能伪装成家庭成员。
+
+信息默认分为 `private / home_shared / role_shared / temporary_shared / system_only`。管理员可以配置分享规则，但管理权不等于默认读取所有成员私有内容。完整产品口径见 [harbornavi-trust-gateway.md](./harbornavi-trust-gateway.md)。
 
 ---
 
