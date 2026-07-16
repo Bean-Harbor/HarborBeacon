@@ -3,5 +3,9 @@ set -e
 
 systemctl stop harboros-beacon.service || true
 systemctl disable harboros-beacon.service || true
+if systemctl list-unit-files harboros-mediamtx.service >/dev/null 2>&1; then
+  systemctl stop harboros-mediamtx.service || true
+  systemctl disable harboros-mediamtx.service || true
+fi
 
 exit 0

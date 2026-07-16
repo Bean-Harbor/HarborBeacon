@@ -1,0 +1,30 @@
+logLevel: warn
+logDestinations: [stdout]
+
+api: true
+apiAddress: 127.0.0.1:9997
+metrics: false
+pprof: false
+playback: false
+
+rtsp: true
+rtspTransports: [tcp]
+rtspAddress: 127.0.0.1:8554
+rtmp: false
+hls: false
+srt: false
+moq: false
+
+webrtc: true
+webrtcAddress: 127.0.0.1:8889
+webrtcAllowOrigins: ["*"]
+webrtcLocalUDPAddress: :8189
+webrtcLocalTCPAddress: ""
+webrtcIPsFromInterfaces: true
+webrtcAdditionalHosts: []
+webrtcICEServers2: []
+
+pathDefaults:
+  rtspTransport: tcp
+
+paths: {}

@@ -215,6 +215,7 @@ pub struct AdminApi {
     task_service: TaskApiService,
     dvr_runtime: DvrRuntime,
     hls_live_runtime: HlsLiveRuntime,
+    webrtc_live_runtime: WebRtcLiveRuntime,
     harbor_assistant_dist: PathBuf,
     public_origin: String,
     model_runtime_activation: Option<ModelRuntimeActivationHandler>,
@@ -1347,6 +1348,7 @@ impl AdminApi {
             task_service,
             dvr_runtime: DvrRuntime::default(),
             hls_live_runtime: HlsLiveRuntime::default(),
+            webrtc_live_runtime: WebRtcLiveRuntime::default(),
             harbor_assistant_dist,
             public_origin,
             model_runtime_activation: None,
@@ -4942,13 +4944,6 @@ impl AdminApi {
             Ok(profile) => profile,
             Err(error) => return error_json(StatusCode(400), &error),
         };
-        if let Some(session) = self
-            .hls_live_runtime
-            .resume_session(&device_id, stream_profile)
-        {
-            return ok_json(&session.to_response(&self.public_origin));
-        }
-
         let state = match self.admin_store.load_or_create_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(422), &error),
@@ -4977,13 +4972,29 @@ impl AdminApi {
                 None => device.primary_stream.url.clone(),
             };
 
-        match self
+        let session = match self
             .hls_live_runtime
-            .start_session(&device.device_id, &stream_url, stream_profile)
+            .resume_session(&device_id, stream_profile)
         {
-            Ok(session) => ok_json(&session.to_response(&self.public_origin)),
-            Err(error) => error_json(StatusCode(422), &error),
-        }
+            Some(session) => session,
+            None => match self.hls_live_runtime.start_session(
+                &device.device_id,
+                &stream_url,
+                stream_profile,
+            ) {
+                Ok(session) => session,
+                Err(error) => return error_json(StatusCode(422), &error),
+            },
+        };
+        let webrtc = session
+            .session_id
+            .as_deref()
+            .map(|session_id| {
+                self.webrtc_live_runtime
+                    .start_session(&device.device_id, session_id, &stream_url)
+            })
+            .unwrap_or_else(|| WebRtcLiveProjection::unavailable("live session is not ready"));
+        ok_json(&session.to_response(&self.public_origin, webrtc))
     }
 
     fn handle_camera_hls_live_status(
@@ -5003,12 +5014,18 @@ impl AdminApi {
             None => return error_json(StatusCode(400), "invalid live status path"),
         };
         let session_id = parse_query_param(raw_url, "session_id");
-        ok_json(
-            &self
-                .hls_live_runtime
-                .status(&device_id, session_id.as_deref())
-                .to_response(&self.public_origin),
-        )
+        let session = self
+            .hls_live_runtime
+            .status(&device_id, session_id.as_deref());
+        let webrtc = if matches!(session.status.as_str(), "starting" | "running") {
+            self.webrtc_live_runtime
+                .status(&device_id, session.session_id.as_deref())
+        } else {
+            self.webrtc_live_runtime
+                .stop_session(&device_id, session_id.as_deref());
+            WebRtcLiveProjection::stopped()
+        };
+        ok_json(&session.to_response(&self.public_origin, webrtc))
     }
 
     fn handle_camera_hls_live_stop(
@@ -5031,12 +5048,16 @@ impl AdminApi {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
         };
-        ok_json(
-            &self
-                .hls_live_runtime
-                .stop_session(&device_id, payload.session_id.as_deref())
-                .to_response(&self.public_origin),
-        )
+        let session = self
+            .hls_live_runtime
+            .stop_session(&device_id, payload.session_id.as_deref());
+        let session_id = payload
+            .session_id
+            .as_deref()
+            .or(session.session_id.as_deref());
+        self.webrtc_live_runtime
+            .stop_session(&device_id, session_id);
+        ok_json(&session.to_response(&self.public_origin, WebRtcLiveProjection::stopped()))
     }
 
     fn handle_camera_hls_live_asset(
@@ -15537,6 +15558,172 @@ struct HlsLiveDiagnostics {
     ffmpeg_running: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct CameraLiveSessionProjection {
+    #[serde(flatten)]
+    hls: HlsLiveSessionProjection,
+    webrtc_url: Option<String>,
+    webrtc_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    webrtc_message: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WebRtcLiveProjection {
+    url: Option<String>,
+    status: String,
+    message: Option<String>,
+}
+
+impl WebRtcLiveProjection {
+    fn ready(path: &str) -> Self {
+        Self {
+            url: Some(webrtc_live_static_whep_url(path)),
+            status: "ready".to_string(),
+            message: None,
+        }
+    }
+
+    fn stopped() -> Self {
+        Self {
+            url: None,
+            status: "stopped".to_string(),
+            message: None,
+        }
+    }
+
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            url: None,
+            status: "unavailable".to_string(),
+            message: Some(message.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WebRtcLiveSession {
+    device_id: String,
+    hls_session_id: String,
+    path: String,
+}
+
+#[derive(Clone, Default)]
+struct WebRtcLiveRuntime {
+    sessions: Arc<Mutex<HashMap<String, WebRtcLiveSession>>>,
+}
+
+impl WebRtcLiveRuntime {
+    fn start_session(
+        &self,
+        device_id: &str,
+        hls_session_id: &str,
+        stream_url: &str,
+    ) -> WebRtcLiveProjection {
+        if let Some(projection) = self.resume_session(device_id, hls_session_id) {
+            return projection;
+        }
+        self.stop_session(device_id, None);
+        let path = webrtc_live_path(hls_session_id);
+        let endpoint = format!(
+            "{}/v3/config/paths/add/{path}",
+            mediamtx_api_base_url().trim_end_matches('/'),
+        );
+        let client = match Client::builder()
+            .connect_timeout(Duration::from_secs(1))
+            .timeout(Duration::from_secs(3))
+            .build()
+        {
+            Ok(client) => client,
+            Err(_) => {
+                return WebRtcLiveProjection::unavailable(
+                    "WebRTC gateway client could not be initialized",
+                )
+            }
+        };
+        let response = client
+            .post(endpoint)
+            .json(&json!({
+                "source": stream_url,
+                "sourceOnDemand": true,
+                "rtspTransport": "tcp",
+            }))
+            .send();
+        match response {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => {
+                return WebRtcLiveProjection::unavailable(format!(
+                    "WebRTC gateway rejected the stream configuration (HTTP {})",
+                    response.status().as_u16(),
+                ))
+            }
+            Err(_) => {
+                return WebRtcLiveProjection::unavailable(
+                    "WebRTC gateway is not available; HLS fallback remains active",
+                )
+            }
+        }
+
+        let session = WebRtcLiveSession {
+            device_id: device_id.to_string(),
+            hls_session_id: hls_session_id.to_string(),
+            path: path.clone(),
+        };
+        match self.sessions.lock() {
+            Ok(mut sessions) => {
+                sessions.insert(device_id.to_string(), session);
+                WebRtcLiveProjection::ready(&path)
+            }
+            Err(_) => {
+                mediamtx_delete_path(&path);
+                WebRtcLiveProjection::unavailable("WebRTC session state is unavailable")
+            }
+        }
+    }
+
+    fn resume_session(
+        &self,
+        device_id: &str,
+        hls_session_id: &str,
+    ) -> Option<WebRtcLiveProjection> {
+        let sessions = self.sessions.lock().ok()?;
+        let session = sessions.get(device_id)?;
+        if session.hls_session_id == hls_session_id {
+            Some(WebRtcLiveProjection::ready(&session.path))
+        } else {
+            None
+        }
+    }
+
+    fn status(&self, device_id: &str, hls_session_id: Option<&str>) -> WebRtcLiveProjection {
+        let Some(hls_session_id) = hls_session_id else {
+            return WebRtcLiveProjection::unavailable("WebRTC session is not configured");
+        };
+        self.resume_session(device_id, hls_session_id)
+            .unwrap_or_else(|| {
+                WebRtcLiveProjection::unavailable(
+                    "WebRTC session is not configured; HLS fallback remains active",
+                )
+            })
+    }
+
+    fn stop_session(&self, device_id: &str, hls_session_id: Option<&str>) {
+        let session = self.sessions.lock().ok().and_then(|mut sessions| {
+            let session = sessions.get(device_id)?;
+            if hls_session_id.is_some_and(|expected| session.hls_session_id != expected) {
+                return None;
+            }
+            sessions.remove(device_id)
+        });
+        if let Some(session) = session {
+            debug_assert_eq!(session.device_id, device_id);
+            mediamtx_delete_path(&session.path);
+        } else if let Some(session_id) = hls_session_id {
+            mediamtx_delete_path(&webrtc_live_path(session_id));
+        }
+    }
+}
+
 const HLS_LIVE_CODEC: &str = "h264_low_latency";
 const HLS_LIVE_TARGET_FPS: &str = "15";
 const HLS_LIVE_SEGMENT_SECONDS: &str = "1";
@@ -15574,8 +15761,17 @@ impl HlsLiveSessionProjection {
         }
     }
 
-    fn to_response(&self, _public_origin: &str) -> Self {
-        self.clone()
+    fn to_response(
+        &self,
+        _public_origin: &str,
+        webrtc: WebRtcLiveProjection,
+    ) -> CameraLiveSessionProjection {
+        CameraLiveSessionProjection {
+            hls: self.clone(),
+            webrtc_url: webrtc.url,
+            webrtc_status: webrtc.status,
+            webrtc_message: webrtc.message,
+        }
     }
 }
 
@@ -16050,6 +16246,36 @@ fn hls_live_static_playlist_url(device_id: &str, session_id: &str) -> String {
         url_encode_path_segment(&safe_live_path_segment(device_id)),
         url_encode_path_segment(session_id)
     )
+}
+
+fn mediamtx_api_base_url() -> String {
+    env::var("HARBOR_MEDIAMTX_API_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:9997".to_string())
+}
+
+fn webrtc_live_path(hls_session_id: &str) -> String {
+    format!("harbor-{hls_session_id}")
+}
+
+fn webrtc_live_static_whep_url(path: &str) -> String {
+    format!("/api/beacon-webrtc/{path}/whep")
+}
+
+fn mediamtx_delete_path(path: &str) {
+    let endpoint = format!(
+        "{}/v3/config/paths/delete/{path}",
+        mediamtx_api_base_url().trim_end_matches('/'),
+    );
+    let Ok(client) = Client::builder()
+        .connect_timeout(Duration::from_millis(500))
+        .timeout(Duration::from_secs(1))
+        .build()
+    else {
+        return;
+    };
+    let _ = client.delete(endpoint).send();
 }
 
 fn hls_live_session_start_timed_out(started_at: u64) -> bool {
@@ -17190,6 +17416,17 @@ sleep 120
         assert!(!args.iter().any(|arg| arg == "-rw_timeout"));
         assert!(!args.iter().any(|arg| arg.contains("delete_segments")));
         assert!(!args.iter().any(|arg| arg == "-an"));
+    }
+
+    #[test]
+    fn webrtc_live_path_and_whep_url_share_the_hls_session_id() {
+        let path = super::webrtc_live_path("live-abc123");
+
+        assert_eq!(path, "harbor-live-abc123");
+        assert_eq!(
+            super::webrtc_live_static_whep_url(&path),
+            "/api/beacon-webrtc/harbor-live-abc123/whep"
+        );
     }
 
     #[test]

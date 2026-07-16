@@ -1,0 +1,20 @@
+[Unit]
+Description=HarborOS MediaMTX WebRTC Gateway
+After=network.target
+Before=harboros-beacon.service
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=harboros-mediamtx
+WorkingDirectory=/var/lib/harboros-mediamtx
+ExecStart=/usr/lib/harboros-beacon/mediamtx /etc/harboros-beacon/mediamtx.yml
+Restart=always
+RestartSec=3s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target

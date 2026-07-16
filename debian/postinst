@@ -62,6 +62,10 @@ ensure_harborbeacon_runtime_env() {
 ensure_shared_token_env
 ensure_harborbeacon_runtime_env
 systemctl daemon-reload
+if [ -x /usr/lib/harboros-beacon/mediamtx ] && [ -f /etc/systemd/system/harboros-mediamtx.service ]; then
+  systemctl enable harboros-mediamtx.service
+  systemctl restart harboros-mediamtx.service
+fi
 systemctl enable harboros-beacon.service
 systemctl restart harboros-beacon.service
 
