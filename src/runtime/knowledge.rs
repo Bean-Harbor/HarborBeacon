@@ -22,6 +22,7 @@ const DEFAULT_LIMIT: usize = 5;
 #[derive(Debug, Clone, PartialEq)]
 pub struct KnowledgeSearchRequest {
     pub query: String,
+    pub rerank_query: Option<String>,
     pub configured_roots: Vec<String>,
     pub index_root: Option<String>,
     pub roots: Vec<String>,
@@ -41,6 +42,7 @@ impl KnowledgeSearchRequest {
     pub fn new(query: impl Into<String>) -> Self {
         Self {
             query: query.into(),
+            rerank_query: None,
             configured_roots: Vec::new(),
             index_root: None,
             roots: Vec::new(),
@@ -374,7 +376,16 @@ impl KnowledgeSearchService {
             let embedding_store_path = index_service.embedding_store_path_for_root(root);
             let embedding_store = if query_embedding_vector.is_some() {
                 match load_embedding_store(&embedding_store_path) {
-                    Ok(store) => store,
+                    Ok(store) if embedding_store_matches_query(&store, &query_embedding) => store,
+                    Ok(store) => {
+                        if !store.entries.is_empty() {
+                            warnings.push(format!(
+                                "Embedding cache 与当前端点或模型不一致，已跳过旧向量；请刷新知识索引：{}",
+                                embedding_store_identity_summary(&store)
+                            ));
+                        }
+                        KnowledgeEmbeddingStore::default()
+                    }
                     Err(error) => {
                         warnings.push(format!(
                             "Embedding cache 读取失败，已继续使用词法分数：{error}"
@@ -389,7 +400,12 @@ impl KnowledgeSearchService {
             for entry in embedding_store
                 .entries
                 .iter()
-                .filter(|entry| !entry.vector.is_empty())
+                .filter(|entry| {
+                    !entry.vector.is_empty()
+                        && query_embedding_vector
+                            .as_ref()
+                            .is_none_or(|query| entry.vector.len() == query.len())
+                })
             {
                 embedding_vectors.insert(entry.key.clone(), entry.vector.clone());
                 embedding_vectors.insert(
@@ -450,9 +466,16 @@ impl KnowledgeSearchService {
         let total_matches = candidates.len();
         candidates.truncate(retrieval.candidate_limit.max(1));
         if retrieval.rerank_enabled {
+            let rerank_query = request
+                .rerank_query
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| rerank_query_for_search(&query));
             apply_local_rerank(
                 &mut candidates,
-                &query,
+                &rerank_query,
                 &retrieval,
                 &model_center_state,
                 &mut warnings,
@@ -525,6 +548,32 @@ impl KnowledgeSearchService {
             empty_guidance: empty_state.as_ref().map(|state| state.guidance.clone()),
         })
     }
+}
+
+fn embedding_store_matches_query(
+    store: &KnowledgeEmbeddingStore,
+    query: &model_center::EmbeddingExecution,
+) -> bool {
+    if store.entries.is_empty() {
+        return true;
+    }
+    store.provider_key.as_deref() == Some(query.provider_key.as_str())
+        && store.model_endpoint_id.as_deref() == query.model_endpoint_id.as_deref()
+        && store.model_name.as_deref() == query.model_name.as_deref()
+        && store.vector_dimensions == Some(query.vector.len())
+}
+
+fn embedding_store_identity_summary(store: &KnowledgeEmbeddingStore) -> String {
+    format!(
+        "provider={}, endpoint={}, model={}, dimensions={}",
+        store.provider_key.as_deref().unwrap_or("unknown"),
+        store.model_endpoint_id.as_deref().unwrap_or("unknown"),
+        store.model_name.as_deref().unwrap_or("unknown"),
+        store
+            .vector_dimensions
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    )
 }
 
 fn request_policy_blocker(request: &KnowledgeSearchRequest) -> Option<String> {
@@ -1235,7 +1284,7 @@ fn apply_rrf_scores(candidates: &mut [SearchCandidate], settings: &KnowledgeRetr
 
 fn apply_local_rerank(
     candidates: &mut [SearchCandidate],
-    query: &str,
+    rerank_query: &str,
     settings: &KnowledgeRetrievalSettings,
     model_center_state: &AdminModelCenterState,
     warnings: &mut Vec<String>,
@@ -1249,8 +1298,12 @@ fn apply_local_rerank(
         .take(top_k)
         .map(rerank_passage_for_candidate)
         .collect::<Vec<_>>();
-    let execution =
-        model_center::run_rerank_with_state(query, &documents, top_k, model_center_state);
+    let execution = model_center::run_rerank_with_state(
+        rerank_query,
+        &documents,
+        top_k,
+        model_center_state,
+    );
     if !execution.available {
         warnings.push(format!(
             "Reranker 不可用，已保留 RRF 排序：{}",
@@ -1265,15 +1318,24 @@ fn apply_local_rerank(
         candidate.hit.rerank_score = None;
     }
 
+    let valid_scores = execution
+        .scores
+        .into_iter()
+        .filter(|score| {
+            score.index < top_k
+                && score.score.is_finite()
+                && score.score >= settings.rerank_min_score
+        })
+        .collect::<Vec<_>>();
+    let max_raw_score = valid_scores
+        .iter()
+        .map(|score| score.score)
+        .max_by(f32::total_cmp)
+        .unwrap_or_default();
+
     let mut applied = 0usize;
-    for score in execution.scores {
-        if score.index >= top_k
-            || !score.score.is_finite()
-            || score.score < settings.rerank_min_score
-        {
-            continue;
-        }
-        let rerank_score = score.score.clamp(0.0, 1.0);
+    for score in valid_scores {
+        let rerank_score = (score.score / max_raw_score.max(f32::EPSILON)).clamp(0.0, 1.0);
         let candidate = &mut candidates[score.index];
         candidate.hit.rerank_score = Some(rerank_score);
         candidate.final_score = (0.75 * rerank_score + 0.25 * candidate.rrf_score).clamp(0.0, 1.0);
@@ -1288,6 +1350,45 @@ fn apply_local_rerank(
             candidate.hit.rerank_score = None;
         }
         warnings.push("Reranker 返回分数低于阈值，已保留 RRF 排序。".to_string());
+    }
+}
+
+fn rerank_query_for_search(query: &str) -> String {
+    let normalized = query
+        .trim()
+        .trim_matches(|character: char| matches!(character, '?' | '？' | '。' | '！' | '!'));
+    let mut topic = normalized;
+    let mut document_list = false;
+    for suffix in [
+        "的是哪些文章",
+        "的是哪些文档",
+        "有哪些文章",
+        "有哪些文档",
+        "哪些文章",
+        "哪些文档",
+        "的文章",
+        "的文档",
+        "文章",
+        "文档",
+    ] {
+        if let Some(value) = topic.strip_suffix(suffix) {
+            topic = value.trim();
+            document_list = true;
+            break;
+        }
+    }
+    if document_list {
+        for prefix in ["请列出", "列出", "搜索", "查找", "找出", "有哪些", "描述", "关于"] {
+            if let Some(value) = topic.strip_prefix(prefix) {
+                topic = value.trim();
+                break;
+            }
+        }
+    }
+    if document_list && !topic.is_empty() {
+        format!("文章的主要主题是{topic}")
+    } else {
+        query.to_string()
     }
 }
 
@@ -2035,6 +2136,22 @@ mod tests {
     }
 
     #[test]
+    fn document_list_rerank_query_targets_the_document_theme() {
+        assert_eq!(
+            super::rerank_query_for_search("春天的文章"),
+            "文章的主要主题是春天"
+        );
+        assert_eq!(
+            super::rerank_query_for_search("描述春天的是哪些文章？"),
+            "文章的主要主题是春天"
+        );
+        assert_eq!(
+            super::rerank_query_for_search("这篇文章如何描写春天？"),
+            "这篇文章如何描写春天？"
+        );
+    }
+
+    #[test]
     fn rerank_reorders_reply_pack_citations_after_rrf() {
         let _guard = INDEX_TEST_LOCK.lock().expect("lock");
         let root = unique_dir("harborbeacon-knowledge-rerank");
@@ -2051,7 +2168,7 @@ mod tests {
         .expect("create admin state dir");
         fs::write(root.join("docs").join("a-note.md"), "春季 整理 alpha").expect("doc a");
         fs::write(root.join("docs").join("b-note.md"), "春季 整理 beta").expect("doc b");
-        write_mock_model_center_state_with_rerank(&admin_state_path, json!([0.2, 0.95]));
+        write_mock_model_center_state_with_rerank(&admin_state_path, json!([0.002, 0.04]));
 
         std::env::set_var("HARBOR_ADMIN_STATE_PATH", &admin_state_path);
         build_search_index(&root, &index_root);

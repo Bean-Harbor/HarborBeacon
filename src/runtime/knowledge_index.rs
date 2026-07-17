@@ -22,7 +22,7 @@ const MAX_INDEX_TEXT_BYTES: u64 = 512 * 1024;
 const MAX_CHUNK_LINES: usize = 4;
 const MAX_CHUNK_CHARS: usize = 320;
 const INDEX_SCHEMA_VERSION: u32 = 1;
-const EMBEDDING_STORE_SCHEMA_VERSION: u32 = 1;
+const EMBEDDING_STORE_SCHEMA_VERSION: u32 = 2;
 const DOCUMENT_EXTENSIONS: &[&str] = &[
     "txt", "md", "markdown", "json", "csv", "html", "htm", "yaml", "yml", "log", "xml", "rss",
     "atom", "pdf", "docx", "pptx", "xlsx", "zip",
@@ -348,6 +348,24 @@ impl KnowledgeIndexService {
         }
         store.root = snapshot.root.to_string_lossy().into_owned();
 
+        let mut dirty = false;
+        if let Some(identity) =
+            model_center::embedding_endpoint_identity_with_state(model_center_state)
+        {
+            let identity_matches = embedding_store_matches_identity(&store, &identity);
+            if !store.entries.is_empty() && !identity_matches {
+                store.entries.clear();
+                store.vector_dimensions = None;
+                dirty = true;
+            }
+            if !identity_matches {
+                store.provider_key = Some(identity.provider_key);
+                store.model_endpoint_id = Some(identity.model_endpoint_id);
+                store.model_name = Some(identity.model_name);
+                dirty = true;
+            }
+        }
+
         let mut entries_by_key = store
             .entries
             .iter()
@@ -355,7 +373,6 @@ impl KnowledgeIndexService {
             .map(|(index, entry)| (entry.key.clone(), index))
             .collect::<HashMap<_, _>>();
         let mut active_keys = HashSet::new();
-        let mut dirty = false;
 
         for entry in &snapshot.manifest.entries {
             for chunk in embedding_chunks_for_entry(entry) {
@@ -383,10 +400,20 @@ impl KnowledgeIndexService {
                     continue;
                 }
 
+                let vector_dimensions = execution.vector.len();
+                if store
+                    .vector_dimensions
+                    .is_some_and(|dimensions| dimensions != vector_dimensions)
+                {
+                    store.entries.clear();
+                    entries_by_key.clear();
+                }
+
                 store.provider_key =
                     (!execution.provider_key.trim().is_empty()).then_some(execution.provider_key);
                 store.model_endpoint_id = execution.model_endpoint_id;
                 store.model_name = execution.model_name;
+                store.vector_dimensions = Some(vector_dimensions);
 
                 let embedding_entry = KnowledgeEmbeddingEntry {
                     key: key.clone(),
@@ -435,8 +462,19 @@ pub struct KnowledgeEmbeddingStore {
     pub model_endpoint_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_dimensions: Option<usize>,
     #[serde(default)]
     pub entries: Vec<KnowledgeEmbeddingEntry>,
+}
+
+fn embedding_store_matches_identity(
+    store: &KnowledgeEmbeddingStore,
+    identity: &model_center::EmbeddingEndpointIdentity,
+) -> bool {
+    store.provider_key.as_deref() == Some(identity.provider_key.as_str())
+        && store.model_endpoint_id.as_deref() == Some(identity.model_endpoint_id.as_str())
+        && store.model_name.as_deref() == Some(identity.model_name.as_str())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

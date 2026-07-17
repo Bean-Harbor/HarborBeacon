@@ -334,7 +334,7 @@ fn default_retrieval_rerank_top_k() -> usize {
 }
 
 fn default_retrieval_rerank_min_score() -> f32 {
-    0.15
+    0.001
 }
 
 fn default_retrieval_mmr_lambda() -> f32 {

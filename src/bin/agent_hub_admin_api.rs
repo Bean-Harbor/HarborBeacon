@@ -1295,6 +1295,8 @@ struct KnowledgeSearchApiRequest {
     #[serde(default)]
     include_videos: Option<bool>,
     #[serde(default)]
+    use_retrieval: Option<bool>,
+    #[serde(default)]
     source_scope: Option<String>,
     #[serde(default)]
     camera_id: Option<String>,
@@ -2373,6 +2375,9 @@ impl AdminApi {
                 .boxed(),
             Method::Post if path == "/api/knowledge/search" => self
                 .handle_knowledge_search(&mut request, &identity_hints)
+                .boxed(),
+            Method::Post if path == "/api/knowledge/answer" => self
+                .handle_knowledge_answer(&mut request, &identity_hints)
                 .boxed(),
             Method::Get if path == "/api/knowledge/preview" => self
                 .handle_knowledge_preview(&raw_url, &identity_hints)
@@ -3953,6 +3958,48 @@ impl AdminApi {
             Ok(response) => ok_json(&response),
             Err(error) => error_json(StatusCode(422), &error),
         }
+    }
+
+    fn handle_knowledge_answer(
+        &self,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
+        let payload: KnowledgeSearchApiRequest = match read_json_body(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        if payload.query.trim().is_empty() {
+            return error_json(
+                StatusCode(422),
+                "Harbor Assistant answer requires a non-empty query.",
+            );
+        }
+        let settings = match self.admin_store.knowledge_settings() {
+            Ok(settings) => settings,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let focus_paths = match self.resolve_dvr_search_focus_paths(&payload) {
+            Ok(paths) => paths,
+            Err(error) => return error_json(StatusCode(422), &error),
+        };
+        let dvr_settings = self.admin_store.dvr_recording_settings().ok();
+        let roots = match resolve_admin_search_source_scope(
+            &payload,
+            &settings,
+            dvr_settings.as_ref(),
+        ) {
+            Ok(roots) => roots,
+            Err(error) => return error_json(StatusCode(422), &error),
+        };
+        let task_request =
+            build_admin_rag_answer_task_request(&principal, payload, focus_paths, roots);
+        let response = self.task_service.handle_task(task_request);
+        ok_json(&response.result.data)
     }
 
     fn resolve_dvr_search_focus_paths(
@@ -10122,6 +10169,7 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/home-guardian/activity"
         || path == "/api/knowledge/settings"
         || path == "/api/knowledge/search"
+        || path == "/api/knowledge/answer"
         || path == "/api/knowledge/preview"
         || path == "/api/knowledge/index/run"
         || path == "/api/knowledge/index/status"
@@ -11639,6 +11687,54 @@ fn build_admin_knowledge_search_request(
     request.latency_budget_ms = None;
     request.focus_paths = focus_paths;
     Ok(request)
+}
+
+fn build_admin_rag_answer_task_request(
+    principal: &AccessPrincipal,
+    payload: KnowledgeSearchApiRequest,
+    focus_paths: Vec<String>,
+    roots: Vec<String>,
+) -> TaskRequest {
+    let query = payload.query.trim().to_string();
+    let mut modalities = Vec::new();
+    if payload.include_documents.unwrap_or(true) {
+        modalities.push("document");
+    }
+    if payload.include_images.unwrap_or(true) {
+        modalities.push("image");
+    }
+    if payload.include_videos.unwrap_or(true) {
+        modalities.push("video");
+    }
+    TaskRequest {
+        task_id: String::new(),
+        trace_id: String::new(),
+        step_id: String::new(),
+        source: TaskSource {
+            channel: "admin_api".to_string(),
+            surface: "harbor_assistant_search".to_string(),
+            conversation_id: format!("harbor-assistant-search:{}", principal.user_id),
+            user_id: principal.user_id.clone(),
+            session_id: format!("harbor-assistant-search:{}", principal.user_id),
+            route_key: String::new(),
+        },
+        intent: TaskIntent {
+            domain: "rag".to_string(),
+            action: "answer".to_string(),
+            raw_text: query.clone(),
+        },
+        entity_refs: Value::Null,
+        args: json!({
+            "query": query,
+            "limit": payload.limit.unwrap_or(10).clamp(1, 10),
+            "modalities": modalities,
+            "roots": roots,
+            "focus_paths": focus_paths,
+            "use_retrieval": payload.use_retrieval,
+        }),
+        autonomy: Default::default(),
+        message: None,
+    }
 }
 
 fn parse_optional_unix_seconds(value: Option<&str>, field: &str) -> Result<Option<u64>, String> {
@@ -21356,6 +21452,7 @@ mod tests {
         assert!(is_admin_surface_path("/api/account-management"));
         assert!(is_admin_surface_path("/api/gateway/status"));
         assert!(is_admin_surface_path("/api/knowledge/search"));
+        assert!(is_admin_surface_path("/api/knowledge/answer"));
         assert!(is_admin_surface_path("/api/knowledge/preview"));
         assert!(is_admin_surface_path("/api/share-links"));
         assert!(is_admin_surface_path("/api/models/endpoints"));
@@ -23049,6 +23146,7 @@ mod tests {
                 include_documents: Some(false),
                 include_images: None,
                 include_videos: Some(true),
+                use_retrieval: None,
                 source_scope: None,
                 camera_id: None,
                 from: None,
@@ -23082,6 +23180,7 @@ mod tests {
             include_documents: None,
             include_images: None,
             include_videos: Some(true),
+            use_retrieval: None,
             source_scope: None,
             camera_id: Some(" camera-main ".to_string()),
             from: Some("1714600000".to_string()),

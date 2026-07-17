@@ -421,6 +421,7 @@ impl RerankCompatibleClient {
             "model": self.config.model,
             "query": request.query,
             "documents": request.documents,
+            "texts": request.documents,
             "top_n": request.top_n.max(1),
         });
 
@@ -519,7 +520,11 @@ fn rerank_url(base_url: &str, rerank_path: &str) -> String {
 }
 
 fn extract_rerank_scores(value: &Value) -> Vec<RerankScore> {
-    let Some(results) = value.get("results").and_then(Value::as_array) else {
+    let Some(results) = value
+        .get("results")
+        .and_then(Value::as_array)
+        .or_else(|| value.as_array())
+    else {
         return Vec::new();
     };
     let mut scores = results
@@ -623,5 +628,17 @@ mod tests {
         let scores = extract_rerank_scores(&response);
         assert_eq!(scores[0].index, 2);
         assert!((scores[0].score - 0.7).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn extract_rerank_scores_supports_tei_array_shape() {
+        let response = json!([
+            {"index": 0, "score": 0.31},
+            {"index": 1, "score": 0.91}
+        ]);
+
+        let scores = extract_rerank_scores(&response);
+        assert_eq!(scores[0].index, 1);
+        assert!((scores[0].score - 0.91).abs() < f32::EPSILON);
     }
 }
