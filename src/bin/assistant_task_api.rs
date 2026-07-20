@@ -230,10 +230,7 @@ impl TaskApiHttpServer {
 pub(crate) fn is_turn_api_path(path: &str) -> bool {
     matches!(
         path,
-        "/api/web/turns"
-            | "/api/turns"
-            | "/web/turns"
-            | "/turns"
+        "/api/web/turns" | "/api/turns" | "/web/turns" | "/turns"
     )
 }
 
@@ -478,8 +475,8 @@ mod tests {
     use tiny_http::{Header, StatusCode};
 
     use super::{
-        header_value, is_turn_api_path, parse_bearer_token, TaskApiHttpServer, HEADER_AUTHORIZATION,
-        HEADER_CONTRACT_VERSION,
+        header_value, is_turn_api_path, parse_bearer_token, TaskApiHttpServer,
+        HEADER_AUTHORIZATION, HEADER_CONTRACT_VERSION,
     };
     use harborbeacon_local_agent::runtime::admin_console::AdminConsoleStore;
     use harborbeacon_local_agent::runtime::registry::DeviceRegistryStore;

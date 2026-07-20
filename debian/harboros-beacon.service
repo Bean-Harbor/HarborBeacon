@@ -1,11 +1,13 @@
 [Unit]
 Description=HarborOS Beacon API Service
-After=network.target
+Wants=harborlink-media.service
+After=network.target harborlink-media.service
 
 [Service]
 Type=simple
 Environment=HARBOR_FFMPEG_BIN=/usr/bin/ffmpeg
 Environment=HARBOR_FFPROBE_BIN=/usr/bin/ffprobe
+Environment=HARBORLINK_MEDIA_API_URL=http://127.0.0.1:8790
 Environment=HARBOR_VISION_EVENT_STORE_PATH=/var/lib/harboros-beacon/vision-events.jsonl
 EnvironmentFile=-/etc/default/harboros-beacon-gate
 EnvironmentFile=-/etc/default/harboros-beacon

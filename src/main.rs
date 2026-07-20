@@ -3,10 +3,7 @@ use std::path::PathBuf;
 
 use serde_json::json;
 
-use harborbeacon_local_agent::adapters::onvif::WsDiscoveryOnvifAdapter;
-use harborbeacon_local_agent::adapters::rtsp::CommandRtspAdapter;
 use harborbeacon_local_agent::orchestrator::approval::{AutonomyConfig, AutonomyLevel};
-use harborbeacon_local_agent::orchestrator::executors::device_discovery::DeviceDiscoveryExecutor;
 use harborbeacon_local_agent::orchestrator::executors::harbor_ops::{
     register_harbor_executors, HarborExecutorConfig,
 };
@@ -29,8 +26,6 @@ enum RunMode {
 #[derive(Debug, Clone)]
 struct Cli {
     plan: Option<PathBuf>,
-    rtsp_open_url: Option<String>,
-    rtsp_player: Option<String>,
     mode: RunMode,
     approval_token: Option<String>,
     required_approval_token: Option<String>,
@@ -50,8 +45,6 @@ impl Default for Cli {
     fn default() -> Self {
         Self {
             plan: None,
-            rtsp_open_url: None,
-            rtsp_player: None,
             mode: RunMode::Plan,
             approval_token: None,
             required_approval_token: None,
@@ -84,18 +77,6 @@ impl Cli {
                 "--plan" => cli.plan = Some(PathBuf::from(take_value(&args, &mut index, "--plan"))),
                 value if value.starts_with("--plan=") => {
                     cli.plan = Some(PathBuf::from(value["--plan=".len()..].to_string()));
-                }
-                "--rtsp-open-url" => {
-                    cli.rtsp_open_url = Some(take_value(&args, &mut index, "--rtsp-open-url"))
-                }
-                value if value.starts_with("--rtsp-open-url=") => {
-                    cli.rtsp_open_url = Some(value["--rtsp-open-url=".len()..].to_string());
-                }
-                "--rtsp-player" => {
-                    cli.rtsp_player = Some(take_value(&args, &mut index, "--rtsp-player"))
-                }
-                value if value.starts_with("--rtsp-player=") => {
-                    cli.rtsp_player = Some(value["--rtsp-player=".len()..].to_string());
                 }
                 "--mode" => cli.mode = parse_run_mode(&take_value(&args, &mut index, "--mode")),
                 value if value.starts_with("--mode=") => {
@@ -196,15 +177,10 @@ impl From<AutonomyArg> for AutonomyLevel {
 fn main() {
     let cli = Cli::parse();
 
-    if let Some(stream_url) = &cli.rtsp_open_url {
-        run_rtsp_open_mode(&cli, stream_url);
-        return;
-    }
-
     let plan_path = match &cli.plan {
         Some(path) => path,
         None => {
-            eprintln!("--plan is required unless --rtsp-open-url is provided");
+            eprintln!("--plan is required");
             std::process::exit(1);
         }
     };
@@ -283,38 +259,12 @@ fn fail(message: &str) -> ! {
 
 fn print_usage() {
     eprintln!(
-        "Usage: harborbeacon-agent [--plan FILE] [--rtsp-open-url URL] [--rtsp-player NAME] [--mode plan|loop] [--approval-token TOKEN] [--required-approval-token TOKEN] [--disable-middleware] [--disable-midcli] [--midcli-passthrough] [--force-dry-run] [--harbor-url URL] [--harbor-api-key KEY] [--harbor-user USER] [--harbor-password PASS] [--autonomy readonly|supervised|full] [--max-iterations N]"
+        "Usage: harborbeacon-agent --plan FILE [--mode plan|loop] [--approval-token TOKEN] [--required-approval-token TOKEN] [--disable-middleware] [--disable-midcli] [--midcli-passthrough] [--force-dry-run] [--harbor-url URL] [--harbor-api-key KEY] [--harbor-user USER] [--harbor-password PASS] [--autonomy readonly|supervised|full] [--max-iterations N]"
     );
-}
-
-fn run_rtsp_open_mode(cli: &Cli, stream_url: &str) {
-    let adapter = CommandRtspAdapter::default();
-    let request = harborbeacon_local_agent::runtime::media::StreamOpenRequest::new(
-        "direct-rtsp-open",
-        stream_url,
-        cli.rtsp_player.clone(),
-    );
-
-    match harborbeacon_local_agent::adapters::rtsp::RtspProbeAdapter::open_stream(
-        &adapter, &request,
-    ) {
-        Ok(result) => match serde_json::to_string_pretty(&result) {
-            Ok(out) => println!("{out}"),
-            Err(e) => {
-                eprintln!("failed to serialize RTSP open result: {e}");
-                std::process::exit(1);
-            }
-        },
-        Err(e) => {
-            eprintln!("failed to open RTSP stream: {e}");
-            std::process::exit(1);
-        }
-    }
 }
 
 fn run_plan_mode(cli: &Cli, plan: TaskPlan) {
     let mut router = Router::new();
-    let device_registry_path = PathBuf::from(".harborbeacon/device-registry.json");
     let harbor_config = HarborExecutorConfig::from_cli(
         cli.harbor_url.clone(),
         cli.harbor_api_key.clone(),
@@ -329,22 +279,6 @@ fn run_plan_mode(cli: &Cli, plan: TaskPlan) {
         std::process::exit(1);
     }
 
-    let device_executor = match DeviceDiscoveryExecutor::new(
-        Box::new(CommandRtspAdapter::default()),
-        Some(Box::new(WsDiscoveryOnvifAdapter::default())),
-        None,
-        None,
-    )
-    .with_registry_store(
-        harborbeacon_local_agent::runtime::registry::DeviceRegistryStore::new(device_registry_path),
-    ) {
-        Ok(executor) => executor,
-        Err(e) => {
-            eprintln!("failed to initialize device registry: {e}");
-            std::process::exit(1);
-        }
-    };
-    router.register(Box::new(device_executor));
     router.register(Box::new(VisionExecutor::new(
         harborbeacon_local_agent::runtime::registry::DeviceRegistryStore::new(PathBuf::from(
             ".harborbeacon/device-registry.json",

@@ -1,8 +1,8 @@
 //! Control plane modules for administration and governance.
 
 pub mod access;
-pub mod apps;
 pub mod approvals;
+pub mod apps;
 pub mod audit;
 pub mod auth;
 pub mod automation;

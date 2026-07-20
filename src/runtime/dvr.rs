@@ -715,6 +715,13 @@ fn collect_segments(
         let sidecar_path = path.with_extension("json");
         let sidecar_exists = sidecar_path.exists();
         let sidecar_path_text = sidecar_path.to_string_lossy().into_owned();
+        let stream_kind = recording_stream_kind_from_sidecar(&sidecar_path).unwrap_or_else(|| {
+            if settings.low_bitrate_stream_preferred {
+                "substream".to_string()
+            } else {
+                "mainstream".to_string()
+            }
+        });
         let replay_url = public_origin.map(|origin| {
             format!(
                 "{}/api/knowledge/preview?path={}",
@@ -727,11 +734,7 @@ fn collect_segments(
             file_path: path.to_string_lossy().into_owned(),
             sidecar_path: Some(sidecar_path_text),
             media_kind: "recording".to_string(),
-            stream_kind: if settings.low_bitrate_stream_preferred {
-                "substream".to_string()
-            } else {
-                "mainstream".to_string()
-            },
+            stream_kind,
             started_at: started.to_string(),
             created_at: started.to_string(),
             ended_at: ended.to_string(),
@@ -751,6 +754,21 @@ fn collect_segments(
         segments.push(segment);
     }
     Ok(())
+}
+
+fn recording_stream_kind_from_sidecar(sidecar_path: &Path) -> Option<String> {
+    let payload: serde_json::Value = serde_json::from_slice(&fs::read(sidecar_path).ok()?).ok()?;
+    let value = payload
+        .pointer("/media_asset/stream_kind")
+        .or_else(|| payload.get("stream_kind"))?
+        .as_str()?
+        .trim()
+        .to_ascii_lowercase();
+    match value.as_str() {
+        "main" | "mainstream" => Some("mainstream".to_string()),
+        "sub" | "substream" => Some("substream".to_string()),
+        _ => None,
+    }
 }
 
 fn collect_snapshots(
@@ -1656,6 +1674,44 @@ mod tests {
         let text = fs::read_to_string(sidecar).expect("sidecar");
         assert!(text.contains("multimodal_rag_vlm"));
         assert!(text.contains("analysis_pending"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn timeline_scan_preserves_recording_profile_from_harborlink_sidecar() {
+        let root = unique_dir("harborbeacon-dvr-stream-kind");
+        let media_root = root.join("library");
+        let settings = DvrRecordingSettings {
+            recording_root: root.to_string_lossy().into_owned(),
+            media_library_root: media_root.to_string_lossy().into_owned(),
+            low_bitrate_stream_preferred: true,
+            segment_seconds: 300,
+            ..Default::default()
+        };
+        let video_path = recording_segment_path(&media_root, "camera-main", 1_704_067_205);
+        fs::create_dir_all(video_path.parent().expect("parent")).expect("create dir");
+        let mut fake_video = b"ftyp".to_vec();
+        fake_video.resize((MIN_PLAYABLE_MP4_BYTES + 1) as usize, 0);
+        fs::write(&video_path, fake_video).expect("write video");
+        fs::write(
+            video_path.with_extension("json"),
+            serde_json::to_vec(&json!({
+                "media_asset": {"stream_kind": "mainstream"}
+            }))
+            .expect("serialize sidecar"),
+        )
+        .expect("write sidecar");
+        let device = CameraDevice::new("camera-main", "Front Door", "rtsp://host/stream1");
+
+        let response = scan_timeline(&settings, &[device], None, None, None, None).expect("scan");
+
+        assert_eq!(response.segments.len(), 1);
+        assert_eq!(response.segments[0].stream_kind, "mainstream");
+        let sidecar: serde_json::Value = serde_json::from_slice(
+            &fs::read(video_path.with_extension("json")).expect("read sidecar"),
+        )
+        .expect("parse sidecar");
+        assert_eq!(sidecar["media_asset"]["stream_kind"], "mainstream");
         let _ = fs::remove_dir_all(root);
     }
 

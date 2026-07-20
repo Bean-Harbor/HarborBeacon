@@ -1054,6 +1054,26 @@ impl AdminConsoleStore {
         self.save_projected_state(state)
     }
 
+    pub fn save_home_assistant_orchestration_state(
+        &self,
+        enabled: bool,
+        exposed_domains: Vec<String>,
+    ) -> Result<AdminConsoleState, String> {
+        let mut state = self.load_or_create_state()?;
+        state.home_assistant.enabled = enabled;
+        state.home_assistant.base_url.clear();
+        state.home_assistant.access_token.clear();
+        state.home_assistant.exposed_domains = exposed_domains;
+        state.home_assistant.last_error = None;
+        state.home_assistant.last_status = if enabled {
+            "configured_in_harborlink".to_string()
+        } else {
+            "disabled".to_string()
+        };
+        state.home_assistant = sanitize_home_assistant_state(state.home_assistant);
+        self.save_projected_state(state)
+    }
+
     pub fn record_home_assistant_test(
         &self,
         ok: bool,

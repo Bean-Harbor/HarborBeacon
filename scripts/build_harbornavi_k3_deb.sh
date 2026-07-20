@@ -68,7 +68,7 @@ sed \
   -e "s/VERSION_PLACEHOLDER/${debian_version}/g" \
   -e "s/ARCH_PLACEHOLDER/${deb_arch}/g" \
   debian/control \
-  | sed 's/^Depends: .*/Depends: libc6, openssl, ca-certificates, python3, python3-opencv, python3-spacemit-ort/' \
+  | sed 's/^Depends: .*/Depends: libc6, openssl, ca-certificates, harborlink, python3, python3-opencv, python3-spacemit-ort/' \
   > "$pkg_dir/DEBIAN/control"
 printf 'X-HarborNavi-Version: %s\n' "$release_label" >> "$pkg_dir/DEBIAN/control"
 
@@ -99,7 +99,7 @@ EOF
 
 mkdir -p "$out_dir"
 find "$pkg_dir" -type d -exec chmod a-s,u=rwx,go=rx {} +
-dpkg-deb --build "$pkg_dir" "${out_dir}/${pkg_name}.deb"
+dpkg-deb --root-owner-group --build "$pkg_dir" "${out_dir}/${pkg_name}.deb"
 
 sha256sum "${out_dir}/${pkg_name}.deb" > "${out_dir}/${pkg_name}.deb.sha256"
 file "${cargo_release_dir}/harboros-beacon" > "${out_dir}/${pkg_name}.file.txt"

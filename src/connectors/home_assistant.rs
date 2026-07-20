@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 8;
+const DEFAULT_HARBORLINK_MEDIA_API_URL: &str = "http://127.0.0.1:8790";
 pub const HOME_ASSISTANT_TOKEN_REDACTION: &str = "__harbor_redacted__";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,8 +21,15 @@ pub struct HomeAssistantClientConfig {
 #[derive(Debug, Clone)]
 pub struct HomeAssistantClient {
     base_url: Url,
-    access_token: String,
+    access_token: Option<String>,
+    backend: HomeAssistantBackend,
     http: Client,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HomeAssistantBackend {
+    Direct,
+    HarborLink,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -172,12 +180,43 @@ impl HomeAssistantClient {
 
         Ok(Self {
             base_url,
-            access_token,
+            access_token: Some(access_token),
+            backend: HomeAssistantBackend::Direct,
+            http,
+        })
+    }
+
+    pub fn from_harborlink_env() -> Result<Self, String> {
+        let base_url = std::env::var("HARBORLINK_MEDIA_API_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_HARBORLINK_MEDIA_API_URL.to_string());
+        let base_url = normalize_base_url(&base_url)?;
+        let http = Client::builder()
+            .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECONDS))
+            .build()
+            .map_err(|error| format!("failed to build HarborLink client: {error}"))?;
+        Ok(Self {
+            base_url,
+            access_token: None,
+            backend: HomeAssistantBackend::HarborLink,
             http,
         })
     }
 
     pub fn test_connection(&self) -> HomeAssistantConnectionTest {
+        if self.backend == HomeAssistantBackend::HarborLink {
+            return match self.post_json("/v1/home-assistant/test", &json!({})) {
+                Ok(test) => test,
+                Err(error) => HomeAssistantConnectionTest {
+                    ok: false,
+                    status: "error".to_string(),
+                    location_name: None,
+                    version: None,
+                    error: Some(error),
+                },
+            };
+        }
         match self.fetch_core_config() {
             Ok(config) => HomeAssistantConnectionTest {
                 ok: true,
@@ -201,11 +240,17 @@ impl HomeAssistantClient {
     }
 
     pub fn fetch_entities(&self) -> Result<Vec<HomeAssistantEntity>, String> {
+        if self.backend == HomeAssistantBackend::HarborLink {
+            return self.get_json("/v1/home-assistant/entities");
+        }
         let raw: Vec<RawHomeAssistantEntity> = self.get_json("/api/states")?;
         Ok(raw.into_iter().map(normalize_entity).collect())
     }
 
     pub fn fetch_services(&self) -> Result<Vec<HomeAssistantServiceDomain>, String> {
+        if self.backend == HomeAssistantBackend::HarborLink {
+            return self.get_json("/v1/home-assistant/services");
+        }
         let raw: Vec<RawHomeAssistantServiceDomain> = self.get_json("/api/services")?;
         Ok(raw.into_iter().map(normalize_service_domain).collect())
     }
@@ -223,11 +268,25 @@ impl HomeAssistantClient {
         if entity_id.is_empty() {
             return Err("Home Assistant entity id is required".to_string());
         }
-        let path = format!("/api/services/{domain}/{service}");
+        let path = if self.backend == HomeAssistantBackend::HarborLink {
+            format!("/v1/home-assistant/services/{domain}/{service}")
+        } else {
+            format!("/api/services/{domain}/{service}")
+        };
         let mut body = fields
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
+        if self.backend == HomeAssistantBackend::HarborLink {
+            let value: HomeAssistantServiceCallResponse = self.post_json(
+                &path,
+                &json!({
+                    "entity_id": entity_id,
+                    "fields": Value::Object(body),
+                }),
+            )?;
+            return Ok(value);
+        }
         body.insert("entity_id".to_string(), json!(entity_id));
         let body = Value::Object(body);
         let value: Value = self.post_json(&path, &body)?;
@@ -246,10 +305,11 @@ impl HomeAssistantClient {
             .base_url
             .join(path.trim_start_matches('/'))
             .map_err(|error| format!("invalid Home Assistant endpoint {path}: {error}"))?;
-        let response = self
-            .http
-            .get(url)
-            .bearer_auth(&self.access_token)
+        let mut request = self.http.get(url);
+        if let Some(access_token) = self.access_token.as_deref() {
+            request = request.bearer_auth(access_token);
+        }
+        let response = request
             .send()
             .map_err(|error| format!("Home Assistant request failed: {error}"))?;
         let status = response.status();
@@ -270,11 +330,11 @@ impl HomeAssistantClient {
             .base_url
             .join(path.trim_start_matches('/'))
             .map_err(|error| format!("invalid Home Assistant endpoint {path}: {error}"))?;
-        let response = self
-            .http
-            .post(url)
-            .bearer_auth(&self.access_token)
-            .json(body)
+        let mut request = self.http.post(url).json(body);
+        if let Some(access_token) = self.access_token.as_deref() {
+            request = request.bearer_auth(access_token);
+        }
+        let response = request
             .send()
             .map_err(|error| format!("Home Assistant request failed: {error}"))?;
         let status = response.status();

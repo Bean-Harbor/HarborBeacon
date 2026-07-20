@@ -46,11 +46,13 @@ use self::system_readiness_actions::build_general_message_readiness_summary;
 #[cfg(test)]
 use self::vision_event_actions::build_redacted_vision_event_summary;
 
-use crate::adapters::rtsp::CommandRtspAdapter;
+use crate::connectors::harborlink_media::HarborLinkMediaClient;
+#[cfg(test)]
+use crate::connectors::home_assistant::HomeAssistantClientConfig;
 use crate::connectors::home_assistant::{
     normalize_home_assistant_service_action_request,
-    validate_home_assistant_service_action_request, HomeAssistantClient, HomeAssistantClientConfig,
-    HomeAssistantEntity, HomeAssistantServiceActionRequest,
+    validate_home_assistant_service_action_request, HomeAssistantClient, HomeAssistantEntity,
+    HomeAssistantServiceActionRequest,
 };
 use crate::connectors::notifications::{
     NotificationAttachment, NotificationAttachmentKind, NotificationContent, NotificationDelivery,
@@ -104,7 +106,7 @@ use crate::runtime::knowledge::{
     KnowledgeSearchCitation, KnowledgeSearchRequest, KnowledgeSearchResponse,
     KnowledgeSearchService,
 };
-use crate::runtime::media::{ClipCaptureRequest, ClipCaptureResult, SnapshotCaptureResult};
+use crate::runtime::media::{ClipCaptureResult, SnapshotCaptureResult};
 use crate::runtime::model_center::{
     run_llm_text_with_state_and_options, run_ocr_with_state, run_vlm_summary_with_state,
     LlmTextExecution, LlmTextOptions,
@@ -2844,13 +2846,6 @@ impl TaskApiService {
             }
         };
         let recording_policy = resolved_recording_policy(&admin_state, Some(&target));
-        let capture_root = match resolved_capture_directory(&admin_state, recording_policy.as_ref())
-        {
-            Ok(path) => path,
-            Err(error) => {
-                return self.failed(request, "camera_hub_service", RiskLevel::Low, error);
-            }
-        };
         let clip_length_seconds = recording_policy
             .as_ref()
             .and_then(RecordingPolicy::clip_length_seconds_hint)
@@ -2865,39 +2860,58 @@ impl TaskApiService {
             .and_then(RecordingPolicy::keyframe_interval_seconds_hint)
             .or(Some(admin_state.defaults.keyframe_interval_seconds));
 
-        let clip_path = build_clip_output_path(&capture_root, &target, current_epoch_ms());
-        let adapter = CommandRtspAdapter::default();
-        let clip_request = ClipCaptureRequest::new(
-            target.device_id.clone(),
-            target.primary_stream.url.clone(),
+        let harborlink = match HarborLinkMediaClient::from_env() {
+            Ok(client) => client,
+            Err(error) => {
+                return self.failed(request, "camera_hub_service", RiskLevel::Low, error);
+            }
+        };
+        let link_clip = match harborlink.capture_clip(
+            &target.device_id,
             clip_length_seconds,
-            StorageTarget::HarborOsPool,
-        )
-        .with_keyframe_hints(keyframe_count, keyframe_interval_seconds);
-
-        let clip = match adapter.capture_clip_to_path(&clip_request, &clip_path) {
+            keyframe_count,
+            keyframe_interval_seconds,
+        ) {
             Ok(result) => result,
             Err(error) => {
                 return self.failed(request, "camera_hub_service", RiskLevel::Low, error);
             }
         };
-        let keyframes_dir = build_keyframe_directory(&capture_root, &clip_path);
-        let keyframes = match adapter.extract_keyframes(
-            &clip_path,
-            &keyframes_dir,
-            keyframe_count,
-            keyframe_interval_seconds,
-        ) {
-            Ok(paths) => paths,
-            Err(error) => {
-                return self.failed(
-                    request,
-                    "camera_hub_service",
-                    RiskLevel::Low,
-                    format!("短视频已保存，但关键帧抽取失败: {error}"),
-                );
-            }
-        };
+        if link_clip.camera_id != target.device_id
+            || link_clip.clip_path.trim().is_empty()
+            || link_clip.keyframe_paths.is_empty()
+        {
+            return self.failed(
+                request,
+                "camera_hub_service",
+                RiskLevel::Low,
+                "HarborLink 返回了无效的短视频采集结果。".to_string(),
+            );
+        }
+        let mut clip = ClipCaptureResult::new(
+            target.device_id.clone(),
+            link_clip.clip_length_seconds,
+            usize::try_from(link_clip.byte_size).unwrap_or(usize::MAX),
+            StorageTarget::HarborOsPool,
+        )
+        .with_keyframe_hints(
+            Some(link_clip.keyframe_count),
+            Some(link_clip.keyframe_interval_seconds),
+        );
+        clip.mime_type = link_clip.mime_type;
+        clip.storage.relative_path = link_clip.clip_path;
+        clip.captured_at_epoch_ms = link_clip.captured_at_epoch_ms;
+        clip.started_at_epoch_ms = link_clip.started_at_epoch_ms;
+        clip.ended_at_epoch_ms = link_clip.ended_at_epoch_ms;
+        clip.index_sidecar_relative_path = PathBuf::from(&clip.storage.relative_path)
+            .with_extension("json")
+            .to_string_lossy()
+            .into_owned();
+        let keyframes = link_clip
+            .keyframe_paths
+            .into_iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
         if let Err(error) = self.persist_clip_ingest(&admin_state, &target, &clip, &keyframes) {
             return self.failed(
                 request,
@@ -5790,26 +5804,6 @@ fn build_snapshot_output_path(
     ))
 }
 
-fn build_clip_output_path(
-    capture_root: &Path,
-    target: &ResolvedCameraTarget,
-    captured_at_epoch_ms: u128,
-) -> PathBuf {
-    capture_root.join(format!(
-        "{}-{}.mp4",
-        sanitize_path_segment(&target.device_id),
-        captured_at_epoch_ms
-    ))
-}
-
-fn build_keyframe_directory(capture_root: &Path, clip_path: &Path) -> PathBuf {
-    let stem = clip_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("clip");
-    capture_root.join("keyframes").join(stem)
-}
-
 fn current_epoch_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -8341,11 +8335,14 @@ fn home_assistant_client_from_admin_state(
     if !state.enabled {
         return Err("Home Assistant integration is disabled".to_string());
     }
-    let config = HomeAssistantClientConfig::new(&state.base_url, &state.access_token);
-    if !config.configured() {
-        return Err("Home Assistant base URL and access token are required".to_string());
+    #[cfg(test)]
+    if !state.base_url.trim().is_empty() && !state.access_token.trim().is_empty() {
+        return HomeAssistantClient::new(HomeAssistantClientConfig::new(
+            state.base_url.clone(),
+            state.access_token.clone(),
+        ));
     }
-    HomeAssistantClient::new(config)
+    HomeAssistantClient::from_harborlink_env()
 }
 
 fn default_notification_target_record(
