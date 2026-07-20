@@ -1299,6 +1299,8 @@ struct KnowledgeSearchApiRequest {
     #[serde(default)]
     source_scope: Option<String>,
     #[serde(default)]
+    source_root_ids: Vec<String>,
+    #[serde(default)]
     camera_id: Option<String>,
     #[serde(default)]
     from: Option<String>,
@@ -11606,6 +11608,33 @@ fn resolve_admin_search_source_scope(
     settings: &KnowledgeSettings,
     dvr_settings: Option<&DvrRecordingSettings>,
 ) -> Result<Vec<String>, String> {
+    let requested_root_ids = payload
+        .source_root_ids
+        .iter()
+        .filter_map(|root_id| non_empty_string(root_id))
+        .collect::<Vec<_>>();
+    if !requested_root_ids.is_empty() {
+        let mut resolved_roots = Vec::new();
+        let mut seen_root_ids = HashSet::new();
+        for root_id in requested_root_ids {
+            if !seen_root_ids.insert(root_id.clone()) {
+                continue;
+            }
+            let root = settings
+                .source_roots
+                .iter()
+                .find(|root| root.root_id == root_id && root.enabled)
+                .ok_or_else(|| {
+                    format!("Knowledge source root is not enabled or configured: {root_id}")
+                })?;
+            let path = non_empty_string(&root.path).ok_or_else(|| {
+                format!("Knowledge source root has no usable path: {root_id}")
+            })?;
+            resolved_roots.push(path);
+        }
+        return Ok(resolved_roots);
+    }
+
     let scope = payload
         .source_scope
         .as_deref()
@@ -19653,6 +19682,7 @@ mod tests {
         parse_optional_unix_seconds, parse_share_link_revoke_path,
         parse_shared_camera_live_page_path, parse_shared_camera_live_stream_path,
         percent_decode_path_segment, probe_local_model_runtime, redact_account_management_snapshot,
+        resolve_admin_search_source_scope,
         redact_admin_string, redact_bridge_provider_config, redact_camera_device_projection,
         redact_model_endpoint_response, redact_state_snapshot, redact_stream_url_credentials,
         redact_value_stream_credentials, redacted_general_message_nsp_route_summary,
@@ -23148,6 +23178,7 @@ mod tests {
                 include_videos: Some(true),
                 use_retrieval: None,
                 source_scope: None,
+                source_root_ids: Vec::new(),
                 camera_id: None,
                 from: None,
                 to: None,
@@ -23173,6 +23204,57 @@ mod tests {
     }
 
     #[test]
+    fn admin_search_source_scope_resolves_enabled_configured_root_ids() {
+        let settings = KnowledgeSettings {
+            source_roots: vec![
+                KnowledgeSourceRoot {
+                    root_id: "documents".to_string(),
+                    label: "Documents".to_string(),
+                    path: "/mnt/documents".to_string(),
+                    enabled: true,
+                    include: Vec::new(),
+                    exclude: Vec::new(),
+                    last_indexed_at: None,
+                },
+                KnowledgeSourceRoot {
+                    root_id: "disabled".to_string(),
+                    label: "Disabled".to_string(),
+                    path: "/mnt/disabled".to_string(),
+                    enabled: false,
+                    include: Vec::new(),
+                    exclude: Vec::new(),
+                    last_indexed_at: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let payload = KnowledgeSearchApiRequest {
+            query: "春天的文章".to_string(),
+            limit: None,
+            include_documents: Some(true),
+            include_images: Some(false),
+            include_videos: Some(false),
+            use_retrieval: Some(true),
+            source_scope: Some("all".to_string()),
+            source_root_ids: vec!["documents".to_string(), "documents".to_string()],
+            camera_id: None,
+            from: None,
+            to: None,
+        };
+
+        assert_eq!(
+            resolve_admin_search_source_scope(&payload, &settings, None).unwrap(),
+            vec!["/mnt/documents".to_string()]
+        );
+
+        let mut disabled_payload = payload;
+        disabled_payload.source_root_ids = vec!["disabled".to_string()];
+        assert!(resolve_admin_search_source_scope(&disabled_payload, &settings, None)
+            .unwrap_err()
+            .contains("not enabled or configured"));
+    }
+
+    #[test]
     fn admin_search_request_detects_and_validates_dvr_focus_fields() {
         let payload = KnowledgeSearchApiRequest {
             query: "谁在倒饮料".to_string(),
@@ -23182,6 +23264,7 @@ mod tests {
             include_videos: Some(true),
             use_retrieval: None,
             source_scope: None,
+            source_root_ids: Vec::new(),
             camera_id: Some(" camera-main ".to_string()),
             from: Some("1714600000".to_string()),
             to: Some("1714600300".to_string()),
