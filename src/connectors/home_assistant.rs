@@ -1,14 +1,17 @@
 //! Home Assistant REST connector.
 
+use std::fs;
 use std::time::Duration;
 
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::{StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 8;
 const DEFAULT_HARBORLINK_MEDIA_API_URL: &str = "http://127.0.0.1:8790";
+const DEFAULT_HARBORLINK_LOCAL_API_TOKEN_FILE: &str = "/etc/harborlink/local-api.token";
+const HARBORLINK_CONTRACT_VERSION: &str = "1.0";
 pub const HOME_ASSISTANT_TOKEN_REDACTION: &str = "__harbor_redacted__";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +25,7 @@ pub struct HomeAssistantClientConfig {
 pub struct HomeAssistantClient {
     base_url: Url,
     access_token: Option<String>,
+    local_api_token: Option<String>,
     backend: HomeAssistantBackend,
     http: Client,
 }
@@ -181,6 +185,7 @@ impl HomeAssistantClient {
         Ok(Self {
             base_url,
             access_token: Some(access_token),
+            local_api_token: None,
             backend: HomeAssistantBackend::Direct,
             http,
         })
@@ -199,6 +204,7 @@ impl HomeAssistantClient {
         Ok(Self {
             base_url,
             access_token: None,
+            local_api_token: read_local_api_token_from_env()?,
             backend: HomeAssistantBackend::HarborLink,
             http,
         })
@@ -309,11 +315,20 @@ impl HomeAssistantClient {
         if let Some(access_token) = self.access_token.as_deref() {
             request = request.bearer_auth(access_token);
         }
+        if self.backend == HomeAssistantBackend::HarborLink {
+            request = self.harborlink_request(request, false);
+        }
         let response = request
             .send()
             .map_err(|error| format!("Home Assistant request failed: {error}"))?;
         let status = response.status();
         if !status.is_success() {
+            if self.backend == HomeAssistantBackend::HarborLink {
+                return Err(format_harborlink_status_error(
+                    response,
+                    "Home Assistant request",
+                ));
+            }
             return Err(format_home_assistant_status_error(status));
         }
         response
@@ -334,16 +349,40 @@ impl HomeAssistantClient {
         if let Some(access_token) = self.access_token.as_deref() {
             request = request.bearer_auth(access_token);
         }
+        if self.backend == HomeAssistantBackend::HarborLink {
+            request = self.harborlink_request(request, true);
+        }
         let response = request
             .send()
             .map_err(|error| format!("Home Assistant request failed: {error}"))?;
         let status = response.status();
         if !status.is_success() {
+            if self.backend == HomeAssistantBackend::HarborLink {
+                return Err(format_harborlink_status_error(
+                    response,
+                    "Home Assistant request",
+                ));
+            }
             return Err(format_home_assistant_status_error(status));
         }
         response
             .json::<T>()
             .map_err(|error| format!("failed to parse Home Assistant response: {error}"))
+    }
+
+    fn harborlink_request(&self, request: RequestBuilder, mutation: bool) -> RequestBuilder {
+        let mut request =
+            request.header("X-HarborLink-Contract-Version", HARBORLINK_CONTRACT_VERSION);
+        if let Some(token) = self.local_api_token.as_deref() {
+            request = request.bearer_auth(token);
+        }
+        if mutation {
+            request = request.header(
+                "X-Request-Id",
+                format!("beacon-{}", uuid::Uuid::new_v4().simple()),
+            );
+        }
+        request
     }
 }
 
@@ -525,6 +564,63 @@ fn normalize_service_domain(raw: RawHomeAssistantServiceDomain) -> HomeAssistant
         domain: raw.domain,
         services,
     }
+}
+
+fn read_local_api_token_from_env() -> Result<Option<String>, String> {
+    if let Ok(value) = std::env::var("HARBORLINK_LOCAL_API_TOKEN") {
+        let value = value.trim().to_string();
+        if !value.is_empty() {
+            return Ok(Some(value));
+        }
+    }
+    let token_file = std::env::var("HARBORLINK_LOCAL_API_TOKEN_FILE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_HARBORLINK_LOCAL_API_TOKEN_FILE.to_string());
+    match fs::read_to_string(&token_file) {
+        Ok(value) => {
+            let value = value.trim().to_string();
+            if value.is_empty() {
+                Err(format!(
+                    "HarborLink local API token file {token_file} is empty"
+                ))
+            } else {
+                Ok(Some(value))
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "failed to read HarborLink local API token file {token_file}: {error}"
+        )),
+    }
+}
+
+fn format_harborlink_status_error(response: Response, operation: &str) -> String {
+    let status = response.status();
+    if let Ok(value) = response.json::<Value>() {
+        if let Some(error) = value.get("error") {
+            let code = error
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("HARBORLINK_ERROR");
+            let dependency = error
+                .get("dependency")
+                .and_then(Value::as_str)
+                .unwrap_or("harborlink");
+            let retryable = error
+                .get("retryable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            return format!(
+                "{operation} failed via HarborLink: {code} from {dependency}; retryable={retryable} (HTTP {})",
+                status.as_u16()
+            );
+        }
+    }
+    format!(
+        "{operation} failed via HarborLink (HTTP {})",
+        status.as_u16()
+    )
 }
 
 fn format_home_assistant_status_error(status: StatusCode) -> String {

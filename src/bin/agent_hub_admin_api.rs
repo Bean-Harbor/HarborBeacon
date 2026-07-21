@@ -2447,6 +2447,9 @@ impl AdminApi {
             Method::Get if path == "/api/harboros/im-capability-map" => self
                 .handle_harboros_im_capability_map(&identity_hints)
                 .boxed(),
+            Method::Get if path == "/api/harbor-link/capabilities" => {
+                self.handle_harborlink_capabilities(&identity_hints).boxed()
+            }
             Method::Get if path == "/api/home-assistant/status" => {
                 self.handle_home_assistant_status(&identity_hints).boxed()
             }
@@ -4381,6 +4384,32 @@ impl AdminApi {
             return error_json(StatusCode(403), &error);
         }
         ok_json(&build_harboros_im_capability_map())
+    }
+
+    fn handle_harborlink_capabilities(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        match self.harborlink_media.capabilities() {
+            Ok(capabilities) => ok_json(&capabilities),
+            Err(error) => ok_json(&json!({
+                "ok": false,
+                "status": "degraded",
+                "contractVersion": "1.0",
+                "dependency": "harborlink",
+                "error": redact_admin_string(&error),
+                "features": {
+                    "homeAssistant": { "status": "degraded" },
+                    "camera": { "status": "degraded" },
+                    "recording": { "status": "degraded" },
+                    "hls": { "status": "degraded" },
+                    "webrtc": { "status": "degraded" }
+                }
+            })),
+        }
     }
 
     fn handle_home_assistant_status(
@@ -10378,6 +10407,7 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/cameras/recordings/timeline"
         || path == "/api/harboros/status"
         || path == "/api/harboros/im-capability-map"
+        || path == "/api/harbor-link/capabilities"
         || path == "/api/home-assistant/status"
         || path == "/api/home-assistant/config"
         || path == "/api/home-assistant/test"
@@ -21250,6 +21280,7 @@ mod tests {
         assert!(is_admin_surface_path("/api/cameras/camera-1/snapshot.jpg"));
         assert!(is_admin_surface_path("/api/cameras/camera-1/live.mjpeg"));
         assert!(is_admin_surface_path("/api/cameras/camera-1/analyze"));
+        assert!(is_admin_surface_path("/api/harbor-link/capabilities"));
         assert!(is_admin_surface_path("/api/home-assistant/status"));
         assert!(is_admin_surface_path("/api/home-assistant/config"));
         assert!(is_admin_surface_path(

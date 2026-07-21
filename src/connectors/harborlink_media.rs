@@ -1,19 +1,24 @@
-use reqwest::blocking::{Client, Response};
+use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::fs;
 use std::io::Read;
 use std::time::Duration;
+use uuid::Uuid;
 
 use crate::runtime::registry::CameraCapabilities;
 
 const DEFAULT_HARBORLINK_MEDIA_API_URL: &str = "http://127.0.0.1:8790";
+const DEFAULT_HARBORLINK_LOCAL_API_TOKEN_FILE: &str = "/etc/harborlink/local-api.token";
+const HARBORLINK_CONTRACT_VERSION: &str = "1.0";
 
 #[derive(Debug, Clone)]
 pub struct HarborLinkMediaClient {
     base_url: String,
+    local_api_token: Option<String>,
     http: Client,
 }
 
@@ -172,7 +177,9 @@ impl HarborLinkMediaClient {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_HARBORLINK_MEDIA_API_URL.to_string());
-        Self::new(base_url)
+        let mut client = Self::new(base_url)?;
+        client.local_api_token = read_local_api_token_from_env()?;
+        Ok(client)
     }
 
     pub fn new(base_url: impl Into<String>) -> Result<Self, String> {
@@ -185,7 +192,37 @@ impl HarborLinkMediaClient {
             .connect_timeout(Duration::from_secs(1))
             .build()
             .map_err(|error| format!("failed to create HarborLink media client: {error}"))?;
-        Ok(Self { base_url, http })
+        Ok(Self {
+            base_url,
+            local_api_token: None,
+            http,
+        })
+    }
+
+    pub fn readyz(&self) -> Result<Value, String> {
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                format!("{}/readyz", self.base_url),
+                false,
+            )
+            .timeout(Duration::from_secs(3))
+            .send()
+            .map_err(unavailable_error)?;
+        decode_json_response(response, "HarborLink readiness")
+    }
+
+    pub fn capabilities(&self) -> Result<Value, String> {
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                format!("{}/v1/capabilities", self.base_url),
+                false,
+            )
+            .timeout(Duration::from_secs(3))
+            .send()
+            .map_err(unavailable_error)?;
+        decode_json_response(response, "HarborLink capabilities")
     }
 
     pub fn start_live_session(
@@ -196,8 +233,7 @@ impl HarborLinkMediaClient {
     ) -> Result<HarborLinkLiveSession, String> {
         let endpoint = self.live_session_collection_endpoint(camera_id);
         let response = self
-            .http
-            .post(endpoint)
+            .request(reqwest::Method::POST, endpoint, true)
             .timeout(Duration::from_secs(4))
             .json(&StartLiveSessionRequest {
                 stream_profile,
@@ -214,8 +250,11 @@ impl HarborLinkMediaClient {
         session_id: &str,
     ) -> Result<HarborLinkLiveSession, String> {
         let response = self
-            .http
-            .get(self.live_session_endpoint(camera_id, session_id))
+            .request(
+                reqwest::Method::GET,
+                self.live_session_endpoint(camera_id, session_id),
+                false,
+            )
             .timeout(Duration::from_secs(4))
             .send()
             .map_err(unavailable_error)?;
@@ -231,8 +270,11 @@ impl HarborLinkMediaClient {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("current");
         let response = self
-            .http
-            .delete(self.live_session_endpoint(camera_id, session_id))
+            .request(
+                reqwest::Method::DELETE,
+                self.live_session_endpoint(camera_id, session_id),
+                true,
+            )
             .timeout(Duration::from_secs(4))
             .send()
             .map_err(unavailable_error)?;
@@ -246,12 +288,15 @@ impl HarborLinkMediaClient {
         ttl_seconds: u64,
     ) -> Result<HarborLinkLiveSession, String> {
         let response = self
-            .http
-            .post(format!(
-                "{}/{}/renew",
-                self.live_session_collection_endpoint(camera_id),
-                encode_path_segment(session_id)
-            ))
+            .request(
+                reqwest::Method::POST,
+                format!(
+                    "{}/{}/renew",
+                    self.live_session_collection_endpoint(camera_id),
+                    encode_path_segment(session_id)
+                ),
+                true,
+            )
             .timeout(Duration::from_secs(4))
             .json(&json!({ "ttl_seconds": ttl_seconds }))
             .send()
@@ -261,12 +306,15 @@ impl HarborLinkMediaClient {
 
     pub fn capture_snapshot(&self, camera_id: &str) -> Result<Vec<u8>, String> {
         let response = self
-            .http
-            .get(format!(
-                "{}/v1/cameras/{}/snapshot.jpg",
-                self.base_url,
-                encode_path_segment(camera_id)
-            ))
+            .request(
+                reqwest::Method::GET,
+                format!(
+                    "{}/v1/cameras/{}/snapshot.jpg",
+                    self.base_url,
+                    encode_path_segment(camera_id)
+                ),
+                false,
+            )
             .timeout(Duration::from_secs(20))
             .send()
             .map_err(unavailable_error)?;
@@ -284,12 +332,15 @@ impl HarborLinkMediaClient {
 
     pub fn open_mjpeg(&self, camera_id: &str) -> Result<HarborLinkMjpegStream, String> {
         let response = self
-            .http
-            .get(format!(
-                "{}/v1/cameras/{}/live.mjpeg",
-                self.base_url,
-                encode_path_segment(camera_id)
-            ))
+            .request(
+                reqwest::Method::GET,
+                format!(
+                    "{}/v1/cameras/{}/live.mjpeg",
+                    self.base_url,
+                    encode_path_segment(camera_id)
+                ),
+                false,
+            )
             .send()
             .map_err(unavailable_error)?;
         if !response.status().is_success() {
@@ -325,12 +376,15 @@ impl HarborLinkMediaClient {
         keyframe_interval_seconds: Option<u32>,
     ) -> Result<HarborLinkClipCapture, String> {
         let response = self
-            .http
-            .post(format!(
-                "{}/v1/cameras/{}/clips",
-                self.base_url,
-                encode_path_segment(camera_id)
-            ))
+            .request(
+                reqwest::Method::POST,
+                format!(
+                    "{}/v1/cameras/{}/clips",
+                    self.base_url,
+                    encode_path_segment(camera_id)
+                ),
+                true,
+            )
             .timeout(Duration::from_secs(
                 u64::from(clip_length_seconds.clamp(3, 300)) + 45,
             ))
@@ -351,7 +405,6 @@ impl HarborLinkMediaClient {
         stream_profile: Option<&str>,
     ) -> Result<HarborLinkRecordingStatus, String> {
         let request = self
-            .http
             .request(
                 method.clone(),
                 format!(
@@ -359,6 +412,7 @@ impl HarborLinkMediaClient {
                     self.base_url,
                     encode_path_segment(camera_id)
                 ),
+                method != reqwest::Method::GET,
             )
             .timeout(Duration::from_secs(10));
         let request = if method == reqwest::Method::POST {
@@ -379,12 +433,15 @@ impl HarborLinkMediaClient {
 
     pub fn credential_status(&self, camera_id: &str) -> Result<HarborLinkCredentialStatus, String> {
         let response = self
-            .http
-            .get(format!(
-                "{}/v1/cameras/{}/credentials",
-                self.base_url,
-                encode_path_segment(camera_id)
-            ))
+            .request(
+                reqwest::Method::GET,
+                format!(
+                    "{}/v1/cameras/{}/credentials",
+                    self.base_url,
+                    encode_path_segment(camera_id)
+                ),
+                false,
+            )
             .timeout(Duration::from_secs(4))
             .send()
             .map_err(unavailable_error)?;
@@ -400,12 +457,15 @@ impl HarborLinkMediaClient {
         rtsp_paths: Option<&[String]>,
     ) -> Result<HarborLinkCredentialStatus, String> {
         let response = self
-            .http
-            .put(format!(
-                "{}/v1/cameras/{}/credentials",
-                self.base_url,
-                encode_path_segment(camera_id)
-            ))
+            .request(
+                reqwest::Method::PUT,
+                format!(
+                    "{}/v1/cameras/{}/credentials",
+                    self.base_url,
+                    encode_path_segment(camera_id)
+                ),
+                true,
+            )
             .timeout(Duration::from_secs(4))
             .json(&json!({
                 "username": username,
@@ -427,12 +487,15 @@ impl HarborLinkMediaClient {
         rtsp_paths: Option<&[String]>,
     ) -> Result<HarborLinkRtspCheck, String> {
         let response = self
-            .http
-            .post(format!(
-                "{}/v1/cameras/{}/rtsp-check",
-                self.base_url,
-                encode_path_segment(camera_id)
-            ))
+            .request(
+                reqwest::Method::POST,
+                format!(
+                    "{}/v1/cameras/{}/rtsp-check",
+                    self.base_url,
+                    encode_path_segment(camera_id)
+                ),
+                true,
+            )
             .timeout(Duration::from_secs(10))
             .json(&json!({
                 "username": username,
@@ -451,12 +514,15 @@ impl HarborLinkMediaClient {
         registration: &Value,
     ) -> Result<HarborLinkCameraRegistration, String> {
         let response = self
-            .http
-            .post(format!(
-                "{}/v1/cameras/{}/register",
-                self.base_url,
-                encode_path_segment(camera_id)
-            ))
+            .request(
+                reqwest::Method::POST,
+                format!(
+                    "{}/v1/cameras/{}/register",
+                    self.base_url,
+                    encode_path_segment(camera_id)
+                ),
+                true,
+            )
             .timeout(Duration::from_secs(20))
             .json(registration)
             .send()
@@ -474,8 +540,11 @@ impl HarborLinkMediaClient {
         rtsp_paths: &[String],
     ) -> Result<HarborLinkDiscoveryResponse, String> {
         let response = self
-            .http
-            .post(format!("{}/v1/cameras/discover", self.base_url))
+            .request(
+                reqwest::Method::POST,
+                format!("{}/v1/cameras/discover", self.base_url),
+                true,
+            )
             .timeout(Duration::from_secs(90))
             .json(&json!({
                 "networkCidr": network_cidr,
@@ -492,8 +561,11 @@ impl HarborLinkMediaClient {
 
     pub fn discovery_settings(&self) -> Result<HarborLinkDiscoverySettings, String> {
         let response = self
-            .http
-            .get(format!("{}/v1/discovery-settings", self.base_url))
+            .request(
+                reqwest::Method::GET,
+                format!("{}/v1/discovery-settings", self.base_url),
+                false,
+            )
             .timeout(Duration::from_secs(4))
             .send()
             .map_err(unavailable_error)?;
@@ -510,8 +582,11 @@ impl HarborLinkMediaClient {
         rtsp_password: Option<&str>,
     ) -> Result<HarborLinkDiscoverySettings, String> {
         let response = self
-            .http
-            .put(format!("{}/v1/discovery-settings", self.base_url))
+            .request(
+                reqwest::Method::PUT,
+                format!("{}/v1/discovery-settings", self.base_url),
+                true,
+            )
             .timeout(Duration::from_secs(4))
             .json(&json!({
                 "networkCidr": network_cidr,
@@ -528,8 +603,11 @@ impl HarborLinkMediaClient {
 
     pub fn save_dvr_settings(&self, settings: &Value) -> Result<Value, String> {
         let response = self
-            .http
-            .put(format!("{}/v1/dvr-settings", self.base_url))
+            .request(
+                reqwest::Method::PUT,
+                format!("{}/v1/dvr-settings", self.base_url),
+                true,
+            )
             .timeout(Duration::from_secs(4))
             .json(settings)
             .send()
@@ -539,12 +617,15 @@ impl HarborLinkMediaClient {
 
     pub fn upsert_camera(&self, camera_id: &str, camera: &Value) -> Result<Value, String> {
         let response = self
-            .http
-            .put(format!(
-                "{}/v1/cameras/{}",
-                self.base_url,
-                encode_path_segment(camera_id)
-            ))
+            .request(
+                reqwest::Method::PUT,
+                format!(
+                    "{}/v1/cameras/{}",
+                    self.base_url,
+                    encode_path_segment(camera_id)
+                ),
+                true,
+            )
             .timeout(Duration::from_secs(4))
             .json(camera)
             .send()
@@ -554,12 +635,15 @@ impl HarborLinkMediaClient {
 
     pub fn update_camera_metadata(&self, camera_id: &str, update: &Value) -> Result<Value, String> {
         let response = self
-            .http
-            .patch(format!(
-                "{}/v1/cameras/{}/metadata",
-                self.base_url,
-                encode_path_segment(camera_id)
-            ))
+            .request(
+                reqwest::Method::PATCH,
+                format!(
+                    "{}/v1/cameras/{}/metadata",
+                    self.base_url,
+                    encode_path_segment(camera_id)
+                ),
+                true,
+            )
             .timeout(Duration::from_secs(4))
             .json(update)
             .send()
@@ -569,12 +653,15 @@ impl HarborLinkMediaClient {
 
     pub fn remove_camera(&self, camera_id: &str) -> Result<Value, String> {
         let response = self
-            .http
-            .delete(format!(
-                "{}/v1/cameras/{}",
-                self.base_url,
-                encode_path_segment(camera_id)
-            ))
+            .request(
+                reqwest::Method::DELETE,
+                format!(
+                    "{}/v1/cameras/{}",
+                    self.base_url,
+                    encode_path_segment(camera_id)
+                ),
+                true,
+            )
             .timeout(Duration::from_secs(4))
             .send()
             .map_err(unavailable_error)?;
@@ -583,8 +670,11 @@ impl HarborLinkMediaClient {
 
     pub fn home_assistant_status(&self) -> Result<HarborLinkHomeAssistantStatus, String> {
         let response = self
-            .http
-            .get(format!("{}/v1/home-assistant", self.base_url))
+            .request(
+                reqwest::Method::GET,
+                format!("{}/v1/home-assistant", self.base_url),
+                false,
+            )
             .timeout(Duration::from_secs(4))
             .send()
             .map_err(unavailable_error)?;
@@ -603,8 +693,11 @@ impl HarborLinkMediaClient {
         clear_access_token: bool,
     ) -> Result<HarborLinkHomeAssistantStatus, String> {
         let response = self
-            .http
-            .put(format!("{}/v1/home-assistant", self.base_url))
+            .request(
+                reqwest::Method::PUT,
+                format!("{}/v1/home-assistant", self.base_url),
+                true,
+            )
             .timeout(Duration::from_secs(4))
             .json(&json!({
                 "enabled": enabled,
@@ -619,6 +712,23 @@ impl HarborLinkMediaClient {
             .send()
             .map_err(unavailable_error)?;
         decode_json_response(response, "Home Assistant configuration")
+    }
+
+    fn request(&self, method: reqwest::Method, url: String, mutation: bool) -> RequestBuilder {
+        let mut request = self
+            .http
+            .request(method, url)
+            .header("X-HarborLink-Contract-Version", HARBORLINK_CONTRACT_VERSION);
+        if let Some(token) = self.local_api_token.as_deref() {
+            request = request.bearer_auth(token);
+        }
+        if mutation {
+            request = request.header(
+                "X-Request-Id",
+                format!("beacon-{}", Uuid::new_v4().simple()),
+            );
+        }
+        request
     }
 
     fn live_session_collection_endpoint(&self, camera_id: &str) -> String {
@@ -638,6 +748,35 @@ impl HarborLinkMediaClient {
     }
 }
 
+fn read_local_api_token_from_env() -> Result<Option<String>, String> {
+    if let Ok(value) = std::env::var("HARBORLINK_LOCAL_API_TOKEN") {
+        let value = value.trim().to_string();
+        if !value.is_empty() {
+            return Ok(Some(value));
+        }
+    }
+    let token_file = std::env::var("HARBORLINK_LOCAL_API_TOKEN_FILE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_HARBORLINK_LOCAL_API_TOKEN_FILE.to_string());
+    match fs::read_to_string(&token_file) {
+        Ok(value) => {
+            let value = value.trim().to_string();
+            if value.is_empty() {
+                Err(format!(
+                    "HarborLink local API token file {token_file} is empty"
+                ))
+            } else {
+                Ok(Some(value))
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "failed to read HarborLink local API token file {token_file}: {error}"
+        )),
+    }
+}
+
 fn unavailable_error(error: reqwest::Error) -> String {
     format!("HarborLink southbound media service is unavailable: {error}")
 }
@@ -649,15 +788,7 @@ fn decode_session_response(response: Response) -> Result<HarborLinkLiveSession, 
             .json::<HarborLinkLiveSession>()
             .map_err(|error| format!("HarborLink returned an invalid media response: {error}"));
     }
-
-    let message = match status {
-        StatusCode::BAD_REQUEST => "HarborLink rejected the live session request",
-        StatusCode::FORBIDDEN => "HarborLink denied the live session request",
-        StatusCode::NOT_FOUND => "HarborLink camera or live session was not found",
-        StatusCode::SERVICE_UNAVAILABLE => "HarborLink southbound media service is unavailable",
-        _ => "HarborLink live session request failed",
-    };
-    Err(format!("{message} (HTTP {})", status.as_u16()))
+    Err(redacted_media_response_error(response, "live session"))
 }
 
 fn decode_json_response<T: for<'de> Deserialize<'de>>(
@@ -665,11 +796,36 @@ fn decode_json_response<T: for<'de> Deserialize<'de>>(
     operation: &str,
 ) -> Result<T, String> {
     if !response.status().is_success() {
-        return Err(redacted_media_error(response.status(), operation));
+        return Err(redacted_media_response_error(response, operation));
     }
     response
         .json::<T>()
         .map_err(|error| format!("HarborLink returned an invalid {operation} response: {error}"))
+}
+
+fn redacted_media_response_error(response: Response, operation: &str) -> String {
+    let status = response.status();
+    if let Ok(value) = response.json::<Value>() {
+        if let Some(error) = value.get("error") {
+            let code = error
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("HARBORLINK_ERROR");
+            let dependency = error
+                .get("dependency")
+                .and_then(Value::as_str)
+                .unwrap_or("harborlink");
+            let retryable = error
+                .get("retryable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            return format!(
+                "HarborLink {operation} failed: {code} from {dependency}; retryable={retryable} (HTTP {})",
+                status.as_u16()
+            );
+        }
+    }
+    redacted_media_error(status, operation)
 }
 
 fn redacted_media_error(status: StatusCode, operation: &str) -> String {
