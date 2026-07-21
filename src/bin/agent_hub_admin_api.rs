@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -2409,7 +2409,7 @@ impl AdminApi {
                 .handle_knowledge_search(&mut request, &identity_hints)
                 .boxed(),
             Method::Get if path == "/api/knowledge/preview" => self
-                .handle_knowledge_preview(&raw_url, &identity_hints)
+                .handle_knowledge_preview(&raw_url, &headers, &identity_hints)
                 .boxed(),
             Method::Post if path == "/api/knowledge/index/run" => {
                 self.handle_run_knowledge_index(&identity_hints).boxed()
@@ -4055,6 +4055,7 @@ impl AdminApi {
     fn handle_knowledge_preview(
         &self,
         raw_url: &str,
+        headers: &[Header],
         hints: &AccessIdentityHints,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
@@ -4083,7 +4084,7 @@ impl AdminApi {
                 None => return error_json(error.status, &error.message),
             },
         };
-        static_file_response(&preview_path)
+        preview_static_file_response(&preview_path, header_value(headers, "Range").as_deref())
     }
 
     fn handle_dvr_recording_settings(
@@ -10560,17 +10561,76 @@ fn mime_type_for_path(path: &Path) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StaticByteRange {
+    start: u64,
+    end: u64,
+}
+
 fn static_file_response(path: &Path) -> Response<std::io::Cursor<Vec<u8>>> {
-    let body = match fs::read(path) {
-        Ok(payload) => payload,
+    static_file_response_with_options(path, None, false)
+}
+
+fn preview_static_file_response(
+    path: &Path,
+    range_header: Option<&str>,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    static_file_response_with_options(path, range_header, true)
+}
+
+fn static_file_response_with_options(
+    path: &Path,
+    range_header: Option<&str>,
+    include_download_filename: bool,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let file_size = match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
+        Ok(_) => return error_json(StatusCode(404), "static file path is not a file"),
         Err(error) => {
             return error_json(
                 StatusCode(500),
-                &format!("failed to read static file {}: {error}", path.display()),
+                &format!("failed to inspect static file {}: {error}", path.display()),
             )
         }
     };
-    let mut response = Response::from_data(body).with_status_code(StatusCode(200));
+    let requested_range = match range_header.map(|value| parse_static_byte_range(value, file_size))
+    {
+        Some(Ok(range)) => Some(range),
+        Some(Err(())) => return range_not_satisfiable_response(path, file_size),
+        None => None,
+    };
+    let (body, status, content_range) = match requested_range {
+        Some(range) => {
+            let body = match read_static_file_range(path, range) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return error_json(
+                        StatusCode(500),
+                        &format!(
+                            "failed to read static file range {}: {error}",
+                            path.display()
+                        ),
+                    )
+                }
+            };
+            (
+                body,
+                StatusCode(206),
+                Some(format!("bytes {}-{}/{}", range.start, range.end, file_size)),
+            )
+        }
+        None => match fs::read(path) {
+            Ok(payload) => (payload, StatusCode(200), None),
+            Err(error) => {
+                return error_json(
+                    StatusCode(500),
+                    &format!("failed to read static file {}: {error}", path.display()),
+                )
+            }
+        },
+    };
+    let body_len = body.len().to_string();
+    let mut response = Response::from_data(body).with_status_code(status);
     add_common_headers(&mut response);
     response.add_header(
         Header::from_bytes(
@@ -10579,7 +10639,131 @@ fn static_file_response(path: &Path) -> Response<std::io::Cursor<Vec<u8>>> {
         )
         .expect("header"),
     );
+    response.add_header(
+        Header::from_bytes(b"Content-Length".as_slice(), body_len.as_bytes()).expect("header"),
+    );
+    if include_download_filename {
+        response.add_header(
+            Header::from_bytes(b"Accept-Ranges".as_slice(), b"bytes".as_slice()).expect("header"),
+        );
+        response.add_header(
+            Header::from_bytes(
+                b"Content-Disposition".as_slice(),
+                inline_content_disposition(path).as_bytes(),
+            )
+            .expect("header"),
+        );
+    }
+    if let Some(value) = content_range {
+        response.add_header(
+            Header::from_bytes(b"Content-Range".as_slice(), value.as_bytes()).expect("header"),
+        );
+    }
     response
+}
+
+fn range_not_satisfiable_response(
+    path: &Path,
+    file_size: u64,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let mut response = Response::from_data(Vec::new()).with_status_code(StatusCode(416));
+    add_common_headers(&mut response);
+    response.add_header(
+        Header::from_bytes(
+            b"Content-Type".as_slice(),
+            mime_type_for_path(path).as_bytes(),
+        )
+        .expect("header"),
+    );
+    response.add_header(
+        Header::from_bytes(b"Content-Length".as_slice(), b"0".as_slice()).expect("header"),
+    );
+    response.add_header(
+        Header::from_bytes(b"Accept-Ranges".as_slice(), b"bytes".as_slice()).expect("header"),
+    );
+    response.add_header(
+        Header::from_bytes(
+            b"Content-Range".as_slice(),
+            format!("bytes */{file_size}").as_bytes(),
+        )
+        .expect("header"),
+    );
+    response.add_header(
+        Header::from_bytes(
+            b"Content-Disposition".as_slice(),
+            inline_content_disposition(path).as_bytes(),
+        )
+        .expect("header"),
+    );
+    response
+}
+
+fn parse_static_byte_range(header_value: &str, file_size: u64) -> Result<StaticByteRange, ()> {
+    if file_size == 0 {
+        return Err(());
+    }
+    let range_spec = header_value.trim().strip_prefix("bytes=").ok_or(())?.trim();
+    if range_spec.contains(',') {
+        return Err(());
+    }
+    let (start_raw, end_raw) = range_spec.split_once('-').ok_or(())?;
+    if start_raw.is_empty() {
+        let suffix_len = end_raw.trim().parse::<u64>().map_err(|_| ())?;
+        if suffix_len == 0 {
+            return Err(());
+        }
+        let start = file_size.saturating_sub(suffix_len);
+        return Ok(StaticByteRange {
+            start,
+            end: file_size - 1,
+        });
+    }
+    let start = start_raw.trim().parse::<u64>().map_err(|_| ())?;
+    if start >= file_size {
+        return Err(());
+    }
+    let end = if end_raw.trim().is_empty() {
+        file_size - 1
+    } else {
+        end_raw.trim().parse::<u64>().map_err(|_| ())?
+    };
+    if end < start {
+        return Err(());
+    }
+    Ok(StaticByteRange {
+        start,
+        end: end.min(file_size - 1),
+    })
+}
+
+fn read_static_file_range(path: &Path, range: StaticByteRange) -> std::io::Result<Vec<u8>> {
+    let mut file = fs::File::open(path)?;
+    file.seek(SeekFrom::Start(range.start))?;
+    let byte_count = range.end - range.start + 1;
+    let mut body = vec![0_u8; byte_count as usize];
+    file.read_exact(&mut body)?;
+    Ok(body)
+}
+
+fn inline_content_disposition(path: &Path) -> String {
+    let filename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("media");
+    format!(
+        "inline; filename=\"{}\"",
+        sanitize_header_filename(filename)
+    )
+}
+
+fn sanitize_header_filename(filename: &str) -> String {
+    filename
+        .chars()
+        .map(|value| match value {
+            '"' | '\\' | '\r' | '\n' => '_',
+            _ => value,
+        })
+        .collect()
 }
 
 fn harbor_assistant_build_missing_response(dist_root: &Path) -> Response<std::io::Cursor<Vec<u8>>> {
@@ -19448,7 +19632,8 @@ mod tests {
         parse_model_runtime_install_path, parse_notification_target_delete_path,
         parse_optional_unix_seconds, parse_share_link_revoke_path,
         parse_shared_camera_live_page_path, parse_shared_camera_live_stream_path,
-        percent_decode_path_segment, probe_local_model_runtime, recording_profile_from_stream_kind,
+        parse_static_byte_range, percent_decode_path_segment, preview_static_file_response,
+        probe_local_model_runtime, recording_profile_from_stream_kind,
         redact_account_management_snapshot, redact_admin_string, redact_bridge_provider_config,
         redact_camera_device_projection, redact_model_endpoint_response, redact_state_snapshot,
         redact_stream_url_credentials, redact_value_stream_credentials,
@@ -21459,6 +21644,74 @@ mod tests {
         assert!(!knowledge_preview_mime_supported(Path::new(
             "C:/tmp/data.json"
         )));
+    }
+
+    #[test]
+    fn static_byte_ranges_cover_explicit_open_and_suffix_requests() {
+        assert_eq!(
+            parse_static_byte_range("bytes=10-19", 100),
+            Ok(super::StaticByteRange { start: 10, end: 19 })
+        );
+        assert_eq!(
+            parse_static_byte_range("bytes=10-", 100),
+            Ok(super::StaticByteRange { start: 10, end: 99 })
+        );
+        assert_eq!(
+            parse_static_byte_range("bytes=-8", 100),
+            Ok(super::StaticByteRange { start: 92, end: 99 })
+        );
+        assert_eq!(
+            parse_static_byte_range("bytes=90-120", 100),
+            Ok(super::StaticByteRange { start: 90, end: 99 })
+        );
+        assert!(parse_static_byte_range("bytes=100-101", 100).is_err());
+        assert!(parse_static_byte_range("bytes=20-10", 100).is_err());
+        assert!(parse_static_byte_range("bytes=0-1,4-5", 100).is_err());
+    }
+
+    #[test]
+    fn preview_static_file_response_supports_browser_byte_ranges() {
+        let path = unique_store_path("knowledge-preview-range").with_extension("mp4");
+        fs::write(&path, b"0123456789").expect("write preview fixture");
+
+        let response = preview_static_file_response(&path, Some("bytes=2-5"));
+        let response_header = |name: &str| {
+            response
+                .headers()
+                .iter()
+                .find(|header| header.field.as_str().to_string().eq_ignore_ascii_case(name))
+                .map(|header| header.value.as_str().to_string())
+        };
+        assert_eq!(response.status_code(), StatusCode(206));
+        assert_eq!(response_header("Accept-Ranges").as_deref(), Some("bytes"));
+        assert_eq!(
+            response_header("Content-Range").as_deref(),
+            Some("bytes 2-5/10")
+        );
+        assert_eq!(response.data_length(), Some(4));
+        let mut body = Vec::new();
+        response
+            .into_reader()
+            .read_to_end(&mut body)
+            .expect("read ranged response");
+        assert_eq!(body, b"2345");
+
+        let invalid_response = preview_static_file_response(&path, Some("bytes=10-12"));
+        let invalid_content_range = invalid_response
+            .headers()
+            .iter()
+            .find(|header| {
+                header
+                    .field
+                    .as_str()
+                    .to_string()
+                    .eq_ignore_ascii_case("Content-Range")
+            })
+            .map(|header| header.value.as_str().to_string());
+        assert_eq!(invalid_response.status_code(), StatusCode(416));
+        assert_eq!(invalid_content_range.as_deref(), Some("bytes */10"));
+
+        fs::remove_file(path).expect("remove preview fixture");
     }
 
     #[test]
