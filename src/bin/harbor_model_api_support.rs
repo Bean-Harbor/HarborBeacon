@@ -434,6 +434,10 @@ struct BackendSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     model_loaded: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    chat_model_loaded: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embedding_model_loaded: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
 }
 
@@ -515,6 +519,8 @@ impl SemanticRouterBackend {
                 kind: BackendKind::SemanticRouter.as_str(),
                 ready: true,
                 model_loaded: Some(true),
+                chat_model_loaded: Some(true),
+                embedding_model_loaded: None,
                 note: Some(
                     "local-only closed-decision semantic router; no cloud fallback".to_string(),
                 ),
@@ -1122,13 +1128,14 @@ fn rough_token_count(text: &str) -> usize {
 #[derive(Debug, Clone)]
 struct CandleBackend {
     config: CandleConfig,
-    state: Arc<Mutex<CandleRuntimeState>>,
+    chat_state: Arc<Mutex<CandleRuntimeState<CandleChatRuntime>>>,
+    embedding_state: Arc<Mutex<CandleRuntimeState<CandleEmbeddingRuntime>>>,
 }
 
 #[derive(Debug)]
-enum CandleRuntimeState {
+enum CandleRuntimeState<T> {
     Uninitialized,
-    Ready(CandleRuntime),
+    Ready(T),
     Failed(String),
 }
 
@@ -1138,10 +1145,27 @@ struct CandleRuntimeStateSummary {
     last_error: Option<String>,
 }
 
-#[derive(Debug)]
-struct CandleRuntime {
-    chat: CandleChatRuntime,
-    embeddings: CandleEmbeddingRuntime,
+fn candle_runtime_state_summary<T>(
+    state: &Arc<Mutex<CandleRuntimeState<T>>>,
+    runtime_label: &str,
+) -> CandleRuntimeStateSummary {
+    let Ok(state) = state.lock() else {
+        return CandleRuntimeStateSummary {
+            loaded: false,
+            last_error: Some(format!("candle {runtime_label} runtime lock is poisoned")),
+        };
+    };
+    match &*state {
+        CandleRuntimeState::Ready(_) => CandleRuntimeStateSummary {
+            loaded: true,
+            last_error: None,
+        },
+        CandleRuntimeState::Failed(error) => CandleRuntimeStateSummary {
+            loaded: false,
+            last_error: Some(error.clone()),
+        },
+        CandleRuntimeState::Uninitialized => CandleRuntimeStateSummary::default(),
+    }
 }
 
 #[derive(Debug)]
@@ -1245,22 +1269,33 @@ impl CandleBackend {
     fn new(config: CandleConfig) -> Self {
         Self {
             config,
-            state: Arc::new(Mutex::new(CandleRuntimeState::Uninitialized)),
+            chat_state: Arc::new(Mutex::new(CandleRuntimeState::Uninitialized)),
+            embedding_state: Arc::new(Mutex::new(CandleRuntimeState::Uninitialized)),
         }
     }
 
     fn health(&self, config: &ModelApiConfig) -> HealthReport {
-        let state = self.runtime_state_summary();
+        let chat_state = candle_runtime_state_summary(&self.chat_state, "chat");
+        let embedding_state =
+            candle_runtime_state_summary(&self.embedding_state, "embedding");
         let chat_available =
-            state.loaded || local_model_assets_available(&self.config.chat_model_id);
-        let embedding_available =
-            state.loaded || local_model_assets_available(&self.config.embedding_model_id);
+            chat_state.loaded || local_model_assets_available(&self.config.chat_model_id);
+        let embedding_available = embedding_state.loaded
+            || local_model_assets_available(&self.config.embedding_model_id);
         let mut notes = vec![CANDLE_CANDIDATE_NOTE.to_string()];
-        if state.loaded {
+        if chat_state.loaded || embedding_state.loaded {
             notes.push("model weights are loaded".to_string());
         } else {
             notes.push("runtime is idle; model weights are not loaded".to_string());
         }
+        notes.push(format!(
+            "chat model weights are {}",
+            if chat_state.loaded { "loaded" } else { "not loaded" }
+        ));
+        notes.push(format!(
+            "embedding model weights are {}",
+            if embedding_state.loaded { "loaded" } else { "not loaded" }
+        ));
         if !chat_available {
             notes.push(format!(
                 "chat model assets are not present at {}",
@@ -1273,8 +1308,11 @@ impl CandleBackend {
                 self.config.embedding_model_id
             ));
         }
-        if let Some(error) = state.last_error.as_ref() {
-            notes.push(format!("last load error: {}", trim_for_note(error)));
+        if let Some(error) = chat_state.last_error.as_ref() {
+            notes.push(format!("chat load error: {}", trim_for_note(error)));
+        }
+        if let Some(error) = embedding_state.last_error.as_ref() {
+            notes.push(format!("embedding load error: {}", trim_for_note(error)));
         }
 
         HealthReport {
@@ -1283,35 +1321,22 @@ impl CandleBackend {
             backend: BackendSummary {
                 kind: BackendKind::Candle.as_str(),
                 ready: true,
-                model_loaded: Some(state.loaded),
+                model_loaded: Some(chat_state.loaded || embedding_state.loaded),
+                chat_model_loaded: Some(chat_state.loaded),
+                embedding_model_loaded: Some(embedding_state.loaded),
                 note: Some(CANDLE_CANDIDATE_NOTE.to_string()),
             },
             bind: config.bind.clone(),
             upstream_base_url: config.upstream_base_url.clone(),
-            chat_model: chat_available.then(|| config.chat_model.clone()),
-            embedding_model: embedding_available.then(|| config.embedding_model.clone()),
+            // For Candle, the *_model_id fields identify the assets the
+            // runtime will actually mmap. The public OpenAI model aliases can
+            // be stale endpoint configuration and must not be reported as
+            // runtime truth.
+            chat_model: chat_available.then(|| self.config.chat_model_id.clone()),
+            embedding_model: embedding_available
+                .then(|| self.config.embedding_model_id.clone()),
             note: Some(notes.join("; ")),
             ready: true,
-        }
-    }
-
-    fn runtime_state_summary(&self) -> CandleRuntimeStateSummary {
-        let Ok(state) = self.state.lock() else {
-            return CandleRuntimeStateSummary {
-                loaded: false,
-                last_error: Some("candle runtime lock is poisoned".to_string()),
-            };
-        };
-        match &*state {
-            CandleRuntimeState::Ready(_) => CandleRuntimeStateSummary {
-                loaded: true,
-                last_error: None,
-            },
-            CandleRuntimeState::Failed(error) => CandleRuntimeStateSummary {
-                loaded: false,
-                last_error: Some(error.clone()),
-            },
-            CandleRuntimeState::Uninitialized => CandleRuntimeStateSummary::default(),
         }
     }
 
@@ -1411,7 +1436,7 @@ impl CandleBackend {
                         "embedding": value.values,
                     }))
                     .collect::<Vec<_>>(),
-                "model": config.embedding_model.clone(),
+                "model": self.config.embedding_model_id.clone(),
                 "usage": {
                     "prompt_tokens": prompt_tokens,
                     "total_tokens": prompt_tokens,
@@ -1427,30 +1452,30 @@ impl CandleBackend {
     }
 
     fn run_chat(&self, request: &CandleChatRequest) -> Result<CandleChatCompletion, String> {
-        self.with_runtime(|runtime| self.generate_with_runtime(&mut runtime.chat, request))
+        self.with_chat_runtime(|runtime| self.generate_with_runtime(runtime, request))
     }
 
     fn run_embeddings(
         &self,
         request: &CandleEmbeddingRequest,
     ) -> Result<Vec<CandleEmbeddingVector>, String> {
-        self.with_runtime(|runtime| self.embed_with_runtime(&runtime.embeddings, request))
+        self.with_embedding_runtime(|runtime| self.embed_with_runtime(runtime, request))
     }
 
-    fn with_runtime<T>(
+    fn with_chat_runtime<T>(
         &self,
-        f: impl FnOnce(&mut CandleRuntime) -> Result<T, String>,
+        f: impl FnOnce(&mut CandleChatRuntime) -> Result<T, String>,
     ) -> Result<T, String> {
         let mut state = self
-            .state
+            .chat_state
             .lock()
-            .map_err(|_| "candle runtime lock is poisoned".to_string())?;
+            .map_err(|_| "candle chat runtime lock is poisoned".to_string())?;
 
         if matches!(
             &*state,
             CandleRuntimeState::Uninitialized | CandleRuntimeState::Failed(_)
         ) {
-            *state = match self.load_runtime() {
+            *state = match self.load_chat_runtime() {
                 Ok(runtime) => CandleRuntimeState::Ready(runtime),
                 Err(error) => CandleRuntimeState::Failed(format!("{error:#}")),
             };
@@ -1459,16 +1484,47 @@ impl CandleBackend {
         match &mut *state {
             CandleRuntimeState::Ready(runtime) => f(runtime),
             CandleRuntimeState::Failed(error) => Err(format!(
-                "failed to initialize candle runtime: {}",
+                "failed to initialize candle chat runtime: {}",
                 trim_for_note(error)
             )),
             CandleRuntimeState::Uninitialized => {
-                Err("candle runtime did not initialize".to_string())
+                Err("candle chat runtime did not initialize".to_string())
             }
         }
     }
 
-    fn load_runtime(&self) -> AnyResult<CandleRuntime> {
+    fn with_embedding_runtime<T>(
+        &self,
+        f: impl FnOnce(&mut CandleEmbeddingRuntime) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut state = self
+            .embedding_state
+            .lock()
+            .map_err(|_| "candle embedding runtime lock is poisoned".to_string())?;
+
+        if matches!(
+            &*state,
+            CandleRuntimeState::Uninitialized | CandleRuntimeState::Failed(_)
+        ) {
+            *state = match self.load_embedding_runtime() {
+                Ok(runtime) => CandleRuntimeState::Ready(runtime),
+                Err(error) => CandleRuntimeState::Failed(format!("{error:#}")),
+            };
+        }
+
+        match &mut *state {
+            CandleRuntimeState::Ready(runtime) => f(runtime),
+            CandleRuntimeState::Failed(error) => Err(format!(
+                "failed to initialize candle embedding runtime: {}",
+                trim_for_note(error)
+            )),
+            CandleRuntimeState::Uninitialized => {
+                Err("candle embedding runtime did not initialize".to_string())
+            }
+        }
+    }
+
+    fn prepare_cache(&self) -> AnyResult<()> {
         let cache_dir = PathBuf::from(self.config.cache_dir.trim());
         if cache_dir.as_os_str().is_empty() {
             return Err(anyhow!("candle cache dir is empty"));
@@ -1485,10 +1541,12 @@ impl CandleBackend {
         })?;
         env::set_var("HF_HOME", &cache_dir);
         env::set_var("HF_HUB_CACHE", &hub_cache_dir);
+        Ok(())
+    }
 
+    fn load_chat_runtime(&self) -> AnyResult<CandleChatRuntime> {
+        self.prepare_cache()?;
         let chat_assets = resolve_model_assets(&self.config.chat_model_id)?;
-        let embedding_assets = resolve_model_assets(&self.config.embedding_model_id)?;
-
         let chat_tokenizer = Tokenizer::from_file(&chat_assets.tokenizer_file)
             .map_err(|error| anyhow!("failed to load tokenizer: {error}"))?;
         let device = Device::Cpu;
@@ -1501,6 +1559,18 @@ impl CandleBackend {
             }
         }
 
+        Ok(CandleChatRuntime {
+            model: chat_model,
+            tokenizer: chat_tokenizer,
+            device,
+            eos_tokens,
+        })
+    }
+
+    fn load_embedding_runtime(&self) -> AnyResult<CandleEmbeddingRuntime> {
+        self.prepare_cache()?;
+        let embedding_assets = resolve_model_assets(&self.config.embedding_model_id)?;
+        let device = Device::Cpu;
         let embedding_tokenizer = Tokenizer::from_file(&embedding_assets.tokenizer_file)
             .map_err(|error| anyhow!("failed to load jina tokenizer: {error}"))?;
         let embedding_vb = unsafe {
@@ -1519,18 +1589,10 @@ impl CandleBackend {
         let embedding_model = JinaBertModel::new(embedding_vb, &embedding_config)
             .context("failed to construct jina embedding model")?;
 
-        Ok(CandleRuntime {
-            chat: CandleChatRuntime {
-                model: chat_model,
-                tokenizer: chat_tokenizer,
-                device: device.clone(),
-                eos_tokens,
-            },
-            embeddings: CandleEmbeddingRuntime {
-                model: embedding_model,
-                tokenizer: embedding_tokenizer,
-                device,
-            },
+        Ok(CandleEmbeddingRuntime {
+            model: embedding_model,
+            tokenizer: embedding_tokenizer,
+            device,
         })
     }
 
@@ -1725,6 +1787,8 @@ impl OpenAIProxyBackend {
                     kind: BackendKind::OpenAIProxy.as_str(),
                     ready: true,
                     model_loaded: None,
+                    chat_model_loaded: None,
+                    embedding_model_loaded: None,
                     note: None,
                 },
                 bind: config.bind.clone(),
@@ -1745,6 +1809,8 @@ impl OpenAIProxyBackend {
                     kind: BackendKind::OpenAIProxy.as_str(),
                     ready: false,
                     model_loaded: None,
+                    chat_model_loaded: None,
+                    embedding_model_loaded: None,
                     note: Some(format!(
                         "upstream health check failed at {} and {}; timeout {} ms",
                         probe_urls[0], probe_urls[1], self.timeout_ms

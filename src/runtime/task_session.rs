@@ -576,6 +576,96 @@ impl TaskConversationStore {
         self.save_file(&file)
     }
 
+    pub fn sessions_for_user_surface(
+        &self,
+        user_id: &str,
+        surface: &str,
+    ) -> Result<Vec<ConversationSession>, String> {
+        let file = self.load_file()?;
+        let mut sessions = file
+            .sessions
+            .values()
+            .filter(|session| session.user_id == user_id && session.surface == surface)
+            .cloned()
+            .collect::<Vec<_>>();
+        sessions.sort_by(|left, right| {
+            let left_started = file
+                .task_runs
+                .values()
+                .filter(|run| run.session_id == left.session_id)
+                .filter_map(|run| run.started_at.as_deref())
+                .max();
+            let right_started = file
+                .task_runs
+                .values()
+                .filter(|run| run.session_id == right.session_id)
+                .filter_map(|run| run.started_at.as_deref())
+                .max();
+            right_started
+                .cmp(&left_started)
+                .then_with(|| right.session_id.cmp(&left.session_id))
+        });
+        Ok(sessions)
+    }
+
+    pub fn delete_session_with_tasks(&self, session_id: &str) -> Result<bool, String> {
+        if session_id.trim().is_empty() {
+            return Ok(false);
+        }
+        let mut file = self.load_file()?;
+        if file.sessions.remove(session_id).is_none() {
+            return Ok(false);
+        }
+        let task_ids = file
+            .task_runs
+            .values()
+            .filter(|run| run.session_id == session_id)
+            .map(|run| run.task_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let step_ids = file
+            .task_steps
+            .values()
+            .filter(|step| task_ids.contains(&step.task_id))
+            .map(|step| step.step_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        file.task_runs
+            .retain(|task_id, _| !task_ids.contains(task_id));
+        file.task_steps
+            .retain(|step_id, _| !step_ids.contains(step_id));
+        file.artifacts
+            .retain(|_, artifact| !task_ids.contains(&artifact.task_id));
+        file.events.retain(|_, event| {
+            !task_ids.contains(&event.source_id)
+                && !step_ids.contains(&event.source_id)
+                && !event
+                    .correlation_id
+                    .as_ref()
+                    .is_some_and(|id| task_ids.contains(id) || step_ids.contains(id))
+                && !event
+                    .causation_id
+                    .as_ref()
+                    .is_some_and(|id| task_ids.contains(id) || step_ids.contains(id))
+        });
+        self.save_file(&file)?;
+        Ok(true)
+    }
+
+    pub fn prune_sessions_for_user_surface(
+        &self,
+        user_id: &str,
+        surface: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, String> {
+        let sessions = self.sessions_for_user_surface(user_id, surface)?;
+        let mut removed = Vec::new();
+        for session in sessions.into_iter().skip(limit.max(1)) {
+            if self.delete_session_with_tasks(&session.session_id)? {
+                removed.push(session.session_id);
+            }
+        }
+        Ok(removed)
+    }
+
     pub fn load_task_run(&self, task_id: &str) -> Result<Option<TaskRun>, String> {
         let file = self.load_file()?;
         Ok(file.task_runs.get(task_id).cloned())
@@ -1694,6 +1784,84 @@ mod tests {
             vec!["task-5", "task-2", "task-4"]
         );
         assert!(recent.iter().all(|run| run.session_id == "sess-a"));
+        let _ = fs::remove_file(store.path());
+    }
+
+    #[test]
+    fn conversation_sessions_are_user_scoped_sorted_and_pruned_with_tasks() {
+        let path = unique_store_path("harborbeacon-task-session-conversation-history");
+        let store = TaskConversationStore::new(&path);
+        for (session_id, conversation_id, user_id) in [
+            ("sess-old", "old", "user-1"),
+            ("sess-new", "new", "user-1"),
+            ("sess-other", "other", "user-2"),
+        ] {
+            store
+                .save_session(&ConversationSession {
+                    session_id: session_id.to_string(),
+                    workspace_id: "home-1".to_string(),
+                    channel: "admin_api".to_string(),
+                    surface: "harbor_assistant_search".to_string(),
+                    conversation_id: conversation_id.to_string(),
+                    user_id: user_id.to_string(),
+                    route_key: String::new(),
+                    last_message_id: String::new(),
+                    chat_type: String::new(),
+                    state: Value::Null,
+                    resume_token: None,
+                    expires_at: None,
+                })
+                .expect("save session");
+        }
+        for (task_id, session_id, started_at) in [
+            ("task-old", "sess-old", "1710000001"),
+            ("task-new", "sess-new", "1710000002"),
+            ("task-other", "sess-other", "1710000003"),
+        ] {
+            store
+                .save_task_run(&TaskRun {
+                    task_id: task_id.to_string(),
+                    workspace_id: "home-1".to_string(),
+                    session_id: session_id.to_string(),
+                    source_channel: "admin_api".to_string(),
+                    domain: "rag".to_string(),
+                    action: "answer".to_string(),
+                    intent_text: task_id.to_string(),
+                    entity_refs: Value::Null,
+                    args: Value::Null,
+                    autonomy_level: "supervised".to_string(),
+                    status: TaskRunStatus::Completed,
+                    risk_level: RiskLevel::Low,
+                    requires_approval: false,
+                    started_at: Some(started_at.to_string()),
+                    completed_at: Some(started_at.to_string()),
+                    metadata: Value::Null,
+                })
+                .expect("save task run");
+        }
+
+        let sessions = store
+            .sessions_for_user_surface("user-1", "harbor_assistant_search")
+            .expect("list sessions");
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.conversation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["new", "old"]
+        );
+
+        let removed = store
+            .prune_sessions_for_user_surface("user-1", "harbor_assistant_search", 1)
+            .expect("prune sessions");
+        assert_eq!(removed, vec!["sess-old"]);
+        assert!(store.load_session("sess-old").expect("load old").is_none());
+        assert!(store.load_task_run("task-old").expect("load old task").is_none());
+        assert!(store.load_session("sess-new").expect("load new").is_some());
+        assert!(store
+            .load_session("sess-other")
+            .expect("load other")
+            .is_some());
         let _ = fs::remove_file(store.path());
     }
 

@@ -778,10 +778,13 @@ fn eval_citation(
         path: path.to_string(),
         modality: "document".to_string(),
         chunk_id: Some("chunk-1".to_string()),
+        parent_id: None,
+        matched_child_ids: Vec::new(),
         line_start: Some(1),
         line_end: Some(1),
         matched_terms: Vec::new(),
         preview: Some(preview.to_string()),
+        answer_context: preview.to_string(),
         score: 100,
         lexical_score: None,
         embedding_score: None,
@@ -789,6 +792,7 @@ fn eval_citation(
         rerank_score: None,
         provenance: Some("document".to_string()),
         source_path: source_path.map(ToString::to_string),
+        modified_unix_millis: None,
     }
 }
 
@@ -802,6 +806,8 @@ mod tests {
             path: r"C:\Users\Bean\family-note.md".to_string(),
             modality: "document".to_string(),
             chunk_id: Some("chunk-1".to_string()),
+            parent_id: None,
+            matched_child_ids: Vec::new(),
             line_start: Some(1),
             line_end: Some(2),
             matched_terms: Vec::new(),
@@ -809,6 +815,7 @@ mod tests {
                 "The garden plan is ready. Raw file C:\\Users\\Bean\\notes.md https://example.test/source"
                     .to_string(),
             ),
+            answer_context: "The garden plan is ready.".to_string(),
             score: 80,
             lexical_score: None,
             embedding_score: None,
@@ -816,6 +823,7 @@ mod tests {
             rerank_score: None,
             provenance: None,
             source_path: Some("https://example.test/private/source".to_string()),
+            modified_unix_millis: None,
         }
     }
 

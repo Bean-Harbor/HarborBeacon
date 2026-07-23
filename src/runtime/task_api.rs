@@ -102,8 +102,9 @@ use crate::runtime::hub::{
     HubScanResultItem,
 };
 use crate::runtime::knowledge::{
-    KnowledgeSearchCitation, KnowledgeSearchHit, KnowledgeSearchReplyPack, KnowledgeSearchRequest,
-    KnowledgeSearchResponse, KnowledgeSearchService,
+    KnowledgeRetrievalStrategy, KnowledgeSearchCitation, KnowledgeSearchHit,
+    KnowledgeSearchReplyPack, KnowledgeSearchRequest, KnowledgeSearchResponse,
+    KnowledgeSearchService,
 };
 use crate::runtime::media::{ClipCaptureRequest, ClipCaptureResult, SnapshotCaptureResult};
 use crate::runtime::model_center::{
@@ -131,6 +132,7 @@ const GENERAL_MESSAGE_RENDERER_MAX_TOKENS: u32 = 48;
 const RAG_DOMAIN: &str = "rag";
 const RAG_OP_ANSWER: &str = "answer";
 const RAG_ANSWER_CONTEXT_LIMIT: usize = 5;
+const RAG_ANSWER_CONTEXT_CHAR_BUDGET: usize = 4_800;
 const RAG_DOCUMENT_LIST_ABSOLUTE_MIN_SCORE: u32 = 350;
 const RAG_DOCUMENT_LIST_RELATIVE_MIN_SCORE: f32 = 0.20;
 const RAG_DOCUMENT_LIST_RERANK_MIN_SCORE: f32 = 0.10;
@@ -140,6 +142,7 @@ const RAG_QUERY_UNDERSTANDING_BUDGET_MS: u64 = 8_000;
 const RAG_QUERY_UNDERSTANDING_MAX_TOKENS: u32 = 192;
 const RAG_ANSWER_BUDGET_MS_ENV: &str = "HARBOR_RAG_ANSWER_BUDGET_MS";
 const RAG_ANSWER_MAX_TOKENS_ENV: &str = "HARBOR_RAG_ANSWER_MAX_TOKENS";
+const RAG_ANSWER_CONTEXT_CHAR_BUDGET_ENV: &str = "HARBOR_RAG_ANSWER_CONTEXT_CHAR_BUDGET";
 const RECENT_CLIP_PLAYBACK_WINDOW_MS: u128 = 15 * 60 * 1000;
 const RECENT_FAMILY_MEMORY_EVENT_WINDOW_MS: u128 = 24 * 60 * 60 * 1000;
 const DEFAULT_TURN_INTENT_DOMAIN: &str = "general";
@@ -169,6 +172,14 @@ enum RagTargetModality {
     Video,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+enum RagRetrievalStrategy {
+    #[default]
+    Semantic,
+    Recent,
+}
+
 impl RagQueryIntent {
     fn answer_shape(self) -> &'static str {
         match self {
@@ -189,8 +200,14 @@ struct RagQueryUnderstanding {
     rerank_query: String,
     intent: RagQueryIntent,
     target_modality: RagTargetModality,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    target_modalities: Vec<RagTargetModality>,
+    #[serde(default)]
+    retrieval_strategy: RagRetrievalStrategy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     topic: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    negative_constraints: Vec<String>,
     answer_shape: String,
     needs_retrieval: bool,
     confidence: f32,
@@ -199,6 +216,43 @@ struct RagQueryUnderstanding {
     model_endpoint_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fallback_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RagReviewedAnswer {
+    answer: String,
+    #[serde(deserialize_with = "deserialize_rag_citation_ids")]
+    used_citation_ids: Vec<usize>,
+    evidence_sufficient: bool,
+    #[serde(default)]
+    unsupported_claims: Vec<String>,
+    #[serde(default)]
+    warnings: Vec<String>,
+}
+
+fn deserialize_rag_citation_ids<'de, D>(deserializer: D) -> Result<Vec<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<Value>::deserialize(deserializer)?
+        .into_iter()
+        .map(|value| match value {
+            Value::Number(number) => number
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| {
+                    <D::Error as serde::de::Error>::custom("citation id must be an integer")
+                }),
+            Value::String(value) => value.trim().parse::<usize>().map_err(|_| {
+                <D::Error as serde::de::Error>::custom(
+                    "citation id string must contain an integer",
+                )
+            }),
+            _ => Err(<D::Error as serde::de::Error>::custom(
+                "citation id must be an integer or integer string",
+            )),
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -582,6 +636,12 @@ struct TaskRuntimeTracking {
     session_id: String,
     step_id: String,
     started_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RagConversationTurn {
+    user: String,
+    assistant: String,
 }
 
 #[derive(Debug, Clone)]
@@ -2633,6 +2693,7 @@ impl TaskApiService {
                 timeout: Some(Duration::from_millis(
                     GENERAL_MESSAGE_ROUTER_BUDGET_MS.min(GENERAL_MESSAGE_TURN_BUDGET_MS),
                 )),
+                json_object_response: false,
             };
             let router_result = run_llm_text_with_state_and_options(
                 &router_prompt,
@@ -2742,6 +2803,57 @@ impl TaskApiService {
         );
         record_workflow_compiler_shadow(&mut trace, workflow_shadow_candidate.as_ref(), &plan);
         Ok((plan, trace))
+    }
+
+    fn recent_rag_conversation_turns(
+        &self,
+        request: &TaskRequest,
+        limit: usize,
+    ) -> Vec<RagConversationTurn> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let session_id = conversation_handle_for_request(request);
+        let mut turns = self
+            .conversation_store
+            .recent_task_runs_for_session(&session_id, limit.saturating_add(1))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|task_run| task_run.task_id != request.task_id)
+            .filter_map(|task_run| {
+                let user = first_string(
+                    &[&task_run.args],
+                    &["/query", "/search/query", "/knowledge/query"],
+                )
+                .or_else(|| {
+                    let value = task_run.intent_text.trim();
+                    (!value.is_empty()).then(|| value.to_string())
+                });
+                let step_output = task_run
+                    .metadata
+                    .pointer("/step_id")
+                    .and_then(Value::as_str)
+                    .and_then(|step_id| {
+                        self.conversation_store
+                            .load_task_step(step_id)
+                            .ok()
+                            .flatten()
+                    })
+                    .map(|step| step.output_payload)
+                    .unwrap_or(Value::Null);
+                let assistant = string_at_paths(
+                    &step_output,
+                    &["/data/answer", "/data/message", "/message"],
+                );
+                Some(RagConversationTurn {
+                    user: truncate_chars(&user?, 800),
+                    assistant: truncate_chars(&assistant?, 1_600),
+                })
+            })
+            .take(limit)
+            .collect::<Vec<_>>();
+        turns.reverse();
+        turns
     }
 
     fn recent_general_message_session_recap(&self, request: &TaskRequest) -> Vec<Value> {
@@ -3381,6 +3493,8 @@ impl TaskApiService {
             retrieval: knowledge_settings.retrieval.clone(),
             require_embeddings: knowledge_require_embeddings(request),
             latency_budget_ms: knowledge_latency_budget_ms(request),
+            strategy: KnowledgeRetrievalStrategy::Semantic,
+            per_modality_limit: None,
         };
 
         match KnowledgeSearchService::search(search_request) {
@@ -3531,9 +3645,15 @@ impl TaskApiService {
             }
         };
 
+        let conversation_turns = self.recent_rag_conversation_turns(
+            request,
+            knowledge_settings.conversation.context_turn_limit,
+        );
+
         let mut query_understanding = match self.admin_store.load_or_create_state() {
             Ok(admin_state) => understand_rag_query(
                 &query,
+                &conversation_turns,
                 Some(&admin_state.models),
                 resource_profile,
             ),
@@ -3543,11 +3663,16 @@ impl TaskApiService {
                 fallback
             }
         };
-        if let Some(use_retrieval) = bool_at_paths(&request.args, &["/use_retrieval"]) {
-            apply_rag_retrieval_preference(&mut query_understanding, &query, use_retrieval);
+        if let Some(mode) = rag_retrieval_mode(request) {
+            apply_rag_retrieval_preference(&mut query_understanding, &query, mode);
         }
         if !query_understanding.needs_retrieval {
-            return self.handle_rag_conversation_answer(request, &query, &query_understanding);
+            return self.handle_rag_conversation_answer(
+                request,
+                &query,
+                &conversation_turns,
+                &query_understanding,
+            );
         }
         let (include_documents, include_images, include_videos) = rag_query_modalities(
             &query_understanding,
@@ -3556,9 +3681,24 @@ impl TaskApiService {
             include_videos,
         );
 
+        let requested_modality_count = [include_documents, include_images, include_videos]
+            .into_iter()
+            .filter(|included| *included)
+            .count();
+        let result_limit = rag_knowledge_result_limit(request, &query_understanding);
+        let retrieval_query = if knowledge_settings.retrieval.query_expansion_enabled {
+            query_understanding.retrieval_query.clone()
+        } else {
+            query.clone()
+        };
+        let rerank_query = if knowledge_settings.retrieval.query_expansion_enabled {
+            query_understanding.rerank_query.clone()
+        } else {
+            query.clone()
+        };
         let search_request = KnowledgeSearchRequest {
-            query: query_understanding.retrieval_query.clone(),
-            rerank_query: Some(query_understanding.rerank_query.clone()),
+            query: retrieval_query,
+            rerank_query: Some(rerank_query),
             configured_roots: knowledge_settings.enabled_source_root_paths(),
             index_root: Some(knowledge_settings.index_root.clone()),
             roots: knowledge_search_roots(request),
@@ -3566,12 +3706,18 @@ impl TaskApiService {
             include_documents,
             include_images,
             include_videos,
-            limit: knowledge_result_limit(request),
+            limit: result_limit,
             privacy_level,
             resource_profile,
             retrieval: knowledge_settings.retrieval.clone(),
             require_embeddings: knowledge_require_embeddings(request),
             latency_budget_ms: knowledge_latency_budget_ms(request),
+            strategy: match query_understanding.retrieval_strategy {
+                RagRetrievalStrategy::Semantic => KnowledgeRetrievalStrategy::Semantic,
+                RagRetrievalStrategy::Recent => KnowledgeRetrievalStrategy::Recent,
+            },
+            per_modality_limit: (requested_modality_count > 1)
+                .then_some(result_limit.div_ceil(requested_modality_count).max(1)),
         };
 
         let search_result = match KnowledgeSearchService::search(search_request) {
@@ -3611,11 +3757,15 @@ impl TaskApiService {
             );
         }
 
-        let citations = rag_answer_context_citations(&query_understanding, &search_result);
+        let candidate_citations =
+            rag_answer_context_citations(&query_understanding, &search_result);
+        let mut citations =
+            rag_answer_eligible_citations(&query_understanding, &candidate_citations);
         if citations.is_empty() {
-            let message = format!(
-                "没有找到与“{}”足够相关的内容。你可以换一种描述，或检查知识源中是否存在对应资料。",
-                query
+            let message = format_no_rag_evidence_message(
+                &query,
+                &query_understanding,
+                !candidate_citations.is_empty(),
             );
             let degraded = search_result.degraded;
             let status = if degraded { "degraded" } else { "completed" };
@@ -3657,12 +3807,26 @@ impl TaskApiService {
         let mut warnings = search_result.warnings.clone();
         let mut degraded_reason = search_result.degraded_reason.clone();
         let mut model = Value::Null;
-        let document_list_answer =
-            build_document_list_rag_answer(&query_understanding, &citations);
-        let mut skip_model = document_list_answer.is_some();
-        let mut answer = document_list_answer
+        let mut reviewed_citation_ids: Option<HashSet<usize>> = None;
+        let mut answer_review = json!({
+            "mode": "compose_and_review",
+            "status": "not_run",
+        });
+        let deterministic_answer = if query_understanding.negative_constraints.is_empty() {
+            build_document_list_rag_answer(&query_understanding, &citations)
+                .or_else(|| build_recent_media_list_rag_answer(&query_understanding, &citations))
+        } else {
+            None
+        };
+        let mut skip_model = deterministic_answer.is_some();
+        let mut answer = deterministic_answer
             .unwrap_or_else(|| build_limited_rag_answer(&query, &citations));
-        let mut prompt = build_rag_answer_prompt(&query, &citations);
+        let mut prompt = build_rag_answer_prompt_with_history(
+            &query,
+            &conversation_turns,
+            &citations,
+            Some(&query_understanding),
+        );
 
         if cloud_profile_requested && privacy_level == PrivacyLevel::AllowRedactedCloud {
             if !privacy_gateway_evaluation.decision.cloud_allowed {
@@ -3706,12 +3870,60 @@ impl TaskApiService {
                                     temperature: Some(0.0),
                                     max_tokens: Some(rag_answer_max_tokens()),
                                     timeout: Some(Duration::from_millis(rag_answer_budget_ms())),
+                                    json_object_response: true,
                                 },
                             );
                             model = llm_execution_model_json(&llm_result);
-                            let generated = normalize_rag_answer_text(&llm_result.text);
-                            if llm_result.available && !generated.is_empty() {
-                                if rag_answer_has_citation_marker(&generated, citations.len()) {
+                            let reviewed_result = parse_rag_reviewed_answer(
+                                &llm_result.text,
+                                citations.len(),
+                            );
+                            let generated = reviewed_result
+                                .as_ref()
+                                .map(|reviewed| reviewed.answer.clone())
+                                .unwrap_or_else(|_| {
+                                    rag_review_answer_candidate(&llm_result.text)
+                                });
+                            let generated = if reviewed_result.is_err()
+                                && query_understanding.intent
+                                == RagQueryIntent::DocumentList
+                                && !query_understanding.negative_constraints.is_empty()
+                            {
+                                add_document_title_citation_markers(&generated, &citations)
+                                    .unwrap_or(generated)
+                            } else {
+                                generated
+                            };
+                            let generated_was_empty = generated.is_empty();
+                            if llm_result.available {
+                                if !generated_was_empty && reviewed_result.is_ok() {
+                                    let reviewed = reviewed_result
+                                        .as_ref()
+                                        .expect("reviewed result checked above");
+                                    reviewed_citation_ids = Some(
+                                        reviewed.used_citation_ids.iter().copied().collect(),
+                                    );
+                                    answer_review = json!({
+                                        "mode": "compose_and_review",
+                                        "status": "passed",
+                                        "evidence_sufficient": reviewed.evidence_sufficient,
+                                        "used_citation_ids": reviewed.used_citation_ids,
+                                        "model_warnings": reviewed.warnings,
+                                    });
+                                    answer = generated;
+                                } else if !generated_was_empty && rag_answer_has_citation_marker(
+                                    &generated,
+                                    citations.len(),
+                                ) {
+                                    answer_review = json!({
+                                        "mode": "compose_and_review",
+                                        "status": "citation_only_fallback",
+                                        "reason": reviewed_result.as_ref().err(),
+                                    });
+                                    warnings.push(
+                                        "LLM 未返回可验证的结构化审查结果，已使用确定性引用校验。"
+                                            .to_string(),
+                                    );
                                     answer = generated;
                                 } else {
                                     let repair_result = run_llm_text_with_state_and_options(
@@ -3719,6 +3931,7 @@ impl TaskApiService {
                                             &query,
                                             &generated,
                                             &citations,
+                                            Some(&query_understanding),
                                         ),
                                         &model_state,
                                         &LlmTextOptions {
@@ -3731,16 +3944,48 @@ impl TaskApiService {
                                             timeout: Some(Duration::from_millis(
                                                 rag_answer_budget_ms(),
                                             )),
+                                            json_object_response: true,
                                         },
                                     );
-                                    let repaired = normalize_rag_answer_text(&repair_result.text);
+                                    let repaired_review = parse_rag_reviewed_answer(
+                                        &repair_result.text,
+                                        citations.len(),
+                                    );
+                                    let repaired = repaired_review
+                                        .as_ref()
+                                        .map(|reviewed| reviewed.answer.clone())
+                                        .unwrap_or_else(|_| {
+                                            rag_review_answer_candidate(&repair_result.text)
+                                        });
                                     let mut answered_with_citations = repair_result.available
                                         && !repaired.is_empty()
-                                        && rag_answer_has_citation_marker(
-                                            &repaired,
-                                            citations.len(),
-                                        );
+                                        && (repaired_review.is_ok()
+                                            || rag_answer_has_citation_marker(
+                                                &repaired,
+                                                citations.len(),
+                                            ));
                                     if answered_with_citations {
+                                        if let Ok(reviewed) = repaired_review {
+                                            reviewed_citation_ids = Some(
+                                                reviewed
+                                                    .used_citation_ids
+                                                    .iter()
+                                                    .copied()
+                                                    .collect(),
+                                            );
+                                            answer_review = json!({
+                                                "mode": "compose_and_review",
+                                                "status": "passed_after_repair",
+                                                "evidence_sufficient": reviewed.evidence_sufficient,
+                                                "used_citation_ids": reviewed.used_citation_ids,
+                                                "model_warnings": reviewed.warnings,
+                                            });
+                                        } else {
+                                            answer_review = json!({
+                                                "mode": "compose_and_review",
+                                                "status": "citation_repair_fallback",
+                                            });
+                                        }
                                         answer = repaired;
                                         model = llm_execution_model_json(&repair_result);
                                     }
@@ -3766,24 +4011,57 @@ impl TaskApiService {
                                                     timeout: Some(Duration::from_millis(
                                                         rag_answer_budget_ms(),
                                                     )),
+                                                    json_object_response: true,
                                                 },
                                             );
                                             model = llm_execution_model_json(&cloud_result);
-                                            let cloud_generated =
-                                                normalize_rag_answer_text(&cloud_result.text);
+                                            let cloud_review = parse_rag_reviewed_answer(
+                                                &cloud_result.text,
+                                                citations.len(),
+                                            );
+                                            let cloud_generated = cloud_review
+                                                .as_ref()
+                                                .map(|reviewed| reviewed.answer.clone())
+                                                .unwrap_or_else(|_| {
+                                                    rag_review_answer_candidate(&cloud_result.text)
+                                                });
                                             if cloud_result.available
                                                 && !cloud_generated.is_empty()
-                                                && rag_answer_has_citation_marker(
-                                                    &cloud_generated,
-                                                    citations.len(),
-                                                )
+                                                && (cloud_review.is_ok()
+                                                    || rag_answer_has_citation_marker(
+                                                        &cloud_generated,
+                                                        citations.len(),
+                                                    ))
                                             {
+                                                if let Ok(reviewed) = cloud_review {
+                                                    reviewed_citation_ids = Some(
+                                                        reviewed
+                                                            .used_citation_ids
+                                                            .iter()
+                                                            .copied()
+                                                            .collect(),
+                                                    );
+                                                    answer_review = json!({
+                                                        "mode": "compose_and_review",
+                                                        "status": "passed_on_cloud_fallback",
+                                                        "evidence_sufficient": reviewed.evidence_sufficient,
+                                                        "used_citation_ids": reviewed.used_citation_ids,
+                                                        "model_warnings": reviewed.warnings,
+                                                    });
+                                                } else {
+                                                    answer_review = json!({
+                                                        "mode": "compose_and_review",
+                                                        "status": "cloud_citation_only_fallback",
+                                                    });
+                                                }
                                                 answer = cloud_generated;
                                                 answered_with_citations = true;
                                             }
                                         }
                                     }
-                                    if !answered_with_citations {
+                                    if !answered_with_citations
+                                        && query_understanding.negative_constraints.is_empty()
+                                    {
                                         if let Some(cited_draft) =
                                             build_cited_rag_answer_from_draft(
                                                 &generated,
@@ -3792,6 +4070,10 @@ impl TaskApiService {
                                         {
                                             answer = cited_draft;
                                             answered_with_citations = true;
+                                            answer_review = json!({
+                                                "mode": "compose_and_review",
+                                                "status": "deterministic_citation_fallback",
+                                            });
                                             warnings.push(
                                                 "LLM 未返回 citation 标记，系统已为回答段落补充检索证据引用。"
                                                     .to_string(),
@@ -3799,12 +4081,27 @@ impl TaskApiService {
                                         }
                                     }
                                     if !answered_with_citations {
-                                        degraded_reason
-                                            .get_or_insert_with(|| "uncited_answer".to_string());
-                                        warnings.push(
-                                            "LLM 输出缺少可解析 citation 标记，已降级为引用片段摘要。"
-                                                .to_string(),
-                                        );
+                                        if generated_was_empty {
+                                            degraded_reason.get_or_insert_with(|| {
+                                                "empty_llm_answer".to_string()
+                                            });
+                                            answer_review = json!({
+                                                "mode": "compose_and_review",
+                                                "status": "empty_output_fallback",
+                                            });
+                                            warnings.push(
+                                                "LLM 请求成功但未生成有效答案，引用修复也未成功，已降级为引用片段摘要。"
+                                                    .to_string(),
+                                            );
+                                        } else {
+                                            degraded_reason.get_or_insert_with(|| {
+                                                "uncited_answer".to_string()
+                                            });
+                                            warnings.push(
+                                                "LLM 输出缺少可解析 citation 标记，已降级为引用片段摘要。"
+                                                    .to_string(),
+                                            );
+                                        }
                                     }
                                 }
                             } else {
@@ -3838,7 +4135,23 @@ impl TaskApiService {
             &privacy_gateway_evaluation,
             capsule_prompt_used,
         );
-        let answer = strip_rag_citation_markers(&answer, citations.len());
+        let citation_count = citations.len();
+        let cited_indices = reviewed_citation_ids.or_else(|| {
+            (!query_understanding.negative_constraints.is_empty())
+                .then(|| rag_answer_cited_indices(&answer, citation_count))
+        });
+        if let Some(cited_indices) = cited_indices {
+            citations = citations
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| cited_indices.contains(&(index + 1)))
+                .map(|(_, citation)| citation)
+                .collect();
+        }
+        if let Some(model_object) = model.as_object_mut() {
+            model_object.insert("answer_review".to_string(), answer_review);
+        }
+        let answer = strip_rag_citation_markers(&answer, citation_count);
         let data = build_rag_answer_data(
             &query,
             &answer,
@@ -3867,6 +4180,7 @@ impl TaskApiService {
         &self,
         request: &TaskRequest,
         query: &str,
+        conversation_turns: &[RagConversationTurn],
         query_understanding: &RagQueryUnderstanding,
     ) -> TaskResponse {
         let search_result = empty_rag_conversation_search_response(query);
@@ -3883,7 +4197,7 @@ impl TaskApiService {
             ) {
                 Ok(model_state) => {
                     let llm_result = run_llm_text_with_state_and_options(
-                        query,
+                        &build_rag_conversation_prompt(query, conversation_turns),
                         &model_state,
                         &LlmTextOptions {
                             purpose: Some("rag.conversation".to_string()),
@@ -3891,6 +4205,7 @@ impl TaskApiService {
                             temperature: Some(0.4),
                             max_tokens: Some(rag_answer_max_tokens()),
                             timeout: Some(Duration::from_millis(rag_answer_budget_ms())),
+                            json_object_response: false,
                         },
                     );
                     model = llm_execution_model_json(&llm_result);
@@ -6615,8 +6930,22 @@ fn rag_answer_context_citations(
     }
 }
 
+fn rag_answer_eligible_citations(
+    understanding: &RagQueryUnderstanding,
+    candidates: &[KnowledgeSearchCitation],
+) -> Vec<KnowledgeSearchCitation> {
+    candidates
+        .iter()
+        .filter(|citation| {
+            rag_target_modalities_allow(&understanding.target_modalities, &citation.modality)
+        })
+        .cloned()
+        .collect()
+}
+
 fn understand_rag_query(
     query: &str,
+    conversation_turns: &[RagConversationTurn],
     model_state: Option<&AdminModelCenterState>,
     resource_profile: RagResourceProfile,
 ) -> RagQueryUnderstanding {
@@ -6642,7 +6971,7 @@ fn understand_rag_query(
         }
     };
     let execution = run_llm_text_with_state_and_options(
-        &build_rag_query_understanding_prompt(query),
+        &build_rag_query_understanding_prompt(query, conversation_turns),
         &model_state,
         &LlmTextOptions {
             purpose: Some("rag.query_understand".to_string()),
@@ -6650,6 +6979,7 @@ fn understand_rag_query(
             temperature: Some(0.0),
             max_tokens: Some(RAG_QUERY_UNDERSTANDING_MAX_TOKENS),
             timeout: Some(Duration::from_millis(RAG_QUERY_UNDERSTANDING_BUDGET_MS)),
+            json_object_response: false,
         },
     );
     if !execution.available {
@@ -6689,6 +7019,13 @@ fn reconcile_rag_query_understanding(
     // deterministic guardrail returns `All` when the question does not name a
     // type, preventing a weak/unknown query from being narrowed arbitrarily.
     model.target_modality = guardrail.target_modality;
+    model.target_modalities = guardrail.target_modalities.clone();
+    model.retrieval_strategy = guardrail.retrieval_strategy;
+    model.negative_constraints = guardrail.negative_constraints.clone();
+    if !guardrail.negative_constraints.is_empty() {
+        model.retrieval_query = guardrail.retrieval_query.clone();
+        model.rerank_query = guardrail.rerank_query.clone();
+    }
     if model.intent == RagQueryIntent::DocumentList {
         model.topic = model.topic.or_else(|| guardrail.topic.clone());
         model.rerank_query = model
@@ -6703,14 +7040,55 @@ fn reconcile_rag_query_understanding(
 }
 
 fn build_rag_query_understanding_system_prompt() -> String {
-    "你是 HarborBeacon 的问题理解器。只输出一行 JSON，不要 Markdown、解释或候选值。intent 必须只选一个：conversation、document_list、factual_answer、summary、comparison、search。用户在打招呼、表达情绪、请求陪伴或闲聊，且没有要求查找外部事实或知识库内容时，必须选择 conversation。target_modality 必须只选一个：all、document、image、video。rewrite_query 是保留名称、时间、否定条件的独立问题。topic 是用户要求内容主要讨论的主题，不是正文顺带提到的词；没有明确主题时输出空字符串。"
+    "你是 HarborBeacon 的问题理解与检索规划器。只输出一行 JSON，不要 Markdown、解释或候选值。intent 必须只选一个：conversation、document_list、factual_answer、summary、comparison、search。用户在打招呼、表达情绪、请求陪伴或闲聊，且没有要求查找知识库内容时，选择 conversation。modalities 必须是数组，元素只能是 document、image、video；用户同时要求图片和文档时必须同时保留两项，未指定类型时输出空数组。retrieval_strategy 只能是 semantic 或 recent；“最近、最新、近期、recent、latest”且目标是文件/文档/图片时使用 recent。类型词如果位于排除约束中，不得作为目标类型。rewrite_query 只写正向检索主题，不要混入排除条件或把“最近”当主题。negative_constraints 逐项保留用户明确的排除条件。topic 是主要主题，没有明确主题时输出空字符串。"
         .to_string()
 }
 
-fn build_rag_query_understanding_prompt(query: &str) -> String {
-    format!(
-        "输出字段只有 intent、target_modality、rewrite_query、topic。名词短语直接指向一类文章、文档、文件或资料时，也属于 document_list。\n示例：\n问题：我心情有点低落，陪我聊聊\n输出：{{\"intent\":\"conversation\",\"target_modality\":\"all\",\"rewrite_query\":\"我心情有点低落，陪我聊聊\",\"topic\":\"\"}}\n问题：家庭预算文件\n输出：{{\"intent\":\"document_list\",\"target_modality\":\"document\",\"rewrite_query\":\"主要讨论家庭预算的文档\",\"topic\":\"家庭预算\"}}\n问题：找几篇主要写家庭预算的内容，不要只是顺带提到费用\n输出：{{\"intent\":\"document_list\",\"target_modality\":\"document\",\"rewrite_query\":\"主要讨论家庭预算且不是仅顺带提到费用的文档\",\"topic\":\"家庭预算\"}}\n问题：查找海边日落照片\n输出：{{\"intent\":\"search\",\"target_modality\":\"image\",\"rewrite_query\":\"海边日落\",\"topic\":\"海边日落\"}}\n问题：比较有线和无线网络方案的区别\n输出：{{\"intent\":\"comparison\",\"target_modality\":\"document\",\"rewrite_query\":\"有线和无线网络方案的主要区别\",\"topic\":\"有线和无线网络\"}}\n问题：{}\n输出：",
+fn build_rag_query_understanding_prompt(
+    query: &str,
+    conversation_turns: &[RagConversationTurn],
+) -> String {
+    let prompt = format!(
+        "输出字段只有 intent、modalities、retrieval_strategy、rewrite_query、topic、negative_constraints。名词短语直接指向一类文章、文档、文件或资料时，也属于 document_list。\n示例：\n问题：我心情有点低落，陪我聊聊\n输出：{{\"intent\":\"conversation\",\"modalities\":[],\"retrieval_strategy\":\"semantic\",\"rewrite_query\":\"我心情有点低落，陪我聊聊\",\"topic\":\"\",\"negative_constraints\":[]}}\n问题：给我春天的图片和文档\n输出：{{\"intent\":\"search\",\"modalities\":[\"image\",\"document\"],\"retrieval_strategy\":\"semantic\",\"rewrite_query\":\"春天\",\"topic\":\"春天\",\"negative_constraints\":[]}}\n问题：总结最近的文档\n输出：{{\"intent\":\"summary\",\"modalities\":[\"document\"],\"retrieval_strategy\":\"recent\",\"rewrite_query\":\"文档\",\"topic\":\"\",\"negative_constraints\":[]}}\n问题：帮我找到春天的相关图片，不要出现夏天的文章\n输出：{{\"intent\":\"search\",\"modalities\":[\"image\"],\"retrieval_strategy\":\"semantic\",\"rewrite_query\":\"春天\",\"topic\":\"春天\",\"negative_constraints\":[\"不要出现夏天的文章\"]}}\n问题：比较有线和无线网络方案的区别\n输出：{{\"intent\":\"comparison\",\"modalities\":[\"document\"],\"retrieval_strategy\":\"semantic\",\"rewrite_query\":\"有线和无线网络方案的主要区别\",\"topic\":\"有线和无线网络\",\"negative_constraints\":[]}}\n问题：{}\n输出：",
         serde_json::to_string(query).unwrap_or_else(|_| "\"\"".to_string())
+    );
+    format!(
+        "{}\n\n{}",
+        format_rag_conversation_context(conversation_turns),
+        prompt
+    )
+}
+
+fn format_rag_conversation_context(conversation_turns: &[RagConversationTurn]) -> String {
+    if conversation_turns.is_empty() {
+        return String::new();
+    }
+    let turns = conversation_turns
+        .iter()
+        .enumerate()
+        .map(|(index, turn)| {
+            json!({
+                "turn": index + 1,
+                "user": turn.user,
+                "assistant": turn.assistant,
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "\n\n<conversation_history>\n{turns}\n</conversation_history>\nUse the history only to resolve references and preserve conversational continuity. The current question is authoritative."
+    )
+}
+
+fn build_rag_conversation_prompt(
+    query: &str,
+    conversation_turns: &[RagConversationTurn],
+) -> String {
+    format!(
+        "{}\n\nCurrent user message:\n{}",
+        format_rag_conversation_context(conversation_turns),
+        query
     )
 }
 
@@ -6731,8 +7109,8 @@ fn parse_rag_query_understanding(query: &str, raw: &str) -> Option<RagQueryUnder
         "search" => RagQueryIntent::Search,
         _ => return None,
     };
-    let inferred_modality = infer_rag_target_modality(query);
-    let target_modality = match value
+    let inferred_modalities = infer_rag_target_modalities(query);
+    let parsed_legacy_target = match value
         .get("target_modality")
         .and_then(Value::as_str)
         .map(str::trim)
@@ -6742,9 +7120,45 @@ fn parse_rag_query_understanding(query: &str, raw: &str) -> Option<RagQueryUnder
         Some("document") => RagTargetModality::Document,
         Some("image") => RagTargetModality::Image,
         Some("video") => RagTargetModality::Video,
-        Some("all") => inferred_modality,
+        Some("all") => legacy_target_modality(&inferred_modalities),
         _ if intent == RagQueryIntent::DocumentList => RagTargetModality::Document,
-        _ => inferred_modality,
+        _ => legacy_target_modality(&inferred_modalities),
+    };
+    let mut target_modalities = value
+        .get("modalities")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .filter_map(parse_rag_target_modality)
+                .filter(|modality| *modality != RagTargetModality::All)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    target_modalities.sort_by_key(|modality| rag_modality_order(*modality));
+    target_modalities.dedup();
+    if target_modalities.is_empty() {
+        target_modalities = if parsed_legacy_target == RagTargetModality::All {
+            inferred_modalities
+        } else {
+            vec![parsed_legacy_target]
+        };
+    }
+    if intent == RagQueryIntent::DocumentList && target_modalities.is_empty() {
+        target_modalities.push(RagTargetModality::Document);
+    }
+    let target_modality = legacy_target_modality(&target_modalities);
+    let retrieval_strategy = match value
+        .get("retrieval_strategy")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("recent") => RagRetrievalStrategy::Recent,
+        _ if is_recent_metadata_query(query) => RagRetrievalStrategy::Recent,
+        _ => RagRetrievalStrategy::Semantic,
     };
     let retrieval_query = value
         .get("rewrite_query")
@@ -6770,6 +7184,20 @@ fn parse_rag_query_understanding(query: &str, raw: &str) -> Option<RagQueryUnder
             .then(|| fallback_document_list_topic(&retrieval_query))
             .flatten()
     });
+    let negative_constraints = value
+        .get("negative_constraints")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .filter(|items| !items.is_empty())
+        .unwrap_or_else(|| split_rag_query_constraints(query).1);
     let rerank_query = if intent == RagQueryIntent::DocumentList {
         topic
             .as_deref()
@@ -6790,7 +7218,10 @@ fn parse_rag_query_understanding(query: &str, raw: &str) -> Option<RagQueryUnder
         rerank_query,
         intent,
         target_modality,
+        target_modalities,
+        retrieval_strategy,
         topic,
+        negative_constraints,
         answer_shape: intent.answer_shape().to_string(),
         needs_retrieval: intent != RagQueryIntent::Conversation,
         confidence,
@@ -6802,47 +7233,75 @@ fn parse_rag_query_understanding(query: &str, raw: &str) -> Option<RagQueryUnder
 
 fn fallback_rag_query_understanding(query: &str) -> RagQueryUnderstanding {
     let normalized = query.trim();
+    let (positive_query, negative_constraints) = split_rag_query_constraints(normalized);
+    let mut target_modalities = infer_rag_target_modalities(&positive_query);
     let intent = if is_explicit_conversation_query(normalized) {
         RagQueryIntent::Conversation
-    } else if rag_answer_is_document_list_query(normalized) {
+    } else if rag_answer_is_document_list_query(&positive_query)
+        && !target_modalities.iter().any(|modality| {
+            matches!(modality, RagTargetModality::Image | RagTargetModality::Video)
+        })
+    {
         RagQueryIntent::DocumentList
     } else if ["总结", "概括", "摘要", "summarize", "summary"]
         .iter()
-        .any(|pattern| normalized.to_ascii_lowercase().contains(pattern))
+        .any(|pattern| positive_query.to_ascii_lowercase().contains(pattern))
     {
         RagQueryIntent::Summary
     } else if ["比较", "对比", "区别", "异同", "compare", "difference"]
         .iter()
-        .any(|pattern| normalized.to_ascii_lowercase().contains(pattern))
+        .any(|pattern| positive_query.to_ascii_lowercase().contains(pattern))
     {
         RagQueryIntent::Comparison
-    } else if ["搜索", "查找", "检索", "search", "find"]
+    } else if [
+        "搜索",
+        "查找",
+        "检索",
+        "找到",
+        "帮我找",
+        "找一下",
+        "找出",
+        "search",
+        "find",
+    ]
         .iter()
-        .any(|pattern| normalized.to_ascii_lowercase().contains(pattern))
+        .any(|pattern| positive_query.to_ascii_lowercase().contains(pattern))
     {
         RagQueryIntent::Search
     } else {
         RagQueryIntent::FactualAnswer
     };
     let topic = (intent == RagQueryIntent::DocumentList)
-        .then(|| fallback_document_list_topic(normalized))
+        .then(|| fallback_document_list_topic(&positive_query))
         .flatten();
     let rerank_query = if let Some(topic) = topic.as_deref() {
         format!("文章的主要主题是{topic}")
     } else {
-        normalized.to_string()
+        positive_query.clone()
     };
     RagQueryUnderstanding {
         original_query: normalized.to_string(),
-        retrieval_query: normalized.to_string(),
+        retrieval_query: positive_query,
         rerank_query,
         intent,
         target_modality: if intent == RagQueryIntent::DocumentList {
             RagTargetModality::Document
         } else {
-            infer_rag_target_modality(normalized)
+            legacy_target_modality(&target_modalities)
+        },
+        target_modalities: {
+            if intent == RagQueryIntent::DocumentList && target_modalities.is_empty() {
+                target_modalities.push(RagTargetModality::Document);
+            }
+            target_modalities
+        },
+        retrieval_strategy: if is_recent_metadata_query(normalized) {
+            RagRetrievalStrategy::Recent
+        } else {
+            RagRetrievalStrategy::Semantic
         },
         topic,
+        negative_constraints,
         answer_shape: intent.answer_shape().to_string(),
         needs_retrieval: intent != RagQueryIntent::Conversation,
         confidence: 0.55,
@@ -6899,11 +7358,27 @@ fn apply_rag_retrieval_preference(
     } else {
         understanding.intent = RagQueryIntent::Conversation;
         understanding.target_modality = RagTargetModality::All;
+        understanding.target_modalities.clear();
+        understanding.retrieval_strategy = RagRetrievalStrategy::Semantic;
         understanding.answer_shape = RagQueryIntent::Conversation.answer_shape().to_string();
         understanding.needs_retrieval = false;
         understanding.retrieval_query = query.trim().to_string();
         understanding.rerank_query = query.trim().to_string();
         understanding.topic = None;
+    }
+}
+
+fn rag_retrieval_mode(request: &TaskRequest) -> Option<bool> {
+    match string_at_paths(&request.args, &["/retrieval_mode"])
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("on") => Some(true),
+        Some("off") => Some(false),
+        Some("auto") => None,
+        _ => bool_at_paths(&request.args, &["/use_retrieval"]),
     }
 }
 
@@ -6936,7 +7411,45 @@ fn empty_rag_conversation_search_response(query: &str) -> KnowledgeSearchRespons
     }
 }
 
-fn infer_rag_target_modality(query: &str) -> RagTargetModality {
+fn split_rag_query_constraints(query: &str) -> (String, Vec<String>) {
+    let mut positive_clauses = Vec::new();
+    let mut negative_constraints = Vec::new();
+    for clause in query
+        .split(|character| matches!(character, '，' | ',' | '；' | ';' | '。' | '\n'))
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
+    {
+        let normalized = clause.to_ascii_lowercase();
+        let is_negative = [
+            "不要",
+            "不需要",
+            "排除",
+            "别给",
+            "别找",
+            "别显示",
+            "禁止",
+            "without",
+            "exclude",
+            "do not",
+            "don't",
+        ]
+        .iter()
+        .any(|marker| normalized.contains(marker));
+        if is_negative {
+            negative_constraints.push(clause.to_string());
+        } else {
+            positive_clauses.push(clause.to_string());
+        }
+    }
+    let positive_query = if positive_clauses.is_empty() {
+        query.trim().to_string()
+    } else {
+        positive_clauses.join(" ")
+    };
+    (positive_query, negative_constraints)
+}
+
+fn infer_rag_target_modalities(query: &str) -> Vec<RagTargetModality> {
     let normalized = query.to_ascii_lowercase();
     let image = ["图片", "图像", "照片", "相片", "image", "photo", "picture"]
         .iter()
@@ -6949,12 +7462,67 @@ fn infer_rag_target_modality(query: &str) -> RagTargetModality {
     ]
     .iter()
     .any(|pattern| normalized.contains(pattern));
-    match (document, image, video) {
-        (true, false, false) => RagTargetModality::Document,
-        (false, true, false) => RagTargetModality::Image,
-        (false, false, true) => RagTargetModality::Video,
-        _ => RagTargetModality::All,
+    let mut modalities = Vec::new();
+    if document {
+        modalities.push(RagTargetModality::Document);
     }
+    if image {
+        modalities.push(RagTargetModality::Image);
+    }
+    if video {
+        modalities.push(RagTargetModality::Video);
+    }
+    modalities
+}
+
+fn parse_rag_target_modality(value: &str) -> Option<RagTargetModality> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "document" => Some(RagTargetModality::Document),
+        "image" => Some(RagTargetModality::Image),
+        "video" => Some(RagTargetModality::Video),
+        "all" => Some(RagTargetModality::All),
+        _ => None,
+    }
+}
+
+fn rag_modality_order(modality: RagTargetModality) -> usize {
+    match modality {
+        RagTargetModality::Document => 0,
+        RagTargetModality::Image => 1,
+        RagTargetModality::Video => 2,
+        RagTargetModality::All => 3,
+    }
+}
+
+fn legacy_target_modality(modalities: &[RagTargetModality]) -> RagTargetModality {
+    if modalities.len() == 1 {
+        modalities[0]
+    } else {
+        RagTargetModality::All
+    }
+}
+
+fn rag_target_modalities_allow(targets: &[RagTargetModality], modality: &str) -> bool {
+    targets.is_empty()
+        || targets.contains(&RagTargetModality::All)
+        || targets.iter().any(|target| match target {
+            RagTargetModality::Document => modality == "document",
+            RagTargetModality::Image => modality == "image",
+            RagTargetModality::Video => modality == "video",
+            RagTargetModality::All => true,
+        })
+}
+
+#[cfg(test)]
+fn rag_target_modality_allows(target: RagTargetModality, modality: &str) -> bool {
+    rag_target_modalities_allow(&[target], modality)
+}
+
+fn is_recent_metadata_query(query: &str) -> bool {
+    let normalized = query.to_ascii_lowercase();
+    ["最近", "最新", "近期", "刚刚", "recent", "latest", "newest"]
+        .iter()
+        .any(|pattern| normalized.contains(pattern))
 }
 
 fn rag_query_modalities(
@@ -6963,12 +7531,15 @@ fn rag_query_modalities(
     include_images: bool,
     include_videos: bool,
 ) -> (bool, bool, bool) {
-    match understanding.target_modality {
-        RagTargetModality::Document => (include_documents, false, false),
-        RagTargetModality::Image => (false, include_images, false),
-        RagTargetModality::Video => (false, false, include_videos),
-        RagTargetModality::All => (include_documents, include_images, include_videos),
+    if understanding.target_modalities.is_empty() {
+        return (include_documents, include_images, include_videos);
     }
+    (
+        include_documents
+            && rag_target_modalities_allow(&understanding.target_modalities, "document"),
+        include_images && rag_target_modalities_allow(&understanding.target_modalities, "image"),
+        include_videos && rag_target_modalities_allow(&understanding.target_modalities, "video"),
+    )
 }
 
 fn fallback_document_list_topic(query: &str) -> Option<String> {
@@ -7079,11 +7650,21 @@ fn rag_answer_visible_search_result(
     citations: &[KnowledgeSearchCitation],
 ) -> KnowledgeSearchResponse {
     let mut visible = search.clone();
-    visible.documents = visible_rag_hits(&search.documents, citations, "document");
-    visible.images = visible_rag_hits(&search.images, citations, "image");
-    visible.videos = visible_rag_hits(&search.videos, citations, "video");
+    let show_broad_candidates = understanding.is_some_and(|understanding| {
+        understanding.intent == RagQueryIntent::Search
+            && (!understanding.target_modalities.is_empty()
+                || !understanding.negative_constraints.is_empty())
+    });
+    let visible_citations = if show_broad_candidates {
+        &search.reply_pack.citations
+    } else {
+        citations
+    };
+    visible.documents = visible_rag_hits(&search.documents, visible_citations, "document");
+    visible.images = visible_rag_hits(&search.images, visible_citations, "image");
+    visible.videos = visible_rag_hits(&search.videos, visible_citations, "video");
     visible.total_matches = visible.documents.len() + visible.images.len() + visible.videos.len();
-    visible.reply_pack.citations = citations.to_vec();
+    visible.reply_pack.citations = visible_citations.to_vec();
     let needs_retrieval = understanding
         .map(|understanding| understanding.needs_retrieval)
         .unwrap_or(true);
@@ -7094,24 +7675,20 @@ fn rag_answer_visible_search_result(
         visible.empty_reason = None;
         visible.empty_guidance = None;
     }
-    if let Some(understanding) = understanding {
-        match understanding.target_modality {
-            RagTargetModality::Document => {
-                visible.images.clear();
-                visible.videos.clear();
-            }
-            RagTargetModality::Image => {
+    if !show_broad_candidates {
+        if let Some(understanding) = understanding {
+            if !rag_target_modalities_allow(&understanding.target_modalities, "document") {
                 visible.documents.clear();
-                visible.videos.clear();
             }
-            RagTargetModality::Video => {
-                visible.documents.clear();
+            if !rag_target_modalities_allow(&understanding.target_modalities, "image") {
                 visible.images.clear();
             }
-            RagTargetModality::All => {}
+            if !rag_target_modalities_allow(&understanding.target_modalities, "video") {
+                visible.videos.clear();
+            }
+            visible.total_matches =
+                visible.documents.len() + visible.images.len() + visible.videos.len();
         }
-        visible.total_matches =
-            visible.documents.len() + visible.images.len() + visible.videos.len();
     }
     visible
 }
@@ -7148,6 +7725,48 @@ fn build_limited_rag_answer(query: &str, citations: &[KnowledgeSearchCitation]) 
         lines.push("已找到匹配来源，但这些来源缺少可直接引用的文本片段；需要刷新索引或换一个更具体的问题。".to_string());
     }
     lines.join("\n")
+}
+
+fn format_no_rag_evidence_message(
+    query: &str,
+    understanding: &RagQueryUnderstanding,
+    has_broad_candidates: bool,
+) -> String {
+    let target = if understanding.target_modalities.is_empty() {
+        "内容".to_string()
+    } else {
+        understanding
+            .target_modalities
+            .iter()
+            .map(|modality| match modality {
+                RagTargetModality::Document => "文档",
+                RagTargetModality::Image => "图片",
+                RagTargetModality::Video => "视频",
+                RagTargetModality::All => "内容",
+            })
+            .collect::<Vec<_>>()
+            .join("和")
+    };
+    let constraint_note = if understanding.negative_constraints.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "已遵守排除条件：{}；没有使用其他类型的结果替代。",
+            understanding.negative_constraints.join("；")
+        )
+    };
+    let evidence_note = if has_broad_candidates {
+        format!(
+            "检索到了一些可能相关的资料，但没有发现能直接满足要求的{}；其他类型的内容不能替代{}。",
+            target, target
+        )
+    } else {
+        format!("没有找到与“{}”足够相关的{}。", query, target)
+    };
+    format!(
+        "{}{}你可以换一种描述，或检查知识源中是否存在对应资料。",
+        evidence_note, constraint_note
+    )
 }
 
 fn rag_answer_is_document_list_query(query: &str) -> bool {
@@ -7222,6 +7841,42 @@ fn build_document_list_rag_answer(
     Some(lines.join("\n"))
 }
 
+fn build_recent_media_list_rag_answer(
+    understanding: &RagQueryUnderstanding,
+    citations: &[KnowledgeSearchCitation],
+) -> Option<String> {
+    if understanding.intent != RagQueryIntent::Search
+        || understanding.retrieval_strategy != RagRetrievalStrategy::Recent
+    {
+        return None;
+    }
+    let media = citations
+        .iter()
+        .enumerate()
+        .filter(|(_, citation)| matches!(citation.modality.as_str(), "image" | "video"))
+        .collect::<Vec<_>>();
+    if media.is_empty() || media.len() != citations.len() {
+        return None;
+    }
+    let media_label = if media.iter().all(|(_, citation)| citation.modality == "image") {
+        "图片"
+    } else if media.iter().all(|(_, citation)| citation.modality == "video") {
+        "视频"
+    } else {
+        "媒体文件"
+    };
+    let mut lines = vec![format!("根据修改时间，最新的{media_label}如下：")];
+    for (position, (citation_index, citation)) in media.iter().enumerate() {
+        lines.push(format!(
+            "{}. 《{}》 [{}]",
+            position + 1,
+            citation.title,
+            citation_index + 1
+        ));
+    }
+    Some(lines.join("\n"))
+}
+
 fn cleaned_citation_preview(citation: &KnowledgeSearchCitation) -> String {
     let preview = citation
         .preview
@@ -7236,47 +7891,134 @@ fn cleaned_citation_preview(citation: &KnowledgeSearchCitation) -> String {
     truncate_chars(&preview, 220)
 }
 
-fn build_rag_answer_prompt(query: &str, citations: &[KnowledgeSearchCitation]) -> String {
-    let mut lines = vec![
-        "请只根据下面编号引用中的事实回答用户问题，不得补充引用之外的信息。".to_string(),
-        "如果引用不足以回答，请明确说证据不足，并引用支持该判断的最相关来源。".to_string(),
+fn citation_answer_context(citation: &KnowledgeSearchCitation) -> String {
+    let context = if citation.answer_context.trim().is_empty() {
+        citation.preview.as_deref().unwrap_or_default()
+    } else {
+        citation.answer_context.as_str()
+    };
+    context.trim().to_string()
+}
+
+fn build_rag_answer_prompt(
+    query: &str,
+    citations: &[KnowledgeSearchCitation],
+    understanding: Option<&RagQueryUnderstanding>,
+) -> String {
+    let constrained_document_list = understanding.is_some_and(|understanding| {
+        understanding.intent == RagQueryIntent::DocumentList
+            && !understanding.negative_constraints.is_empty()
+    });
+    let mut lines = Vec::new();
+    if constrained_document_list {
+        lines.extend([
+            "这是文档筛选任务，不是正文摘要任务。先在内部判断每篇候选是否满足原问题和排除条件。".to_string(),
+            "必须检查全部候选并列出所有符合项，不要只选择最相关的一篇。排除条件按文档主要主题判断；正文仅为比较而提到排除词，不代表文档主题违规。".to_string(),
+            "最终只列出符合条件的文档标题；不得解释正文，不得列出被排除的标题。".to_string(),
+            "每行必须严格使用格式：- 《原始 title》 [n]。不要输出判断过程或其他文字。".to_string(),
+        ]);
+    }
+    lines.extend([
+        "下面是检索得到的可能相关材料，不代表它们一定能够回答用户问题。".to_string(),
+        "请先比较原问题与材料，只根据真正满足要求的材料回答，不得补充材料之外的信息。".to_string(),
+        "如果材料不足以回答，请明确说明没有找到符合要求的证据。".to_string(),
         "每个句子或列表项末尾都必须带一个或多个 [n] 形式的有效引用编号。".to_string(),
         "不得只输出引用编号；不得改写、猜测或虚构文档标题。".to_string(),
+        "除非用户明确要求展开，回答应简洁归纳，最多四个句子或六个列表项。".to_string(),
         "如果问题要求列出文档或文章，必须逐项原样复制 title，并在每项末尾标注对应 [n]。".to_string(),
+        "回答前检查：结果类型和内容必须满足用户的目标类型与排除条件；不得用其他类型的来源凑数。文字中的景物描写不等于实际图片，只有 image 类型、Markdown 图片或可访问的图片链接才算图片证据。".to_string(),
+        "如果存在排除条件，先逐条判断每份材料的主要主题是否违反条件；违反条件的材料不得出现在最终答案中，也不得引用。检查和组织答案在同一次回答中完成，不要输出检查过程。".to_string(),
+        "只输出一个 JSON object，不要输出 Markdown 代码块。字段必须为 answer、used_citation_ids、evidence_sufficient、unsupported_claims、warnings。".to_string(),
+        "answer 是面向用户的最终答案并保留 [n] 引用；used_citation_ids 必须与 answer 中实际出现的引用完全一致。unsupported_claims 表示最终 answer 中仍无法由证据支持的陈述，正常情况下必须为空数组。".to_string(),
         String::new(),
         format!("问题：{query}"),
-        String::new(),
-        "引用：".to_string(),
-    ];
-    for (index, citation) in citations.iter().enumerate() {
-        let preview = cleaned_citation_preview(citation);
+    ]);
+    if let Some(understanding) = understanding {
+        let modalities = if understanding.target_modalities.is_empty() {
+            "all".to_string()
+        } else {
+            understanding
+                .target_modalities
+                .iter()
+                .map(|modality| match modality {
+                    RagTargetModality::All => "all",
+                    RagTargetModality::Document => "document",
+                    RagTargetModality::Image => "image",
+                    RagTargetModality::Video => "video",
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        lines.push(format!("目标类型：{modalities}"));
         lines.push(format!(
-            "[{}] title={} modality={} path={} chunk={} text={}",
-            index + 1,
-            citation.title,
-            citation.modality,
-            citation.path,
-            citation.chunk_id.as_deref().unwrap_or(""),
-            truncate_chars(&preview, 700)
+            "检索策略：{}",
+            match understanding.retrieval_strategy {
+                RagRetrievalStrategy::Semantic => "semantic",
+                RagRetrievalStrategy::Recent => "recent（按文件修改时间从新到旧）",
+            }
         ));
+        if !understanding.negative_constraints.is_empty() {
+            lines.push(format!(
+                "必须遵守的排除条件：{}",
+                understanding.negative_constraints.join("；")
+            ));
+        }
+    }
+    lines.push(String::new());
+    lines.push("引用：".to_string());
+    let mut remaining_context_chars = rag_answer_context_char_budget();
+    for (index, citation) in citations.iter().enumerate() {
+        let citations_left = citations.len().saturating_sub(index).max(1);
+        let per_citation_limit = remaining_context_chars / citations_left;
+        let per_citation_limit = if constrained_document_list {
+            per_citation_limit.min(480)
+        } else {
+            per_citation_limit
+        };
+        let context = truncate_chars(&citation_answer_context(citation), per_citation_limit);
+        remaining_context_chars = remaining_context_chars.saturating_sub(context.chars().count());
+        let evidence = json!({
+            "citation_id": index + 1,
+            "title": citation.title,
+            "modality": citation.modality,
+            "path": citation.path,
+            "chunk_id": citation.chunk_id.as_deref().unwrap_or(""),
+            "context": context,
+            "modified_unix_millis": citation.modified_unix_millis,
+        });
+        lines.push(format!("evidence={evidence}"));
     }
     lines.join("\n")
+}
+
+fn build_rag_answer_prompt_with_history(
+    query: &str,
+    conversation_turns: &[RagConversationTurn],
+    citations: &[KnowledgeSearchCitation],
+    understanding: Option<&RagQueryUnderstanding>,
+) -> String {
+    format!(
+        "{}\n\n{}",
+        format_rag_conversation_context(conversation_turns),
+        build_rag_answer_prompt(query, citations, understanding)
+    )
 }
 
 fn build_rag_answer_citation_repair_prompt(
     query: &str,
     draft: &str,
     citations: &[KnowledgeSearchCitation],
+    understanding: Option<&RagQueryUnderstanding>,
 ) -> String {
     format!(
-        "上一版回答缺少可解析引用，请重新回答。删除所有无法由引用支持的陈述；每个保留的句子或列表项末尾必须添加有效的 [n]。只输出修复后的最终答案。\n\n上一版回答：\n{}\n\n{}",
+        "上一版输出未通过结构化审查或引用校验，请重新回答。删除所有无法由引用支持的陈述；每个保留的句子或列表项末尾必须添加有效的 [n]。按要求只输出包含 answer、used_citation_ids、evidence_sufficient、unsupported_claims、warnings 的 JSON object。\n\n上一版回答：\n{}\n\n{}",
         draft,
-        build_rag_answer_prompt(query, citations)
+        build_rag_answer_prompt(query, citations, understanding)
     )
 }
 
 fn build_rag_answer_system_prompt() -> String {
-    "You are HarborBeacon's evidence-grounded RAG answerer. Use only the numbered evidence supplied by the user. Every factual sentence and every list item MUST end with one or more in-range citation markers such as [1] or [1][2]. Never invent or rewrite document titles. For document-list questions, copy each evidence title verbatim. If evidence is weak, state that with a citation instead of adding uncited facts. Output only the final answer."
+    "You are HarborBeacon's evidence-grounded RAG composer and reviewer. Use only the supplied evidence objects. Obey the requested target modality and every negative constraint; never substitute another source type merely to produce an answer. While composing, remove claims that the evidence does not support and verify every citation. Every factual sentence and list item in answer MUST end with one or more in-range citation markers such as [1] or [1][2]. used_citation_ids MUST exactly match the citation markers used in answer. Set evidence_sufficient=false when the evidence cannot answer the question. unsupported_claims lists any claims still present in answer that lack support and should normally be empty. Never invent or rewrite document titles. Return exactly one JSON object with fields answer, used_citation_ids, evidence_sufficient, unsupported_claims, and warnings. Do not output Markdown or the judging process."
         .to_string()
 }
 
@@ -7287,12 +8029,136 @@ fn normalize_rag_answer_text(text: &str) -> String {
         .to_string()
 }
 
+fn parse_rag_reviewed_answer(
+    text: &str,
+    citation_count: usize,
+) -> Result<RagReviewedAnswer, String> {
+    let start = text.find('{').ok_or_else(|| "missing_json_object".to_string())?;
+    let end = text
+        .rfind('}')
+        .filter(|end| *end >= start)
+        .ok_or_else(|| "incomplete_json_object".to_string())?;
+    let mut reviewed: RagReviewedAnswer = serde_json::from_str(&text[start..=end])
+        .map_err(|_| "invalid_review_json".to_string())?;
+    reviewed.answer = reviewed.answer.trim().to_string();
+    reviewed
+        .unsupported_claims
+        .retain(|claim| !claim.trim().is_empty());
+    reviewed.warnings.retain(|warning| !warning.trim().is_empty());
+    if reviewed.answer.is_empty() {
+        return Err("empty_reviewed_answer".to_string());
+    }
+    if !reviewed.unsupported_claims.is_empty() {
+        return Err("unsupported_claims_present".to_string());
+    }
+
+    let used_citation_ids = reviewed
+        .used_citation_ids
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    if used_citation_ids.len() != reviewed.used_citation_ids.len()
+        || used_citation_ids
+            .iter()
+            .any(|index| *index == 0 || *index > citation_count)
+    {
+        return Err("invalid_used_citation_ids".to_string());
+    }
+    let answer_citation_ids = rag_answer_referenced_indices(&reviewed.answer);
+    if answer_citation_ids
+        .iter()
+        .any(|index| *index == 0 || *index > citation_count)
+        || answer_citation_ids != used_citation_ids
+    {
+        return Err("citation_contract_mismatch".to_string());
+    }
+    if reviewed.evidence_sufficient && used_citation_ids.is_empty() {
+        return Err("sufficient_answer_without_citations".to_string());
+    }
+    Ok(reviewed)
+}
+
+fn rag_review_answer_candidate(text: &str) -> String {
+    if text.contains('{') || text.contains("\"answer\"") {
+        if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) {
+            if end >= start {
+                return serde_json::from_str::<Value>(&text[start..=end])
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("answer")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|answer| !answer.is_empty())
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default();
+            }
+        }
+        return String::new();
+    }
+    normalize_rag_answer_text(text)
+}
+
+fn rag_answer_referenced_indices(answer: &str) -> HashSet<usize> {
+    answer
+        .replace('【', "[")
+        .replace('】', "]")
+        .split('[')
+        .skip(1)
+        .filter_map(|suffix| suffix.split_once(']'))
+        .map(|(candidate, _)| candidate.trim())
+        .filter(|candidate| {
+            !candidate.is_empty() && candidate.chars().all(|character| character.is_ascii_digit())
+        })
+        .filter_map(|candidate| candidate.parse::<usize>().ok())
+        .collect()
+}
+
 fn rag_answer_has_citation_marker(answer: &str, citation_count: usize) -> bool {
     (1..=citation_count).any(|index| {
         let bracket = format!("[{index}]");
         let wide_bracket = format!("【{index}】");
         answer.contains(&bracket) || answer.contains(&wide_bracket)
     })
+}
+
+fn rag_answer_cited_indices(answer: &str, citation_count: usize) -> HashSet<usize> {
+    (1..=citation_count)
+        .filter(|index| {
+            answer.contains(&format!("[{index}]"))
+                || answer.contains(&format!("【{index}】"))
+        })
+        .collect()
+}
+
+fn add_document_title_citation_markers(
+    draft: &str,
+    citations: &[KnowledgeSearchCitation],
+) -> Option<String> {
+    let mut matched_any = false;
+    let lines = draft
+        .lines()
+        .map(|line| {
+            let markers = citations
+                .iter()
+                .enumerate()
+                .filter(|(_, citation)| {
+                    citation.modality == "document"
+                        && !citation.title.trim().is_empty()
+                        && line.contains(citation.title.trim())
+                })
+                .map(|(index, _)| format!("[{}]", index + 1))
+                .collect::<Vec<_>>();
+            if markers.is_empty() {
+                line.to_string()
+            } else {
+                matched_any = true;
+                format!("{} {}", line.trim_end(), markers.join(""))
+            }
+        })
+        .collect::<Vec<_>>();
+    matched_any.then(|| lines.join("\n"))
 }
 
 fn strip_rag_citation_markers(answer: &str, citation_count: usize) -> String {
@@ -8537,13 +9403,12 @@ fn conversation_handle_for_request(request: &TaskRequest) -> String {
 }
 
 fn step_id_for_request(request: &TaskRequest) -> String {
-    let step_id = first_non_empty(&[request.step_id.as_str()])
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "s1".to_string());
-    if looks_like_turn_local_step_id(&step_id) {
-        format!("{}:{step_id}", request.task_id)
-    } else {
-        step_id
+    match first_non_empty(&[request.step_id.as_str()]) {
+        Some(step_id) if looks_like_turn_local_step_id(step_id) => {
+            format!("{}:{step_id}", request.task_id)
+        }
+        Some(step_id) => step_id.to_string(),
+        None => format!("{}:s1", request.task_id),
     }
 }
 
@@ -9622,6 +10487,7 @@ fn maybe_render_general_message_reply(
             temperature: Some(0.2),
             max_tokens: Some(GENERAL_MESSAGE_RENDERER_MAX_TOKENS),
             timeout: Some(Duration::from_millis(remaining_budget_ms)),
+            json_object_response: false,
         },
     );
     trace.renderer_latency_ms = Some(started.elapsed().as_millis() as u64);
@@ -10140,7 +11006,41 @@ fn knowledge_result_limit(request: &TaskRequest) -> usize {
         &["/limit", "/search/limit", "/knowledge/limit"],
     )
     .unwrap_or(5)
-    .clamp(1, 10)
+    .clamp(1, 50)
+}
+
+fn rag_knowledge_result_limit(
+    request: &TaskRequest,
+    understanding: &RagQueryUnderstanding,
+) -> usize {
+    if let Some(limit) = usize_at_paths(
+        &request.args,
+        &["/limit", "/search/limit", "/knowledge/limit"],
+    ) {
+        return limit.clamp(1, 50);
+    }
+
+    match understanding.intent {
+        RagQueryIntent::Conversation => 5,
+        RagQueryIntent::FactualAnswer => 6,
+        RagQueryIntent::Summary | RagQueryIntent::Comparison => 8,
+        RagQueryIntent::DocumentList => {
+            if understanding.retrieval_strategy == RagRetrievalStrategy::Recent {
+                20
+            } else {
+                12
+            }
+        }
+        RagQueryIntent::Search => {
+            if understanding.target_modalities.iter().any(|modality| {
+                matches!(modality, RagTargetModality::Image | RagTargetModality::Video)
+            }) {
+                12
+            } else {
+                10
+            }
+        }
+    }
 }
 
 fn knowledge_privacy_level(
@@ -10212,6 +11112,13 @@ fn rag_answer_budget_ms() -> u64 {
 
 fn rag_answer_max_tokens() -> u32 {
     positive_env_u32(RAG_ANSWER_MAX_TOKENS_ENV, RAG_ANSWER_MAX_TOKENS)
+}
+
+fn rag_answer_context_char_budget() -> usize {
+    positive_env_u64(
+        RAG_ANSWER_CONTEXT_CHAR_BUDGET_ENV,
+        RAG_ANSWER_CONTEXT_CHAR_BUDGET as u64,
+    ) as usize
 }
 
 fn positive_env_u64(name: &str, default: u64) -> u64 {
@@ -10866,6 +11773,7 @@ mod tests {
         format_pending_candidates, general_message_requests_capability_summary,
         infer_home_assistant_natural_action, infer_query_from_raw_text, knowledge_modalities,
         normalize_command_text, notification_delivery_outcome, parse_general_message_plan,
+        parse_rag_query_understanding, rag_knowledge_result_limit,
         pending_candidates_from_results, protocol_string, resolve_home_assistant_action_entity,
         resolve_notification_recipient, room_aliases, should_route_general_message_to_knowledge,
         GeneralMessageConversationAct, GeneralMessagePlanKind, HomeAssistantEntityResolution,
@@ -10922,16 +11830,36 @@ mod tests {
     static RETRIEVAL_GATE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static HARBOROS_TASK_API_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    #[test]
+    fn rag_result_limit_supports_smart_planning_and_explicit_override() {
+        let understanding = parse_rag_query_understanding(
+            "列出最近的文档",
+            r#"{"intent":"document_list","modalities":["document"],"retrieval_strategy":"recent","rewrite_query":"文档","topic":"","negative_constraints":[]}"#,
+        )
+        .expect("recent document understanding");
+        let mut request = TaskRequest::default();
+        request.args = json!({});
+        assert_eq!(rag_knowledge_result_limit(&request, &understanding), 20);
+
+        request.args = json!({"limit": 42});
+        assert_eq!(rag_knowledge_result_limit(&request, &understanding), 42);
+        request.args = json!({"limit": 1000});
+        assert_eq!(rag_knowledge_result_limit(&request, &understanding), 50);
+    }
+
     fn rag_test_citation(title: &str, path: &str) -> KnowledgeSearchCitation {
         KnowledgeSearchCitation {
             title: title.to_string(),
             path: path.to_string(),
             modality: "document".to_string(),
             chunk_id: Some("chunk-0001".to_string()),
+            parent_id: None,
+            matched_child_ids: Vec::new(),
             line_start: Some(1),
             line_end: Some(2),
             matched_terms: vec!["春天".to_string()],
             preview: Some("这是一篇描述春天的文章。".to_string()),
+            answer_context: "这是一篇描述春天的完整文章内容。".to_string(),
             score: 100,
             lexical_score: Some(1.0),
             embedding_score: Some(0.9),
@@ -10939,6 +11867,7 @@ mod tests {
             rerank_score: None,
             provenance: None,
             source_path: None,
+            modified_unix_millis: None,
         }
     }
 
@@ -10953,9 +11882,12 @@ mod tests {
             hybrid_score: Some(0.5),
             rerank_score: None,
             chunk_id: Some("chunk-0001".to_string()),
+            parent_id: None,
+            matched_child_ids: Vec::new(),
             line_start: Some(1),
             line_end: Some(2),
             snippet: Some("测试片段".to_string()),
+            answer_context: "测试片段的完整上下文。".to_string(),
             matched_terms: vec!["春天".to_string()],
             provenance: None,
             source_path: None,
@@ -10963,6 +11895,7 @@ mod tests {
             content_indexed: true,
             filename_match_used: false,
             content_match_used: true,
+            modified_unix_millis: None,
         }
     }
 
@@ -10980,6 +11913,25 @@ mod tests {
 
         assert!(answer.contains("《春日花园.md》 [1]"));
         assert!(answer.contains("《樱花观察.txt》 [2]"));
+        assert!(super::rag_answer_has_citation_marker(&answer, citations.len()));
+    }
+
+    #[test]
+    fn rag_recent_image_search_uses_deterministic_cited_list() {
+        let mut first = rag_test_citation("newest.webp", "/knowledge/newest.webp");
+        first.modality = "image".to_string();
+        let mut second = rag_test_citation("older.jpg", "/knowledge/older.jpg");
+        second.modality = "image".to_string();
+        let citations = vec![first, second];
+        let mut understanding = super::fallback_rag_query_understanding("给我最新的图片");
+        understanding.intent = super::RagQueryIntent::Search;
+        understanding.retrieval_strategy = super::RagRetrievalStrategy::Recent;
+
+        let answer = super::build_recent_media_list_rag_answer(&understanding, &citations)
+            .expect("recent media list answer");
+
+        assert!(answer.contains("《newest.webp》 [1]"));
+        assert!(answer.contains("《older.jpg》 [2]"));
         assert!(super::rag_answer_has_citation_marker(&answer, citations.len()));
     }
 
@@ -11047,6 +11999,118 @@ mod tests {
             super::rag_query_modalities(&understanding, true, true, true),
             (false, true, false)
         );
+        assert_eq!(
+            super::rag_query_modalities(&understanding, false, true, false),
+            (false, true, false)
+        );
+    }
+
+    #[test]
+    fn rag_query_understanding_preserves_document_and_image_targets() {
+        let understanding =
+            super::fallback_rag_query_understanding("给我春天的图片和文档");
+
+        assert_eq!(
+            understanding.target_modalities,
+            vec![
+                super::RagTargetModality::Document,
+                super::RagTargetModality::Image,
+            ]
+        );
+        assert_eq!(understanding.target_modality, super::RagTargetModality::All);
+        assert_eq!(
+            super::rag_query_modalities(&understanding, true, true, true),
+            (true, true, false)
+        );
+        assert!(super::rag_target_modalities_allow(
+            &understanding.target_modalities,
+            "document"
+        ));
+        assert!(super::rag_target_modalities_allow(
+            &understanding.target_modalities,
+            "image"
+        ));
+    }
+
+    #[test]
+    fn rag_query_understanding_routes_recent_documents_to_metadata_strategy() {
+        let understanding = super::parse_rag_query_understanding(
+            "总结最近的文档",
+            r#"{"intent":"summary","modalities":["document"],"retrieval_strategy":"recent","rewrite_query":"文档","topic":"","negative_constraints":[]}"#,
+        )
+        .expect("query understanding");
+
+        assert_eq!(understanding.intent, super::RagQueryIntent::Summary);
+        assert_eq!(
+            understanding.target_modalities,
+            vec![super::RagTargetModality::Document]
+        );
+        assert_eq!(
+            understanding.retrieval_strategy,
+            super::RagRetrievalStrategy::Recent
+        );
+        assert!(understanding.needs_retrieval);
+    }
+
+    #[test]
+    fn rag_query_understanding_separates_image_target_from_negated_article_constraint() {
+        let query = "帮我找到春天的相关图片，不要出现夏天的文章";
+        let understanding = super::fallback_rag_query_understanding(query);
+
+        assert_eq!(understanding.intent, super::RagQueryIntent::Search);
+        assert_eq!(
+            understanding.target_modality,
+            super::RagTargetModality::Image
+        );
+        assert_eq!(understanding.retrieval_query, "帮我找到春天的相关图片");
+        assert_eq!(
+            understanding.negative_constraints,
+            vec!["不要出现夏天的文章".to_string()]
+        );
+        assert_eq!(
+            super::rag_query_modalities(&understanding, true, true, true),
+            (false, true, false)
+        );
+        assert!(!super::rag_target_modality_allows(
+            understanding.target_modality,
+            "document"
+        ));
+        assert!(super::rag_target_modality_allows(
+            understanding.target_modality,
+            "image"
+        ));
+
+        let mistaken_model = super::parse_rag_query_understanding(
+            query,
+            r#"{"intent":"document_list","target_modality":"document","rewrite_query":"夏天的文章","topic":"夏天"}"#,
+        )
+        .expect("model understanding");
+        let reconciled = super::reconcile_rag_query_understanding(mistaken_model, &understanding);
+        assert_eq!(reconciled.intent, super::RagQueryIntent::Search);
+        assert_eq!(reconciled.target_modality, super::RagTargetModality::Image);
+        assert_eq!(reconciled.retrieval_query, "帮我找到春天的相关图片");
+        assert_eq!(reconciled.negative_constraints, understanding.negative_constraints);
+    }
+
+    #[test]
+    fn rag_answer_prompt_and_empty_result_preserve_negative_constraints() {
+        let query = "帮我找到春天的相关图片，不要出现夏天的文章";
+        let understanding = super::fallback_rag_query_understanding(query);
+        let mut citation = rag_test_citation("春景.jpg", "/knowledge/春景.jpg");
+        citation.modality = "image".to_string();
+
+        let prompt =
+            super::build_rag_answer_prompt(query, &[citation], Some(&understanding));
+        assert!(prompt.contains("目标类型：image"));
+        assert!(prompt.contains("必须遵守的排除条件：不要出现夏天的文章"));
+        assert!(prompt.contains("不得用其他类型的来源凑数"));
+        assert!(prompt.contains("检查和组织答案在同一次回答中完成"));
+
+        let empty = super::format_no_rag_evidence_message(query, &understanding, true);
+        assert!(empty.contains("检索到了一些可能相关的资料"));
+        assert!(empty.contains("没有发现能直接满足要求的图片"));
+        assert!(empty.contains("不要出现夏天的文章"));
+        assert!(empty.contains("没有使用其他类型的结果替代"));
     }
 
     #[test]
@@ -11114,9 +12178,10 @@ mod tests {
     }
 
     #[test]
-    fn rag_visible_search_only_shows_cited_unique_target_modality() {
+    fn rag_visible_search_keeps_broad_candidates_for_final_evidence_check() {
         let mut image_citation = rag_test_citation("春景.jpg", "/knowledge/春景.jpg");
         image_citation.modality = "image".to_string();
+        let document_citation = rag_test_citation("春来了.txt", "/knowledge/春来了.txt");
         let mut image_hit = rag_test_hit("春景.jpg", "/knowledge/春景.jpg", 900);
         image_hit.modality = "image".to_string();
         let search = KnowledgeSearchResponse {
@@ -11126,7 +12191,10 @@ mod tests {
             documents: vec![rag_test_hit("春来了.txt", "/knowledge/春来了.txt", 950)],
             images: vec![image_hit.clone(), image_hit],
             videos: Vec::new(),
-            reply_pack: KnowledgeSearchReplyPack::default(),
+            reply_pack: KnowledgeSearchReplyPack {
+                citations: vec![document_citation, image_citation.clone()],
+                ..KnowledgeSearchReplyPack::default()
+            },
             supported_modalities: vec!["document".to_string(), "image".to_string()],
             pending_modalities: Vec::new(),
             status: "completed".to_string(),
@@ -11147,10 +12215,30 @@ mod tests {
             &[image_citation],
         );
 
-        assert!(visible.documents.is_empty());
+        assert_eq!(visible.documents.len(), 1);
+        assert_eq!(visible.documents[0].title, "春来了.txt");
         assert_eq!(visible.images.len(), 1);
         assert_eq!(visible.images[0].title, "春景.jpg");
-        assert_eq!(visible.total_matches, 1);
+        assert_eq!(visible.total_matches, 2);
+        assert_eq!(visible.reply_pack.citations.len(), 2);
+    }
+
+    #[test]
+    fn rag_answer_evidence_check_rejects_text_as_an_image() {
+        let understanding =
+            super::fallback_rag_query_understanding("帮我找到春天的相关图片，不要出现夏天的文章");
+        let document = rag_test_citation("春来了.txt", "/knowledge/春来了.txt");
+        let mut image = rag_test_citation("春景.jpg", "/knowledge/春景.jpg");
+        image.modality = "image".to_string();
+
+        let eligible = super::rag_answer_eligible_citations(
+            &understanding,
+            &[document, image.clone()],
+        );
+
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(eligible[0].path, image.path);
+        assert_eq!(eligible[0].modality, "image");
     }
 
     #[test]
@@ -11160,6 +12248,59 @@ mod tests {
             2,
         );
         assert_eq!(visible, "第一句。\n第二句。");
+    }
+
+    #[test]
+    fn rag_answer_tracks_only_evidence_used_by_constrained_final_answer() {
+        let cited = super::rag_answer_cited_indices(
+            "1. 《我爱春天.txt》 [1]\n2. 《春来了.txt》【2】",
+            4,
+        );
+
+        assert_eq!(cited, std::collections::HashSet::from([1, 2]));
+        assert!(!cited.contains(&4));
+    }
+
+    #[test]
+    fn rag_answer_maps_exact_document_titles_to_citations_for_small_models() {
+        let citations = vec![
+            rag_test_citation("我爱春天.txt", "/knowledge/我爱春天.txt"),
+            rag_test_citation("春来了.txt", "/knowledge/春来了.txt"),
+            rag_test_citation("多彩的夏天.txt", "/knowledge/多彩的夏天.txt"),
+        ];
+
+        let answer = super::add_document_title_citation_markers(
+            "找到以下文章：\n- 《我爱春天.txt》\n- 《春来了.txt》",
+            &citations,
+        )
+        .expect("titles should map to citations");
+
+        assert!(answer.contains("《我爱春天.txt》 [1]"));
+        assert!(answer.contains("《春来了.txt》 [2]"));
+        assert!(!answer.contains("[3]"));
+    }
+
+    #[test]
+    fn constrained_document_list_prompt_prioritizes_filtering_over_summarizing() {
+        let understanding = super::fallback_rag_query_understanding(
+            "帮我找到春天的相关文章，不要出现夏天的文章",
+        );
+        let citations = vec![
+            rag_test_citation("春来了.txt", "/knowledge/春来了.txt"),
+            rag_test_citation("多彩的夏天.txt", "/knowledge/多彩的夏天.txt"),
+        ];
+
+        let prompt = super::build_rag_answer_prompt(
+            &understanding.original_query,
+            &citations,
+            Some(&understanding),
+        );
+
+        assert!(prompt.starts_with("这是文档筛选任务，不是正文摘要任务。"));
+        assert!(prompt.contains("必须检查全部候选并列出所有符合项"));
+        assert!(prompt.contains("排除条件按文档主要主题判断"));
+        assert!(prompt.contains("不得列出被排除的标题"));
+        assert!(prompt.contains("- 《原始 title》 [n]"));
     }
 
     #[test]
@@ -11246,6 +12387,7 @@ mod tests {
     fn rag_query_understanding_falls_back_when_model_is_unavailable() {
         let understanding = super::understand_rag_query(
             "春天的文章",
+            &[],
             None,
             RagResourceProfile::CpuOnly,
         );
@@ -11254,6 +12396,49 @@ mod tests {
         assert_eq!(understanding.topic.as_deref(), Some("春天"));
         assert_eq!(understanding.source, "heuristic_fallback");
         assert!(understanding.fallback_reason.is_some());
+    }
+
+    #[test]
+    fn rag_prompts_include_only_the_configured_recent_conversation_turns() {
+        let turns = vec![
+            super::RagConversationTurn {
+                user: "列出春天的文章".to_string(),
+                assistant: "找到《春日记录》。".to_string(),
+            },
+            super::RagConversationTurn {
+                user: "第二篇是什么".to_string(),
+                assistant: "第二篇是《花园计划》。".to_string(),
+            },
+        ];
+
+        let understanding_prompt =
+            super::build_rag_query_understanding_prompt("总结它", &turns);
+        let conversation_prompt = super::build_rag_conversation_prompt("继续", &turns);
+
+        assert!(understanding_prompt.contains("列出春天的文章"));
+        assert!(understanding_prompt.contains("花园计划"));
+        assert!(understanding_prompt.contains("总结它"));
+        assert!(conversation_prompt.contains("Current user message:\n继续"));
+        assert!(conversation_prompt.contains("<conversation_history>"));
+    }
+
+    #[test]
+    fn default_task_step_id_is_scoped_to_the_task() {
+        let first = TaskRequest {
+            task_id: "task-first".to_string(),
+            ..Default::default()
+        };
+        let second = TaskRequest {
+            task_id: "task-second".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(super::step_id_for_request(&first), "task-first:s1");
+        assert_eq!(super::step_id_for_request(&second), "task-second:s1");
+        assert_ne!(
+            super::step_id_for_request(&first),
+            super::step_id_for_request(&second)
+        );
     }
 
     #[test]
@@ -11293,11 +12478,99 @@ mod tests {
             "文章讲了什么？",
             "文章描述了春天。",
             &citations,
+            None,
         );
 
         assert!(prompt.contains("每个句子或列表项末尾"));
-        assert!(prompt.contains("[1] title=春日花园.md"));
+        assert!(prompt.contains("\"citation_id\":1"));
+        assert!(prompt.contains("\"title\":\"春日花园.md\""));
         assert!(!super::rag_answer_has_citation_marker("没有引用 [2]", 1));
+
+        let empty_draft_prompt = super::build_rag_answer_citation_repair_prompt(
+            "文章讲了什么？",
+            "",
+            &citations,
+            None,
+        );
+        assert!(empty_draft_prompt.contains("上一版回答："));
+        assert!(empty_draft_prompt.contains("\"citation_id\":1"));
+        assert!(empty_draft_prompt.contains("\"context\":"));
+    }
+
+    #[test]
+    fn rag_reviewed_answer_requires_supported_in_range_citations() {
+        let reviewed = super::parse_rag_reviewed_answer(
+            r#"```json
+            {
+              "answer": "文章描写了春天的花园。[1]",
+              "used_citation_ids": ["1"],
+              "evidence_sufficient": true,
+              "unsupported_claims": [],
+              "warnings": []
+            }
+            ```"#,
+            1,
+        )
+        .expect("valid reviewed answer");
+
+        assert_eq!(reviewed.used_citation_ids, vec![1]);
+        assert!(reviewed.evidence_sufficient);
+        assert!(super::parse_rag_reviewed_answer(
+            r#"{"answer":"无依据结论。[1]","used_citation_ids":[1],"evidence_sufficient":true,"unsupported_claims":["无依据结论"],"warnings":[]}"#,
+            1,
+        )
+        .is_err());
+        assert!(super::parse_rag_reviewed_answer(
+            r#"{"answer":"引用错位。[2]","used_citation_ids":[1],"evidence_sufficient":true,"unsupported_claims":[],"warnings":[]}"#,
+            2,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rag_review_candidate_extracts_answer_without_exposing_json() {
+        let candidate = super::rag_review_answer_candidate(
+            r#"{"answer":"保留这个回答。[1]","used_citation_ids":[1]}"#,
+        );
+
+        assert_eq!(candidate, "保留这个回答。[1]");
+        assert!(super::rag_review_answer_candidate(
+            r#"{"answer":"被截断的回答。[1]","used_citation_ids":[1]"#,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn rag_answer_prompt_uses_full_internal_context_but_api_keeps_short_preview() {
+        let mut citation = rag_test_citation("春日花园.md", "/knowledge/春日花园.md");
+        citation.preview = Some("卡片短预览".to_string());
+        citation.answer_context =
+            "完整证据第一段。完整证据第二段，包含只能由模型阅读的细节。".to_string();
+
+        let prompt =
+            super::build_rag_answer_prompt("文章讲了什么？", &[citation.clone()], None);
+        assert!(prompt.contains("完整证据第二段，包含只能由模型阅读的细节。"));
+        assert!(prompt.contains("\"context\":"));
+        assert!(prompt.contains("used_citation_ids"));
+        let api_value = serde_json::to_value(&citation).expect("serialize citation");
+        assert_eq!(api_value["preview"], "卡片短预览");
+        assert!(api_value.get("answer_context").is_none());
+    }
+
+    #[test]
+    fn rag_answer_prompt_balances_long_contexts_within_total_budget() {
+        let mut first = rag_test_citation("first.md", "/knowledge/first.md");
+        first.answer_context = "a".repeat(3_000);
+        let mut second = rag_test_citation("second.md", "/knowledge/second.md");
+        second.answer_context = "b".repeat(3_000);
+
+        let prompt =
+            super::build_rag_answer_prompt("summarize", &[first.clone(), second.clone()], None);
+
+        assert!(!prompt.contains(&first.answer_context));
+        assert!(!prompt.contains(&second.answer_context));
+        assert!(prompt.contains(&"a".repeat(2_300)));
+        assert!(prompt.contains(&"b".repeat(2_300)));
     }
 
     #[test]
@@ -11344,9 +12617,12 @@ mod tests {
                 hybrid_score: Some(0.82),
                 rerank_score: None,
                 chunk_id: Some("chunk-0001".to_string()),
+                parent_id: None,
+                matched_child_ids: Vec::new(),
                 line_start: Some(1),
                 line_end: Some(1),
                 snippet: Some("春天的公园里有绿色草地和盛开的花".to_string()),
+                answer_context: "春天的公园里有绿色草地、盛开的花和散步的人。".to_string(),
                 matched_terms: vec!["春天".to_string()],
                 provenance: Some("vlm".to_string()),
                 source_path: None,
@@ -11354,6 +12630,7 @@ mod tests {
                 content_indexed: true,
                 filename_match_used: false,
                 content_match_used: true,
+                modified_unix_millis: None,
             }],
             videos: Vec::new(),
             reply_pack: KnowledgeSearchReplyPack::default(),
@@ -11412,9 +12689,12 @@ mod tests {
                 hybrid_score: Some(0.76),
                 rerank_score: None,
                 chunk_id: Some("chunk-0001".to_string()),
+                parent_id: None,
+                matched_child_ids: Vec::new(),
                 line_start: Some(1),
                 line_end: Some(1),
                 snippet: Some("keyframe 30%: 门口有一个快递箱".to_string()),
+                answer_context: "keyframe 30%: 门口有一个快递箱，画面中没有人。".to_string(),
                 matched_terms: vec!["快递".to_string()],
                 provenance: Some("vlm_keyframe".to_string()),
                 source_path: Some("/tmp/keyframes/frame-02.jpg".to_string()),
@@ -11422,6 +12702,7 @@ mod tests {
                 content_indexed: true,
                 filename_match_used: false,
                 content_match_used: true,
+                modified_unix_millis: None,
             }],
             reply_pack: KnowledgeSearchReplyPack::default(),
             supported_modalities: vec!["video".to_string(), "vlm_keyframe".to_string()],
@@ -11491,9 +12772,12 @@ mod tests {
                 hybrid_score: Some(0.76),
                 rerank_score: None,
                 chunk_id: Some("chunk-0001".to_string()),
+                parent_id: None,
+                matched_child_ids: Vec::new(),
                 line_start: Some(1),
                 line_end: Some(1),
                 snippet: Some("门口有人拿起快递箱".to_string()),
+                answer_context: "门口有人拿起快递箱，时间范围为 00:00:05 至 00:00:12。".to_string(),
                 matched_terms: vec!["快递".to_string()],
                 provenance: Some("video_sidecar".to_string()),
                 source_path: Some(sidecar_path.to_string_lossy().into_owned()),
@@ -11501,6 +12785,7 @@ mod tests {
                 content_indexed: true,
                 filename_match_used: false,
                 content_match_used: true,
+                modified_unix_millis: None,
             }],
             reply_pack: KnowledgeSearchReplyPack::default(),
             supported_modalities: vec!["video".to_string()],
@@ -11591,6 +12876,7 @@ mod tests {
                 privacy_level,
                 default_resource_profile,
                 retrieval: Default::default(),
+                conversation: Default::default(),
             })
             .expect("save knowledge settings");
         KnowledgeIndexService::from_config(

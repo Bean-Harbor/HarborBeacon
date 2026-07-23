@@ -64,7 +64,7 @@ use harborbeacon_local_agent::control_plane::models::{
 use harborbeacon_local_agent::control_plane::routing::{
     build_routing_status, RoutingRuntimeProjection,
 };
-use harborbeacon_local_agent::control_plane::tasks::TaskStepRun;
+use harborbeacon_local_agent::control_plane::tasks::{TaskRun, TaskStepRun};
 use harborbeacon_local_agent::control_plane::users::{MembershipStatus, RoleKind};
 use harborbeacon_local_agent::orchestrator::executors::harbor_apps::{
     build_harbor_app_execution_plan, harbor_app_execution_plan_snapshot, HarborAppExecutorConfig,
@@ -82,8 +82,10 @@ use harborbeacon_local_agent::runtime::admin_console::{
     validate_knowledge_settings, AccountManagementSnapshot, AdminConsoleState, AdminConsoleStore,
     AdminDefaults, AdminModelCenterState, AutomationRuleReview, BridgeProviderConfig,
     DeviceCredentialSecret, DeviceEvidenceRecord, GatewayStatusSummary, HomeAssistantAdminState,
-    HomeAssistantConfigUpdate, KnowledgeIndexJobRecord, KnowledgeSettings, KnowledgeSourceRoot,
-    ModelDownloadJobRecord, ModelRuntimeRecord, NotificationTargetRecord, RagResourceProfile,
+    HomeAssistantConfigUpdate, KnowledgeConversationSettings, KnowledgeIndexJobRecord,
+    KnowledgeRetrievalSettings, KnowledgeSettings, KnowledgeSourceRoot, ModelDownloadJobRecord,
+    ModelRuntimeRecord,
+    NotificationTargetRecord, RagResourceProfile,
 };
 use harborbeacon_local_agent::runtime::discovery::RtspProbeRequest;
 use harborbeacon_local_agent::runtime::dvr::{
@@ -1287,6 +1289,8 @@ struct KnowledgeIndexRunResponse {
 struct KnowledgeSearchApiRequest {
     query: String,
     #[serde(default)]
+    conversation_id: Option<String>,
+    #[serde(default)]
     limit: Option<usize>,
     #[serde(default)]
     include_documents: Option<bool>,
@@ -1296,6 +1300,8 @@ struct KnowledgeSearchApiRequest {
     include_videos: Option<bool>,
     #[serde(default)]
     use_retrieval: Option<bool>,
+    #[serde(default)]
+    retrieval_mode: Option<String>,
     #[serde(default)]
     source_scope: Option<String>,
     #[serde(default)]
@@ -1469,7 +1475,13 @@ struct ModelCapabilityStatus {
     label: String,
     model_kind: String,
     status: String,
+    desired_model_id: Option<String>,
+    active_model_id: Option<String>,
+    transition_status: String,
+    last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     selected_model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     runtime_model_id: Option<String>,
     current_model: Option<ModelCapabilityCurrentModel>,
     installed_models: Vec<ModelCapabilityInstallableModel>,
@@ -1578,6 +1590,8 @@ struct LocalModelRuntimeProjection {
     backend_kind: Option<String>,
     chat_model: Option<String>,
     embedding_model: Option<String>,
+    chat_model_loaded: Option<bool>,
+    embedding_model_loaded: Option<bool>,
     note: Option<String>,
     error: Option<String>,
 }
@@ -2374,6 +2388,24 @@ impl AdminApi {
             }
             Method::Put if path == "/api/knowledge/settings" => self
                 .handle_save_knowledge_settings(&mut request, &identity_hints)
+                .boxed(),
+            Method::Get if path == "/api/knowledge/retrieval-settings" => self
+                .handle_knowledge_retrieval_settings(&identity_hints)
+                .boxed(),
+            Method::Patch if path == "/api/knowledge/retrieval-settings" => self
+                .handle_save_knowledge_retrieval_settings(&mut request, &identity_hints)
+                .boxed(),
+            Method::Patch if path == "/api/knowledge/conversation-settings" => self
+                .handle_save_knowledge_conversation_settings(&mut request, &identity_hints)
+                .boxed(),
+            Method::Get if path == "/api/knowledge/conversations" => self
+                .handle_knowledge_conversations(&identity_hints)
+                .boxed(),
+            Method::Get if path.starts_with("/api/knowledge/conversations/") => self
+                .handle_knowledge_conversation(&path, &identity_hints)
+                .boxed(),
+            Method::Delete if path.starts_with("/api/knowledge/conversations/") => self
+                .handle_delete_knowledge_conversation(&path, &identity_hints)
                 .boxed(),
             Method::Post if path == "/api/knowledge/search" => self
                 .handle_knowledge_search(&mut request, &identity_hints)
@@ -3962,6 +3994,197 @@ impl AdminApi {
         }
     }
 
+    fn handle_knowledge_retrieval_settings(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        match self.admin_store.knowledge_settings() {
+            Ok(settings) => ok_json(&settings.retrieval),
+            Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
+    fn handle_save_knowledge_retrieval_settings(
+        &self,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        let retrieval: KnowledgeRetrievalSettings = match read_json_body(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let mut settings = match self.admin_store.knowledge_settings() {
+            Ok(settings) => settings,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        settings.retrieval = retrieval;
+        match validate_knowledge_settings(settings)
+            .and_then(|settings| self.admin_store.save_knowledge_settings(settings))
+        {
+            Ok(state) => ok_json(&state.knowledge.retrieval),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_save_knowledge_conversation_settings(
+        &self,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
+        let update: KnowledgeConversationSettingsUpdate = match read_json_body(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let mut settings = match self.admin_store.knowledge_settings() {
+            Ok(settings) => settings,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        settings.conversation = KnowledgeConversationSettings {
+            history_limit: update.history_limit,
+            context_turn_limit: update.context_turn_limit,
+        };
+        match validate_knowledge_settings(settings)
+            .and_then(|settings| self.admin_store.save_knowledge_settings(settings))
+        {
+            Ok(state) => {
+                let conversation = state.knowledge.conversation;
+                let _ = self.task_service.conversation_store().prune_sessions_for_user_surface(
+                    &principal.user_id,
+                    HARBOR_ASSISTANT_SEARCH_SURFACE,
+                    conversation.history_limit,
+                );
+                ok_json(&conversation)
+            }
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_knowledge_conversations(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
+        let limit = self
+            .admin_store
+            .knowledge_settings()
+            .map(|settings| settings.conversation.history_limit)
+            .unwrap_or(10)
+            .clamp(1, 100);
+        let store = self.task_service.conversation_store();
+        let sessions = match store.sessions_for_user_surface(
+            &principal.user_id,
+            HARBOR_ASSISTANT_SEARCH_SURFACE,
+        ) {
+            Ok(sessions) => sessions,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let conversations = sessions
+            .into_iter()
+            .filter(|session| {
+                normalize_harbor_assistant_conversation_id(&session.conversation_id).is_some()
+            })
+            .take(limit)
+            .filter_map(|session| {
+                let runs = store
+                    .recent_task_runs_for_session(&session.session_id, usize::MAX)
+                    .ok()?;
+                let oldest = runs.last()?;
+                Some(HarborAssistantConversationSummary {
+                    conversation_id: session.conversation_id,
+                    title: harbor_assistant_conversation_query(oldest)
+                        .chars()
+                        .take(48)
+                        .collect(),
+                    updated_at: runs.first().and_then(|run| run.started_at.clone()),
+                    turn_count: runs.len(),
+                })
+            })
+            .collect::<Vec<_>>();
+        ok_json(&json!({
+            "conversations": conversations,
+            "settings": self.admin_store.knowledge_settings().ok().map(|value| value.conversation),
+        }))
+    }
+
+    fn handle_knowledge_conversation(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
+        let conversation_id = match parse_harbor_assistant_conversation_path(path) {
+            Some(value) => value,
+            None => return error_json(StatusCode(400), "invalid conversation id"),
+        };
+        let session_id = harbor_assistant_search_session_id(&principal.user_id, &conversation_id);
+        let store = self.task_service.conversation_store();
+        let session = match store.load_session(&session_id) {
+            Ok(Some(session))
+                if session.user_id == principal.user_id
+                    && session.surface == HARBOR_ASSISTANT_SEARCH_SURFACE => session,
+            Ok(_) => return error_json(StatusCode(404), "conversation not found"),
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let mut runs = match store.recent_task_runs_for_session(&session.session_id, usize::MAX) {
+            Ok(runs) => runs,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        runs.reverse();
+        let turns = runs
+            .iter()
+            .filter_map(|run| harbor_assistant_conversation_turn(store, run))
+            .collect::<Vec<_>>();
+        ok_json(&HarborAssistantConversationDetail {
+            conversation_id,
+            turns,
+        })
+    }
+
+    fn handle_delete_knowledge_conversation(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
+        let conversation_id = match parse_harbor_assistant_conversation_path(path) {
+            Some(value) => value,
+            None => return error_json(StatusCode(400), "invalid conversation id"),
+        };
+        let session_id = harbor_assistant_search_session_id(&principal.user_id, &conversation_id);
+        let store = self.task_service.conversation_store();
+        match store.load_session(&session_id) {
+            Ok(Some(session))
+                if session.user_id == principal.user_id
+                    && session.surface == HARBOR_ASSISTANT_SEARCH_SURFACE => {}
+            Ok(_) => return error_json(StatusCode(404), "conversation not found"),
+            Err(error) => return error_json(StatusCode(500), &error),
+        }
+        match store.delete_session_with_tasks(&session_id) {
+            Ok(true) => ok_json(&json!({ "deleted": true, "conversation_id": conversation_id })),
+            Ok(false) => error_json(StatusCode(404), "conversation not found"),
+            Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
     fn handle_knowledge_answer(
         &self,
         request: &mut Request,
@@ -4000,7 +4223,30 @@ impl AdminApi {
         };
         let task_request =
             build_admin_rag_answer_task_request(&principal, payload, focus_paths, roots);
-        let response = self.task_service.handle_task(task_request);
+        let conversation_id = task_request.source.conversation_id.clone();
+        let mut response = self.task_service.handle_task(task_request);
+        if let Some(data) = response.result.data.as_object_mut() {
+            data.insert(
+                "conversation_id".to_string(),
+                Value::String(conversation_id),
+            );
+            data.insert(
+                "conversation_context_turn_limit".to_string(),
+                json!(settings.conversation.context_turn_limit),
+            );
+        }
+        if let Err(error) = self.task_service.conversation_store().prune_sessions_for_user_surface(
+            &principal.user_id,
+            HARBOR_ASSISTANT_SEARCH_SURFACE,
+            settings.conversation.history_limit,
+        ) {
+            if let Some(data) = response.result.data.as_object_mut() {
+                data.insert(
+                    "conversation_history_warning".to_string(),
+                    Value::String(error),
+                );
+            }
+        }
         ok_json(&response.result.data)
     }
 
@@ -6409,15 +6655,57 @@ impl AdminApi {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
         };
-        if let Err(error) = self.activate_selected_model_capability(&capability_id, &body.model_id)
-        {
+        let previous_active_model_id = self
+            .admin_store
+            .load_or_create_state()
+            .ok()
+            .and_then(|state| {
+                model_capability_assignment(&state.models, &capability_id)
+                    .and_then(|binding| binding.active_model_id.clone())
+            });
+        if let Err(error) = self.admin_store.save_model_capability_assignment(
+            &capability_id,
+            &body.model_id,
+            previous_active_model_id.as_deref(),
+            "loading",
+            None,
+        ) {
             return error_json(StatusCode(422), &error);
         }
-        if let Err(error) = self
-            .admin_store
-            .save_model_capability_binding(&capability_id, &body.model_id)
+        let activation = match self.activate_selected_model_capability(&capability_id, &body.model_id)
         {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = self.admin_store.save_model_capability_assignment(
+                    &capability_id,
+                    &body.model_id,
+                    previous_active_model_id.as_deref(),
+                    "failed",
+                    Some(&error),
+                );
+                return error_json(StatusCode(422), &error);
+            }
+        };
+        let (active_model_id, transition_status, last_error) = if activation.activated {
+            (Some(body.model_id.as_str()), "ready", None)
+        } else {
+            (
+                previous_active_model_id.as_deref(),
+                "failed",
+                Some(activation.message.as_str()),
+            )
+        };
+        if let Err(error) = self.admin_store.save_model_capability_assignment(
+            &capability_id,
+            &body.model_id,
+            active_model_id,
+            transition_status,
+            last_error,
+        ) {
             return error_json(StatusCode(422), &error);
+        }
+        if !activation.activated {
+            return error_json(StatusCode(422), &activation.message);
         }
         self.record_admin_audit(
             &principal,
@@ -6434,9 +6722,14 @@ impl AdminApi {
         &self,
         capability_id: &str,
         model_id: &str,
-    ) -> Result<(), String> {
+    ) -> Result<ModelRuntimeActivationResult, String> {
         let Some(capability_model_kind) = model_kind_for_capability(capability_id) else {
-            return Ok(());
+            return Ok(ModelRuntimeActivationResult {
+                activated: true,
+                status: "selected".to_string(),
+                message: "Capability selection does not require runtime activation.".to_string(),
+                runtime_model_id: Some(model_id.to_string()),
+            });
         };
         let state = self.admin_store.load_or_create_state()?;
         let download_jobs = self.admin_store.list_model_download_jobs()?;
@@ -6458,6 +6751,15 @@ impl AdminApi {
                 model.display_name, capability_id
             ));
         }
+        let Some(model_kind) = runtime_model_kind_for_capability(capability_id) else {
+            return Ok(ModelRuntimeActivationResult {
+                activated: true,
+                status: "selected".to_string(),
+                message: "Capability selection does not require runtime activation.".to_string(),
+                runtime_model_id: Some(model_id.to_string()),
+            });
+        };
+        let mut external_activation = None;
         if let Some(profile) = managed_runtime_profile_for_model(model) {
             let runtime_projection = LocalModelRuntimeProjection::default();
             let runtime_status =
@@ -6470,15 +6772,27 @@ impl AdminApi {
                 ));
             }
         } else if external_runtime_profile_for_model(model) {
-            return Err(format!(
-                "模型 {} 需要在高级设置配置 OpenAI-compatible runtime；Harbor 不会自动启动或接管外部 runtime",
-                model.display_name
-            ));
+            let runtime_model_id = configured_external_runtime_model_id(
+                &state.models.endpoints,
+                &catalog.models,
+                model_kind,
+                &model.model_id,
+            )
+            .ok_or_else(|| {
+                format!(
+                    "{} requires a configured and running OpenAI-compatible endpoint.",
+                    model.display_name
+                )
+            })?;
+            external_activation = Some(ModelRuntimeActivationResult {
+                activated: true,
+                status: "external_runtime_ready".to_string(),
+                message: format!(
+                    "Existing OpenAI-compatible runtime is already serving {runtime_model_id}."
+                ),
+                runtime_model_id: Some(runtime_model_id),
+            });
         }
-
-        let Some(model_kind) = runtime_model_kind_for_capability(capability_id) else {
-            return Ok(());
-        };
 
         let request = ModelRuntimeActivationRequest {
             capability_id: capability_id.to_string(),
@@ -6487,7 +6801,9 @@ impl AdminApi {
             local_path: model.local_path.clone(),
             runtime_profiles: model.runtime_profiles.clone(),
         };
-        let result = if let Some(handler) = self.model_runtime_activation.as_ref() {
+        let result = if let Some(result) = external_activation {
+            result
+        } else if let Some(handler) = self.model_runtime_activation.as_ref() {
             handler(request)?
         } else {
             ModelRuntimeActivationResult {
@@ -6497,7 +6813,8 @@ impl AdminApi {
                 runtime_model_id: None,
             }
         };
-        self.record_model_runtime_activation(model_kind, model, result)
+        self.record_model_runtime_activation(model_kind, model, result.clone())?;
+        Ok(result)
     }
 
     fn record_model_runtime_activation(
@@ -6528,14 +6845,20 @@ impl AdminApi {
         } else {
             ModelEndpointStatus::Degraded
         };
-        self.admin_store.patch_model_endpoint(
-            endpoint_id,
-            json!({
-                "model_name": model_name,
-                "status": status,
-                "metadata": metadata,
-            }),
-        )?;
+        let mut endpoint_patch = json!({
+            "model_name": model_name,
+            "status": status,
+            "metadata": metadata,
+        });
+        if managed_runtime_profile_for_model(model) == Some("harbor-candle") {
+            set_metadata_string(
+                &mut endpoint_patch,
+                "provider_key",
+                "openai_compatible".to_string(),
+            );
+        }
+        self.admin_store
+            .patch_model_endpoint(endpoint_id, endpoint_patch)?;
         Ok(())
     }
 
@@ -10133,7 +10456,7 @@ fn add_common_headers<R: Read>(response: &mut Response<R>) {
         ("Access-Control-Allow-Headers", "Content-Type"),
         (
             "Access-Control-Allow-Methods",
-            "GET, POST, PATCH, PUT, OPTIONS",
+            "GET, POST, PATCH, PUT, DELETE, OPTIONS",
         ),
         ("Cache-Control", "no-store"),
     ] {
@@ -10170,6 +10493,9 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path.starts_with("/api/family/memory/events/")
         || path == "/api/home-guardian/activity"
         || path == "/api/knowledge/settings"
+        || path == "/api/knowledge/conversation-settings"
+        || path == "/api/knowledge/conversations"
+        || path.starts_with("/api/knowledge/conversations/")
         || path == "/api/knowledge/search"
         || path == "/api/knowledge/answer"
         || path == "/api/knowledge/preview"
@@ -11132,6 +11458,11 @@ fn build_hardware_readiness_response() -> HardwareReadinessResponse {
     }
 }
 
+// NVIDIA reports many retail "16 GB" and "24 GB" cards slightly below their
+// binary GiB equivalent (for example, a 16 GB RTX 5060 Ti reports 16,311 MiB).
+// Keep the product tiers in GiB while accepting this normal reporting variance.
+const GPU_MARKETING_CAPACITY_TOLERANCE_MIB: u64 = 256;
+
 fn hardware_class_for_probe(
     cpu_count: usize,
     memory_mb: Option<u64>,
@@ -11140,13 +11471,13 @@ fn hardware_class_for_probe(
 ) -> String {
     let memory_mb = memory_mb.unwrap_or_default();
     if let Some(vram) = gpu_vram_total_mb {
-        if vram >= 48 * 1024 {
+        if vram >= 48 * 1024 - GPU_MARKETING_CAPACITY_TOLERANCE_MIB {
             return "multi_gpu_or_remote".to_string();
         }
-        if vram >= 24 * 1024 {
+        if vram >= 24 * 1024 - GPU_MARKETING_CAPACITY_TOLERANCE_MIB {
             return "gpu_24gb_plus".to_string();
         }
-        if vram >= 16 * 1024 {
+        if vram >= 16 * 1024 - GPU_MARKETING_CAPACITY_TOLERANCE_MIB {
             return "gpu_16gb".to_string();
         }
         return "low_vram_gpu".to_string();
@@ -11718,6 +12049,35 @@ fn build_admin_knowledge_search_request(
     Ok(request)
 }
 
+#[derive(Debug, Deserialize)]
+struct KnowledgeConversationSettingsUpdate {
+    history_limit: usize,
+    context_turn_limit: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct HarborAssistantConversationSummary {
+    conversation_id: String,
+    title: String,
+    updated_at: Option<String>,
+    turn_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct HarborAssistantConversationTurn {
+    task_id: String,
+    query: String,
+    answer: String,
+    created_at: Option<String>,
+    response: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct HarborAssistantConversationDetail {
+    conversation_id: String,
+    turns: Vec<HarborAssistantConversationTurn>,
+}
+
 fn build_admin_rag_answer_task_request(
     principal: &AccessPrincipal,
     payload: KnowledgeSearchApiRequest,
@@ -11725,6 +12085,12 @@ fn build_admin_rag_answer_task_request(
     roots: Vec<String>,
 ) -> TaskRequest {
     let query = payload.query.trim().to_string();
+    let conversation_id = payload
+        .conversation_id
+        .as_deref()
+        .and_then(normalize_harbor_assistant_conversation_id)
+        .unwrap_or_else(|| "default".to_string());
+    let session_id = harbor_assistant_search_session_id(&principal.user_id, &conversation_id);
     let mut modalities = Vec::new();
     if payload.include_documents.unwrap_or(true) {
         modalities.push("document");
@@ -11741,10 +12107,10 @@ fn build_admin_rag_answer_task_request(
         step_id: String::new(),
         source: TaskSource {
             channel: "admin_api".to_string(),
-            surface: "harbor_assistant_search".to_string(),
-            conversation_id: format!("harbor-assistant-search:{}", principal.user_id),
+            surface: HARBOR_ASSISTANT_SEARCH_SURFACE.to_string(),
+            conversation_id,
             user_id: principal.user_id.clone(),
-            session_id: format!("harbor-assistant-search:{}", principal.user_id),
+            session_id,
             route_key: String::new(),
         },
         intent: TaskIntent {
@@ -11755,15 +12121,76 @@ fn build_admin_rag_answer_task_request(
         entity_refs: Value::Null,
         args: json!({
             "query": query,
-            "limit": payload.limit.unwrap_or(10).clamp(1, 10),
+            "limit": payload.limit.map(|limit| limit.clamp(1, 50)),
             "modalities": modalities,
             "roots": roots,
             "focus_paths": focus_paths,
             "use_retrieval": payload.use_retrieval,
+            "retrieval_mode": payload.retrieval_mode.as_deref().unwrap_or("auto"),
         }),
         autonomy: Default::default(),
         message: None,
     }
+}
+
+const HARBOR_ASSISTANT_SEARCH_SURFACE: &str = "harbor_assistant_search";
+
+fn normalize_harbor_assistant_conversation_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()
+        && value.len() <= 64
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_')))
+    .then(|| value.to_string())
+}
+
+fn harbor_assistant_search_session_id(user_id: &str, conversation_id: &str) -> String {
+    format!("harbor-assistant-search:{user_id}:{conversation_id}")
+}
+
+fn parse_harbor_assistant_conversation_path(path: &str) -> Option<String> {
+    let raw = path.strip_prefix("/api/knowledge/conversations/")?;
+    if raw.is_empty() || raw.contains('/') {
+        return None;
+    }
+    let decoded = percent_decode_path_segment(raw).ok()?;
+    normalize_harbor_assistant_conversation_id(&decoded)
+}
+
+fn harbor_assistant_conversation_query(task_run: &TaskRun) -> String {
+    non_empty_string(&task_run.intent_text)
+        .or_else(|| {
+            task_run
+                .args
+                .pointer("/query")
+                .and_then(Value::as_str)
+                .and_then(non_empty_string)
+        })
+        .unwrap_or_default()
+}
+
+fn harbor_assistant_conversation_turn(
+    store: &TaskConversationStore,
+    task_run: &TaskRun,
+) -> Option<HarborAssistantConversationTurn> {
+    let step = task_run
+        .metadata
+        .pointer("/step_id")
+        .and_then(Value::as_str)
+        .and_then(|step_id| store.load_task_step(step_id).ok().flatten())?;
+    let response = step.output_payload.pointer("/data")?.clone();
+    let answer = response
+        .pointer("/answer")
+        .and_then(Value::as_str)
+        .and_then(non_empty_string)?;
+    Some(HarborAssistantConversationTurn {
+        task_id: task_run.task_id.clone(),
+        query: harbor_assistant_conversation_query(task_run),
+        answer,
+        created_at: task_run.started_at.clone(),
+        response,
+    })
 }
 
 fn parse_optional_unix_seconds(value: Option<&str>, field: &str) -> Result<Option<u64>, String> {
@@ -14953,7 +15380,8 @@ fn build_model_capability_status(
         model_kind,
     );
     let runtime_ready = model_capability_runtime_ready(model_kind, runtime, runtime_bound);
-    let selected_model_id = selected_model_id_for_capability(model_state, capability_id);
+    let assignment = model_capability_assignment(model_state, capability_id);
+    let desired_model_id = assignment.map(|value| value.desired_model_id.clone());
     let installable_models = catalog_models
         .iter()
         .filter(|model| {
@@ -14997,7 +15425,7 @@ fn build_model_capability_status(
     let installed_model = catalog_models
         .iter()
         .find(|model| {
-            selected_model_id
+            desired_model_id
                 .as_ref()
                 .is_some_and(|selected| selected == &model.model_id)
         })
@@ -15033,12 +15461,37 @@ fn build_model_capability_status(
         .as_ref()
         .map(|status| status.next_action.clone());
     let runtime_missing = required_runtime_profile.is_some() && !runtime_installed;
-    let endpoint_ready = endpoint.is_some_and(|value| value.status == ModelEndpointStatus::Active);
-    let ready = if runtime_bound {
-        runtime_ready
-    } else {
-        endpoint_ready
-    };
+    let endpoint_runtime_model = endpoint.and_then(probe_local_endpoint_runtime_model);
+    let projected_runtime_model = runtime_ready
+        .then(|| runtime_model_name_for_kind(model_kind, runtime))
+        .flatten();
+    let cloud_runtime_model = endpoint
+        .filter(|value| {
+            value.endpoint_kind == ModelEndpointKind::Cloud
+                && value.status == ModelEndpointStatus::Active
+        })
+        .and_then(|value| non_empty_string(&value.model_name));
+    let cloud_runtime_ready = cloud_runtime_model.is_some();
+    let runtime_model_id = endpoint_runtime_model
+        .as_ref()
+        .map(|model| model.model_id.clone())
+        .or(projected_runtime_model)
+        .or(cloud_runtime_model);
+    let runtime_model_loaded = endpoint_runtime_model
+        .as_ref()
+        .map(|model| model.loaded)
+        .unwrap_or_else(|| match (cloud_runtime_ready, model_kind) {
+            (true, _) => true,
+            (false, ModelKind::Llm) => runtime.chat_model_loaded.unwrap_or(runtime_ready),
+            (false, ModelKind::Embedder) => {
+                runtime.embedding_model_loaded.unwrap_or(runtime_ready)
+            }
+            (false, _) => runtime_model_id.is_some(),
+        });
+    // Capability readiness and the displayed serving model must come from the
+    // same runtime evidence. In particular, an external vLLM can serve LLM
+    // requests while the embedded Candle runtime is intentionally inactive.
+    let ready = runtime_model_id.is_some() && runtime_model_loaded;
     let unsupported =
         endpoint.is_none() && installable_models.is_empty() && capability_jobs.is_empty();
     let status = if ready {
@@ -15059,18 +15512,32 @@ fn build_model_capability_status(
         "needs_model"
     }
     .to_string();
-    let current_model = (status != "needs_model")
-        .then(|| {
-            endpoint.map(|endpoint| ModelCapabilityCurrentModel {
-                model_endpoint_id: endpoint.model_endpoint_id.clone(),
-                model_name: runtime_model_name_for_kind(model_kind, runtime)
-                    .unwrap_or_else(|| endpoint.model_name.clone()),
-                provider_key: endpoint.provider_key.clone(),
-                status: endpoint.status.as_str().to_string(),
-            })
+    // Local endpoint metadata and persisted capability assignments describe
+    // intent, not what is currently loaded, so they must not become runtime
+    // truth.
+    let active_model_id = runtime_model_id
+        .as_ref()
+        .and_then(|identity| canonical_catalog_model_id(identity, catalog_models));
+    let transition_status = assignment
+        .map(|value| value.transition_status.as_str())
+        .filter(|value| matches!(*value, "loading" | "failed"))
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if ready && active_model_id.is_some() {
+                "ready"
+            } else {
+                "unknown"
+            }
+            .to_string()
+        });
+    let current_model = active_model_id.as_ref().and_then(|active_model_id| {
+        endpoint.map(|endpoint| ModelCapabilityCurrentModel {
+            model_endpoint_id: endpoint.model_endpoint_id.clone(),
+            model_name: active_model_id.clone(),
+            provider_key: endpoint.provider_key.clone(),
+            status: endpoint.status.as_str().to_string(),
         })
-        .flatten();
-    let runtime_model_id = runtime_model_name_for_kind(model_kind, runtime);
+    });
     let policy = find_route_policy(route_policies, route_policy_id);
     let next_action = match status.as_str() {
         "ready" => "可以使用".to_string(),
@@ -15078,6 +15545,9 @@ fn build_model_capability_status(
         "needs_runtime" => runtime_next_action
             .clone()
             .unwrap_or_else(|| "安装 Harbor-managed runtime".to_string()),
+        "installed_not_running" if runtime_model_id.is_some() => {
+            "运行时已就绪，首次请求时按需加载模型".to_string()
+        }
         "installed_not_running" => "模型已安装，点击选择会自动切换并启动".to_string(),
         "unsupported" => "暂不支持该能力".to_string(),
         "degraded" => runtime
@@ -15091,6 +15561,7 @@ fn build_model_capability_status(
         format!("route_policy_status={}", policy_status_value(policy)),
         format!("runtime_bound={runtime_bound}"),
         format!("runtime_ready={runtime_ready}"),
+        format!("runtime_model_loaded={runtime_model_loaded}"),
     ];
     if let Some(profile) = required_runtime_profile {
         evidence.push(format!("required_runtime_profile={profile}"));
@@ -15117,7 +15588,11 @@ fn build_model_capability_status(
         label: label.to_string(),
         model_kind: model_kind.as_str().to_string(),
         status,
-        selected_model_id,
+        desired_model_id: desired_model_id.clone(),
+        active_model_id: active_model_id.clone(),
+        transition_status,
+        last_error: assignment.and_then(|value| value.last_error.clone()),
+        selected_model_id: desired_model_id,
         runtime_model_id,
         current_model,
         installed_models,
@@ -15169,7 +15644,10 @@ fn local_model_catalog_specs() -> Vec<LocalModelCatalogSpec> {
             repo_id: Some("Qwen/Qwen3.5-4B"),
             revision: "main",
             file_policy: "runtime_snapshot",
-            runtime_profiles: &["vllm-openai-compatible", "sglang-openai-compatible"],
+            runtime_profiles: &[
+                "vllm-openai-compatible",
+                "sglang-openai-compatible",
+            ],
             expected_capabilities: &["llm", "vlm", "image_text_to_text"],
             acceptance_note: Some("primary-live-test"),
         },
@@ -15587,16 +16065,177 @@ fn catalog_model_matches_kind_or_capability(
             .any(|capability| capability.eq_ignore_ascii_case(capability_id))
 }
 
-fn selected_model_id_for_capability(
-    model_state: &AdminModelCenterState,
+fn model_capability_assignment<'a>(
+    model_state: &'a AdminModelCenterState,
     capability_id: &str,
-) -> Option<String> {
+) -> Option<&'a harborbeacon_local_agent::runtime::admin_console::ModelCapabilityBindingRecord> {
     model_state
         .capability_bindings
         .iter()
         .find(|binding| binding.capability_id == capability_id)
-        .map(|binding| binding.model_id.clone())
-        .and_then(|model_id| non_empty_string(&model_id))
+}
+
+fn canonical_catalog_model_id(
+    runtime_identity: &str,
+    catalog_models: &[LocalModelCatalogItem],
+) -> Option<String> {
+    let identity = runtime_identity.trim();
+    catalog_models
+        .iter()
+        .find(|model| {
+            model.model_id == identity
+                || model
+                    .local_path
+                    .as_deref()
+                    .is_some_and(|local_path| local_path == identity)
+        })
+        .map(|model| model.model_id.clone())
+        .or_else(|| non_empty_string(identity))
+}
+
+fn configured_external_runtime_model_id(
+    endpoints: &[ModelEndpoint],
+    catalog_models: &[LocalModelCatalogItem],
+    model_kind: ModelKind,
+    desired_model_id: &str,
+) -> Option<String> {
+    endpoints
+        .iter()
+        .filter(|endpoint| {
+            endpoint.endpoint_kind == ModelEndpointKind::Local
+                && endpoint.status == ModelEndpointStatus::Active
+                && endpoint.model_kind == model_kind
+                && endpoint
+                    .provider_key
+                    .eq_ignore_ascii_case("openai_compatible")
+        })
+        .find_map(|endpoint| {
+            let runtime_model_id = probe_local_openai_compatible_serving_model(endpoint)?;
+            let canonical_model_id =
+                canonical_catalog_model_id(&runtime_model_id, catalog_models)?;
+            (canonical_model_id == desired_model_id).then_some(runtime_model_id)
+        })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProbedEndpointRuntimeModel {
+    model_id: String,
+    loaded: bool,
+}
+
+fn probe_local_openai_compatible_serving_model(endpoint: &ModelEndpoint) -> Option<String> {
+    probe_local_endpoint_runtime_model(endpoint).map(|model| model.model_id)
+}
+
+fn probe_local_endpoint_runtime_model(
+    endpoint: &ModelEndpoint,
+) -> Option<ProbedEndpointRuntimeModel> {
+    if endpoint.endpoint_kind != ModelEndpointKind::Local
+        || endpoint.status != ModelEndpointStatus::Active
+    {
+        return None;
+    }
+    let base_url = metadata_string_value(&endpoint.metadata, "base_url")?;
+    let normalized = base_url.trim().trim_end_matches('/');
+    if !(normalized.starts_with("http://127.0.0.1:")
+        || normalized.starts_with("http://localhost:"))
+    {
+        return None;
+    }
+    let models_url = if normalized.ends_with("/v1") {
+        format!("{normalized}/models")
+    } else {
+        format!("{normalized}/v1/models")
+    };
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .ok()?;
+    let mut request = client.get(models_url);
+    if let Some(api_key) = metadata_string_value(&endpoint.metadata, "api_key")
+        .filter(|value| !value.trim().is_empty())
+    {
+        request = request.bearer_auth(api_key);
+    }
+    if let Ok(payload) = request.send().and_then(|response| response.json::<Value>()) {
+        if let Some(model_id) = payload
+            .get("data")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find_map(|model| model.get("id").and_then(Value::as_str))
+            .and_then(non_empty_string)
+        {
+            return Some(ProbedEndpointRuntimeModel {
+                model_id,
+                loaded: true,
+            });
+        }
+    }
+    if endpoint.model_kind == ModelKind::Embedder {
+        let info_base_url = normalized.strip_suffix("/v1").unwrap_or(normalized);
+        let mut info_request = client.get(format!("{info_base_url}/info"));
+        if let Some(api_key) = metadata_string_value(&endpoint.metadata, "api_key")
+            .filter(|value| !value.trim().is_empty())
+        {
+            info_request = info_request.bearer_auth(api_key);
+        }
+        if let Some(model_id) = info_request
+            .send()
+            .ok()
+            .and_then(|response| response.error_for_status().ok())
+            .and_then(|response| response.json::<Value>().ok())
+            .filter(|info| info.pointer("/model_type/embedding").is_some())
+            .and_then(|_| {
+                metadata_string_value(&endpoint.metadata, "catalog_model_id")
+                    .or_else(|| metadata_string_value(&endpoint.metadata, "model"))
+                    .or_else(|| non_empty_string(&endpoint.model_name))
+            })
+        {
+            return Some(ProbedEndpointRuntimeModel {
+                model_id,
+                loaded: true,
+            });
+        }
+    }
+
+    let healthz_url = metadata_string_value(&endpoint.metadata, "healthz_url")?;
+    let mut health_request = client.get(healthz_url);
+    if let Some(api_key) = metadata_string_value(&endpoint.metadata, "api_key")
+        .filter(|value| !value.trim().is_empty())
+    {
+        health_request = health_request.bearer_auth(api_key);
+    }
+    let health = health_request
+        .send()
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json::<Value>()
+        .ok()?;
+    if !health.get("ready").and_then(Value::as_bool).unwrap_or(false)
+        || !health
+            .pointer("/backend/ready")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return None;
+    }
+    let (model_field, loaded_field) = match endpoint.model_kind {
+        ModelKind::Llm => ("chat_model", "/backend/chat_model_loaded"),
+        ModelKind::Embedder => ("embedding_model", "/backend/embedding_model_loaded"),
+        _ => return None,
+    };
+    let model_id = health
+        .get(model_field)
+        .and_then(Value::as_str)
+        .and_then(non_empty_string)?;
+    let loaded = health
+        .pointer(loaded_field)
+        .and_then(Value::as_bool)
+        .or_else(|| health.pointer("/backend/model_loaded").and_then(Value::as_bool))
+        .unwrap_or(true);
+    Some(ProbedEndpointRuntimeModel { model_id, loaded })
 }
 
 fn model_capability_installable_model(
@@ -17559,6 +18198,12 @@ fn probe_local_model_runtime(endpoints: &[ModelEndpoint]) -> LocalModelRuntimePr
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string),
+        chat_model_loaded: payload
+            .pointer("/backend/chat_model_loaded")
+            .and_then(Value::as_bool),
+        embedding_model_loaded: payload
+            .pointer("/backend/embedding_model_loaded")
+            .and_then(Value::as_bool),
         note: payload
             .get("note")
             .and_then(Value::as_str)
@@ -17584,7 +18229,9 @@ fn overlay_model_endpoints_with_runtime_truth(
             let mut projection_mismatch = false;
 
             if let Some(default_endpoint) = builtin_defaults.get(&overlayed.model_endpoint_id) {
-                if is_builtin_local_openai_endpoint(default_endpoint) {
+                if is_builtin_local_openai_endpoint(default_endpoint)
+                    && !model_endpoint_uses_external_runtime(&overlayed)
+                {
                     let legacy_base_url = metadata_string_value(&overlayed.metadata, "base_url")
                         .is_some_and(|value| is_legacy_model_api_url(&value));
                     if metadata_missing_or_empty(&overlayed.metadata, "base_url") || legacy_base_url
@@ -18221,6 +18868,31 @@ fn is_builtin_local_openai_endpoint(endpoint: &ModelEndpoint) -> bool {
             endpoint.model_kind,
             ModelKind::Llm | ModelKind::Embedder | ModelKind::Vlm
         )
+}
+
+fn model_endpoint_uses_external_runtime(endpoint: &ModelEndpoint) -> bool {
+    let backend_kind = metadata_string_value(&endpoint.metadata, "runtime_backend_kind")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(backend_kind.as_str(), "vllm" | "sglang" | "openai_proxy") {
+        return true;
+    }
+    endpoint
+        .metadata
+        .get("runtime_profiles")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(|profile| {
+            matches!(
+                profile.trim().to_ascii_lowercase().as_str(),
+                "vllm-openai-compatible"
+                    | "sglang-openai-compatible"
+                    | "openai-compatible-embedding"
+                    | "openai-compatible-vlm"
+            )
+        })
 }
 
 fn infer_healthz_url(base_url: &str) -> String {
@@ -19641,7 +20313,8 @@ impl Drop for FfmpegMjpegStream {
 mod tests {
     use super::{
         apply_bridge_provider_binding_projection, authorize_gateway_service_request,
-        build_admin_knowledge_search_request, build_default_notification_target_readiness,
+        build_admin_knowledge_search_request, build_admin_rag_answer_task_request,
+        build_default_notification_target_readiness,
         build_device_credential_status, build_feature_availability_response,
         build_files_browse_response, build_harboros_im_capability_map,
         build_harboros_status_response, build_hardware_readiness_response,
@@ -19655,6 +20328,7 @@ mod tests {
         default_model_download_target_path_in_root, default_model_endpoints,
         embedding_warmup_timeout_stats, ensure_local_admin_access, ensure_local_camera_access,
         harbor_assistant_build_missing_response, hardware_class_for_probe, has_forwarding_headers,
+        HARBOR_ASSISTANT_SEARCH_SURFACE,
         huggingface_download_should_fallback_to_plain_http, huggingface_resolve_url,
         identity_query_suffix, is_admin_surface_path, is_harbor_assistant_client_route,
         is_harbor_assistant_surface_path, is_safe_live_asset_name,
@@ -19662,7 +20336,8 @@ mod tests {
         live_bridge_provider_from_setup_status, local_model_catalog_item,
         local_model_catalog_specs, mime_type_for_path, model_download_huggingface_endpoint,
         model_download_huggingface_endpoints, model_download_jobs_status,
-        model_hardware_recommendation, model_snapshot_file_allowed, normalize_unified_admin_path,
+        model_hardware_recommendation, model_snapshot_file_allowed,
+        normalize_harbor_assistant_conversation_id, normalize_unified_admin_path,
         notification_delivery_error_to_harbor_app_error,
         overlay_model_endpoints_with_runtime_truth, parse_approval_decision_path,
         parse_camera_analyze_path, parse_camera_hls_live_asset_path,
@@ -19679,9 +20354,11 @@ mod tests {
         parse_member_role_update_path, parse_model_download_cancel_path,
         parse_model_download_job_path, parse_model_endpoint_path, parse_model_endpoint_test_path,
         parse_model_runtime_install_path, parse_notification_target_delete_path,
-        parse_optional_unix_seconds, parse_share_link_revoke_path,
+        parse_harbor_assistant_conversation_path, parse_optional_unix_seconds,
+        parse_share_link_revoke_path,
         parse_shared_camera_live_page_path, parse_shared_camera_live_stream_path,
-        percent_decode_path_segment, probe_local_model_runtime, redact_account_management_snapshot,
+        percent_decode_path_segment, probe_local_model_runtime,
+        probe_local_openai_compatible_serving_model, redact_account_management_snapshot,
         resolve_admin_search_source_scope,
         redact_admin_string, redact_bridge_provider_config, redact_camera_device_projection,
         redact_model_endpoint_response, redact_state_snapshot, redact_stream_url_credentials,
@@ -22329,6 +23006,14 @@ mod tests {
             hardware_class_for_probe(8, Some(32_000), true, Some(16_384)),
             "gpu_16gb"
         );
+        assert_eq!(
+            hardware_class_for_probe(8, Some(32_000), true, Some(16_311)),
+            "gpu_16gb"
+        );
+        assert_eq!(
+            hardware_class_for_probe(8, Some(32_000), true, Some(16_127)),
+            "low_vram_gpu"
+        );
 
         let mut hardware = build_hardware_readiness_response();
         hardware.hardware_class = "tiny_cpu".to_string();
@@ -22436,6 +23121,83 @@ mod tests {
         assert!(router.runtime_installable);
         assert_eq!(router.next_action, "选择或安装模型");
         assert!(router.current_model.is_none());
+    }
+
+    #[test]
+    fn model_capabilities_do_not_treat_persisted_assignment_as_runtime_truth() {
+        let runtime = LocalModelRuntimeProjection {
+            error: Some("runtime offline".to_string()),
+            ..Default::default()
+        };
+        let endpoints =
+            overlay_model_endpoints_with_runtime_truth(&default_model_endpoints(), &runtime);
+        let mut model_state = AdminModelCenterState::default();
+        model_state.capability_bindings.push(
+            harborbeacon_local_agent::runtime::admin_console::ModelCapabilityBindingRecord {
+                capability_id: "vlm".to_string(),
+                desired_model_id: "Qwen/Qwen3.5-9B".to_string(),
+                active_model_id: Some("Qwen/Qwen3.5-9B".to_string()),
+                transition_status: "ready".to_string(),
+                last_error: None,
+                updated_at: "1".to_string(),
+            },
+        );
+
+        let response = build_model_capabilities_response(
+            &model_state,
+            &endpoints,
+            &default_model_route_policies(),
+            Vec::new(),
+            &runtime,
+        );
+        let vision = response
+            .capabilities
+            .iter()
+            .find(|capability| capability.capability_id == "vlm")
+            .expect("vision capability");
+
+        assert_eq!(vision.desired_model_id.as_deref(), Some("Qwen/Qwen3.5-9B"));
+        assert!(vision.active_model_id.is_none());
+        assert!(vision.runtime_model_id.is_none());
+        assert!(vision.current_model.is_none());
+        assert_eq!(vision.transition_status, "unknown");
+    }
+
+    #[test]
+    fn model_capabilities_use_external_runtime_evidence_for_ready_status() {
+        let runtime = LocalModelRuntimeProjection::default();
+        let mut endpoints = default_model_endpoints();
+        let llm_endpoint = endpoints
+            .iter_mut()
+            .find(|endpoint| endpoint.model_kind == ModelKind::Llm)
+            .expect("llm endpoint");
+        llm_endpoint.endpoint_kind = ModelEndpointKind::Cloud;
+        llm_endpoint.status = ModelEndpointStatus::Active;
+        llm_endpoint.model_name = "Qwen/Qwen3.5-4B".to_string();
+
+        let response = build_model_capabilities_response(
+            &AdminModelCenterState::default(),
+            &endpoints,
+            &default_model_route_policies(),
+            Vec::new(),
+            &runtime,
+        );
+        for capability_id in ["semantic_router", "retrieval_answer"] {
+            let capability = response
+                .capabilities
+                .iter()
+                .find(|capability| capability.capability_id == capability_id)
+                .expect("llm capability");
+            assert_eq!(capability.status, "ready");
+            assert_eq!(
+                capability.runtime_model_id.as_deref(),
+                Some("Qwen/Qwen3.5-4B")
+            );
+            assert_eq!(
+                capability.active_model_id.as_deref(),
+                Some("Qwen/Qwen3.5-4B")
+            );
+        }
     }
 
     #[test]
@@ -23172,11 +23934,13 @@ mod tests {
         let request = build_admin_knowledge_search_request(
             KnowledgeSearchApiRequest {
                 query: " 找到春天照片 ".to_string(),
+                conversation_id: None,
                 limit: Some(500),
                 include_documents: Some(false),
                 include_images: None,
                 include_videos: Some(true),
                 use_retrieval: None,
+                retrieval_mode: None,
                 source_scope: None,
                 source_root_ids: Vec::new(),
                 camera_id: None,
@@ -23200,6 +23964,51 @@ mod tests {
         assert_eq!(
             request.focus_paths,
             vec!["/mnt/source-a/camera-main/segment.mp4"]
+        );
+    }
+
+    #[test]
+    fn rag_answer_request_scopes_each_conversation_to_its_own_session() {
+        let principal = AccessPrincipal {
+            workspace_id: "home-1".to_string(),
+            user_id: "user-1".to_string(),
+            display_name: "User".to_string(),
+            role_kind: RoleKind::Owner,
+        };
+        let request = build_admin_rag_answer_task_request(
+            &principal,
+            KnowledgeSearchApiRequest {
+                query: "继续总结第二篇".to_string(),
+                conversation_id: Some("conv-2".to_string()),
+                limit: None,
+                include_documents: None,
+                include_images: None,
+                include_videos: None,
+                use_retrieval: None,
+                retrieval_mode: None,
+                source_scope: None,
+                source_root_ids: Vec::new(),
+                camera_id: None,
+                from: None,
+                to: None,
+            },
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(request.source.conversation_id, "conv-2");
+        assert_eq!(
+            request.source.session_id,
+            "harbor-assistant-search:user-1:conv-2"
+        );
+        assert_eq!(request.source.surface, HARBOR_ASSISTANT_SEARCH_SURFACE);
+        assert!(normalize_harbor_assistant_conversation_id("../bad").is_none());
+        assert_eq!(
+            parse_harbor_assistant_conversation_path(
+                "/api/knowledge/conversations/conv-2"
+            )
+            .as_deref(),
+            Some("conv-2")
         );
     }
 
@@ -23230,11 +24039,13 @@ mod tests {
         };
         let payload = KnowledgeSearchApiRequest {
             query: "春天的文章".to_string(),
+            conversation_id: None,
             limit: None,
             include_documents: Some(true),
             include_images: Some(false),
             include_videos: Some(false),
             use_retrieval: Some(true),
+            retrieval_mode: None,
             source_scope: Some("all".to_string()),
             source_root_ids: vec!["documents".to_string(), "documents".to_string()],
             camera_id: None,
@@ -23258,11 +24069,13 @@ mod tests {
     fn admin_search_request_detects_and_validates_dvr_focus_fields() {
         let payload = KnowledgeSearchApiRequest {
             query: "谁在倒饮料".to_string(),
+            conversation_id: None,
             limit: None,
             include_documents: None,
             include_images: None,
             include_videos: Some(true),
             use_retrieval: None,
+            retrieval_mode: None,
             source_scope: None,
             source_root_ids: Vec::new(),
             camera_id: Some(" camera-main ".to_string()),
@@ -23844,7 +24657,13 @@ mod tests {
             })
         }));
         api.admin_store
-            .save_model_capability_binding("semantic_router", "qwen2.5-1.5b-instruct")
+            .save_model_capability_assignment(
+                "semantic_router",
+                "qwen2.5-1.5b-instruct",
+                None,
+                "loading",
+                None,
+            )
             .expect("save binding");
 
         api.activate_selected_model_capability("semantic_router", "qwen2.5-1.5b-instruct")
@@ -23890,6 +24709,97 @@ mod tests {
     }
 
     #[test]
+    fn local_openai_probe_reports_the_model_actually_served() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            let body = json!({
+                "object": "list",
+                "data": [{"id": "Qwen/Qwen3.5-4B", "object": "model"}]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+        let endpoint = ModelEndpoint {
+            model_endpoint_id: "vlm-local-openai-compatible".to_string(),
+            workspace_id: None,
+            provider_account_id: None,
+            model_kind: ModelKind::Vlm,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "openai_compatible".to_string(),
+            model_name: "Qwen/Qwen3.5-9B".to_string(),
+            capability_tags: vec!["vlm".to_string()],
+            cost_policy: json!({}),
+            status: ModelEndpointStatus::Active,
+            metadata: json!({"base_url": format!("http://{addr}/v1")}),
+        };
+
+        assert_eq!(
+            probe_local_openai_compatible_serving_model(&endpoint).as_deref(),
+            Some("Qwen/Qwen3.5-4B")
+        );
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn local_embedding_probe_uses_tei_info_when_models_route_is_unavailable() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let addr = listener.local_addr().expect("listener address");
+        let server = std::thread::spawn(move || {
+            for (status, body) in [
+                ("404 Not Found", "{}"),
+                (
+                    "200 OK",
+                    r#"{"model_id":"/data","model_type":{"embedding":{"pooling":"last_token"}}}"#,
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut request = [0_u8; 2048];
+                let _ = stream.read(&mut request).expect("read request");
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+            }
+        });
+        let endpoint = ModelEndpoint {
+            model_endpoint_id: "embed-local-openai-compatible".to_string(),
+            workspace_id: None,
+            provider_account_id: None,
+            model_kind: ModelKind::Embedder,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "openai_compatible".to_string(),
+            model_name: "Qwen/Qwen3-Embedding-0.6B".to_string(),
+            capability_tags: vec!["embedding".to_string()],
+            cost_policy: json!({}),
+            status: ModelEndpointStatus::Active,
+            metadata: json!({
+                "base_url": format!("http://{addr}/v1"),
+                "catalog_model_id": "Qwen/Qwen3-Embedding-0.6B"
+            }),
+        };
+
+        assert_eq!(
+            probe_local_openai_compatible_serving_model(&endpoint).as_deref(),
+            Some("Qwen/Qwen3-Embedding-0.6B")
+        );
+        server.join().expect("server");
+    }
+
+    #[test]
     fn external_openai_compatible_catalog_model_is_not_auto_started() {
         let registry_path = unique_store_path("harborbeacon-model-external-registry");
         let admin_path = unique_store_path("harborbeacon-model-external-state");
@@ -23932,7 +24842,7 @@ mod tests {
             .activate_selected_model_capability("semantic_router", "Qwen/Qwen3.5-4B")
             .expect_err("external runtime model should not be auto-started");
 
-        assert!(error.contains("OpenAI-compatible runtime"));
+        assert!(error.contains("configured and running OpenAI-compatible endpoint"));
         assert!(seen_requests.lock().expect("request lock").is_empty());
 
         let _ = fs::remove_file(admin_path);

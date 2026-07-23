@@ -788,6 +788,8 @@ fn run_vlm_summary_for_event(
         image_data_url,
         detection_summary,
         user_prompt: Some(cli.vlm_prompt.clone()),
+        system_prompt: None,
+        disable_thinking: false,
     }) {
         Ok(response) => VlmSummaryExecution {
             available: true,

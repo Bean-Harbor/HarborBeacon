@@ -3,9 +3,11 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use markitdown::model::ConversionOptions;
 use markitdown::MarkItDown;
@@ -19,10 +21,12 @@ pub const KNOWLEDGE_INDEX_ROOT_ENV: &str = "HARBOR_KNOWLEDGE_INDEX_ROOT";
 
 const DEFAULT_INDEX_DIR: &str = ".harborbeacon/knowledge-index";
 const MAX_INDEX_TEXT_BYTES: u64 = 512 * 1024;
-const MAX_CHUNK_LINES: usize = 4;
-const MAX_CHUNK_CHARS: usize = 320;
-const INDEX_SCHEMA_VERSION: u32 = 1;
-const EMBEDDING_STORE_SCHEMA_VERSION: u32 = 2;
+const CHILD_CHUNK_TARGET_TOKENS: usize = 240;
+const CHILD_CHUNK_OVERLAP_TOKENS: usize = 48;
+const PARENT_CHUNK_TARGET_TOKENS: usize = 750;
+const PARENT_CHUNK_MAX_TOKENS: usize = 900;
+const INDEX_SCHEMA_VERSION: u32 = 2;
+const EMBEDDING_STORE_SCHEMA_VERSION: u32 = 3;
 const DOCUMENT_EXTENSIONS: &[&str] = &[
     "txt", "md", "markdown", "json", "csv", "html", "htm", "yaml", "yml", "log", "xml", "rss",
     "atom", "pdf", "docx", "pptx", "xlsx", "zip",
@@ -34,7 +38,20 @@ const SIDECAR_EXTENSIONS: &[&str] = &["txt", "md", "markdown", "json", "csv", "y
 const MARKITDOWN_EXTENSIONS: &[&str] = &[
     "html", "htm", "xml", "rss", "atom", "pdf", "docx", "pptx", "xlsx", "zip",
 ];
-const VIDEO_KEYFRAME_SAMPLE_POINTS: &[u32] = &[10, 30, 50, 70, 90];
+const VIDEO_KEYFRAME_MIN_COUNT: usize = 5;
+const VIDEO_KEYFRAME_MAX_COUNT: usize = 48;
+const VIDEO_KEYFRAME_RETRY_OFFSETS_SECONDS: &[f64] = &[0.0, 1.0, -1.0, 2.0, -2.0];
+const VIDEO_TOOL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const VIDEO_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+const VIDEO_FRAME_EXTRACT_TIMEOUT: Duration = Duration::from_secs(30);
+const VIDEO_FRAME_QUALITY_TIMEOUT: Duration = Duration::from_secs(15);
+const VIDEO_SCENE_DETECT_TIMEOUT: Duration = Duration::from_secs(120);
+const VIDEO_FRAME_MIN_LUMA: f64 = 6.0;
+const VIDEO_FRAME_MAX_LUMA: f64 = 238.0;
+const VIDEO_FRAME_MAX_BLUR_SCORE: f64 = 12.0;
+const VIDEO_SCENE_SAMPLE_FPS: f64 = 2.0;
+const VIDEO_SCENE_CHANGE_THRESHOLD: f64 = 0.28;
+const VIDEO_SCENE_TARGET_RATIO: f64 = 0.6;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -65,9 +82,35 @@ pub struct KnowledgeFileSignature {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct KnowledgeIndexChunk {
     pub chunk_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_id: Option<String>,
+    #[serde(default)]
+    pub section_path: Vec<String>,
     pub line_start: usize,
     pub line_end: usize,
     pub text: String,
+    #[serde(default)]
+    pub indexed_text: String,
+    #[serde(default)]
+    pub source_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct KnowledgeIndexParentChunk {
+    pub parent_id: String,
+    #[serde(default)]
+    pub section_path: Vec<String>,
+    pub line_start: usize,
+    pub line_end: usize,
+    pub text: String,
+    #[serde(default)]
+    pub child_ids: Vec<String>,
     #[serde(default)]
     pub source_kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -91,6 +134,8 @@ pub struct KnowledgeIndexEntry {
     pub title: String,
     pub searchable_text: String,
     #[serde(default)]
+    pub parent_chunks: Vec<KnowledgeIndexParentChunk>,
+    #[serde(default)]
     pub chunks: Vec<KnowledgeIndexChunk>,
     #[serde(default)]
     pub text_sources: Vec<KnowledgeIndexTextSource>,
@@ -99,6 +144,34 @@ pub struct KnowledgeIndexEntry {
     pub file_signature: KnowledgeFileSignature,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidecar_signature: Option<KnowledgeFileSignature>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub processing_warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct VideoKeyframe {
+    path: PathBuf,
+    timestamp_seconds: f64,
+    percent: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+struct VideoKeyframeExtraction {
+    frames: Vec<VideoKeyframe>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct VideoFrameQuality {
+    luminance: Option<f64>,
+    blur_score: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CommandCapture {
+    success: bool,
+    stdout: String,
+    stderr: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -353,16 +426,53 @@ impl KnowledgeIndexService {
             model_center::embedding_endpoint_identity_with_state(model_center_state)
         {
             let identity_matches = embedding_store_matches_identity(&store, &identity);
-            if !store.entries.is_empty() && !identity_matches {
-                store.entries.clear();
-                store.vector_dimensions = None;
-                dirty = true;
-            }
-            if !identity_matches {
+            if store.entries.is_empty() && !identity_matches {
                 store.provider_key = Some(identity.provider_key);
                 store.model_endpoint_id = Some(identity.model_endpoint_id);
                 store.model_name = Some(identity.model_name);
                 dirty = true;
+            }
+        }
+
+        if !store.entries.is_empty() {
+            let probe_text = snapshot
+                .manifest
+                .entries
+                .iter()
+                .flat_map(embedding_chunks_for_entry)
+                .map(|chunk| {
+                    if chunk.indexed_text.trim().is_empty() {
+                        chunk.text.trim().to_string()
+                    } else {
+                        chunk.indexed_text.trim().to_string()
+                    }
+                })
+                .find(|text| !text.is_empty());
+            if let Some(probe_text) = probe_text {
+                let execution =
+                    model_center::run_embedding_with_state(&probe_text, model_center_state);
+                if execution.available && !execution.vector.is_empty() {
+                    let execution_model_name = execution
+                        .model_name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    let identity_matches = store.provider_key.as_deref()
+                        == Some(execution.provider_key.as_str())
+                        && store.model_endpoint_id.as_deref()
+                            == execution.model_endpoint_id.as_deref()
+                        && store.model_name.as_deref() == execution_model_name
+                        && store.vector_dimensions == Some(execution.vector.len());
+                    if !identity_matches {
+                        store.entries.clear();
+                        store.vector_dimensions = None;
+                        dirty = true;
+                    }
+                    store.provider_key = Some(execution.provider_key);
+                    store.model_endpoint_id = execution.model_endpoint_id;
+                    store.model_name = execution.model_name;
+                    store.vector_dimensions = Some(execution.vector.len());
+                }
             }
         }
 
@@ -376,7 +486,11 @@ impl KnowledgeIndexService {
 
         for entry in &snapshot.manifest.entries {
             for chunk in embedding_chunks_for_entry(entry) {
-                let text = chunk.text.trim();
+                let text = if chunk.indexed_text.trim().is_empty() {
+                    chunk.text.trim()
+                } else {
+                    chunk.indexed_text.trim()
+                };
                 if text.is_empty() {
                     continue;
                 }
@@ -626,9 +740,14 @@ fn embedding_chunks_for_entry(entry: &KnowledgeIndexEntry) -> Vec<KnowledgeIndex
     }
     vec![KnowledgeIndexChunk {
         chunk_id: "chunk-0001".to_string(),
+        parent_id: None,
+        previous_id: None,
+        next_id: None,
+        section_path: Vec::new(),
         line_start: 1,
         line_end: entry.searchable_text.lines().count().max(1),
         text: entry.searchable_text.clone(),
+        indexed_text: entry.searchable_text.clone(),
         source_kind: entry.modality.as_str().to_string(),
         source_path: entry.sidecar_path.clone(),
     }]
@@ -720,7 +839,7 @@ fn refresh_entry(
                 provider_key: markitdown_provider_key(path),
                 text: text.clone(),
             }];
-            let chunks = build_text_chunks(&text_sources);
+            let hierarchy = build_text_chunk_hierarchy(&text_sources);
             if old_state.entries.contains_key(&path_key) {
                 stats.updated += 1;
             } else {
@@ -731,17 +850,19 @@ fn refresh_entry(
                 path: path_key,
                 title,
                 searchable_text: text,
-                chunks,
+                parent_chunks: hierarchy.parents,
+                chunks: hierarchy.children,
                 text_sources,
                 sidecar_path: None,
                 file_signature,
                 sidecar_signature: None,
+                processing_warnings: Vec::new(),
             }))
         }
         KnowledgeModality::Image => {
             let (sidecar_path, sidecar_signature, text_sources) = image_text_sources(path)?;
             let searchable_text = join_text_sources(&text_sources);
-            let chunks = build_text_chunks(&text_sources);
+            let hierarchy = build_text_chunk_hierarchy(&text_sources);
             if let Some(old_entry) = old_state.entries.get(&path_key) {
                 if old_entry.file_signature == file_signature
                     && old_entry.sidecar_signature == sidecar_signature
@@ -761,11 +882,13 @@ fn refresh_entry(
                 path: path_key,
                 title,
                 searchable_text,
-                chunks,
+                parent_chunks: hierarchy.parents,
+                chunks: hierarchy.children,
                 text_sources,
                 sidecar_path,
                 file_signature,
                 sidecar_signature,
+                processing_warnings: Vec::new(),
             }))
         }
         KnowledgeModality::Audio => {
@@ -775,7 +898,7 @@ fn refresh_entry(
                 return Ok(None);
             }
             let searchable_text = join_text_sources(&text_sources);
-            let chunks = build_text_chunks(&text_sources);
+            let hierarchy = build_text_chunk_hierarchy(&text_sources);
             if let Some(old_entry) = old_state.entries.get(&path_key) {
                 if old_entry.file_signature == file_signature
                     && old_entry.sidecar_signature == sidecar_signature
@@ -795,25 +918,28 @@ fn refresh_entry(
                 path: path_key,
                 title,
                 searchable_text,
-                chunks,
+                parent_chunks: hierarchy.parents,
+                chunks: hierarchy.children,
                 text_sources,
                 sidecar_path,
                 file_signature,
                 sidecar_signature,
+                processing_warnings: Vec::new(),
             }))
         }
         KnowledgeModality::Video => {
-            let (sidecar_path, sidecar_signature, text_sources) =
+            let (sidecar_path, sidecar_signature, text_sources, processing_warnings) =
                 video_text_sources(path, index_root)?;
-            if text_sources.is_empty() {
+            if text_sources.is_empty() && processing_warnings.is_empty() {
                 return Ok(None);
             }
             let searchable_text = join_text_sources(&text_sources);
-            let chunks = build_text_chunks(&text_sources);
+            let hierarchy = build_text_chunk_hierarchy(&text_sources);
             if let Some(old_entry) = old_state.entries.get(&path_key) {
                 if old_entry.file_signature == file_signature
                     && old_entry.sidecar_signature == sidecar_signature
                     && old_entry.text_sources == text_sources
+                    && old_entry.processing_warnings == processing_warnings
                 {
                     stats.reused += 1;
                     return Ok(Some(old_entry.clone()));
@@ -829,11 +955,13 @@ fn refresh_entry(
                 path: path_key,
                 title,
                 searchable_text,
-                chunks,
+                parent_chunks: hierarchy.parents,
+                chunks: hierarchy.children,
                 text_sources,
                 sidecar_path,
                 file_signature,
                 sidecar_signature,
+                processing_warnings,
             }))
         }
     }
@@ -920,11 +1048,13 @@ fn video_text_sources(
         Option<String>,
         Option<KnowledgeFileSignature>,
         Vec<KnowledgeIndexTextSource>,
+        Vec<String>,
     ),
     String,
 > {
     let (sidecar_path, sidecar_signature, sidecar_text) = media_sidecar_state(video_path)?;
     let mut text_sources = Vec::new();
+    let mut processing_warnings = Vec::new();
     if !sidecar_text.is_empty() {
         text_sources.push(KnowledgeIndexTextSource {
             source_kind: "video_sidecar".to_string(),
@@ -934,98 +1064,587 @@ fn video_text_sources(
         });
     }
 
-    for (index, frame_path) in extract_video_keyframes(video_path, index_root)
-        .unwrap_or_default()
-        .into_iter()
-        .enumerate()
-    {
-        let vlm = model_center::run_vlm_summary(&frame_path);
+    let extraction = extract_video_keyframes(video_path, index_root);
+    processing_warnings.extend(extraction.warnings);
+    for frame in extraction.frames {
+        let vlm = model_center::run_vlm_summary(&frame.path);
         if vlm.available && !vlm.text.trim().is_empty() {
-            let percent = VIDEO_KEYFRAME_SAMPLE_POINTS
-                .get(index)
-                .copied()
-                .unwrap_or_default();
             text_sources.push(KnowledgeIndexTextSource {
                 source_kind: "vlm_keyframe".to_string(),
-                source_path: Some(frame_path.to_string_lossy().into_owned()),
+                source_path: Some(frame.path.to_string_lossy().into_owned()),
                 provider_key: Some(vlm.provider_key),
-                text: format!("keyframe {percent}%: {}", vlm.text.trim()),
+                text: format!(
+                    "keyframe {}% at {:.3}s: {}",
+                    format_keyframe_percent(frame.percent),
+                    frame.timestamp_seconds,
+                    vlm.text.trim()
+                ),
             });
+        } else {
+            processing_warnings.push(format!(
+                "VLM produced no searchable text for keyframe at {:.3}s ({:.1}%)",
+                frame.timestamp_seconds, frame.percent
+            ));
         }
     }
 
-    Ok((sidecar_path, sidecar_signature, text_sources))
+    for warning in &processing_warnings {
+        eprintln!(
+            "video keyframe warning for {}: {warning}",
+            video_path.display()
+        );
+    }
+
+    Ok((
+        sidecar_path,
+        sidecar_signature,
+        text_sources,
+        processing_warnings,
+    ))
 }
 
-fn extract_video_keyframes(video_path: &Path, index_root: &Path) -> Result<Vec<PathBuf>, String> {
+fn extract_video_keyframes(
+    video_path: &Path,
+    index_root: &Path,
+) -> VideoKeyframeExtraction {
+    let mut result = VideoKeyframeExtraction::default();
     let Some(ffmpeg_bin) = resolve_ffmpeg_bin() else {
-        return Ok(Vec::new());
+        result
+            .warnings
+            .push("FFmpeg is unavailable; no video keyframes were extracted".to_string());
+        return result;
     };
-    let Some(duration_seconds) = probe_video_duration_seconds(video_path) else {
-        return Ok(Vec::new());
+    let duration_seconds = match probe_video_duration_seconds(video_path) {
+        Ok(duration) => duration,
+        Err(error) => {
+            result.warnings.push(error);
+            return result;
+        }
     };
     if duration_seconds <= 0.0 {
-        return Ok(Vec::new());
+        result.warnings.push(format!(
+            "video duration is not positive: {duration_seconds}"
+        ));
+        return result;
     }
 
     let output_dir = video_keyframe_cache_dir(index_root, video_path);
-    fs::create_dir_all(&output_dir).map_err(|error| {
-        format!(
+    if let Err(error) = fs::create_dir_all(&output_dir) {
+        result.warnings.push(format!(
             "failed to create video keyframe cache {}: {error}",
             output_dir.display()
-        )
-    })?;
+        ));
+        return result;
+    }
 
-    let mut frames = Vec::new();
-    for (index, percent) in VIDEO_KEYFRAME_SAMPLE_POINTS.iter().enumerate() {
-        let timestamp = (duration_seconds * (*percent as f64 / 100.0)).max(0.0);
-        let output_path = output_dir.join(format!("frame-{:02}.jpg", index + 1));
-        let status = Command::new(&ffmpeg_bin)
-            .arg("-y")
-            .arg("-loglevel")
-            .arg("error")
-            .arg("-ss")
-            .arg(format!("{timestamp:.3}"))
-            .arg("-i")
-            .arg(video_path)
-            .arg("-frames:v")
-            .arg("1")
-            .arg("-q:v")
-            .arg("3")
-            .arg(&output_path)
-            .status();
-        match status {
-            Ok(status)
-                if status.success()
-                    && output_path
-                        .metadata()
-                        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0) =>
+    let uniform_targets = video_keyframe_targets(duration_seconds);
+    let targets = match detect_video_scene_timestamps(
+        &ffmpeg_bin,
+        video_path,
+        duration_seconds,
+    ) {
+        Ok(scene_timestamps) => merge_video_keyframe_targets(
+            duration_seconds,
+            &uniform_targets,
+            &scene_timestamps,
+        ),
+        Err(error) => {
+            result.warnings.push(format!(
+                "content-aware scene detection failed; using time-based keyframes: {error}"
+            ));
+            uniform_targets
+        }
+    };
+
+    for (index, target_timestamp) in targets.into_iter().enumerate() {
+        let output_path = output_dir.join(format!("frame-{:03}.jpg", index + 1));
+        let _ = fs::remove_file(&output_path);
+        let mut attempt_errors = Vec::new();
+        let mut attempted_timestamps = Vec::new();
+        let mut selected = None;
+
+        for offset in VIDEO_KEYFRAME_RETRY_OFFSETS_SECONDS {
+            let timestamp = (target_timestamp + offset)
+                .clamp(0.0, (duration_seconds - 0.001).max(0.0));
+            if attempted_timestamps
+                .iter()
+                .any(|previous: &f64| (*previous - timestamp).abs() < 0.001)
             {
-                frames.push(output_path);
+                continue;
             }
-            _ => {}
+            attempted_timestamps.push(timestamp);
+            let _ = fs::remove_file(&output_path);
+
+            match extract_video_frame(
+                &ffmpeg_bin,
+                video_path,
+                timestamp,
+                &output_path,
+            ) {
+                Ok(()) => {}
+                Err(error) => {
+                    attempt_errors.push(format!("{timestamp:.3}s: {error}"));
+                    continue;
+                }
+            }
+
+            match probe_video_frame_quality(&ffmpeg_bin, &output_path) {
+                Ok(quality) => {
+                    if let Some(reason) = video_frame_rejection_reason(quality) {
+                        attempt_errors.push(format!("{timestamp:.3}s: {reason}"));
+                        let _ = fs::remove_file(&output_path);
+                        continue;
+                    }
+                }
+                Err(error) => {
+                    result.warnings.push(format!(
+                        "frame quality check unavailable at {timestamp:.3}s; accepted frame: {error}"
+                    ));
+                }
+            }
+
+            selected = Some(timestamp);
+            break;
+        }
+
+        if let Some(timestamp_seconds) = selected {
+            result.frames.push(VideoKeyframe {
+                path: output_path,
+                timestamp_seconds,
+                percent: timestamp_seconds / duration_seconds * 100.0,
+            });
+        } else {
+            result.warnings.push(format!(
+                "failed to extract an acceptable keyframe near {target_timestamp:.3}s after {} attempts: {}",
+                attempted_timestamps.len(),
+                attempt_errors.join(" | ")
+            ));
         }
     }
-    Ok(frames)
+
+    if result.frames.is_empty() {
+        result.warnings.push(format!(
+            "no usable keyframes were extracted from {}",
+            video_path.display()
+        ));
+    } else if result.frames.len() < video_keyframe_count(duration_seconds) {
+        result.warnings.push(format!(
+            "partially extracted video keyframes: {}/{} succeeded",
+            result.frames.len(),
+            video_keyframe_count(duration_seconds)
+        ));
+    }
+
+    result
 }
 
-fn probe_video_duration_seconds(video_path: &Path) -> Option<f64> {
-    let ffprobe_bin = resolve_ffprobe_bin()?;
-    let output = Command::new(&ffprobe_bin)
+fn video_keyframe_count(duration_seconds: f64) -> usize {
+    let count = if duration_seconds <= 60.0 {
+        VIDEO_KEYFRAME_MIN_COUNT
+    } else if duration_seconds <= 600.0 {
+        (duration_seconds / 30.0).ceil() as usize
+    } else if duration_seconds <= 3_600.0 {
+        (duration_seconds / 120.0).ceil().max(20.0) as usize
+    } else {
+        (duration_seconds / 300.0).ceil().max(30.0) as usize
+    };
+    count.clamp(VIDEO_KEYFRAME_MIN_COUNT, VIDEO_KEYFRAME_MAX_COUNT)
+}
+
+fn video_keyframe_targets(duration_seconds: f64) -> Vec<f64> {
+    if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
+        return Vec::new();
+    }
+    let count = video_keyframe_count(duration_seconds);
+    (0..count)
+        .map(|index| duration_seconds * ((index as f64 + 0.5) / count as f64))
+        .collect()
+}
+
+fn detect_video_scene_timestamps(
+    ffmpeg_bin: &str,
+    video_path: &Path,
+    duration_seconds: f64,
+) -> Result<Vec<f64>, String> {
+    let mut command = Command::new(ffmpeg_bin);
+    command
+        .arg("-hide_banner")
+        .arg("-nostdin")
+        .arg("-loglevel")
+        .arg("info")
+        .arg("-i")
+        .arg(video_path)
+        .arg("-an")
+        .arg("-sn")
+        .arg("-vf")
+        .arg(format!(
+            "fps={VIDEO_SCENE_SAMPLE_FPS:.1},scale=320:-2,select=gt(scene\\,{VIDEO_SCENE_CHANGE_THRESHOLD:.2}),metadata=print"
+        ))
+        .arg("-vsync")
+        .arg("vfr")
+        .arg("-f")
+        .arg("null")
+        .arg("-");
+    let capture = run_command_with_timeout(&mut command, VIDEO_SCENE_DETECT_TIMEOUT)?;
+    if !capture.success {
+        return Err(format!(
+            "FFmpeg scene detector exited unsuccessfully: {}",
+            compact_command_error(&capture.stderr)
+        ));
+    }
+    Ok(parse_video_scene_timestamps(
+        &capture.stderr,
+        duration_seconds,
+    ))
+}
+
+fn parse_video_scene_timestamps(output: &str, duration_seconds: f64) -> Vec<f64> {
+    let mut timestamps = output
+        .lines()
+        .filter_map(|line| parse_metric_after(line, "pts_time:"))
+        .filter(|timestamp| {
+            timestamp.is_finite()
+                && *timestamp > 0.0
+                && *timestamp < duration_seconds
+        })
+        .collect::<Vec<_>>();
+    timestamps.sort_by(f64::total_cmp);
+    timestamps.dedup_by(|left, right| (*left - *right).abs() < 0.05);
+    timestamps
+}
+
+fn merge_video_keyframe_targets(
+    duration_seconds: f64,
+    uniform_targets: &[f64],
+    scene_timestamps: &[f64],
+) -> Vec<f64> {
+    if uniform_targets.is_empty() || scene_timestamps.is_empty() {
+        return uniform_targets.to_vec();
+    }
+
+    let target_count = uniform_targets.len();
+    let mut scenes = scene_timestamps
+        .iter()
+        .copied()
+        .filter(|timestamp| {
+            timestamp.is_finite()
+                && *timestamp > 0.0
+                && *timestamp < duration_seconds
+        })
+        .collect::<Vec<_>>();
+    scenes.sort_by(f64::total_cmp);
+    scenes.dedup_by(|left, right| (*left - *right).abs() < 0.05);
+    if scenes.is_empty() {
+        return uniform_targets.to_vec();
+    }
+
+    let scene_budget = ((target_count as f64 * VIDEO_SCENE_TARGET_RATIO).ceil() as usize)
+        .clamp(1, target_count)
+        .min(scenes.len());
+    let mut selected = evenly_spaced_values(&scenes, scene_budget);
+    let mut remaining_uniform = uniform_targets.to_vec();
+
+    while selected.len() < target_count && !remaining_uniform.is_empty() {
+        let best_index = remaining_uniform
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| {
+                minimum_timestamp_distance(**left, &selected)
+                    .total_cmp(&minimum_timestamp_distance(**right, &selected))
+                    .then_with(|| right.total_cmp(left))
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        let candidate = remaining_uniform.swap_remove(best_index);
+        if selected
+            .iter()
+            .all(|existing| (*existing - candidate).abs() >= 0.05)
+        {
+            selected.push(candidate);
+        }
+    }
+
+    if selected.len() < target_count {
+        for candidate in uniform_targets {
+            if selected
+                .iter()
+                .all(|existing| (*existing - *candidate).abs() >= 0.05)
+            {
+                selected.push(*candidate);
+                if selected.len() == target_count {
+                    break;
+                }
+            }
+        }
+    }
+
+    selected.sort_by(f64::total_cmp);
+    selected.truncate(target_count);
+    selected
+}
+
+fn evenly_spaced_values(values: &[f64], count: usize) -> Vec<f64> {
+    if count == 0 || values.is_empty() {
+        return Vec::new();
+    }
+    if values.len() <= count {
+        return values.to_vec();
+    }
+    (0..count)
+        .map(|index| {
+            let value_index =
+                (((index as f64 + 0.5) * values.len() as f64 / count as f64).floor() as usize)
+                    .min(values.len() - 1);
+            values[value_index]
+        })
+        .collect()
+}
+
+fn minimum_timestamp_distance(timestamp: f64, selected: &[f64]) -> f64 {
+    selected
+        .iter()
+        .map(|existing| (*existing - timestamp).abs())
+        .min_by(f64::total_cmp)
+        .unwrap_or(f64::INFINITY)
+}
+
+fn extract_video_frame(
+    ffmpeg_bin: &str,
+    video_path: &Path,
+    timestamp_seconds: f64,
+    output_path: &Path,
+) -> Result<(), String> {
+    let mut command = Command::new(ffmpeg_bin);
+    command
+        .arg("-hide_banner")
+        .arg("-nostdin")
+        .arg("-y")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-ss")
+        .arg(format!("{timestamp_seconds:.3}"))
+        .arg("-i")
+        .arg(video_path)
+        .arg("-map")
+        .arg("0:v:0")
+        .arg("-an")
+        .arg("-sn")
+        .arg("-frames:v")
+        .arg("1")
+        .arg("-q:v")
+        .arg("3")
+        .arg(output_path);
+    let capture = run_command_with_timeout(&mut command, VIDEO_FRAME_EXTRACT_TIMEOUT)?;
+    if !capture.success {
+        return Err(format!(
+            "FFmpeg exited unsuccessfully: {}",
+            compact_command_error(&capture.stderr)
+        ));
+    }
+    if !output_path
+        .metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+    {
+        return Err("FFmpeg did not produce a non-empty image".to_string());
+    }
+    Ok(())
+}
+
+fn probe_video_frame_quality(
+    ffmpeg_bin: &str,
+    frame_path: &Path,
+) -> Result<VideoFrameQuality, String> {
+    let mut command = Command::new(ffmpeg_bin);
+    command
+        .arg("-hide_banner")
+        .arg("-nostdin")
+        .arg("-loglevel")
+        .arg("info")
+        .arg("-i")
+        .arg(frame_path)
+        .arg("-vf")
+        .arg("signalstats,metadata=print,blurdetect=block_width=32:block_height=32:block_pct=80")
+        .arg("-frames:v")
+        .arg("1")
+        .arg("-f")
+        .arg("null")
+        .arg("-");
+    let capture = run_command_with_timeout(&mut command, VIDEO_FRAME_QUALITY_TIMEOUT)?;
+    if !capture.success {
+        return Err(format!(
+            "FFmpeg quality probe failed: {}",
+            compact_command_error(&capture.stderr)
+        ));
+    }
+    let quality = parse_video_frame_quality(&capture.stderr);
+    if quality.luminance.is_none() && quality.blur_score.is_none() {
+        return Err("FFmpeg returned no luminance or blur metrics".to_string());
+    }
+    Ok(quality)
+}
+
+fn parse_video_frame_quality(output: &str) -> VideoFrameQuality {
+    VideoFrameQuality {
+        luminance: parse_metric_after(output, "lavfi.signalstats.YAVG="),
+        blur_score: parse_metric_after(output, "blur mean:"),
+    }
+}
+
+fn parse_metric_after(output: &str, marker: &str) -> Option<f64> {
+    output.lines().find_map(|line| {
+        let (_, value) = line.split_once(marker)?;
+        value
+            .split_whitespace()
+            .next()?
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|metric| metric.is_finite())
+    })
+}
+
+fn video_frame_rejection_reason(quality: VideoFrameQuality) -> Option<String> {
+    if let Some(luminance) = quality.luminance {
+        if luminance < VIDEO_FRAME_MIN_LUMA {
+            return Some(format!(
+                "frame is too dark (YAVG {luminance:.3} < {VIDEO_FRAME_MIN_LUMA:.1})"
+            ));
+        }
+        if luminance > VIDEO_FRAME_MAX_LUMA {
+            return Some(format!(
+                "frame is too bright (YAVG {luminance:.3} > {VIDEO_FRAME_MAX_LUMA:.1})"
+            ));
+        }
+    }
+    if let Some(blur_score) = quality.blur_score {
+        if blur_score > VIDEO_FRAME_MAX_BLUR_SCORE {
+            return Some(format!(
+                "frame is too blurry (score {blur_score:.3} > {VIDEO_FRAME_MAX_BLUR_SCORE:.1})"
+            ));
+        }
+    }
+    None
+}
+
+fn probe_video_duration_seconds(video_path: &Path) -> Result<f64, String> {
+    let Some(ffprobe_bin) = resolve_ffprobe_bin() else {
+        return Err("FFprobe is unavailable; video duration cannot be read".to_string());
+    };
+    let mut command = Command::new(&ffprobe_bin);
+    command
         .arg("-v")
         .arg("error")
         .arg("-show_entries")
         .arg("format=duration")
         .arg("-of")
         .arg("default=noprint_wrappers=1:nokey=1")
-        .arg(video_path)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+        .arg(video_path);
+    let capture = run_command_with_timeout(&mut command, VIDEO_PROBE_TIMEOUT)?;
+    if !capture.success {
+        return Err(format!(
+            "FFprobe failed for {}: {}",
+            video_path.display(),
+            compact_command_error(&capture.stderr)
+        ));
     }
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    text.parse::<f64>().ok().filter(|value| value.is_finite())
+    capture
+        .stdout
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .ok_or_else(|| {
+            format!(
+                "FFprobe returned an invalid duration for {}: {}",
+                video_path.display(),
+                compact_command_error(&capture.stdout)
+            )
+        })
+}
+
+fn run_command_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<CommandCapture, String> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to start media tool: {error}"))?;
+    let mut stdout_reader = spawn_child_pipe_reader(child.stdout.take());
+    let mut stderr_reader = spawn_child_pipe_reader(child.stderr.take());
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = finish_child_pipe_reader(stdout_reader.take());
+                let stderr = finish_child_pipe_reader(stderr_reader.take());
+                return Ok(CommandCapture {
+                    success: status.success(),
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) if started.elapsed() < timeout => {
+                thread::sleep(VIDEO_TOOL_POLL_INTERVAL);
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let stdout = finish_child_pipe_reader(stdout_reader.take());
+                let stderr = finish_child_pipe_reader(stderr_reader.take());
+                return Err(format!(
+                    "media tool timed out after {:.1}s: {}{}",
+                    timeout.as_secs_f64(),
+                    compact_command_error(&stdout),
+                    compact_command_error(&stderr)
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("failed while waiting for media tool: {error}"));
+            }
+        }
+    }
+}
+
+fn spawn_child_pipe_reader<T>(pipe: Option<T>) -> Option<thread::JoinHandle<String>>
+where
+    T: Read + Send + 'static,
+{
+    pipe.map(|mut pipe| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
+    })
+}
+
+fn finish_child_pipe_reader(reader: Option<thread::JoinHandle<String>>) -> String {
+    reader
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default()
+}
+
+fn compact_command_error(value: &str) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        "no diagnostic output".to_string()
+    } else {
+        compact.chars().take(500).collect()
+    }
+}
+
+fn format_keyframe_percent(percent: f64) -> String {
+    if (percent - percent.round()).abs() < 0.05 {
+        format!("{:.0}", percent)
+    } else {
+        format!("{percent:.1}")
+    }
 }
 
 fn video_keyframe_cache_dir(index_root: &Path, video_path: &Path) -> PathBuf {
@@ -1149,107 +1768,305 @@ fn join_text_sources(text_sources: &[KnowledgeIndexTextSource]) -> String {
         .join("\n")
 }
 
-fn build_text_chunks(text_sources: &[KnowledgeIndexTextSource]) -> Vec<KnowledgeIndexChunk> {
-    let mut chunks = Vec::new();
+#[derive(Debug, Default)]
+struct KnowledgeChunkHierarchy {
+    parents: Vec<KnowledgeIndexParentChunk>,
+    children: Vec<KnowledgeIndexChunk>,
+}
+
+#[derive(Debug, Clone)]
+struct ChunkSourceLine {
+    number: usize,
+    text: String,
+    section_path: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ParentChunkDraft {
+    lines: Vec<ChunkSourceLine>,
+    section_path: Vec<String>,
+}
+
+fn build_text_chunk_hierarchy(
+    text_sources: &[KnowledgeIndexTextSource],
+) -> KnowledgeChunkHierarchy {
+    let mut hierarchy = KnowledgeChunkHierarchy::default();
     for source in text_sources {
-        chunks.extend(build_chunks_for_source(source));
-    }
-    chunks
-}
-
-fn build_chunks_for_source(source: &KnowledgeIndexTextSource) -> Vec<KnowledgeIndexChunk> {
-    let text = source.text.as_str();
-    let mut chunks = Vec::new();
-    let mut current_lines: Vec<String> = Vec::new();
-    let mut current_start_line = 1usize;
-    let mut current_end_line = 0usize;
-    let mut current_chars = 0usize;
-
-    for (index, raw_line) in text.lines().enumerate() {
-        let line_number = index + 1;
-        let line = raw_line.trim_end();
-        let line_chars = line.chars().count();
-        let projected_chars =
-            current_chars + line_chars + if current_lines.is_empty() { 0 } else { 1 };
-        if !current_lines.is_empty()
-            && (current_lines.len() >= MAX_CHUNK_LINES || projected_chars > MAX_CHUNK_CHARS)
-        {
-            push_chunk(
-                &mut chunks,
-                source,
-                &current_lines,
-                current_start_line,
-                current_end_line,
-            );
-            current_lines.clear();
-            current_chars = 0;
-            current_start_line = line_number;
+        let parent_drafts = build_parent_drafts_for_source(source);
+        let source_child_start = hierarchy.children.len();
+        for draft in parent_drafts {
+            let parent_id = format!("parent-{:04}", hierarchy.parents.len() + 1);
+            let parent_text = join_chunk_source_lines(&draft.lines);
+            if parent_text.is_empty() {
+                continue;
+            }
+            let parent_index = hierarchy.parents.len();
+            hierarchy.parents.push(KnowledgeIndexParentChunk {
+                parent_id: parent_id.clone(),
+                section_path: draft.section_path.clone(),
+                line_start: draft.lines.first().map(|line| line.number).unwrap_or(1),
+                line_end: draft.lines.last().map(|line| line.number).unwrap_or(1),
+                text: parent_text,
+                child_ids: Vec::new(),
+                source_kind: source.source_kind.clone(),
+                source_path: source.source_path.clone(),
+            });
+            let child_drafts = build_child_drafts(&draft.lines);
+            for child_lines in child_drafts {
+                let text = join_chunk_source_lines(&child_lines);
+                if text.is_empty() {
+                    continue;
+                }
+                let indexed_text = build_child_indexed_text(&draft.section_path, &text);
+                let chunk_id = format!("chunk-{:04}", hierarchy.children.len() + 1);
+                hierarchy.parents[parent_index]
+                    .child_ids
+                    .push(chunk_id.clone());
+                hierarchy.children.push(KnowledgeIndexChunk {
+                    chunk_id,
+                    parent_id: Some(parent_id.clone()),
+                    previous_id: None,
+                    next_id: None,
+                    section_path: draft.section_path.clone(),
+                    line_start: child_lines.first().map(|line| line.number).unwrap_or(1),
+                    line_end: child_lines.last().map(|line| line.number).unwrap_or(1),
+                    text,
+                    indexed_text,
+                    source_kind: source.source_kind.clone(),
+                    source_path: source.source_path.clone(),
+                });
+            }
         }
-
-        current_end_line = line_number;
-        current_chars = current_chars + line_chars + if current_lines.is_empty() { 0 } else { 1 };
-        current_lines.push(line.to_string());
+        link_adjacent_children(&mut hierarchy.children[source_child_start..]);
     }
-
-    if !current_lines.is_empty() {
-        push_chunk(
-            &mut chunks,
-            source,
-            &current_lines,
-            current_start_line,
-            current_end_line,
-        );
-    } else if !text.trim().is_empty() {
-        chunks.push(KnowledgeIndexChunk {
-            chunk_id: "chunk-0001".to_string(),
-            line_start: 1,
-            line_end: 1,
-            text: text.trim().to_string(),
-            source_kind: source.source_kind.clone(),
-            source_path: source.source_path.clone(),
-        });
-    }
-
-    if chunks.is_empty() {
-        chunks.push(KnowledgeIndexChunk {
-            chunk_id: "chunk-0001".to_string(),
-            line_start: 1,
-            line_end: 1,
-            text: text.trim().to_string(),
-            source_kind: source.source_kind.clone(),
-            source_path: source.source_path.clone(),
-        });
-    }
-
-    chunks
+    hierarchy
 }
 
-fn push_chunk(
-    chunks: &mut Vec<KnowledgeIndexChunk>,
-    source: &KnowledgeIndexTextSource,
-    lines: &[String],
-    line_start: usize,
-    line_end: usize,
+fn build_parent_drafts_for_source(source: &KnowledgeIndexTextSource) -> Vec<ParentChunkDraft> {
+    let mut drafts = Vec::new();
+    let mut current_lines = Vec::new();
+    let mut current_tokens = 0usize;
+    let mut heading_stack = Vec::<String>::new();
+
+    for (index, raw_line) in source.text.lines().enumerate() {
+        let text = raw_line.trim_end().to_string();
+        let heading = markdown_heading(&text);
+        if heading.is_some() && !current_lines.is_empty() {
+            push_parent_draft(&mut drafts, &mut current_lines);
+            current_tokens = 0;
+        }
+        if let Some((level, title)) = heading {
+            heading_stack.truncate(level.saturating_sub(1));
+            heading_stack.push(title);
+        }
+        let source_line = ChunkSourceLine {
+            number: index + 1,
+            text,
+            section_path: heading_stack.clone(),
+        };
+        for segment in split_source_line(&source_line, PARENT_CHUNK_MAX_TOKENS) {
+            let line_tokens = estimated_token_count(&segment.text).max(1);
+            let projected_tokens = current_tokens.saturating_add(line_tokens);
+            let at_paragraph_boundary = segment.text.trim().is_empty();
+            if !current_lines.is_empty()
+                && (projected_tokens > PARENT_CHUNK_MAX_TOKENS
+                    || (current_tokens >= PARENT_CHUNK_TARGET_TOKENS
+                        && at_paragraph_boundary))
+            {
+                push_parent_draft(&mut drafts, &mut current_lines);
+                current_tokens = 0;
+            }
+            current_lines.push(segment);
+            current_tokens = current_tokens.saturating_add(line_tokens);
+        }
+    }
+    push_parent_draft(&mut drafts, &mut current_lines);
+    drafts
+}
+
+fn push_parent_draft(
+    drafts: &mut Vec<ParentChunkDraft>,
+    current_lines: &mut Vec<ChunkSourceLine>,
 ) {
-    let text = lines
+    if current_lines.iter().all(|line| line.text.trim().is_empty()) {
+        current_lines.clear();
+        return;
+    }
+    let section_path = current_lines
         .iter()
-        .map(|line| line.trim_end())
+        .find(|line| !line.section_path.is_empty())
+        .map(|line| line.section_path.clone())
+        .unwrap_or_default();
+    drafts.push(ParentChunkDraft {
+        lines: std::mem::take(current_lines),
+        section_path,
+    });
+}
+
+fn build_child_drafts(lines: &[ChunkSourceLine]) -> Vec<Vec<ChunkSourceLine>> {
+    let mut drafts = Vec::new();
+    let mut current = Vec::new();
+    let mut current_tokens = 0usize;
+
+    for line in lines {
+        for segment in split_source_line(line, CHILD_CHUNK_TARGET_TOKENS) {
+            let line_tokens = estimated_token_count(&segment.text).max(1);
+            if !current.is_empty()
+                && current_tokens.saturating_add(line_tokens) > CHILD_CHUNK_TARGET_TOKENS
+            {
+                drafts.push(current.clone());
+                current = trailing_overlap_lines(&current, CHILD_CHUNK_OVERLAP_TOKENS);
+                current_tokens = estimated_lines_token_count(&current);
+            }
+            current.push(segment);
+            current_tokens = current_tokens.saturating_add(line_tokens);
+        }
+    }
+    if !current.is_empty() && current.iter().any(|line| !line.text.trim().is_empty()) {
+        drafts.push(current);
+    }
+    drafts
+}
+
+fn trailing_overlap_lines(
+    lines: &[ChunkSourceLine],
+    token_budget: usize,
+) -> Vec<ChunkSourceLine> {
+    let mut overlap = Vec::new();
+    let mut tokens = 0usize;
+    for line in lines.iter().rev() {
+        let line_tokens = estimated_token_count(&line.text).max(1);
+        if overlap.is_empty() && line_tokens > token_budget {
+            overlap.push(source_line_tail(line, token_budget));
+            break;
+        }
+        if !overlap.is_empty() && tokens.saturating_add(line_tokens) > token_budget {
+            break;
+        }
+        overlap.push(line.clone());
+        tokens = tokens.saturating_add(line_tokens);
+        if tokens >= token_budget {
+            break;
+        }
+    }
+    overlap.reverse();
+    overlap
+}
+
+fn split_source_line(line: &ChunkSourceLine, token_budget: usize) -> Vec<ChunkSourceLine> {
+    if estimated_token_count(&line.text) <= token_budget || line.text.is_empty() {
+        return vec![line.clone()];
+    }
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut current_tokens = 0usize;
+    let mut ascii_run = 0usize;
+    for character in line.text.chars() {
+        let token_increment = if character.is_ascii_alphanumeric() || character == '_' {
+            let previous_tokens = ascii_run.div_ceil(4);
+            ascii_run += 1;
+            ascii_run.div_ceil(4).saturating_sub(previous_tokens)
+        } else {
+            ascii_run = 0;
+            usize::from(!character.is_whitespace())
+        };
+        if !current.is_empty()
+            && current_tokens.saturating_add(token_increment) > token_budget
+        {
+            segments.push(ChunkSourceLine {
+                number: line.number,
+                text: std::mem::take(&mut current),
+                section_path: line.section_path.clone(),
+            });
+            current_tokens = 0;
+            ascii_run = usize::from(character.is_ascii_alphanumeric() || character == '_');
+        }
+        current.push(character);
+        current_tokens = current_tokens.saturating_add(token_increment);
+    }
+    if !current.is_empty() {
+        segments.push(ChunkSourceLine {
+            number: line.number,
+            text: current,
+            section_path: line.section_path.clone(),
+        });
+    }
+    segments
+}
+
+fn source_line_tail(line: &ChunkSourceLine, token_budget: usize) -> ChunkSourceLine {
+    split_source_line(line, token_budget)
+        .pop()
+        .unwrap_or_else(|| line.clone())
+}
+
+fn link_adjacent_children(children: &mut [KnowledgeIndexChunk]) {
+    for index in 0..children.len() {
+        children[index].previous_id = index
+            .checked_sub(1)
+            .and_then(|previous| children.get(previous))
+            .map(|chunk| chunk.chunk_id.clone());
+        children[index].next_id = children
+            .get(index + 1)
+            .map(|chunk| chunk.chunk_id.clone());
+    }
+}
+
+fn join_chunk_source_lines(lines: &[ChunkSourceLine]) -> String {
+    lines
+        .iter()
+        .map(|line| line.text.trim_end())
         .collect::<Vec<_>>()
         .join("\n")
         .trim()
-        .to_string();
-    if text.is_empty() {
-        return;
+        .to_string()
+}
+
+fn build_child_indexed_text(section_path: &[String], text: &str) -> String {
+    if section_path.is_empty() {
+        return text.to_string();
     }
-    let chunk_id = format!("chunk-{:04}", chunks.len() + 1);
-    chunks.push(KnowledgeIndexChunk {
-        chunk_id,
-        line_start,
-        line_end,
-        text,
-        source_kind: source.source_kind.clone(),
-        source_path: source.source_path.clone(),
-    });
+    format!("章节：{}\n{text}", section_path.join(" > "))
+}
+
+fn estimated_lines_token_count(lines: &[ChunkSourceLine]) -> usize {
+    lines
+        .iter()
+        .map(|line| estimated_token_count(&line.text).max(1))
+        .sum()
+}
+
+fn estimated_token_count(text: &str) -> usize {
+    let mut tokens = 0usize;
+    let mut ascii_run = 0usize;
+    let flush_ascii_run = |tokens: &mut usize, ascii_run: &mut usize| {
+        if *ascii_run > 0 {
+            *tokens = tokens.saturating_add((*ascii_run).div_ceil(4));
+            *ascii_run = 0;
+        }
+    };
+    for character in text.chars() {
+        if character.is_ascii_alphanumeric() || character == '_' {
+            ascii_run += 1;
+            continue;
+        }
+        flush_ascii_run(&mut tokens, &mut ascii_run);
+        if !character.is_whitespace() {
+            tokens = tokens.saturating_add(1);
+        }
+    }
+    flush_ascii_run(&mut tokens, &mut ascii_run);
+    tokens
+}
+
+fn markdown_heading(line: &str) -> Option<(usize, String)> {
+    let trimmed = line.trim_start();
+    let level = trimmed.chars().take_while(|character| *character == '#').count();
+    if !(1..=6).contains(&level) {
+        return None;
+    }
+    let title = trimmed.get(level..)?.trim();
+    (!title.is_empty()).then(|| (level, title.to_string()))
 }
 
 fn file_signature(path: &Path) -> Result<KnowledgeFileSignature, String> {
@@ -1338,9 +2155,19 @@ fn system_time_to_millis(value: SystemTime) -> Option<u128> {
 
 #[cfg(test)]
 mod tests {
-    use super::{KnowledgeIndexConfig, KnowledgeIndexService, KnowledgeModality};
+    use super::{
+        build_text_chunk_hierarchy, detect_video_scene_timestamps, extract_video_keyframes,
+        embedding_store_matches_identity, load_embedding_store,
+        format_keyframe_percent, merge_video_keyframe_targets, parse_video_frame_quality,
+        parse_video_scene_timestamps, video_frame_rejection_reason, video_keyframe_count,
+        video_keyframe_targets, KnowledgeIndexConfig, KnowledgeIndexService,
+        KnowledgeEmbeddingStore, KnowledgeIndexTextSource, KnowledgeModality, VideoFrameQuality,
+        EMBEDDING_STORE_SCHEMA_VERSION,
+    };
+    use crate::runtime::model_center::EmbeddingEndpointIdentity;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn unique_dir(prefix: &str) -> PathBuf {
@@ -1355,6 +2182,282 @@ mod tests {
         if path.exists() {
             let _ = fs::remove_dir_all(path);
         }
+    }
+
+    #[test]
+    fn embedding_store_identity_rejects_configured_alias_for_actual_runtime_model() {
+        let store = KnowledgeEmbeddingStore {
+            provider_key: Some("qwen".to_string()),
+            model_endpoint_id: Some("embed-local-openai-compatible".to_string()),
+            model_name: Some("Qwen/Qwen3-Embedding-0.6B".to_string()),
+            ..KnowledgeEmbeddingStore::default()
+        };
+        let identity = EmbeddingEndpointIdentity {
+            provider_key: "qwen".to_string(),
+            model_endpoint_id: "embed-local-openai-compatible".to_string(),
+            model_name: "/models/jina-embeddings-v2-base-zh".to_string(),
+        };
+
+        assert!(!embedding_store_matches_identity(&store, &identity));
+    }
+
+    #[test]
+    fn embedding_store_v2_is_invalidated_before_runtime_identity_rebuild() {
+        let root = unique_dir("harborbeacon-embedding-store-v2");
+        fs::create_dir_all(&root).expect("create embedding store test root");
+        let path = root.join("store.embeddings.json");
+        fs::write(
+            &path,
+            r#"{
+                "schema_version": 2,
+                "root": "/knowledge",
+                "provider_key": "qwen",
+                "model_endpoint_id": "embed-local-openai-compatible",
+                "model_name": "Qwen/Qwen3-Embedding-0.6B",
+                "vector_dimensions": 768,
+                "entries": [{
+                    "key": "/knowledge/doc.txt::chunk-0001",
+                    "path": "/knowledge/doc.txt",
+                    "chunk_id": "chunk-0001",
+                    "text_hash": "legacy",
+                    "vector": [0.1, 0.2]
+                }]
+            }"#,
+        )
+        .expect("write legacy embedding store");
+
+        let store = load_embedding_store(&path).expect("load embedding store");
+
+        assert_eq!(store.schema_version, EMBEDDING_STORE_SCHEMA_VERSION);
+        assert!(store.entries.is_empty());
+        cleanup_dir(&root);
+    }
+
+    #[test]
+    fn parent_child_chunking_preserves_sections_overlap_and_adjacency() {
+        let first_paragraph = "春".repeat(180);
+        let second_paragraph = "花".repeat(180);
+        let source = KnowledgeIndexTextSource {
+            source_kind: "normalized_markdown".to_string(),
+            source_path: Some("/knowledge/spring.md".to_string()),
+            provider_key: Some("markitdown".to_string()),
+            text: format!(
+                "# 春季\n{first_paragraph}\n{second_paragraph}\n## 氛围\n公园里的人们正在散步。"
+            ),
+        };
+
+        let hierarchy = build_text_chunk_hierarchy(&[source]);
+
+        assert_eq!(hierarchy.parents.len(), 2);
+        assert!(hierarchy.children.len() >= 3);
+        assert_eq!(hierarchy.parents[0].section_path, vec!["春季"]);
+        assert_eq!(
+            hierarchy.parents[1].section_path,
+            vec!["春季", "氛围"]
+        );
+        assert!(hierarchy.parents[0].child_ids.len() >= 2);
+        assert!(hierarchy.children.iter().all(|child| child.parent_id.is_some()));
+        assert_eq!(hierarchy.children[0].previous_id, None);
+        assert_eq!(
+            hierarchy.children[0].next_id,
+            Some(hierarchy.children[1].chunk_id.clone())
+        );
+        assert_eq!(
+            hierarchy.children[1].previous_id,
+            Some(hierarchy.children[0].chunk_id.clone())
+        );
+        assert!(hierarchy.children[1].text.contains('春'));
+        assert!(hierarchy.children[1].text.contains('花'));
+        assert!(hierarchy.children[1].indexed_text.contains("章节：春季"));
+    }
+
+    #[test]
+    fn video_keyframe_budget_scales_with_duration_without_boundary_regression() {
+        assert_eq!(video_keyframe_count(30.0), 5);
+        assert_eq!(video_keyframe_count(60.0), 5);
+        assert_eq!(video_keyframe_count(300.0), 10);
+        assert_eq!(video_keyframe_count(600.0), 20);
+        assert_eq!(video_keyframe_count(601.0), 20);
+        assert_eq!(video_keyframe_count(3_600.0), 30);
+        assert_eq!(video_keyframe_count(3_601.0), 30);
+        assert_eq!(video_keyframe_count(14_400.0), 48);
+        assert_eq!(video_keyframe_count(86_400.0), 48);
+    }
+
+    #[test]
+    fn video_keyframe_targets_are_centered_and_keep_true_percentages() {
+        let targets = video_keyframe_targets(100.0);
+        assert_eq!(targets, vec![10.0, 30.0, 50.0, 70.0, 90.0]);
+        assert_eq!(format_keyframe_percent(30.0), "30");
+        assert_eq!(format_keyframe_percent(31.25), "31.2");
+        assert!(video_keyframe_targets(0.0).is_empty());
+        assert!(video_keyframe_targets(f64::NAN).is_empty());
+    }
+
+    #[test]
+    fn video_frame_quality_parser_and_filters_reject_unusable_frames() {
+        let parsed = parse_video_frame_quality(
+            "lavfi.signalstats.YAVG=94.6634\n[blurdetect] blur mean: 5.5236030\n",
+        );
+        assert_eq!(
+            parsed,
+            VideoFrameQuality {
+                luminance: Some(94.6634),
+                blur_score: Some(5.523603),
+            }
+        );
+        assert!(video_frame_rejection_reason(parsed).is_none());
+        assert!(video_frame_rejection_reason(VideoFrameQuality {
+            luminance: Some(4.0),
+            blur_score: Some(1.0),
+        })
+        .expect("dark rejection")
+        .contains("too dark"));
+        assert!(video_frame_rejection_reason(VideoFrameQuality {
+            luminance: Some(250.0),
+            blur_score: Some(1.0),
+        })
+        .expect("bright rejection")
+        .contains("too bright"));
+        assert!(video_frame_rejection_reason(VideoFrameQuality {
+            luminance: Some(100.0),
+            blur_score: Some(20.0),
+        })
+        .expect("blur rejection")
+        .contains("too blurry"));
+    }
+
+    #[test]
+    fn video_scene_parser_and_target_merge_preserve_scenes_and_coverage() {
+        let parsed = parse_video_scene_timestamps(
+            "[Parsed_metadata] frame:0 pts:20 pts_time:2.0\n\
+             [Parsed_metadata] frame:1 pts:50 pts_time:5.0\n\
+             [Parsed_metadata] frame:2 pts:50 pts_time:5.02\n\
+             [Parsed_metadata] frame:3 pts:120 pts_time:12.0\n",
+            10.0,
+        );
+        assert_eq!(parsed, vec![2.0, 5.0]);
+
+        let uniform = video_keyframe_targets(100.0);
+        let merged = merge_video_keyframe_targets(
+            100.0,
+            &uniform,
+            &[5.0, 25.0, 55.0, 75.0, 95.0],
+        );
+        assert_eq!(merged.len(), uniform.len());
+        assert!(merged.contains(&5.0));
+        assert!(merged.contains(&55.0));
+        assert!(merged.contains(&95.0));
+        assert!(merged.windows(2).all(|items| items[0] < items[1]));
+    }
+
+    #[test]
+    fn video_scene_detection_uses_real_ffmpeg_when_available() {
+        if which::which("ffmpeg").is_err() {
+            return;
+        }
+        let workspace = unique_dir("harborbeacon-video-scenes-real");
+        let video_path = workspace.join("scene-cuts.mp4");
+        fs::create_dir_all(&workspace).expect("create workspace");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-nostdin",
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:size=320x240:rate=10:duration=2",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:size=320x240:rate=10:duration=2",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=green:size=320x240:rate=10:duration=2",
+                "-filter_complex",
+                "[0:v][1:v][2:v]concat=n=3:v=1:a=0",
+                "-c:v",
+                "mpeg4",
+            ])
+            .arg(&video_path)
+            .status()
+            .expect("run ffmpeg scene fixture");
+        assert!(status.success());
+
+        let timestamps =
+            detect_video_scene_timestamps("ffmpeg", &video_path, 6.0)
+                .expect("detect scene timestamps");
+        assert!(
+            timestamps.iter().any(|timestamp| (*timestamp - 2.0).abs() <= 0.6),
+            "missing first scene cut: {timestamps:?}"
+        );
+        assert!(
+            timestamps.iter().any(|timestamp| (*timestamp - 4.0).abs() <= 0.6),
+            "missing second scene cut: {timestamps:?}"
+        );
+
+        cleanup_dir(&workspace);
+    }
+
+    #[test]
+    fn video_keyframe_extraction_uses_real_ffmpeg_when_available() {
+        if which::which("ffmpeg").is_err() || which::which("ffprobe").is_err() {
+            return;
+        }
+        let workspace = unique_dir("harborbeacon-video-keyframe-real");
+        let index_root = workspace.join("index");
+        let video_path = workspace.join("sample.mp4");
+        fs::create_dir_all(&index_root).expect("create index root");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-nostdin",
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=640x360:rate=10",
+                "-t",
+                "12",
+                "-c:v",
+                "mpeg4",
+            ])
+            .arg(&video_path)
+            .status()
+            .expect("run ffmpeg fixture");
+        assert!(status.success());
+
+        let extraction = extract_video_keyframes(&video_path, &index_root);
+        assert_eq!(
+            extraction.frames.len(),
+            5,
+            "unexpected extraction warnings: {:?}",
+            extraction.warnings
+        );
+        assert!(
+            extraction
+                .frames
+                .iter()
+                .all(|frame| frame.path.is_file()
+                    && frame
+                        .path
+                        .metadata()
+                        .is_ok_and(|metadata| metadata.len() > 0))
+        );
+        assert!(
+            extraction
+                .frames
+                .windows(2)
+                .all(|frames| frames[0].timestamp_seconds < frames[1].timestamp_seconds)
+        );
+
+        cleanup_dir(&workspace);
     }
 
     #[test]
