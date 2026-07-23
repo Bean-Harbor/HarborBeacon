@@ -47,8 +47,6 @@ use self::system_readiness_actions::build_general_message_readiness_summary;
 use self::vision_event_actions::build_redacted_vision_event_summary;
 
 use crate::connectors::harborlink_media::HarborLinkMediaClient;
-#[cfg(test)]
-use crate::connectors::home_assistant::HomeAssistantClientConfig;
 use crate::connectors::home_assistant::{
     normalize_home_assistant_service_action_request,
     validate_home_assistant_service_action_request, HomeAssistantClient, HomeAssistantEntity,
@@ -1822,7 +1820,7 @@ impl TaskApiService {
             service: pending_ha.service.clone(),
             entity_hint: pending_ha.entity_hint.clone(),
         };
-        let state = match self.admin_store.home_assistant_secret_state() {
+        let state = match self.admin_store.home_assistant_state() {
             Ok(state) => state,
             Err(error) => {
                 if let Err(response) =
@@ -8335,13 +8333,6 @@ fn home_assistant_client_from_admin_state(
     if !state.enabled {
         return Err("Home Assistant integration is disabled".to_string());
     }
-    #[cfg(test)]
-    if !state.base_url.trim().is_empty() && !state.access_token.trim().is_empty() {
-        return HomeAssistantClient::new(HomeAssistantClientConfig::new(
-            state.base_url.clone(),
-            state.access_token.clone(),
-        ));
-    }
     HomeAssistantClient::from_harborlink_env()
 }
 
@@ -10058,9 +10049,8 @@ mod tests {
     };
     use crate::orchestrator::contracts::RiskLevel;
     use crate::runtime::admin_console::{
-        AdminConsoleState, AdminConsoleStore, HomeAssistantConfigUpdate, IdentityBindingRecord,
-        KnowledgeSettings, KnowledgeSourceRoot, NotificationTargetRecord, RagResourceProfile,
-        RemoteViewConfig,
+        AdminConsoleState, AdminConsoleStore, IdentityBindingRecord, KnowledgeSettings,
+        KnowledgeSourceRoot, NotificationTargetRecord, RagResourceProfile, RemoteViewConfig,
     };
     use crate::runtime::hub::HubScanResultItem;
     use crate::runtime::knowledge::{
@@ -10495,25 +10485,45 @@ mod tests {
         let _ = fs::remove_file(conversation_path);
     }
 
-    fn configure_mock_home_assistant(service: &TaskApiService, base_url: &str) {
+    fn configure_mock_harborlink_home_assistant(service: &TaskApiService) {
         service
             .clone()
             .admin_store
-            .save_home_assistant_config(HomeAssistantConfigUpdate {
-                enabled: true,
-                base_url: base_url.to_string(),
-                access_token: Some("ha-test-token".to_string()),
-                exposed_domains: vec!["light".to_string(), "input_boolean".to_string()],
-            })
+            .save_home_assistant_orchestration_state(
+                true,
+                vec!["light".to_string(), "input_boolean".to_string()],
+            )
             .expect("save HA config");
     }
 
-    fn start_mock_home_assistant_server(
+    struct MockHarborLinkEnvironment {
+        previous_url: Option<std::ffi::OsString>,
+        previous_mode: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for MockHarborLinkEnvironment {
+        fn drop(&mut self) {
+            restore_env_var("HARBORLINK_MEDIA_API_URL", self.previous_url.take());
+            restore_env_var("HARBORBEACON_SOUTHBOUND_MODE", self.previous_mode.take());
+        }
+    }
+
+    fn start_mock_harborlink_server(
         states_sequence: Vec<Value>,
         expected_requests: usize,
-    ) -> (String, Arc<Mutex<Vec<Value>>>, thread::JoinHandle<()>) {
-        let server = Server::http("127.0.0.1:0").expect("HA mock server");
+    ) -> (
+        Arc<Mutex<Vec<Value>>>,
+        thread::JoinHandle<()>,
+        MockHarborLinkEnvironment,
+    ) {
+        let server = Server::http("127.0.0.1:0").expect("HarborLink mock server");
         let base_url = format!("http://{}", server.server_addr());
+        let environment = MockHarborLinkEnvironment {
+            previous_url: std::env::var_os("HARBORLINK_MEDIA_API_URL"),
+            previous_mode: std::env::var_os("HARBORBEACON_SOUTHBOUND_MODE"),
+        };
+        std::env::set_var("HARBORLINK_MEDIA_API_URL", &base_url);
+        std::env::set_var("HARBORBEACON_SOUTHBOUND_MODE", "harborlink");
         let posts = Arc::new(Mutex::new(Vec::new()));
         let post_records = posts.clone();
         let json_header =
@@ -10525,7 +10535,7 @@ mod tests {
                 let method = request.method().clone();
                 let url = request.url().to_string();
                 match (method, url.as_str()) {
-                    (Method::Get, "/api/states") => {
+                    (Method::Get, "/v1/home-assistant/entities") => {
                         let index = state_index.min(states_sequence.len().saturating_sub(1));
                         state_index = state_index.saturating_add(1);
                         let body = states_sequence
@@ -10537,7 +10547,7 @@ mod tests {
                             .respond(Response::from_string(body).with_header(json_header.clone()))
                             .expect("states response");
                     }
-                    (Method::Post, path) if path.starts_with("/api/services/") => {
+                    (Method::Post, path) if path.starts_with("/v1/home-assistant/services/") => {
                         let mut body = String::new();
                         request
                             .as_reader()
@@ -10550,7 +10560,22 @@ mod tests {
                             .expect("post records")
                             .push(json!({ "path": path, "body": body_json }));
                         request
-                            .respond(Response::from_string("[]").with_header(json_header.clone()))
+                            .respond(
+                                Response::from_string(
+                                    json!({
+                                        "domain": path.split('/').nth(4).unwrap_or_default(),
+                                        "service": path.split('/').nth(5).unwrap_or_default(),
+                                        "entity_id": body_json
+                                            .get("entity_id")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or_default(),
+                                        "ok": true,
+                                        "changed_entity_count": 1
+                                    })
+                                    .to_string(),
+                                )
+                                .with_header(json_header.clone()),
+                            )
                             .expect("service response");
                     }
                     _ => {
@@ -10561,7 +10586,7 @@ mod tests {
                 }
             }
         });
-        (base_url, posts, server_thread)
+        (posts, server_thread, environment)
     }
 
     fn home_assistant_light_entities() -> Value {
@@ -10592,7 +10617,11 @@ mod tests {
     ) -> Value {
         json!({
             "entity_id": entity_id,
+            "domain": entity_id.split('.').next().unwrap_or_default(),
             "state": state,
+            "display_name": friendly_name,
+            "area_id": area_id,
+            "device_class": device_class,
             "attributes": {
                 "friendly_name": friendly_name,
                 "area_id": area_id,
@@ -15189,9 +15218,9 @@ mod tests {
     fn general_message_home_assistant_ambiguous_entities_need_input_and_persist_candidates() {
         let (service, conversation_store, admin_path, registry_path, conversation_path) =
             build_task_api_service("general-message-ha-clarify");
-        let (base_url, _posts, server_thread) =
-            start_mock_home_assistant_server(vec![home_assistant_light_entities()], 1);
-        configure_mock_home_assistant(&service, &base_url);
+        let (_posts, server_thread, _harborlink_env) =
+            start_mock_harborlink_server(vec![home_assistant_light_entities()], 1);
+        configure_mock_harborlink_home_assistant(&service);
         let request = general_message_test_request("ha_clarify", "开灯", Value::Null);
 
         let response = service.handle_task(request.clone());
@@ -15239,9 +15268,9 @@ mod tests {
     fn general_message_home_assistant_clarification_ordinal_executes_selected_entity() {
         let (service, conversation_store, admin_path, registry_path, conversation_path) =
             build_task_api_service("general-message-ha-ordinal");
-        let (base_url, posts, server_thread) =
-            start_mock_home_assistant_server(vec![home_assistant_light_entities()], 3);
-        configure_mock_home_assistant(&service, &base_url);
+        let (posts, server_thread, _harborlink_env) =
+            start_mock_harborlink_server(vec![home_assistant_light_entities()], 3);
+        configure_mock_harborlink_home_assistant(&service);
         let first_request = general_message_test_request("ha_ordinal", "开灯", Value::Null);
         let first = service.handle_task(first_request.clone());
         let resume_token = first.resume_token.clone().expect("resume token");
@@ -15262,15 +15291,19 @@ mod tests {
         );
         assert_eq!(response.result.data["reply_pack"]["fields"], json!({}));
         let post_records = posts.lock().expect("posts");
-        assert_eq!(post_records.len(), 1);
-        assert_eq!(post_records[0]["path"], "/api/services/light/turn_on");
+        assert_eq!(post_records.len(), 1, "{post_records:#?}");
+        assert_eq!(
+            post_records[0]["path"],
+            "/v1/home-assistant/services/light/turn_on"
+        );
         assert_eq!(post_records[0]["body"]["entity_id"], "light.kitchen");
         assert_eq!(
             post_records[0]["body"]
                 .as_object()
                 .map(serde_json::Map::len),
-            Some(1)
+            Some(2)
         );
+        assert_eq!(post_records[0]["body"]["fields"], json!({}));
         drop(post_records);
         let loaded = conversation_store
             .load_for_session(
@@ -15289,9 +15322,9 @@ mod tests {
     fn general_message_home_assistant_clarification_name_executes_selected_entity() {
         let (service, conversation_store, admin_path, registry_path, conversation_path) =
             build_task_api_service("general-message-ha-name");
-        let (base_url, posts, server_thread) =
-            start_mock_home_assistant_server(vec![home_assistant_light_entities()], 3);
-        configure_mock_home_assistant(&service, &base_url);
+        let (posts, server_thread, _harborlink_env) =
+            start_mock_harborlink_server(vec![home_assistant_light_entities()], 3);
+        configure_mock_harborlink_home_assistant(&service);
         let first_request = general_message_test_request("ha_name", "开灯", Value::Null);
         let first = service.handle_task(first_request.clone());
         let resume_token = first.resume_token.clone().expect("resume token");
@@ -15331,9 +15364,9 @@ mod tests {
     fn general_message_home_assistant_clarification_cancel_clears_pending_without_execution() {
         let (service, conversation_store, admin_path, registry_path, conversation_path) =
             build_task_api_service("general-message-ha-cancel");
-        let (base_url, posts, server_thread) =
-            start_mock_home_assistant_server(vec![home_assistant_light_entities()], 1);
-        configure_mock_home_assistant(&service, &base_url);
+        let (posts, server_thread, _harborlink_env) =
+            start_mock_harborlink_server(vec![home_assistant_light_entities()], 1);
+        configure_mock_harborlink_home_assistant(&service);
         let first_request = general_message_test_request("ha_cancel", "开灯", Value::Null);
         let first = service.handle_task(first_request.clone());
         let resume_token = first.resume_token.clone().expect("resume token");
@@ -15376,9 +15409,9 @@ mod tests {
             Some("porch"),
             Some("light")
         )]);
-        let (base_url, posts, server_thread) =
-            start_mock_home_assistant_server(vec![home_assistant_light_entities(), only_porch], 2);
-        configure_mock_home_assistant(&service, &base_url);
+        let (posts, server_thread, _harborlink_env) =
+            start_mock_harborlink_server(vec![home_assistant_light_entities(), only_porch], 2);
+        configure_mock_harborlink_home_assistant(&service);
         let first_request = general_message_test_request("ha_stale", "开灯", Value::Null);
         let first = service.handle_task(first_request.clone());
         let resume_token = first.resume_token.clone().expect("resume token");
@@ -15427,9 +15460,9 @@ mod tests {
     fn general_message_home_assistant_unsafe_followup_blocks_and_clears_pending() {
         let (service, conversation_store, admin_path, registry_path, conversation_path) =
             build_task_api_service("general-message-ha-unsafe-followup");
-        let (base_url, posts, server_thread) =
-            start_mock_home_assistant_server(vec![home_assistant_light_entities()], 1);
-        configure_mock_home_assistant(&service, &base_url);
+        let (posts, server_thread, _harborlink_env) =
+            start_mock_harborlink_server(vec![home_assistant_light_entities()], 1);
+        configure_mock_harborlink_home_assistant(&service);
         let first_request = general_message_test_request("ha_unsafe_followup", "开灯", Value::Null);
         let first = service.handle_task(first_request.clone());
         let resume_token = first.resume_token.clone().expect("resume token");
@@ -15915,9 +15948,9 @@ mod tests {
     fn general_message_nsp_home_assistant_slots_clarify_ambiguous_entities() {
         let (service, _conversation_store, admin_path, registry_path, conversation_path) =
             build_task_api_service("general-message-nsp-ha-clarify");
-        let (base_url, posts, server_thread) =
-            start_mock_home_assistant_server(vec![home_assistant_light_entities()], 1);
-        configure_mock_home_assistant(&service, &base_url);
+        let (posts, server_thread, _harborlink_env) =
+            start_mock_harborlink_server(vec![home_assistant_light_entities()], 1);
+        configure_mock_harborlink_home_assistant(&service);
         configure_mock_general_message_llm(
             &service,
             r#"{

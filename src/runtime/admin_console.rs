@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::connectors::home_assistant::{
-    redact_home_assistant_token, token_is_redacted, HOME_ASSISTANT_TOKEN_REDACTION,
+    redact_home_assistant_token, HOME_ASSISTANT_TOKEN_REDACTION,
 };
 use crate::control_plane::access::{PermissionBinding, PermissionEffect, ScopeKind};
 use crate::control_plane::apps::{
@@ -37,9 +37,7 @@ use crate::control_plane::users::{
     Membership, MembershipStatus, RoleKind, UserAccount, UserStatus, Workspace, WorkspaceStatus,
     WorkspaceType,
 };
-use crate::runtime::dvr::{
-    dvr_knowledge_root_id, sanitize_dvr_recording_settings, DvrRecordingSettings,
-};
+use crate::runtime::dvr::{sanitize_dvr_recording_settings, DvrRecordingSettings};
 use crate::runtime::hub::non_empty_opt;
 use crate::runtime::registry::{CameraDevice, DeviceRegistryStore};
 
@@ -689,18 +687,6 @@ impl Default for HomeAssistantAdminState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct HomeAssistantConfigUpdate {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub base_url: String,
-    #[serde(default)]
-    pub access_token: Option<String>,
-    #[serde(default)]
-    pub exposed_domains: Vec<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceSummary {
     pub workspace_id: String,
@@ -1022,36 +1008,6 @@ impl AdminConsoleStore {
         Ok(redact_home_assistant_state(
             self.load_state()?.home_assistant,
         ))
-    }
-
-    pub fn home_assistant_secret_state(&self) -> Result<HomeAssistantAdminState, String> {
-        Ok(self.load_state()?.home_assistant)
-    }
-
-    pub fn save_home_assistant_config(
-        &self,
-        update: HomeAssistantConfigUpdate,
-    ) -> Result<AdminConsoleState, String> {
-        let mut state = self.load_or_create_state()?;
-        let mut next = state.home_assistant.clone();
-        next.enabled = update.enabled;
-        next.base_url = update.base_url;
-        next.exposed_domains = update.exposed_domains;
-        if let Some(access_token) = update.access_token {
-            if !token_is_redacted(&access_token) {
-                next.access_token = access_token;
-            }
-        }
-        next.last_error = None;
-        if !next.enabled {
-            next.last_status = "disabled".to_string();
-        } else if next.base_url.trim().is_empty() || next.access_token.trim().is_empty() {
-            next.last_status = "not_configured".to_string();
-        } else {
-            next.last_status = "configured".to_string();
-        }
-        state.home_assistant = sanitize_home_assistant_state(next);
-        self.save_projected_state(state)
     }
 
     pub fn save_home_assistant_orchestration_state(
@@ -1481,18 +1437,6 @@ impl AdminConsoleStore {
         settings: DvrRecordingSettings,
     ) -> Result<AdminConsoleState, String> {
         let settings = sanitize_dvr_recording_settings(settings);
-        fs::create_dir_all(&settings.recording_root).map_err(|error| {
-            format!(
-                "failed to create DVR recording_root {}: {error}",
-                settings.recording_root
-            )
-        })?;
-        fs::create_dir_all(&settings.media_library_root).map_err(|error| {
-            format!(
-                "failed to create DVR media_library_root {}: {error}",
-                settings.media_library_root
-            )
-        })?;
         let mut state = self.load_or_create_state()?;
         state.dvr = settings.clone();
         upsert_dvr_knowledge_root(&mut state.knowledge, &settings);
@@ -2471,47 +2415,10 @@ fn sanitize_unit_or_positive_f32(value: f32, min: f32, max: f32, fallback: f32) 
 }
 
 fn upsert_dvr_knowledge_root(settings: &mut KnowledgeSettings, dvr: &DvrRecordingSettings) {
-    let root_id = dvr_knowledge_root_id().to_string();
-    if dvr.enabled_device_ids.is_empty() {
-        settings
-            .source_roots
-            .retain(|existing| existing.root_id != root_id);
-        return;
-    }
-
-    let path = dvr.media_library_root.trim();
-    if path.is_empty() {
-        return;
-    }
-    let root = KnowledgeSourceRoot {
-        root_id: root_id.clone(),
-        label: "Camera DVR Library".to_string(),
-        path: path.to_string(),
-        enabled: true,
-        include: vec![
-            "**/*.mp4".to_string(),
-            "**/*.jpg".to_string(),
-            "**/*.jpeg".to_string(),
-            "**/*.png".to_string(),
-            "**/*.webp".to_string(),
-            "**/*.json".to_string(),
-        ],
-        exclude: Vec::new(),
-        last_indexed_at: None,
-    };
-    if let Some(existing) = settings
+    let _ = dvr;
+    settings
         .source_roots
-        .iter_mut()
-        .find(|existing| existing.root_id == root_id)
-    {
-        existing.label = root.label;
-        existing.path = root.path;
-        existing.enabled = true;
-        existing.include = root.include;
-        existing.exclude = root.exclude;
-    } else {
-        settings.source_roots.push(root);
-    }
+        .retain(|existing| existing.root_id != "camera-dvr-recordings");
 }
 
 fn sanitize_knowledge_index_jobs(
@@ -4011,20 +3918,18 @@ pub fn redact_home_assistant_state(mut state: HomeAssistantAdminState) -> HomeAs
 
 fn sanitize_home_assistant_state(state: HomeAssistantAdminState) -> HomeAssistantAdminState {
     let exposed_domains = sanitize_home_assistant_domains(state.exposed_domains);
-    let base_url = state.base_url.trim().trim_end_matches('/').to_string();
-    let access_token = state.access_token.trim().to_string();
     let mut last_status = state.last_status.trim().to_ascii_lowercase();
     if last_status.is_empty() {
-        last_status = if base_url.is_empty() || access_token.is_empty() {
-            "not_configured".to_string()
+        last_status = if state.enabled {
+            "configured_in_harborlink".to_string()
         } else {
-            "configured".to_string()
+            "not_configured".to_string()
         };
     }
     HomeAssistantAdminState {
         enabled: state.enabled,
-        base_url,
-        access_token,
+        base_url: String::new(),
+        access_token: String::new(),
         exposed_domains,
         last_status,
         last_error: state
@@ -5925,9 +5830,8 @@ mod tests {
         user_recent_interactive_surface, AdminConsoleState, AdminConsoleStore, AdminDefaults,
         AdminModelCenterState, AutomationRuleReview, BridgeProviderCapabilities,
         BridgeProviderConfig, DeviceCredentialSecret, DeviceEvidenceRecord, DvrRecordingSettings,
-        HomeAssistantConfigUpdate, IdentityBindingRecord, KnowledgeSettings, KnowledgeSourceRoot,
-        RemoteViewConfig, BRIDGE_PROVIDER_ACCOUNT_ID, LOCAL_RTSP_CREDENTIAL_ID,
-        LOCAL_RTSP_PROVIDER_ACCOUNT_ID,
+        IdentityBindingRecord, KnowledgeSettings, KnowledgeSourceRoot, RemoteViewConfig,
+        BRIDGE_PROVIDER_ACCOUNT_ID, LOCAL_RTSP_CREDENTIAL_ID, LOCAL_RTSP_PROVIDER_ACCOUNT_ID,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -6114,56 +6018,6 @@ mod tests {
         let paths = default_rtsp_paths();
         assert!(paths.contains(&"/stream1".to_string()));
         assert!(paths.contains(&"/stream2".to_string()));
-    }
-
-    #[test]
-    fn save_home_assistant_config_redacts_and_preserves_secret() {
-        let registry_path = temp_path("registry-ha-config");
-        let admin_path = temp_path("admin-ha-config");
-        let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
-        let store = AdminConsoleStore::new(admin_path.clone(), registry);
-
-        store
-            .save_home_assistant_config(HomeAssistantConfigUpdate {
-                enabled: true,
-                base_url: " http://ha.local:8123/ ".to_string(),
-                access_token: Some("ha-token".to_string()),
-                exposed_domains: vec![
-                    "Light".to_string(),
-                    "sensor".to_string(),
-                    "bad-domain".to_string(),
-                ],
-            })
-            .expect("save ha config");
-
-        let secret = store
-            .home_assistant_secret_state()
-            .expect("load secret ha state");
-        assert_eq!(secret.base_url, "http://ha.local:8123");
-        assert_eq!(secret.access_token, "ha-token");
-        assert_eq!(secret.exposed_domains, vec!["light", "sensor"]);
-
-        let redacted = store
-            .home_assistant_state()
-            .expect("load redacted ha state");
-        assert_eq!(
-            redacted.access_token,
-            super::home_assistant_token_redaction_marker()
-        );
-
-        store
-            .save_home_assistant_config(HomeAssistantConfigUpdate {
-                enabled: true,
-                base_url: "http://ha-new.local:8123".to_string(),
-                access_token: Some(String::new()),
-                exposed_domains: vec!["camera".to_string()],
-            })
-            .expect("save redacted ha config");
-        let preserved = store
-            .home_assistant_secret_state()
-            .expect("reload secret ha state");
-        assert_eq!(preserved.base_url, "http://ha-new.local:8123");
-        assert_eq!(preserved.access_token, "ha-token");
     }
 
     #[test]
@@ -6603,17 +6457,14 @@ mod tests {
     }
 
     #[test]
-    fn save_dvr_recording_settings_upserts_video_knowledge_root() {
+    fn save_dvr_recording_settings_removes_beacon_owned_video_knowledge_root() {
         let registry_path = temp_path("registry-dvr-settings");
         let admin_path = temp_path("admin-dvr-settings");
         let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
         let store = AdminConsoleStore::new(admin_path.clone(), registry);
-        let recording_root = std::env::temp_dir().join("harborbeacon-dvr-recordings-valid");
-        let media_library_root = recording_root.join("library");
-
         let updated = store
             .save_dvr_recording_settings(DvrRecordingSettings {
-                recording_root: recording_root.to_string_lossy().into_owned(),
+                recording_root: "/tmp/beacon-must-not-own-dvr".to_string(),
                 retention_days: 14,
                 segment_seconds: 600,
                 continuous_bitrate_mbps: 2,
@@ -6624,26 +6475,24 @@ mod tests {
 
         assert_eq!(updated.dvr.retention_days, 14);
         assert_eq!(updated.dvr.segment_seconds, 600);
-        assert!(updated.knowledge.source_roots.iter().any(|root| {
-            root.root_id == "camera-dvr-recordings"
-                && root.path == media_library_root.to_string_lossy()
-                && root.enabled
-                && root.include.iter().any(|pattern| pattern == "**/*.mp4")
-        }));
+        assert!(!updated
+            .knowledge
+            .source_roots
+            .iter()
+            .any(|root| root.root_id == "camera-dvr-recordings"));
         assert_eq!(
             updated.platform.workspaces[0].settings["dvr"]["recording_root"],
-            json!(recording_root.to_string_lossy())
+            json!("/mnt/software/harborlink/camera-dvr")
         );
         assert_eq!(
             updated.platform.workspaces[0].settings["dvr"]["media_library_root"],
-            json!(media_library_root.to_string_lossy())
+            json!("/mnt/software/harborlink/camera-dvr/library")
         );
 
         let reloaded = store.dvr_recording_settings().expect("reload dvr");
         assert_eq!(reloaded.retention_days, 14);
         assert_eq!(reloaded.enabled_device_ids, vec!["camera-main"]);
 
-        let _ = std::fs::remove_dir_all(recording_root);
         let _ = std::fs::remove_file(admin_path);
         let _ = std::fs::remove_file(registry_path);
     }

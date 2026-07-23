@@ -68,7 +68,7 @@ sed \
   -e "s/VERSION_PLACEHOLDER/${debian_version}/g" \
   -e "s/ARCH_PLACEHOLDER/${deb_arch}/g" \
   debian/control \
-  | sed 's/^Depends: .*/Depends: libc6, openssl, ca-certificates, harborlink, python3, python3-opencv, python3-spacemit-ort/' \
+  | sed 's/^Depends: .*/Depends: libc6, openssl, ca-certificates, harborlink (>= 0.1.0), python3, python3-opencv, python3-spacemit-ort/' \
   > "$pkg_dir/DEBIAN/control"
 printf 'X-HarborNavi-Version: %s\n' "$release_label" >> "$pkg_dir/DEBIAN/control"
 

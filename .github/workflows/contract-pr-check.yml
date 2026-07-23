@@ -11,19 +11,44 @@ on:
 permissions:
   contents: read
 
+env:
+  HARBORBEACON_SOUTHBOUND_MODE: harborlink
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  rust_quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - run: cargo fmt --check
+      - run: cargo clippy --lib --tests
+      - run: cargo check --bin harboros-beacon --bin agent-hub-admin-api
+      - run: cargo test --lib -- --test-threads=1
+      - run: cargo test --bin agent-hub-admin-api -- --test-threads=1
+
+  harborlink_package_contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Verify HarborLink dependency and lifecycle metadata
+        run: |
+          grep -Eq '^Depends:.*harborlink \(>= [0-9]+\.[0-9]+\.[0-9]+\)' debian/control
+          grep -F 'harborlink (>= 0.1.0)' scripts/build_harbornavi_k3_deb.sh
+          bash -n scripts/build_harbornavi_k3_deb.sh
+          grep -F 'User=harborbeacon' debian/harboros-beacon.service
+          grep -F 'LoadCredential=harborlink-local-api-token:' debian/harboros-beacon.service
+
   schema_check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release --bin validate-contract-schemas
       - run: ./target/release/validate-contract-schemas --report validate-contract-report.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
         if: always()
         with:
           name: schema-check-report

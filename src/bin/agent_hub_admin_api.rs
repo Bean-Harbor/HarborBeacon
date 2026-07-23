@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 use harborbeacon_local_agent::connectors::harborlink_media::{
     HarborLinkCredentialStatus, HarborLinkHomeAssistantStatus, HarborLinkLiveSession,
-    HarborLinkMediaClient, HarborLinkRecordingStatus,
+    HarborLinkMediaClient, HarborLinkRecordingArtifact, HarborLinkRecordingStatus,
 };
 #[cfg(test)]
 use harborbeacon_local_agent::connectors::home_assistant::validate_home_assistant_service_fields as validate_home_assistant_service_fields_shared;
@@ -87,9 +87,8 @@ use harborbeacon_local_agent::runtime::admin_console::{
     ModelDownloadJobRecord, ModelRuntimeRecord, NotificationTargetRecord, RagResourceProfile,
 };
 use harborbeacon_local_agent::runtime::dvr::{
-    apply_retention_policy, build_status_response, dvr_media_preview_path, media_library_root_path,
-    scan_timeline, store_snapshot_bytes, DvrRecordingSettings, DvrRecordingStatus,
-    DvrRecordingStatusResponse, DvrTimelineSegment,
+    build_status_response, DvrRecordingSettings, DvrRecordingStatus, DvrRecordingStatusResponse,
+    DvrTimelineResponse, DvrTimelineSegment,
 };
 use harborbeacon_local_agent::runtime::evt_readiness::{
     build_evt_evidence_bundle, build_evt_readiness_report, evt_preflight_workflow_summary,
@@ -2408,9 +2407,9 @@ impl AdminApi {
             Method::Post if path == "/api/knowledge/search" => self
                 .handle_knowledge_search(&mut request, &identity_hints)
                 .boxed(),
-            Method::Get if path == "/api/knowledge/preview" => self
-                .handle_knowledge_preview(&raw_url, &headers, &identity_hints)
-                .boxed(),
+            Method::Get if path == "/api/knowledge/preview" => {
+                self.handle_knowledge_preview(&raw_url, &headers, &identity_hints)
+            }
             Method::Post if path == "/api/knowledge/index/run" => {
                 self.handle_run_knowledge_index(&identity_hints).boxed()
             }
@@ -2440,6 +2439,12 @@ impl AdminApi {
             }
             Method::Get if path == "/api/cameras/recordings/timeline" => self
                 .handle_dvr_recordings_timeline(&raw_url, &identity_hints)
+                .boxed(),
+            Method::Get if path.starts_with("/api/cameras/recordings/artifacts/") => {
+                self.handle_dvr_artifact(&path, &headers, &identity_hints)
+            }
+            Method::Delete if path.starts_with("/api/cameras/recordings/artifacts/") => self
+                .handle_delete_dvr_artifact(&path, &identity_hints)
                 .boxed(),
             Method::Get if path == "/api/harboros/status" => {
                 self.handle_harboros_status(&identity_hints).boxed()
@@ -4025,31 +4030,11 @@ impl AdminApi {
                 return Err("DVR search time filter has from greater than to.".to_string());
             }
         }
-        let settings = self.admin_store.dvr_recording_settings()?;
-        if let Err(error) = apply_retention_policy(&settings) {
-            return Err(error);
-        }
-        let devices = self.hub().load_registered_cameras()?;
-        let camera_id = payload.camera_id.as_deref().and_then(non_empty_string);
-        let timeline = scan_timeline(
-            &settings,
-            &devices,
-            camera_id.as_deref(),
-            from_secs,
-            to_secs,
-            None,
-        )?;
-        let focus_paths = timeline
-            .segments
-            .into_iter()
-            .map(|segment| segment.file_path)
-            .collect::<Vec<_>>();
-        if focus_paths.is_empty() {
-            return Err(
-                "No DVR recording segments matched the requested camera/time scope.".to_string(),
-            );
-        }
-        Ok(focus_paths)
+        let _ = (from_secs, to_secs);
+        Err(
+            "DVR content search is owned by the HarborLink artifact contract and is not a Beacon filesystem search scope."
+                .to_string(),
+        )
     }
 
     fn handle_knowledge_preview(
@@ -4057,32 +4042,24 @@ impl AdminApi {
         raw_url: &str,
         headers: &[Header],
         hints: &AccessIdentityHints,
-    ) -> Response<std::io::Cursor<Vec<u8>>> {
+    ) -> ResponseBox {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
-            return error_json(StatusCode(403), &error);
+            return error_json(StatusCode(403), &error).boxed();
         }
         let requested_path = match parse_query_param(raw_url, "path")
             .and_then(percent_decode_optional_query_value)
             .and_then(|value| non_empty_string(&value))
         {
             Some(path) => path,
-            None => return error_json(StatusCode(400), "knowledge preview requires path"),
+            None => return error_json(StatusCode(400), "knowledge preview requires path").boxed(),
         };
         let settings = match self.admin_store.knowledge_settings() {
             Ok(settings) => settings,
-            Err(error) => return error_json(StatusCode(500), &error),
+            Err(error) => return error_json(StatusCode(500), &error).boxed(),
         };
         let preview_path = match resolve_knowledge_preview_path(&requested_path, &settings) {
             Ok(path) => path,
-            Err(error) => match self
-                .admin_store
-                .dvr_recording_settings()
-                .ok()
-                .and_then(|settings| dvr_media_preview_path(&settings, &requested_path).ok())
-            {
-                Some(path) => path,
-                None => return error_json(error.status, &error.message),
-            },
+            Err(error) => return error_json(error.status, &error.message).boxed(),
         };
         preview_static_file_response(&preview_path, header_value(headers, "Range").as_deref())
     }
@@ -4186,8 +4163,8 @@ impl AdminApi {
             Ok(settings) => settings,
             Err(error) => return error_json(StatusCode(500), &error),
         };
-        if let Err(error) = apply_retention_policy(&settings) {
-            return error_json(StatusCode(422), &error);
+        if let Err(error) = self.harborlink_media.apply_dvr_retention() {
+            return error_json(StatusCode(502), &error);
         }
         let devices = match self.hub().load_registered_cameras() {
             Ok(devices) => devices,
@@ -4199,17 +4176,119 @@ impl AdminApi {
         let from_secs =
             parse_query_param(raw_url, "from").and_then(|value| value.parse::<u64>().ok());
         let to_secs = parse_query_param(raw_url, "to").and_then(|value| value.parse::<u64>().ok());
-        match scan_timeline(
-            &settings,
-            &devices,
-            device_id.as_deref(),
-            from_secs,
-            to_secs,
-            Some(&self.public_origin),
-        ) {
-            Ok(response) => ok_json(&response),
-            Err(error) => error_json(StatusCode(422), &error),
+        if let Some(device_id) = device_id.as_deref() {
+            if !devices.iter().any(|device| device.device_id == device_id) {
+                return error_json(StatusCode(404), "camera device not found");
+            }
         }
+        let mut segments = Vec::new();
+        for device in devices
+            .iter()
+            .filter(|device| device_id.as_deref().is_none_or(|id| device.device_id == id))
+        {
+            let artifacts = match self.harborlink_media.recording_timeline(&device.device_id) {
+                Ok(artifacts) => artifacts,
+                Err(error) => return error_json(StatusCode(502), &error),
+            };
+            segments.extend(artifacts.into_iter().filter_map(|artifact| {
+                dvr_timeline_segment_from_harborlink(artifact, from_secs, to_secs)
+            }));
+        }
+        segments.sort_by(|left, right| right.started_at.cmp(&left.started_at));
+        ok_json(&DvrTimelineResponse {
+            generated_at: current_rfc3339_timestamp(),
+            recording_root: settings.recording_root,
+            media_library_root: settings.media_library_root,
+            segments,
+        })
+    }
+
+    fn handle_dvr_artifact(
+        &self,
+        path: &str,
+        headers: &[Header],
+        hints: &AccessIdentityHints,
+    ) -> ResponseBox {
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error).boxed(),
+        };
+        let artifact_id = match parse_dvr_artifact_path(path) {
+            Some(artifact_id) => artifact_id,
+            None => return error_json(StatusCode(400), "invalid DVR artifact path").boxed(),
+        };
+        let range = header_value(headers, "Range");
+        let response = match self
+            .harborlink_media
+            .open_dvr_artifact(&artifact_id, range.as_deref())
+        {
+            Ok(response) => response,
+            Err(error) => return error_json(StatusCode(502), &error).boxed(),
+        };
+        let status = StatusCode(response.status().as_u16());
+        let content_length = response
+            .content_length()
+            .and_then(|value| usize::try_from(value).ok());
+        let mut forwarded_headers = Vec::new();
+        for name in [
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::CONTENT_RANGE,
+            reqwest::header::ACCEPT_RANGES,
+            reqwest::header::CONTENT_DISPOSITION,
+        ] {
+            if let Some(value) = response
+                .headers()
+                .get(&name)
+                .and_then(|value| value.to_str().ok())
+            {
+                if let Ok(header) = Header::from_bytes(name.as_str().as_bytes(), value.as_bytes()) {
+                    forwarded_headers.push(header);
+                }
+            }
+        }
+        self.record_admin_audit(
+            &principal,
+            "dvr_artifact",
+            &artifact_id,
+            "dvr_artifact.read",
+            json!({"range": range}),
+            json!({"status": status.0, "streamed": true}),
+        );
+        Response::new(
+            status,
+            forwarded_headers,
+            Box::new(response),
+            content_length,
+            None,
+        )
+    }
+
+    fn handle_delete_dvr_artifact(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
+        let artifact_id = match parse_dvr_artifact_path(path) {
+            Some(artifact_id) => artifact_id,
+            None => return error_json(StatusCode(400), "invalid DVR artifact path"),
+        };
+        let result = match self.harborlink_media.delete_dvr_artifact(&artifact_id) {
+            Ok(result) => result,
+            Err(error) => return error_json(StatusCode(502), &error),
+        };
+        self.record_admin_audit(
+            &principal,
+            "dvr_artifact",
+            &artifact_id,
+            "dvr_artifact.delete",
+            json!({"artifact_id": artifact_id}),
+            result.clone(),
+        );
+        ok_json(&result)
     }
 
     fn handle_run_knowledge_index(
@@ -4489,7 +4568,7 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
             return error_json(StatusCode(403), &error);
         }
-        let state = match self.admin_store.home_assistant_secret_state() {
+        let state = match self.admin_store.home_assistant_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -4527,7 +4606,7 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
             return error_json(StatusCode(403), &error);
         }
-        let state = match self.admin_store.home_assistant_secret_state() {
+        let state = match self.admin_store.home_assistant_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -4588,7 +4667,7 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        let state = match self.admin_store.home_assistant_secret_state() {
+        let state = match self.admin_store.home_assistant_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -4611,7 +4690,7 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        let state = match self.admin_store.home_assistant_secret_state() {
+        let state = match self.admin_store.home_assistant_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -4637,7 +4716,7 @@ impl AdminApi {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
         };
-        let state = match self.admin_store.home_assistant_secret_state() {
+        let state = match self.admin_store.home_assistant_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -4706,7 +4785,7 @@ impl AdminApi {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
         };
-        let state = match self.admin_store.home_assistant_secret_state() {
+        let state = match self.admin_store.home_assistant_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -5969,7 +6048,7 @@ impl AdminApi {
             service: guardian_request.service,
             fields: json!({}),
         };
-        let state = match self.admin_store.home_assistant_secret_state() {
+        let state = match self.admin_store.home_assistant_state() {
             Ok(state) => state,
             Err(error) => {
                 return json!({
@@ -7627,7 +7706,10 @@ impl AdminApi {
 
         let task_response =
             redact_camera_task_response(self.snapshot_camera(&principal, &device_id));
-        let media_item = self.store_dvr_snapshot_media_item(&device_id).ok();
+        let media_item = match self.harborlink_media.archive_snapshot(&device_id) {
+            Ok(artifact) => dvr_timeline_segment_from_harborlink(artifact, None, None),
+            Err(error) => return error_json(StatusCode(502), &error),
+        };
         ok_json(&CameraTaskResponse {
             task_response,
             media_item,
@@ -8558,13 +8640,6 @@ impl AdminApi {
                     .map(DeviceCredentialStatusResponse::from_harborlink)
             })
             .collect()
-    }
-
-    fn store_dvr_snapshot_media_item(&self, device_id: &str) -> Result<DvrTimelineSegment, String> {
-        let settings = self.admin_store.dvr_recording_settings()?;
-        let device = self.load_camera_device(device_id)?;
-        let bytes = self.capture_camera_snapshot(device_id)?;
-        store_snapshot_bytes(&settings, &device, &bytes, Some(&self.public_origin))
     }
 
     fn load_camera_device(
@@ -10250,6 +10325,17 @@ fn no_content() -> Response<std::io::Cursor<Vec<u8>>> {
 }
 
 fn error_json(status: StatusCode, message: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    if let Ok(projection) = serde_json::from_str::<Value>(message) {
+        if projection.get("code").and_then(Value::as_str).is_some() {
+            let projected_status = projection
+                .get("statusCode")
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok())
+                .map(StatusCode)
+                .unwrap_or(status);
+            return json_response(projected_status, &json!({ "error": projection }));
+        }
+    }
     json_response(status, &json!({ "error": message }))
 }
 
@@ -10406,6 +10492,7 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/cameras/recording-settings"
         || path == "/api/cameras/recordings/status"
         || path == "/api/cameras/recordings/timeline"
+        || path.starts_with("/api/cameras/recordings/artifacts/")
         || path == "/api/harboros/status"
         || path == "/api/harboros/im-capability-map"
         || path == "/api/harbor-link/capabilities"
@@ -10571,11 +10658,93 @@ fn static_file_response(path: &Path) -> Response<std::io::Cursor<Vec<u8>>> {
     static_file_response_with_options(path, None, false)
 }
 
-fn preview_static_file_response(
-    path: &Path,
-    range_header: Option<&str>,
-) -> Response<std::io::Cursor<Vec<u8>>> {
-    static_file_response_with_options(path, range_header, true)
+fn preview_static_file_response(path: &Path, range_header: Option<&str>) -> ResponseBox {
+    let file_size = match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
+        Ok(_) => return error_json(StatusCode(404), "static file path is not a file").boxed(),
+        Err(error) => {
+            return error_json(
+                StatusCode(500),
+                &format!("failed to inspect static file {}: {error}", path.display()),
+            )
+            .boxed()
+        }
+    };
+    let requested_range = match range_header.map(|value| parse_static_byte_range(value, file_size))
+    {
+        Some(Ok(range)) => Some(range),
+        Some(Err(())) => return range_not_satisfiable_response(path, file_size).boxed(),
+        None => None,
+    };
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            return error_json(
+                StatusCode(500),
+                &format!("failed to open static file {}: {error}", path.display()),
+            )
+            .boxed()
+        }
+    };
+    let (reader, status, content_range, body_len): (
+        Box<dyn Read + Send>,
+        StatusCode,
+        Option<String>,
+        u64,
+    ) = match requested_range {
+        Some(range) => {
+            if let Err(error) = file.seek(SeekFrom::Start(range.start)) {
+                return error_json(
+                    StatusCode(500),
+                    &format!("failed to seek static file {}: {error}", path.display()),
+                )
+                .boxed();
+            }
+            let byte_count = range.end - range.start + 1;
+            (
+                Box::new(file.take(byte_count)),
+                StatusCode(206),
+                Some(format!("bytes {}-{}/{}", range.start, range.end, file_size)),
+                byte_count,
+            )
+        }
+        None => (Box::new(file), StatusCode(200), None, file_size),
+    };
+    let body_len = match usize::try_from(body_len) {
+        Ok(value) => value,
+        Err(_) => {
+            return error_json(
+                StatusCode(413),
+                "static file is too large for this platform",
+            )
+            .boxed()
+        }
+    };
+    let mut response = Response::new(status, Vec::new(), reader, Some(body_len), None);
+    add_common_headers(&mut response);
+    response.add_header(
+        Header::from_bytes(
+            b"Content-Type".as_slice(),
+            mime_type_for_path(path).as_bytes(),
+        )
+        .expect("header"),
+    );
+    response.add_header(
+        Header::from_bytes(b"Accept-Ranges".as_slice(), b"bytes".as_slice()).expect("header"),
+    );
+    response.add_header(
+        Header::from_bytes(
+            b"Content-Disposition".as_slice(),
+            inline_content_disposition(path).as_bytes(),
+        )
+        .expect("header"),
+    );
+    if let Some(value) = content_range {
+        response.add_header(
+            Header::from_bytes(b"Content-Range".as_slice(), value.as_bytes()).expect("header"),
+        );
+    }
+    response
 }
 
 fn static_file_response_with_options(
@@ -12015,7 +12184,7 @@ fn knowledge_index_storage_summary(index_path: &Path) -> KnowledgeIndexStorageSu
 fn resolve_admin_search_source_scope(
     payload: &KnowledgeSearchApiRequest,
     settings: &KnowledgeSettings,
-    dvr_settings: Option<&DvrRecordingSettings>,
+    _dvr_settings: Option<&DvrRecordingSettings>,
 ) -> Result<Vec<String>, String> {
     let scope = payload
         .source_scope
@@ -12028,32 +12197,20 @@ fn resolve_admin_search_source_scope(
     if scope == "all" {
         return Ok(Vec::new());
     }
-    let dvr_root = dvr_settings
-        .map(|settings| {
-            media_library_root_path(settings)
-                .to_string_lossy()
-                .into_owned()
-        })
-        .and_then(|path| non_empty_string(&path));
     match scope.as_str() {
-        "dvr_library" => dvr_root
-            .map(|path| vec![path])
-            .ok_or_else(|| "DVR media library source scope requires DVR settings.".to_string()),
+        "dvr_library" => Err(
+            "DVR media is owned by HarborLink and cannot be exposed as a Beacon filesystem scope."
+                .to_string(),
+        ),
         "nas_files" => {
-            let dvr_root = dvr_root.unwrap_or_default();
             let roots = settings
                 .source_roots
                 .iter()
                 .filter(|root| root.enabled)
                 .filter_map(|root| non_empty_string(&root.path))
-                .filter(|root_path| {
-                    dvr_root.is_empty()
-                        || (!path_is_same_or_inside(root_path, &dvr_root)
-                            && !path_is_same_or_inside(&dvr_root, root_path))
-                })
                 .collect::<Vec<_>>();
             if roots.is_empty() {
-                Err("No NAS source roots are configured outside the DVR media library.".to_string())
+                Err("No enabled NAS source roots are configured.".to_string())
             } else {
                 Ok(roots)
             }
@@ -13883,19 +14040,15 @@ fn command_available(command: &str) -> bool {
 fn build_home_assistant_status_response(
     state: &HomeAssistantAdminState,
 ) -> HomeAssistantStatusResponse {
-    let managed_by_harborlink = state.enabled
-        && state.base_url.trim().is_empty()
-        && state.access_token.trim().is_empty()
-        && state.last_status != "not_configured";
-    let token_configured = managed_by_harborlink || !state.access_token.trim().is_empty();
+    let managed_by_harborlink = state.enabled && state.last_status != "not_configured";
+    let token_configured = managed_by_harborlink;
     HomeAssistantStatusResponse {
-        configured: managed_by_harborlink
-            || (!state.base_url.trim().is_empty() && token_configured),
+        configured: managed_by_harborlink,
         enabled: state.enabled,
         base_url: if managed_by_harborlink {
             "harborlink://home-assistant".to_string()
         } else {
-            state.base_url.clone()
+            String::new()
         },
         managed_by_harborlink,
         harborlink_available: false,
@@ -19300,6 +19453,15 @@ fn parse_camera_recording_stop_path(path: &str) -> Option<String> {
     parse_camera_recording_action_path(path, "/recordings/stop")
 }
 
+fn parse_dvr_artifact_path(path: &str) -> Option<String> {
+    let artifact_id = path.strip_prefix("/api/cameras/recordings/artifacts/")?;
+    if artifact_id.is_empty() || artifact_id.contains('/') {
+        None
+    } else {
+        percent_decode_path_segment(artifact_id).ok()
+    }
+}
+
 fn parse_camera_recording_action_path(path: &str, suffix: &str) -> Option<String> {
     let trimmed = path.strip_prefix("/api/cameras/")?;
     let device_id = trimmed.strip_suffix(suffix)?;
@@ -19401,6 +19563,62 @@ fn url_encode_path_segment(value: &str) -> String {
         }
     }
     encoded
+}
+
+fn current_rfc3339_timestamp() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+fn dvr_timeline_segment_from_harborlink(
+    artifact: HarborLinkRecordingArtifact,
+    from_secs: Option<u64>,
+    to_secs: Option<u64>,
+) -> Option<DvrTimelineSegment> {
+    let modified_secs = u64::try_from(artifact.modified_at_epoch_ms / 1_000).unwrap_or(u64::MAX);
+    if from_secs.is_some_and(|from| modified_secs < from)
+        || to_secs.is_some_and(|to| modified_secs > to)
+    {
+        return None;
+    }
+    let started_at_epoch_ms = if artifact.started_at_epoch_ms == 0 {
+        artifact.modified_at_epoch_ms
+    } else {
+        artifact.started_at_epoch_ms
+    };
+    let ended_at_epoch_ms = if artifact.ended_at_epoch_ms == 0 {
+        artifact.modified_at_epoch_ms
+    } else {
+        artifact.ended_at_epoch_ms
+    };
+    let started_at = (started_at_epoch_ms / 1_000).to_string();
+    let ended_at = (ended_at_epoch_ms / 1_000).to_string();
+    let artifact_id = artifact.artifact_id;
+    let is_snapshot = artifact.kind == "snapshot";
+    let replay_url = format!(
+        "/api/cameras/recordings/artifacts/{}",
+        url_encode_path_segment(&artifact_id)
+    );
+    Some(DvrTimelineSegment {
+        device_id: artifact.camera_id,
+        file_path: format!("harborlink://dvr/{artifact_id}"),
+        sidecar_path: None,
+        media_kind: artifact.kind,
+        stream_kind: artifact.stream_kind,
+        started_at: started_at.clone(),
+        created_at: started_at,
+        ended_at,
+        duration_seconds: artifact.duration_seconds,
+        duration_actual_seconds: Some(artifact.duration_seconds),
+        retention_expires_at: String::new(),
+        size_bytes: artifact.byte_size,
+        replay_url: Some(replay_url.clone()),
+        thumbnail_url: is_snapshot.then_some(replay_url),
+        playable: artifact.mime_type.starts_with("video/")
+            || artifact.mime_type.starts_with("image/"),
+        indexed: false,
+    })
 }
 
 fn percent_decode_path_segment(value: &str) -> Result<String, String> {
@@ -19605,7 +19823,8 @@ mod tests {
         build_redacted_diagnostics_bundle, build_release_readiness_response,
         build_rtsp_url_from_patch, current_epoch_secs, default_model_download_target_path,
         default_model_download_target_path_in_root, default_model_endpoints,
-        embedding_warmup_timeout_stats, ensure_local_admin_access, ensure_local_camera_access,
+        dvr_timeline_segment_from_harborlink, embedding_warmup_timeout_stats,
+        ensure_local_admin_access, ensure_local_camera_access,
         harbor_assistant_build_missing_response, hardware_class_for_probe, has_forwarding_headers,
         huggingface_download_should_fallback_to_plain_http, huggingface_resolve_url,
         identity_query_suffix, is_admin_surface_path, is_harbor_assistant_client_route,
@@ -19645,11 +19864,11 @@ mod tests {
         validate_home_assistant_service_fields, validate_home_assistant_service_smoke,
         validate_outreach_delivery_request, AdminApi, CameraLiveSessionProjection,
         CameraStreamProfile, HarborLinkHomeAssistantStatus, HarborLinkLiveSession,
-        HarborLinkMediaClient, HarborLinkRecordingStatus, HomeAssistantServiceSmokeRequest,
-        HomeGuardianEvaluationQueue, KnowledgeSearchApiRequest, LocalModelRuntimeProjection,
-        ManualAddRequest, ModelRuntimeActivationRequest, ModelRuntimeActivationResult,
-        OutreachDeliveryRecipientRequest, OutreachDeliveryRequest, VisionIngestLimiter,
-        DEFAULT_HF_ENDPOINT, HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS,
+        HarborLinkMediaClient, HarborLinkRecordingArtifact, HarborLinkRecordingStatus,
+        HomeAssistantServiceSmokeRequest, HomeGuardianEvaluationQueue, KnowledgeSearchApiRequest,
+        LocalModelRuntimeProjection, ManualAddRequest, ModelRuntimeActivationRequest,
+        ModelRuntimeActivationResult, OutreachDeliveryRecipientRequest, OutreachDeliveryRequest,
+        VisionIngestLimiter, DEFAULT_HF_ENDPOINT, HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS,
         HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS, MAX_VISION_EVENT_INGEST_INFLIGHT,
         PRIVACY_GATEWAY_AUDIT_ACTION,
     };
@@ -21006,6 +21225,29 @@ mod tests {
             response.statuses[0].live_mjpeg_url.as_deref(),
             Some("http://harborbeacon.local:4174/api/cameras/camera%201%2Fleft/live.mjpeg")
         );
+
+        let snapshot = dvr_timeline_segment_from_harborlink(
+            HarborLinkRecordingArtifact {
+                artifact_id: "snapshots~cam-1~2026~07~23~021258.jpg".to_string(),
+                camera_id: "cam-1".to_string(),
+                kind: "snapshot".to_string(),
+                mime_type: "image/jpeg".to_string(),
+                byte_size: 146_584,
+                started_at_epoch_ms: 1_784_772_778_000,
+                ended_at_epoch_ms: 1_784_772_778_000,
+                duration_seconds: 0,
+                stream_kind: "snapshot".to_string(),
+                modified_at_epoch_ms: 1_784_772_778_731,
+                preview_url: "/v1/dvr/artifacts/snapshot".to_string(),
+            },
+            None,
+            None,
+        )
+        .expect("snapshot projection");
+        assert_eq!(snapshot.media_kind, "snapshot");
+        assert_eq!(snapshot.started_at, "1784772778");
+        assert_eq!(snapshot.thumbnail_url, snapshot.replay_url);
+        assert!(snapshot.playable);
 
         let home_assistant = build_home_assistant_status_response_with_link(
             &HomeAssistantAdminState::default(),

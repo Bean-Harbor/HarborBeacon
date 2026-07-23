@@ -12,14 +12,52 @@ use uuid::Uuid;
 use crate::runtime::registry::CameraCapabilities;
 
 const DEFAULT_HARBORLINK_MEDIA_API_URL: &str = "http://127.0.0.1:8790";
-const DEFAULT_HARBORLINK_LOCAL_API_TOKEN_FILE: &str = "/etc/harborlink/local-api.token";
+const DEFAULT_HARBORLINK_LOCAL_API_TOKEN_FILE: &str =
+    "/run/credentials/harboros-beacon.service/harborlink-local-api-token";
 const HARBORLINK_CONTRACT_VERSION: &str = "1.0";
+const HARBORLINK_CUTOVER_MODE: &str = "harborlink";
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HarborLinkContractError {
+    pub status_code: u16,
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    pub dependency: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct HarborLinkMediaClient {
     base_url: String,
     local_api_token: Option<String>,
     http: Client,
+}
+
+trait HarborLinkRequestBuilderExt {
+    fn send_harborlink(self) -> Result<Response, reqwest::Error>;
+}
+
+impl HarborLinkRequestBuilderExt for RequestBuilder {
+    fn send_harborlink(self) -> Result<Response, reqwest::Error> {
+        let mutation = self
+            .try_clone()
+            .and_then(|request| request.build().ok())
+            .is_some_and(|request| request.headers().contains_key("X-Request-Id"));
+        let retry = mutation.then(|| self.try_clone()).flatten();
+        match self.send() {
+            Err(error) if error.is_connect() || error.is_timeout() => {
+                if let Some(retry) = retry {
+                    retry.send()
+                } else {
+                    Err(error)
+                }
+            }
+            result => result,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -75,6 +113,34 @@ pub struct HarborLinkClipCapture {
     pub clip_length_seconds: u32,
     pub keyframe_count: u32,
     pub keyframe_interval_seconds: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarborLinkRecordingArtifact {
+    pub artifact_id: String,
+    pub camera_id: String,
+    pub kind: String,
+    pub mime_type: String,
+    pub byte_size: u64,
+    #[serde(default)]
+    pub started_at_epoch_ms: u128,
+    #[serde(default)]
+    pub ended_at_epoch_ms: u128,
+    #[serde(default)]
+    pub duration_seconds: u32,
+    #[serde(default)]
+    pub stream_kind: String,
+    pub modified_at_epoch_ms: u128,
+    pub preview_url: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarborLinkRetentionResult {
+    pub retention_days: u32,
+    pub removed_files: usize,
+    pub reclaimed_bytes: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -173,6 +239,7 @@ impl Read for HarborLinkMjpegStream {
 
 impl HarborLinkMediaClient {
     pub fn from_env() -> Result<Self, String> {
+        require_harborlink_cutover()?;
         let base_url = std::env::var("HARBORLINK_MEDIA_API_URL")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -207,7 +274,7 @@ impl HarborLinkMediaClient {
                 false,
             )
             .timeout(Duration::from_secs(3))
-            .send()
+            .send_harborlink()
             .map_err(unavailable_error)?;
         decode_json_response(response, "HarborLink readiness")
     }
@@ -220,7 +287,7 @@ impl HarborLinkMediaClient {
                 false,
             )
             .timeout(Duration::from_secs(3))
-            .send()
+            .send_harborlink()
             .map_err(unavailable_error)?;
         decode_json_response(response, "HarborLink capabilities")
     }
@@ -239,7 +306,7 @@ impl HarborLinkMediaClient {
                 stream_profile,
                 ttl_seconds,
             })
-            .send()
+            .send_harborlink()
             .map_err(unavailable_error)?;
         decode_session_response(response)
     }
@@ -256,7 +323,7 @@ impl HarborLinkMediaClient {
                 false,
             )
             .timeout(Duration::from_secs(4))
-            .send()
+            .send_harborlink()
             .map_err(unavailable_error)?;
         decode_session_response(response)
     }
@@ -276,7 +343,7 @@ impl HarborLinkMediaClient {
                 true,
             )
             .timeout(Duration::from_secs(4))
-            .send()
+            .send_harborlink()
             .map_err(unavailable_error)?;
         decode_session_response(response)
     }
@@ -299,7 +366,7 @@ impl HarborLinkMediaClient {
             )
             .timeout(Duration::from_secs(4))
             .json(&json!({ "ttl_seconds": ttl_seconds }))
-            .send()
+            .send_harborlink()
             .map_err(unavailable_error)?;
         decode_session_response(response)
     }
@@ -316,7 +383,7 @@ impl HarborLinkMediaClient {
                 false,
             )
             .timeout(Duration::from_secs(20))
-            .send()
+            .send_harborlink()
             .map_err(unavailable_error)?;
         if !response.status().is_success() {
             return Err(redacted_media_error(response.status(), "camera snapshot"));
@@ -330,6 +397,23 @@ impl HarborLinkMediaClient {
         Ok(bytes.to_vec())
     }
 
+    pub fn archive_snapshot(&self, camera_id: &str) -> Result<HarborLinkRecordingArtifact, String> {
+        let response = self
+            .request(
+                reqwest::Method::POST,
+                format!(
+                    "{}/v1/cameras/{}/snapshot.jpg",
+                    self.base_url,
+                    encode_path_segment(camera_id)
+                ),
+                true,
+            )
+            .timeout(Duration::from_secs(20))
+            .send_harborlink()
+            .map_err(unavailable_error)?;
+        decode_json_response(response, "camera snapshot archive")
+    }
+
     pub fn open_mjpeg(&self, camera_id: &str) -> Result<HarborLinkMjpegStream, String> {
         let response = self
             .request(
@@ -341,7 +425,7 @@ impl HarborLinkMediaClient {
                 ),
                 false,
             )
-            .send()
+            .send_harborlink()
             .map_err(unavailable_error)?;
         if !response.status().is_success() {
             return Err(redacted_media_error(
@@ -393,7 +477,7 @@ impl HarborLinkMediaClient {
                 "keyframeCount": keyframe_count,
                 "keyframeIntervalSeconds": keyframe_interval_seconds,
             }))
-            .send()
+            .send_harborlink()
             .map_err(unavailable_error)?;
         decode_json_response(response, "camera clip capture")
     }
@@ -420,7 +504,7 @@ impl HarborLinkMediaClient {
         } else {
             request
         };
-        let response = request.send().map_err(unavailable_error)?;
+        let response = request.send_harborlink().map_err(unavailable_error)?;
         if !response.status().is_success() {
             return Err(redacted_media_error(response.status(), "camera recording"));
         }
@@ -443,7 +527,7 @@ impl HarborLinkMediaClient {
                 false,
             )
             .timeout(Duration::from_secs(4))
-            .send()
+            .send_harborlink()
             .map_err(unavailable_error)?;
         decode_json_response(response, "camera credential status")
     }
@@ -473,7 +557,7 @@ impl HarborLinkMediaClient {
                 "rtspPort": rtsp_port,
                 "rtspPaths": rtsp_paths,
             }))
-            .send()
+            .send_harborlink()
             .map_err(unavailable_error)?;
         decode_json_response(response, "camera credential update")
     }
@@ -503,7 +587,7 @@ impl HarborLinkMediaClient {
                 "rtspPort": rtsp_port,
                 "rtspPaths": rtsp_paths,
             }))
-            .send()
+            .send_harborlink()
             .map_err(unavailable_error)?;
         decode_json_response(response, "camera RTSP check")
     }
@@ -525,7 +609,7 @@ impl HarborLinkMediaClient {
             )
             .timeout(Duration::from_secs(20))
             .json(registration)
-            .send()
+            .send_harborlink()
             .map_err(unavailable_error)?;
         decode_json_response(response, "camera registration")
     }
@@ -554,7 +638,7 @@ impl HarborLinkMediaClient {
                 "rtspPassword": rtsp_password,
                 "rtspPaths": rtsp_paths,
             }))
-            .send()
+            .send_harborlink()
             .map_err(unavailable_error)?;
         decode_json_response(response, "camera discovery")
     }
@@ -567,7 +651,7 @@ impl HarborLinkMediaClient {
                 false,
             )
             .timeout(Duration::from_secs(4))
-            .send()
+            .send_harborlink()
             .map_err(unavailable_error)?;
         decode_json_response(response, "camera discovery settings")
     }
@@ -596,7 +680,7 @@ impl HarborLinkMediaClient {
                 "rtspUsername": rtsp_username,
                 "rtspPassword": rtsp_password,
             }))
-            .send()
+            .send_harborlink()
             .map_err(unavailable_error)?;
         decode_json_response(response, "camera discovery settings")
     }
@@ -610,9 +694,86 @@ impl HarborLinkMediaClient {
             )
             .timeout(Duration::from_secs(4))
             .json(settings)
-            .send()
+            .send_harborlink()
             .map_err(unavailable_error)?;
         decode_json_response(response, "DVR settings update")
+    }
+
+    pub fn recording_timeline(
+        &self,
+        camera_id: &str,
+    ) -> Result<Vec<HarborLinkRecordingArtifact>, String> {
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                format!(
+                    "{}/v1/cameras/{}/artifacts",
+                    self.base_url,
+                    encode_path_segment(camera_id)
+                ),
+                false,
+            )
+            .timeout(Duration::from_secs(10))
+            .send_harborlink()
+            .map_err(unavailable_error)?;
+        decode_json_response(response, "DVR timeline")
+    }
+
+    pub fn apply_dvr_retention(&self) -> Result<HarborLinkRetentionResult, String> {
+        let response = self
+            .request(
+                reqwest::Method::POST,
+                format!("{}/v1/dvr/retention/apply", self.base_url),
+                true,
+            )
+            .timeout(Duration::from_secs(30))
+            .send_harborlink()
+            .map_err(unavailable_error)?;
+        decode_json_response(response, "DVR retention")
+    }
+
+    pub fn delete_dvr_artifact(&self, artifact_id: &str) -> Result<Value, String> {
+        let response = self
+            .request(
+                reqwest::Method::DELETE,
+                format!(
+                    "{}/v1/dvr/artifacts/{}",
+                    self.base_url,
+                    encode_path_segment(artifact_id)
+                ),
+                true,
+            )
+            .timeout(Duration::from_secs(10))
+            .send_harborlink()
+            .map_err(unavailable_error)?;
+        decode_json_response(response, "DVR artifact deletion")
+    }
+
+    pub fn open_dvr_artifact(
+        &self,
+        artifact_id: &str,
+        range: Option<&str>,
+    ) -> Result<Response, String> {
+        let mut request = self
+            .request(
+                reqwest::Method::GET,
+                format!(
+                    "{}/v1/dvr/artifacts/{}",
+                    self.base_url,
+                    encode_path_segment(artifact_id)
+                ),
+                false,
+            )
+            .timeout(Duration::from_secs(30));
+        if let Some(range) = range {
+            request = request.header(reqwest::header::RANGE, range);
+        }
+        let response = request.send_harborlink().map_err(unavailable_error)?;
+        if response.status().is_success() {
+            Ok(response)
+        } else {
+            Err(redacted_media_response_error(response, "DVR artifact"))
+        }
     }
 
     pub fn upsert_camera(&self, camera_id: &str, camera: &Value) -> Result<Value, String> {
@@ -628,7 +789,7 @@ impl HarborLinkMediaClient {
             )
             .timeout(Duration::from_secs(4))
             .json(camera)
-            .send()
+            .send_harborlink()
             .map_err(unavailable_error)?;
         decode_json_response(response, "camera registry update")
     }
@@ -646,7 +807,7 @@ impl HarborLinkMediaClient {
             )
             .timeout(Duration::from_secs(4))
             .json(update)
-            .send()
+            .send_harborlink()
             .map_err(unavailable_error)?;
         decode_json_response(response, "camera metadata update")
     }
@@ -663,7 +824,7 @@ impl HarborLinkMediaClient {
                 true,
             )
             .timeout(Duration::from_secs(4))
-            .send()
+            .send_harborlink()
             .map_err(unavailable_error)?;
         decode_json_response(response, "camera registry removal")
     }
@@ -676,7 +837,7 @@ impl HarborLinkMediaClient {
                 false,
             )
             .timeout(Duration::from_secs(4))
-            .send()
+            .send_harborlink()
             .map_err(unavailable_error)?;
         decode_json_response(response, "Home Assistant status")
     }
@@ -709,7 +870,7 @@ impl HarborLinkMediaClient {
                 "cameraEntityBindings": camera_entity_bindings,
                 "clearAccessToken": clear_access_token,
             }))
-            .send()
+            .send_harborlink()
             .map_err(unavailable_error)?;
         decode_json_response(response, "Home Assistant configuration")
     }
@@ -777,8 +938,28 @@ fn read_local_api_token_from_env() -> Result<Option<String>, String> {
     }
 }
 
+fn require_harborlink_cutover() -> Result<(), String> {
+    let mode = std::env::var("HARBORBEACON_SOUTHBOUND_MODE").unwrap_or_default();
+    if mode.trim().eq_ignore_ascii_case(HARBORLINK_CUTOVER_MODE) {
+        Ok(())
+    } else {
+        Err("HARBORBEACON_SOUTHBOUND_MODE must explicitly select harborlink".to_string())
+    }
+}
+
 fn unavailable_error(error: reqwest::Error) -> String {
-    format!("HarborLink southbound media service is unavailable: {error}")
+    let status = error
+        .status()
+        .map(|status| status.as_u16())
+        .unwrap_or(StatusCode::SERVICE_UNAVAILABLE.as_u16());
+    encode_contract_error(HarborLinkContractError {
+        status_code: status,
+        code: "HARBORLINK_UNAVAILABLE".to_string(),
+        message: "HarborLink southbound service is unavailable".to_string(),
+        retryable: true,
+        dependency: "harborlink".to_string(),
+        request_id: None,
+    })
 }
 
 fn decode_session_response(response: Response) -> Result<HarborLinkLiveSession, String> {
@@ -786,7 +967,7 @@ fn decode_session_response(response: Response) -> Result<HarborLinkLiveSession, 
     if status.is_success() {
         return response
             .json::<HarborLinkLiveSession>()
-            .map_err(|error| format!("HarborLink returned an invalid media response: {error}"));
+            .map_err(|_| invalid_response_error("live session"));
     }
     Err(redacted_media_response_error(response, "live session"))
 }
@@ -800,11 +981,16 @@ fn decode_json_response<T: for<'de> Deserialize<'de>>(
     }
     response
         .json::<T>()
-        .map_err(|error| format!("HarborLink returned an invalid {operation} response: {error}"))
+        .map_err(|_| invalid_response_error(operation))
 }
 
 fn redacted_media_response_error(response: Response, operation: &str) -> String {
     let status = response.status();
+    let response_request_id = response
+        .headers()
+        .get("X-Request-Id")
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
     if let Ok(value) = response.json::<Value>() {
         if let Some(error) = value.get("error") {
             let code = error
@@ -819,13 +1005,53 @@ fn redacted_media_response_error(response: Response, operation: &str) -> String 
                 .get("retryable")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            return format!(
-                "HarborLink {operation} failed: {code} from {dependency}; retryable={retryable} (HTTP {})",
-                status.as_u16()
-            );
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .map(redact_contract_message)
+                .unwrap_or_else(|| format!("HarborLink {operation} failed"));
+            let request_id = value
+                .get("requestId")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .or(response_request_id);
+            return encode_contract_error(HarborLinkContractError {
+                status_code: status.as_u16(),
+                code: code.to_string(),
+                message,
+                retryable,
+                dependency: dependency.to_string(),
+                request_id,
+            });
         }
     }
-    redacted_media_error(status, operation)
+    encode_contract_error(HarborLinkContractError {
+        status_code: status.as_u16(),
+        code: "HARBORLINK_ERROR".to_string(),
+        message: redacted_media_error(status, operation),
+        retryable: status.is_server_error(),
+        dependency: "harborlink".to_string(),
+        request_id: response_request_id,
+    })
+}
+
+fn invalid_response_error(operation: &str) -> String {
+    encode_contract_error(HarborLinkContractError {
+        status_code: StatusCode::BAD_GATEWAY.as_u16(),
+        code: "HARBORLINK_INVALID_RESPONSE".to_string(),
+        message: format!("HarborLink returned an invalid {operation} response"),
+        retryable: false,
+        dependency: "harborlink".to_string(),
+        request_id: None,
+    })
+}
+
+fn encode_contract_error(error: HarborLinkContractError) -> String {
+    serde_json::to_string(&error).expect("HarborLink contract error serialization must succeed")
+}
+
+fn redact_contract_message(value: &str) -> String {
+    value.replace(['\r', '\n'], " ").chars().take(512).collect()
 }
 
 fn redacted_media_error(status: StatusCode, operation: &str) -> String {
@@ -853,7 +1079,8 @@ fn encode_path_segment(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        encode_path_segment, HarborLinkMediaClient, StartLiveSessionRequest, StartRecordingRequest,
+        encode_path_segment, HarborLinkContractError, HarborLinkMediaClient,
+        StartLiveSessionRequest, StartRecordingRequest,
     };
 
     #[test]
@@ -903,6 +1130,48 @@ mod tests {
         .expect("serialize request");
 
         assert!(body.get("stream_profile").is_none());
+    }
+
+    #[test]
+    fn mutation_retry_clones_reuse_the_same_request_id() {
+        let client = HarborLinkMediaClient::new("http://127.0.0.1:8790").expect("client");
+        let request = client.request(
+            reqwest::Method::POST,
+            "http://127.0.0.1:8790/v1/cameras/cam-1/recordings/current".to_string(),
+            true,
+        );
+        let first = request
+            .try_clone()
+            .expect("clone first attempt")
+            .build()
+            .expect("build first attempt");
+        let retry = request
+            .try_clone()
+            .expect("clone retry")
+            .build()
+            .expect("build retry");
+        assert_eq!(
+            first.headers().get("X-Request-Id"),
+            retry.headers().get("X-Request-Id")
+        );
+        assert!(first.headers().get("X-Request-Id").is_some());
+    }
+
+    #[test]
+    fn structured_contract_errors_preserve_review_fields() {
+        let error = HarborLinkContractError {
+            status_code: 503,
+            code: "MEDIAMTX_UNAVAILABLE".to_string(),
+            message: "Media relay is unavailable".to_string(),
+            retryable: true,
+            dependency: "mediamtx".to_string(),
+            request_id: Some("beacon-operation-1".to_string()),
+        };
+        let value = serde_json::to_value(error).expect("serialize contract error");
+        assert_eq!(value["code"], "MEDIAMTX_UNAVAILABLE");
+        assert_eq!(value["retryable"], true);
+        assert_eq!(value["dependency"], "mediamtx");
+        assert_eq!(value["requestId"], "beacon-operation-1");
     }
 
     #[test]
