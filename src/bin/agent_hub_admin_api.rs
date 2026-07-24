@@ -2923,8 +2923,12 @@ impl AdminApi {
                     .boxed()
             }
             Method::Post if path.starts_with("/api/cameras/") && path.ends_with("/snapshot") => {
-                self.handle_camera_task_snapshot(&path, &identity_hints)
-                    .boxed()
+                self.handle_camera_task_snapshot(
+                    &path,
+                    &identity_hints,
+                    business_request_id.as_deref(),
+                )
+                .boxed()
             }
             Method::Post if path.starts_with("/api/cameras/") && path.ends_with("/analyze") => {
                 self.handle_camera_analyze(&path, &identity_hints).boxed()
@@ -8140,6 +8144,7 @@ impl AdminApi {
         &self,
         path: &str,
         hints: &AccessIdentityHints,
+        business_request_id: Option<&str>,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
         let device_id = match parse_camera_task_snapshot_path(path) {
             Some(device_id) => device_id,
@@ -8151,14 +8156,11 @@ impl AdminApi {
                 Err(error) => return error_json(StatusCode(403), &error),
             };
 
-        let task_response =
-            redact_camera_task_response(self.snapshot_camera(&principal, &device_id));
-        let media_item = match self.harborlink_media.archive_snapshot(&device_id) {
-            Ok(artifact) => dvr_timeline_segment_from_harborlink(artifact, None, None),
-            Err(error) => return error_json(StatusCode(502), &error),
-        };
+        let task_response = self.snapshot_camera(&principal, &device_id, business_request_id);
+        let media_item = snapshot_artifact_from_task_response(&task_response)
+            .and_then(|artifact| dvr_timeline_segment_from_harborlink(artifact, None, None));
         ok_json(&CameraTaskResponse {
-            task_response,
+            task_response: redact_camera_task_response(task_response),
             media_item,
         })
     }
@@ -9009,16 +9011,29 @@ impl AdminApi {
             ))
     }
 
-    fn snapshot_camera(&self, principal: &AccessPrincipal, device_id: &str) -> TaskResponse {
-        self.task_service
-            .handle_task(self.build_camera_task_request(
-                principal,
-                "snapshot",
-                "抓拍摄像头画面",
-                json!({
-                    "device_id": device_id,
-                }),
-            ))
+    fn snapshot_camera(
+        &self,
+        principal: &AccessPrincipal,
+        device_id: &str,
+        business_request_id: Option<&str>,
+    ) -> TaskResponse {
+        let mut request = self.build_camera_task_request(
+            principal,
+            "snapshot",
+            "抓拍摄像头画面",
+            json!({
+                "device_id": device_id,
+            }),
+        );
+        if let Some(request_id) = business_request_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            request.task_id = format!("task-camera-snapshot-{}", short_sha256(request_id));
+            request.trace_id = request.task_id.clone();
+            request.step_id = "snapshot".to_string();
+        }
+        self.task_service.handle_task(request)
     }
 
     fn share_camera_link(&self, principal: &AccessPrincipal, device_id: &str) -> TaskResponse {
@@ -9125,7 +9140,7 @@ impl AdminApi {
             .record_device_evidence(rtsp_check.clone())?;
 
         let snapshot_check = if device_has_snapshot_path(device) {
-            let response = self.snapshot_camera(principal, &device.device_id);
+            let response = self.snapshot_camera(principal, &device.device_id, None);
             build_snapshot_check_evidence(device, &response, Some(&validation_id))
         } else {
             build_snapshot_skipped_evidence(
@@ -20162,6 +20177,16 @@ fn dvr_timeline_segment_from_harborlink(
     })
 }
 
+fn snapshot_artifact_from_task_response(
+    response: &TaskResponse,
+) -> Option<HarborLinkRecordingArtifact> {
+    let artifact = response
+        .result
+        .data
+        .pointer("/snapshot/harborlink_artifact")?;
+    serde_json::from_value(artifact.clone()).ok()
+}
+
 fn percent_decode_path_segment(value: &str) -> Result<String, String> {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
@@ -20394,14 +20419,14 @@ mod tests {
         resolve_harbor_assistant_asset_path, resolve_knowledge_preview_path,
         run_knowledge_index_jobs, run_model_download_job, run_model_download_transfer,
         sanitized_outreach_delivery_request_audit, service_overloaded_response,
-        url_encode_path_segment, validate_home_assistant_service_fields,
-        validate_home_assistant_service_smoke, validate_outreach_delivery_request, AdminApi,
-        CameraLiveSessionProjection, CameraStreamProfile, DetectionJobProjection,
-        DetectionJobRuntime, DetectionJobStartRequest, HarborLinkHomeAssistantStatus,
-        HarborLinkLiveSession, HarborLinkMediaClient, HarborLinkRecordingArtifact,
-        HarborLinkRecordingStatus, HomeAssistantServiceSmokeRequest, HomeGuardianEvaluationQueue,
-        KnowledgeSearchApiRequest, LocalModelRuntimeProjection, ManualAddRequest,
-        ModelRuntimeActivationRequest, ModelRuntimeActivationResult,
+        snapshot_artifact_from_task_response, url_encode_path_segment,
+        validate_home_assistant_service_fields, validate_home_assistant_service_smoke,
+        validate_outreach_delivery_request, AdminApi, CameraLiveSessionProjection,
+        CameraStreamProfile, DetectionJobProjection, DetectionJobRuntime, DetectionJobStartRequest,
+        HarborLinkHomeAssistantStatus, HarborLinkLiveSession, HarborLinkMediaClient,
+        HarborLinkRecordingArtifact, HarborLinkRecordingStatus, HomeAssistantServiceSmokeRequest,
+        HomeGuardianEvaluationQueue, KnowledgeSearchApiRequest, LocalModelRuntimeProjection,
+        ManualAddRequest, ModelRuntimeActivationRequest, ModelRuntimeActivationResult,
         OutreachDeliveryRecipientRequest, OutreachDeliveryRequest, VisionIngestLimiter,
         DEFAULT_HF_ENDPOINT, HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS,
         HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS, MAX_DETECTION_JOB_HISTORY,
@@ -20441,7 +20466,7 @@ mod tests {
     use harborbeacon_local_agent::runtime::privacy_gateway::PRIVACY_GATEWAY_POLICY_VERSION;
     use harborbeacon_local_agent::runtime::registry::{CameraDevice, DeviceRegistryStore};
     use harborbeacon_local_agent::runtime::remote_view;
-    use harborbeacon_local_agent::runtime::task_api::TaskApiService;
+    use harborbeacon_local_agent::runtime::task_api::{TaskApiService, TaskResponse, TaskStatus};
     use harborbeacon_local_agent::runtime::task_session::TaskConversationStore;
     use harborbeacon_local_agent::runtime::vision_event::{
         ingest_local_vision_event, LocalVisionEvent, SnapshotArtifact, StoredLocalVisionEvent,
@@ -21865,24 +21890,44 @@ mod tests {
             Some("http://harborbeacon.local:4174/api/cameras/camera%201%2Fleft/live.mjpeg")
         );
 
-        let snapshot = dvr_timeline_segment_from_harborlink(
-            HarborLinkRecordingArtifact {
-                artifact_id: "snapshots~cam-1~2026~07~23~021258.jpg".to_string(),
-                camera_id: "cam-1".to_string(),
-                kind: "snapshot".to_string(),
-                mime_type: "image/jpeg".to_string(),
-                byte_size: 146_584,
-                started_at_epoch_ms: 1_784_772_778_000,
-                ended_at_epoch_ms: 1_784_772_778_000,
-                duration_seconds: 0,
-                stream_kind: "snapshot".to_string(),
-                modified_at_epoch_ms: 1_784_772_778_731,
-                preview_url: "/v1/dvr/artifacts/snapshot".to_string(),
+        let snapshot_artifact = HarborLinkRecordingArtifact {
+            artifact_id: "snapshots~cam-1~2026~07~23~021258.jpg".to_string(),
+            camera_id: "cam-1".to_string(),
+            kind: "snapshot".to_string(),
+            mime_type: "image/jpeg".to_string(),
+            byte_size: 146_584,
+            started_at_epoch_ms: 1_784_772_778_000,
+            ended_at_epoch_ms: 1_784_772_778_000,
+            duration_seconds: 0,
+            stream_kind: "snapshot".to_string(),
+            modified_at_epoch_ms: 1_784_772_778_731,
+            preview_url: "/v1/dvr/artifacts/snapshot".to_string(),
+        };
+        let task_response = TaskResponse {
+            task_id: "task-snapshot".to_string(),
+            trace_id: "trace-snapshot".to_string(),
+            status: TaskStatus::Completed,
+            executor_used: "camera_hub_service".to_string(),
+            risk_level: harborbeacon_local_agent::orchestrator::contracts::RiskLevel::Low,
+            result: harborbeacon_local_agent::runtime::task_api::TaskResultEnvelope {
+                data: json!({
+                    "snapshot": {
+                        "harborlink_artifact": snapshot_artifact.clone(),
+                    }
+                }),
+                ..Default::default()
             },
-            None,
-            None,
-        )
-        .expect("snapshot projection");
+            audit_ref: "audit-snapshot".to_string(),
+            missing_fields: Vec::new(),
+            prompt: None,
+            resume_token: None,
+        };
+        let extracted = snapshot_artifact_from_task_response(&task_response)
+            .expect("snapshot artifact from task response");
+        assert_eq!(extracted.artifact_id, snapshot_artifact.artifact_id);
+
+        let snapshot = dvr_timeline_segment_from_harborlink(snapshot_artifact, None, None)
+            .expect("snapshot projection");
         assert_eq!(snapshot.media_kind, "snapshot");
         assert_eq!(snapshot.started_at, "1784772778");
         assert_eq!(snapshot.thumbnail_url, snapshot.replay_url);

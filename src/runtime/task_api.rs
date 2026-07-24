@@ -14,7 +14,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -46,7 +45,9 @@ use self::system_readiness_actions::build_general_message_readiness_summary;
 #[cfg(test)]
 use self::vision_event_actions::build_redacted_vision_event_summary;
 
-use crate::connectors::harborlink_media::{harborlink_request_scope, HarborLinkMediaClient};
+use crate::connectors::harborlink_media::{
+    harborlink_request_scope, HarborLinkMediaClient, HarborLinkRecordingArtifact,
+};
 use crate::connectors::home_assistant::{
     normalize_home_assistant_service_action_request,
     validate_home_assistant_service_action_request, HomeAssistantClient, HomeAssistantEntity,
@@ -90,12 +91,12 @@ use crate::orchestrator::router::{Executor, Router};
 use crate::orchestrator::workflow_compiler::{
     compile_system_diagnostics_candidate, WorkflowCandidate,
 };
-use crate::runtime::admin_console::{
-    harboros_writable_root, AdminConsoleState, AdminConsoleStore, AdminModelCenterState,
-    NotificationTargetRecord, RagResourceProfile,
-};
 #[cfg(test)]
 use crate::runtime::admin_console::{resolved_identity_binding_records, IdentityBindingRecord};
+use crate::runtime::admin_console::{
+    AdminConsoleState, AdminConsoleStore, AdminModelCenterState, NotificationTargetRecord,
+    RagResourceProfile,
+};
 use crate::runtime::hub::{
     looks_like_auth_error, CameraConnectRequest, CameraHubService, HubScanRequest,
     HubScanResultItem,
@@ -104,7 +105,7 @@ use crate::runtime::knowledge::{
     KnowledgeSearchCitation, KnowledgeSearchRequest, KnowledgeSearchResponse,
     KnowledgeSearchService,
 };
-use crate::runtime::media::{ClipCaptureResult, SnapshotCaptureResult};
+use crate::runtime::media::ClipCaptureResult;
 use crate::runtime::model_center::{
     run_llm_text_with_state_and_options, run_ocr_with_state, run_vlm_summary_with_state,
     LlmTextExecution, LlmTextOptions,
@@ -119,7 +120,6 @@ use crate::runtime::task_session::{
     TaskConversationState, TaskConversationStore,
 };
 use crate::runtime::vision_event::StoredLocalVisionEvent;
-const ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV: &str = "HARBOR_ALLOW_NON_HARBOROS_CAPTURE_ROOT";
 const GENERAL_MESSAGE_RECAP_LIMIT: usize = 3;
 const GENERAL_MESSAGE_TURN_BUDGET_MS: u64 = 24_000;
 const GENERAL_MESSAGE_ROUTER_BUDGET_MS: u64 = 12_000;
@@ -3103,38 +3103,22 @@ impl TaskApiService {
             return response;
         }
 
-        match self.hub().capture_camera_snapshot_result(&target.device_id) {
+        let harborlink = match HarborLinkMediaClient::from_env() {
+            Ok(client) => client,
+            Err(error) => {
+                return self.failed(request, "camera_hub_service", RiskLevel::Low, error);
+            }
+        };
+        match harborlink.archive_snapshot(&target.device_id) {
             Ok(snapshot) => {
-                let admin_state = match self.admin_store.load_or_create_state() {
-                    Ok(state) => state,
-                    Err(error) => {
-                        return self.failed(request, "camera_hub_service", RiskLevel::Low, error);
-                    }
-                };
-                let recording_policy = resolved_recording_policy(&admin_state, Some(&target));
-                let snapshot = match self.persist_snapshot_capture(
-                    &admin_state,
-                    recording_policy.as_ref(),
-                    &target,
-                    snapshot,
-                ) {
-                    Ok(snapshot) => snapshot,
-                    Err(error) => {
-                        return self.failed(
-                            request,
-                            "camera_hub_service",
-                            RiskLevel::Low,
-                            format!("抓拍已完成，但保存图片失败: {error}"),
-                        );
-                    }
-                };
-                let media_asset = build_snapshot_media_asset(request, &target, &snapshot);
+                let media_asset =
+                    build_harborlink_snapshot_media_asset(request, &target, &snapshot);
                 if let Err(error) = self.conversation_store.save_media_asset(&media_asset) {
                     return self.failed(
                         request,
                         "camera_hub_service",
                         RiskLevel::Low,
-                        format!("抓拍已完成，但保存媒体记录失败: {error}"),
+                        format!("抓拍已归档，但保存媒体引用失败: {error}"),
                     );
                 }
 
@@ -3143,8 +3127,8 @@ impl TaskApiService {
                     "camera_hub_service",
                     RiskLevel::Low,
                     format!("已抓拍 {} 当前画面。", target.display_name),
-                    build_snapshot_payload(&target, &snapshot, &media_asset),
-                    vec![build_snapshot_artifact(&snapshot, &media_asset)],
+                    build_harborlink_snapshot_payload(&target, &snapshot, &media_asset),
+                    vec![build_harborlink_snapshot_artifact(&snapshot, &media_asset)],
                     vec![format!("分析 {}", target.display_name)],
                 )
             }
@@ -3859,54 +3843,6 @@ impl TaskApiService {
             .first()
             .cloned()
             .ok_or_else(|| "未找到可分析的摄像头设备。".to_string())
-    }
-
-    fn persist_snapshot_capture(
-        &self,
-        state: &AdminConsoleState,
-        recording_policy: Option<&RecordingPolicy>,
-        target: &ResolvedCameraTarget,
-        snapshot: SnapshotCaptureResult,
-    ) -> Result<SnapshotCaptureResult, String> {
-        let capture_root = resolved_capture_directory(state, recording_policy)?;
-        let image_bytes = BASE64_STANDARD
-            .decode(snapshot.bytes_base64.as_bytes())
-            .map_err(|error| format!("failed to decode snapshot bytes: {error}"))?;
-        let output_path = build_snapshot_output_path(
-            &capture_root,
-            target,
-            snapshot.captured_at_epoch_ms,
-            snapshot.format.file_extension(),
-        );
-        fs::write(&output_path, &image_bytes).map_err(|error| {
-            format!(
-                "failed to write snapshot {}: {error}",
-                output_path.display()
-            )
-        })?;
-
-        let mut persisted = snapshot;
-        persisted.storage.target = StorageTarget::HarborOsPool;
-        persisted.storage.relative_path = output_path.to_string_lossy().to_string();
-        persisted.index_sidecar_relative_path = output_path
-            .with_extension("json")
-            .to_string_lossy()
-            .to_string();
-
-        let ocr = run_ocr_with_state(&output_path, &state.models);
-        let vlm = run_vlm_summary_with_state(&output_path, &state.models);
-        let snapshot_tags = vec!["camera".to_string(), "snapshot".to_string()];
-        write_media_index_sidecar(
-            &output_path.with_extension("json"),
-            &persisted.storage.relative_path,
-            None,
-            target,
-            &ocr.text,
-            &vlm.text,
-            &snapshot_tags,
-        )?;
-
-        Ok(persisted)
     }
 
     fn persist_clip_ingest(
@@ -5216,9 +5152,9 @@ fn build_vision_artifacts(payload: &Value) -> Vec<TaskArtifact> {
     artifacts
 }
 
-fn build_snapshot_payload(
+fn build_harborlink_snapshot_payload(
     target: &ResolvedCameraTarget,
-    snapshot: &SnapshotCaptureResult,
+    snapshot: &HarborLinkRecordingArtifact,
     media_asset: &MediaAsset,
 ) -> Value {
     json!({
@@ -5227,48 +5163,57 @@ fn build_snapshot_payload(
             "media_asset_id": media_asset.asset_id.clone(),
             "mime_type": snapshot.mime_type.clone(),
             "byte_size": snapshot.byte_size,
-            "captured_at_epoch_ms": snapshot.captured_at_epoch_ms,
-            "storage": snapshot.storage.clone(),
+            "captured_at_epoch_ms": harborlink_snapshot_captured_at(snapshot),
+            "storage": {
+                "target": StorageTargetKind::HarborOsPool,
+                "relative_path": harborlink_snapshot_storage_uri(snapshot),
+            },
+            "harborlink_artifact": snapshot,
         }
     })
 }
 
-fn build_snapshot_artifact(
-    snapshot: &SnapshotCaptureResult,
+fn build_harborlink_snapshot_artifact(
+    snapshot: &HarborLinkRecordingArtifact,
     media_asset: &MediaAsset,
 ) -> TaskArtifact {
+    let proxy_url = format!(
+        "/api/cameras/recordings/artifacts/{}",
+        url_encode_path_segment(&snapshot.artifact_id)
+    );
     TaskArtifact {
         kind: "image".to_string(),
         label: "抓拍图片".to_string(),
         mime_type: snapshot.mime_type.clone(),
         media_asset_id: Some(media_asset.asset_id.clone()),
-        path: Some(snapshot.storage.relative_path.clone()),
-        url: None,
+        path: Some(harborlink_snapshot_storage_uri(snapshot)),
+        url: Some(proxy_url),
         metadata: json!({
             "media_asset_id": media_asset.asset_id.clone(),
-            "storage_target": snapshot.storage.target,
-            "captured_at_epoch_ms": snapshot.captured_at_epoch_ms,
+            "storage_target": StorageTargetKind::HarborOsPool,
+            "captured_at_epoch_ms": harborlink_snapshot_captured_at(snapshot),
             "byte_size": snapshot.byte_size,
+            "harborlink_artifact_id": snapshot.artifact_id,
         }),
     }
 }
 
-fn build_snapshot_media_asset(
+fn build_harborlink_snapshot_media_asset(
     request: &TaskRequest,
     target: &ResolvedCameraTarget,
-    snapshot: &SnapshotCaptureResult,
+    snapshot: &HarborLinkRecordingArtifact,
 ) -> MediaAsset {
     MediaAsset {
         asset_id: new_media_asset_id(),
         workspace_id: workspace_id_for_request(request),
         device_id: Some(target.device_id.clone()),
         asset_kind: MediaAssetKind::Snapshot,
-        storage_target: storage_target_kind_from_snapshot(snapshot.storage.target),
-        storage_uri: snapshot.storage.relative_path.clone(),
+        storage_target: StorageTargetKind::HarborOsPool,
+        storage_uri: harborlink_snapshot_storage_uri(snapshot),
         mime_type: snapshot.mime_type.clone(),
-        byte_size: snapshot.byte_size as u64,
-        checksum: snapshot_checksum(snapshot),
-        captured_at: Some(snapshot.captured_at_epoch_ms.to_string()),
+        byte_size: snapshot.byte_size,
+        checksum: None,
+        captured_at: Some(harborlink_snapshot_captured_at(snapshot).to_string()),
         started_at: None,
         ended_at: None,
         derived_from_asset_id: None,
@@ -5281,9 +5226,22 @@ fn build_snapshot_media_asset(
             "source_surface": request.source.surface.clone(),
             "camera_display_name": target.display_name.clone(),
             "room_name": target.room_name.clone(),
-            "storage_relative_path": snapshot.storage.relative_path.clone(),
-            "device_ingest_metadata": snapshot.ingest_metadata.clone(),
+            "storage_relative_path": harborlink_snapshot_storage_uri(snapshot),
+            "harborlink_artifact_id": snapshot.artifact_id,
+            "harborlink_preview_url": snapshot.preview_url,
         }),
+    }
+}
+
+fn harborlink_snapshot_storage_uri(snapshot: &HarborLinkRecordingArtifact) -> String {
+    format!("harborlink://dvr/{}", snapshot.artifact_id)
+}
+
+fn harborlink_snapshot_captured_at(snapshot: &HarborLinkRecordingArtifact) -> u128 {
+    if snapshot.started_at_epoch_ms == 0 {
+        snapshot.modified_at_epoch_ms
+    } else {
+        snapshot.started_at_epoch_ms
     }
 }
 
@@ -5730,98 +5688,11 @@ fn resolved_recording_policy(
         .or_else(|| state.platform.recording_policies.first().cloned())
 }
 
-fn resolved_capture_directory(
-    state: &AdminConsoleState,
-    recording_policy: Option<&RecordingPolicy>,
-) -> Result<PathBuf, String> {
-    let root = PathBuf::from(harboros_writable_root());
-    ensure_safe_capture_root(&root)?;
-    let subdirectory = recording_policy
-        .and_then(RecordingPolicy::capture_subdirectory)
-        .unwrap_or(state.defaults.capture_subdirectory.as_str());
-    let subdirectory = sanitize_relative_subdirectory(subdirectory)
-        .ok_or_else(|| "capture 子目录不合法，必须是 writable root 下的相对路径。".to_string())?;
-    let capture_root = root.join(subdirectory);
-    fs::create_dir_all(&capture_root).map_err(|error| {
-        format!(
-            "failed to create capture directory {}: {error}",
-            capture_root.display()
-        )
-    })?;
-    Ok(capture_root)
-}
-
-fn ensure_safe_capture_root(root: &Path) -> Result<(), String> {
-    let normalized = root.to_string_lossy().replace('\\', "/");
-    if normalized.starts_with("/mnt/software/harborbeacon-agent-ci") {
-        Ok(())
-    } else if std::env::var(ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV)
-        .ok()
-        .is_some_and(|value| env_flag_enabled(&value))
-        && root.is_absolute()
-        && normalized.ends_with("/harborbeacon-agent-ci")
-    {
-        Ok(())
-    } else {
-        Err(format!(
-            "capture writable root {} is outside the approved HarborOS root",
-            root.display()
-        ))
-    }
-}
-
-fn sanitize_relative_subdirectory(value: &str) -> Option<PathBuf> {
-    let trimmed = value.trim().trim_matches('/');
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let candidate = Path::new(trimmed);
-    if candidate.is_absolute() {
-        return None;
-    }
-    let mut sanitized = PathBuf::new();
-    for component in candidate.components() {
-        match component {
-            std::path::Component::Normal(segment) => sanitized.push(segment),
-            _ => return None,
-        }
-    }
-    (!sanitized.as_os_str().is_empty()).then_some(sanitized)
-}
-
-fn build_snapshot_output_path(
-    capture_root: &Path,
-    target: &ResolvedCameraTarget,
-    captured_at_epoch_ms: u128,
-    extension: &str,
-) -> PathBuf {
-    capture_root.join(format!(
-        "{}-{}.{}",
-        sanitize_path_segment(&target.device_id),
-        captured_at_epoch_ms,
-        extension
-    ))
-}
-
 fn current_epoch_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default()
-}
-
-fn sanitize_path_segment(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 fn write_media_index_sidecar(
@@ -5943,20 +5814,6 @@ fn storage_target_kind_from_snapshot(target: StorageTarget) -> StorageTargetKind
         StorageTarget::HarborOsPool => StorageTargetKind::HarborOsPool,
         StorageTarget::ExternalShare => StorageTargetKind::Nas,
     }
-}
-
-fn snapshot_checksum(snapshot: &SnapshotCaptureResult) -> Option<String> {
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(snapshot.bytes_base64.as_bytes())
-        .ok()?;
-    let digest = Sha256::digest(&bytes);
-    Some(format!(
-        "sha256:{}",
-        digest
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    ))
 }
 
 fn file_byte_size(path: &str) -> u64 {
@@ -9933,13 +9790,6 @@ fn notification_delivery_outcome(
     }
 }
 
-fn env_flag_enabled(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
-
 fn current_timestamp() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -10009,7 +9859,6 @@ mod tests {
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use base64::Engine as _;
     use serde_json::{json, Value};
     use tiny_http::{Header, Method, Response, Server};
 
@@ -10018,20 +9867,20 @@ mod tests {
         build_knowledge_search_artifacts, build_redacted_vision_event_summary, conversation_key,
         delivery_hints_from_task_response, effective_autonomy_level,
         effective_autonomy_level_for_task_run, effective_requires_approval,
-        ensure_safe_capture_root, env_flag_enabled, fallback_general_message_plan,
-        format_pending_candidates, general_message_requests_capability_summary,
-        infer_home_assistant_natural_action, infer_query_from_raw_text, knowledge_modalities,
-        normalize_command_text, notification_delivery_outcome, parse_general_message_plan,
-        pending_candidates_from_results, protocol_string, resolve_home_assistant_action_entity,
-        resolve_notification_recipient, room_aliases, should_route_general_message_to_knowledge,
-        GeneralMessageConversationAct, GeneralMessagePlanKind, HomeAssistantEntityResolution,
-        HomeAssistantNaturalAction, HomeAssistantNaturalActionRequest, PendingTaskCandidate,
-        TaskApiService, TaskArtifact, TaskIntent, TaskMessage, TaskRequest, TaskRequestAcceptance,
-        TaskResponse, TaskResultEnvelope, TaskSource, TaskStatus, TaskTurnActor, TaskTurnBlock,
+        fallback_general_message_plan, format_pending_candidates,
+        general_message_requests_capability_summary, infer_home_assistant_natural_action,
+        infer_query_from_raw_text, knowledge_modalities, normalize_command_text,
+        notification_delivery_outcome, parse_general_message_plan, pending_candidates_from_results,
+        protocol_string, resolve_home_assistant_action_entity, resolve_notification_recipient,
+        room_aliases, should_route_general_message_to_knowledge, GeneralMessageConversationAct,
+        GeneralMessagePlanKind, HomeAssistantEntityResolution, HomeAssistantNaturalAction,
+        HomeAssistantNaturalActionRequest, PendingTaskCandidate, TaskApiService, TaskArtifact,
+        TaskIntent, TaskMessage, TaskRequest, TaskRequestAcceptance, TaskResponse,
+        TaskResultEnvelope, TaskSource, TaskStatus, TaskTurnActor, TaskTurnBlock,
         TaskTurnContinuation, TaskTurnConversation, TaskTurnEnvelope, TaskTurnInput,
-        TaskTurnTransport, ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV, KNOWLEDGE_DOMAIN,
-        KNOWLEDGE_OP_SEARCH,
+        TaskTurnTransport, KNOWLEDGE_DOMAIN, KNOWLEDGE_OP_SEARCH,
     };
+    use crate::connectors::harborlink_media::HarborLinkRecordingArtifact;
     use crate::connectors::home_assistant::HomeAssistantEntity;
     use crate::connectors::notifications::{
         NotificationContent, NotificationDelivery, NotificationDeliveryError,
@@ -10039,7 +9888,6 @@ mod tests {
         NotificationMetadata, NotificationPayloadFormat, NotificationRecipientIdType,
         NotificationRequest, NotificationSource, SharedHttpErrorDetail, SharedHttpErrorEnvelope,
     };
-    use crate::connectors::storage::StorageTarget;
     use crate::control_plane::approvals::ApprovalStatus;
     use crate::control_plane::auth::{AuthSource, IdentityBinding};
     use crate::control_plane::media::{MediaAssetKind, StorageTargetKind};
@@ -10059,7 +9907,6 @@ mod tests {
         KnowledgeSearchHit, KnowledgeSearchReplyPack, KnowledgeSearchResponse,
     };
     use crate::runtime::knowledge_index::{KnowledgeIndexConfig, KnowledgeIndexService};
-    use crate::runtime::media::{SnapshotCaptureResult, SnapshotFormat};
     use crate::runtime::registry::{
         CameraCapabilities, CameraDevice, CameraStreamRef, DeviceRegistryStore, DeviceStatus,
         ResolvedCameraTarget, StreamTransport,
@@ -11300,7 +11147,7 @@ mod tests {
     }
 
     #[test]
-    fn build_snapshot_media_asset_populates_platform_fields() {
+    fn build_harborlink_snapshot_media_asset_populates_platform_fields() {
         let request = TaskRequest {
             task_id: "task-snapshot".to_string(),
             trace_id: "trace-snapshot".to_string(),
@@ -11355,17 +11202,23 @@ mod tests {
             },
             last_seen_at: None,
         };
-        let bytes = b"fake-jpeg";
-        let snapshot = SnapshotCaptureResult::new(
-            "cam-1",
-            SnapshotFormat::Jpeg,
-            base64::engine::general_purpose::STANDARD.encode(bytes),
-            bytes.len(),
-            StorageTarget::LocalDisk,
-        );
-        let expected_captured_at = snapshot.captured_at_epoch_ms.to_string();
+        let snapshot = HarborLinkRecordingArtifact {
+            artifact_id: "snapshots~cam-1~2026~07~24~030401.jpg".to_string(),
+            camera_id: "cam-1".to_string(),
+            kind: "snapshot".to_string(),
+            mime_type: "image/jpeg".to_string(),
+            byte_size: 9,
+            started_at_epoch_ms: 1_721_790_241_000,
+            ended_at_epoch_ms: 1_721_790_241_000,
+            duration_seconds: 0,
+            stream_kind: "snapshot".to_string(),
+            modified_at_epoch_ms: 1_721_790_241_000,
+            preview_url: "/v1/dvr/artifacts/snapshot".to_string(),
+        };
+        let expected_captured_at = snapshot.started_at_epoch_ms.to_string();
 
-        let media_asset = super::build_snapshot_media_asset(&request, &target, &snapshot);
+        let media_asset =
+            super::build_harborlink_snapshot_media_asset(&request, &target, &snapshot);
         assert!(media_asset.asset_id.starts_with("asset-"));
         assert_eq!(
             media_asset.workspace_id,
@@ -11373,18 +11226,18 @@ mod tests {
         );
         assert_eq!(media_asset.device_id.as_deref(), Some("cam-1"));
         assert_eq!(media_asset.asset_kind, MediaAssetKind::Snapshot);
-        assert_eq!(media_asset.storage_target, StorageTargetKind::LocalDisk);
-        assert_eq!(media_asset.storage_uri, snapshot.storage.relative_path);
+        assert_eq!(media_asset.storage_target, StorageTargetKind::HarborOsPool);
+        assert_eq!(
+            media_asset.storage_uri,
+            "harborlink://dvr/snapshots~cam-1~2026~07~24~030401.jpg"
+        );
         assert_eq!(media_asset.mime_type, "image/jpeg");
-        assert_eq!(media_asset.byte_size, bytes.len() as u64);
+        assert_eq!(media_asset.byte_size, 9);
         assert_eq!(
             media_asset.captured_at.as_deref(),
             Some(expected_captured_at.as_str())
         );
-        assert!(media_asset
-            .checksum
-            .as_deref()
-            .is_some_and(|value| value.starts_with("sha256:")));
+        assert!(media_asset.checksum.is_none());
         assert_eq!(
             media_asset
                 .metadata
@@ -11395,30 +11248,37 @@ mod tests {
         assert_eq!(
             media_asset
                 .metadata
-                .pointer("/device_ingest_metadata/provenance")
+                .pointer("/harborlink_artifact_id")
                 .and_then(Value::as_str),
-            Some("media")
-        );
-        assert_eq!(
-            media_asset
-                .metadata
-                .pointer("/device_ingest_metadata/ingest_disposition")
-                .and_then(Value::as_str),
-            Some("knowledge_index_candidate")
+            Some(snapshot.artifact_id.as_str())
         );
 
-        let payload = super::build_snapshot_payload(&target, &snapshot, &media_asset);
+        let payload = super::build_harborlink_snapshot_payload(&target, &snapshot, &media_asset);
         assert_eq!(
             payload
                 .pointer("/snapshot/media_asset_id")
                 .and_then(Value::as_str),
             Some(media_asset.asset_id.as_str())
         );
+        assert_eq!(
+            payload
+                .pointer("/snapshot/harborlink_artifact/artifactId")
+                .and_then(Value::as_str),
+            Some(snapshot.artifact_id.as_str())
+        );
 
-        let artifact = super::build_snapshot_artifact(&snapshot, &media_asset);
+        let artifact = super::build_harborlink_snapshot_artifact(&snapshot, &media_asset);
         assert_eq!(
             artifact.media_asset_id.as_deref(),
             Some(media_asset.asset_id.as_str())
+        );
+        assert_eq!(
+            artifact.path.as_deref(),
+            Some("harborlink://dvr/snapshots~cam-1~2026~07~24~030401.jpg")
+        );
+        assert_eq!(
+            artifact.url.as_deref(),
+            Some("/api/cameras/recordings/artifacts/snapshots~cam-1~2026~07~24~030401.jpg")
         );
         assert_eq!(
             artifact
@@ -11944,43 +11804,6 @@ mod tests {
         };
 
         assert!(should_route_general_message_to_knowledge(&request));
-    }
-
-    #[test]
-    fn env_flag_enabled_accepts_common_truthy_strings() {
-        assert!(env_flag_enabled("1"));
-        assert!(env_flag_enabled("true"));
-        assert!(env_flag_enabled("YES"));
-        assert!(env_flag_enabled(" on "));
-        assert!(!env_flag_enabled("0"));
-        assert!(!env_flag_enabled("false"));
-        assert!(!env_flag_enabled(""));
-    }
-
-    #[test]
-    fn ensure_safe_capture_root_allows_explicit_non_harboros_root_with_guard() {
-        let original = std::env::var(ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV).ok();
-        let allowed_root = if cfg!(windows) {
-            Path::new("C:/tmp/harborbeacon-agent-ci")
-        } else {
-            Path::new("/home/harbor/work/.tmp-live/harborbeacon-agent-ci")
-        };
-        unsafe {
-            std::env::set_var(ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV, "1");
-        }
-
-        let result = ensure_safe_capture_root(allowed_root);
-
-        match original {
-            Some(value) => unsafe {
-                std::env::set_var(ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV, value);
-            },
-            None => unsafe {
-                std::env::remove_var(ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV);
-            },
-        }
-
-        assert!(result.is_ok());
     }
 
     #[test]
