@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -26,8 +26,9 @@ use tiny_http::{Header, Method, Request, Response, ResponseBox, Server, StatusCo
 use uuid::Uuid;
 
 use harborbeacon_local_agent::connectors::harborlink_media::{
-    HarborLinkCredentialStatus, HarborLinkHomeAssistantStatus, HarborLinkLiveSession,
-    HarborLinkMediaClient, HarborLinkRecordingArtifact, HarborLinkRecordingStatus,
+    harborlink_request_scope, HarborLinkCredentialStatus, HarborLinkHomeAssistantStatus,
+    HarborLinkLiveSession, HarborLinkMediaClient, HarborLinkRecordingArtifact,
+    HarborLinkRecordingStatus,
 };
 #[cfg(test)]
 use harborbeacon_local_agent::connectors::home_assistant::validate_home_assistant_service_fields as validate_home_assistant_service_fields_shared;
@@ -87,8 +88,8 @@ use harborbeacon_local_agent::runtime::admin_console::{
     ModelDownloadJobRecord, ModelRuntimeRecord, NotificationTargetRecord, RagResourceProfile,
 };
 use harborbeacon_local_agent::runtime::dvr::{
-    build_status_response, DvrRecordingSettings, DvrRecordingStatus, DvrRecordingStatusResponse,
-    DvrTimelineResponse, DvrTimelineSegment,
+    build_status_response, sanitize_dvr_recording_settings, DvrRecordingSettings,
+    DvrRecordingStatus, DvrRecordingStatusResponse, DvrTimelineResponse, DvrTimelineSegment,
 };
 use harborbeacon_local_agent::runtime::evt_readiness::{
     build_evt_evidence_bundle, build_evt_readiness_report, evt_preflight_workflow_summary,
@@ -166,6 +167,18 @@ const ADMIN_HTTP_REQUEST_QUEUE_CAPACITY: usize = 256;
 const MAX_VISION_EVENT_INGEST_INFLIGHT: usize = 8;
 const HOME_GUARDIAN_ACTIVITY_LIMIT: usize = 500;
 const MAX_FAMILY_MEMORY_FEEDBACK_JSON_BYTES: usize = 32 * 1024;
+const DEFAULT_DETECTION_JOB_TTL_SECONDS: u64 = 60;
+const MIN_DETECTION_JOB_TTL_SECONDS: u64 = 60;
+const MAX_DETECTION_JOB_TTL_SECONDS: u64 = 900;
+const MAX_DETECTION_JOB_HISTORY: usize = 64;
+const DEFAULT_DETECTION_MAX_FPS: f64 = 5.0;
+const MAX_DETECTION_MAX_FPS: f64 = 10.0;
+const DEFAULT_DETECTION_CONFIDENCE: f64 = 0.35;
+const DEFAULT_DETECTION_WORKER: &str =
+    "/usr/lib/harboros-beacon/harbornavi_k3_yolo_stream_worker.py";
+const DEFAULT_DETECTION_MODEL: &str = "/var/lib/harboros-beacon/models/yolov8n_192x320.q.onnx";
+const DEFAULT_DETECTION_LABELS: &str = "/var/lib/harboros-beacon/models/label.txt";
+const DEFAULT_DETECTION_OUTPUT_ROOT: &str = "/run/harboros-beacon/detection-jobs";
 
 #[derive(Debug, Clone)]
 struct Cli {
@@ -301,6 +314,7 @@ pub struct AdminApi {
     guardian_action_runs: Arc<Mutex<HashMap<String, u64>>>,
     guardian_rule_cache: Arc<Mutex<HomeGuardianRuleCache>>,
     guardian_activity_log_lock: Arc<Mutex<()>>,
+    detection_jobs: Arc<Mutex<HashMap<String, DetectionJobRuntime>>>,
     http_runtime: HttpRuntimeCounters,
     vision_ingest_limiter: VisionIngestLimiter,
 }
@@ -1766,6 +1780,59 @@ struct DeviceValidationRunResponse {
     evidence: DeviceEvidenceResponse,
 }
 
+#[derive(Debug, Deserialize)]
+struct DetectionJobStartRequest {
+    camera_id: String,
+    #[serde(default)]
+    target_labels: Vec<String>,
+    duration_seconds: Option<u64>,
+    max_fps: Option<f64>,
+    confidence: Option<f64>,
+    stream_profile: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DetectionJobRenewRequest {
+    ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DetectionJobConfig {
+    camera_id: String,
+    target_label: String,
+    ttl_seconds: u64,
+    max_fps: f64,
+    confidence: f64,
+    stream_profile: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DetectionJobProjection {
+    job_id: String,
+    camera_id: String,
+    status: String,
+    target_labels: Vec<String>,
+    stream_profile: String,
+    max_fps: f64,
+    confidence: f64,
+    lease_id: String,
+    started_at: String,
+    updated_at: String,
+    expires_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metrics: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+struct DetectionJobRuntime {
+    projection: DetectionJobProjection,
+    output_dir: PathBuf,
+    child: Option<Child>,
+}
+
 type StateResponse = HubStateSnapshot;
 type ScanRequest = HubScanRequest;
 type ScanResponse = HubScanSummary;
@@ -1802,6 +1869,7 @@ impl AdminApi {
             guardian_action_runs: Arc::new(Mutex::new(HashMap::new())),
             guardian_rule_cache: Arc::new(Mutex::new(HomeGuardianRuleCache::default())),
             guardian_activity_log_lock: Arc::new(Mutex::new(())),
+            detection_jobs: Arc::new(Mutex::new(HashMap::new())),
             http_runtime: HttpRuntimeCounters::new(),
             vision_ingest_limiter: VisionIngestLimiter::new(),
         };
@@ -2317,6 +2385,9 @@ impl AdminApi {
         let remote_addr = request.remote_addr().copied();
         let headers = request.headers().to_vec();
         let identity_hints = request_identity_hints(&raw_url, &headers);
+        let business_request_id = header_value(&headers, "X-Request-Id")
+            .or_else(|| header_value(&headers, "Idempotency-Key"));
+        let _harborlink_request_scope = harborlink_request_scope(business_request_id.as_deref());
 
         if is_admin_surface_path(path.as_str()) || is_harbor_assistant_surface_path(path.as_str()) {
             if let Err(error) = ensure_local_admin_access(remote_addr, &headers) {
@@ -2515,6 +2586,21 @@ impl AdminApi {
             Method::Get if path == "/api/feature-availability" => {
                 self.handle_feature_availability(&identity_hints).boxed()
             }
+            Method::Post if path == "/api/vision/detection-jobs" => self
+                .handle_start_detection_job(&mut request, &identity_hints)
+                .boxed(),
+            Method::Post
+                if path.starts_with("/api/vision/detection-jobs/") && path.ends_with("/renew") =>
+            {
+                self.handle_renew_detection_job(&path, &mut request, &identity_hints)
+                    .boxed()
+            }
+            Method::Get if path.starts_with("/api/vision/detection-jobs/") => self
+                .handle_get_detection_job(&path, &identity_hints)
+                .boxed(),
+            Method::Delete if path.starts_with("/api/vision/detection-jobs/") => self
+                .handle_stop_detection_job(&path, &identity_hints)
+                .boxed(),
             Method::Get if path == "/api/vision/events" => self
                 .handle_list_local_vision_events(&raw_url, &identity_hints)
                 .boxed(),
@@ -3992,12 +4078,10 @@ impl AdminApi {
             Ok(paths) => paths,
             Err(error) => return error_json(StatusCode(422), &error),
         };
-        let dvr_settings = self.admin_store.dvr_recording_settings().ok();
-        let scoped_roots =
-            match resolve_admin_search_source_scope(&payload, &settings, dvr_settings.as_ref()) {
-                Ok(roots) => roots,
-                Err(error) => return error_json(StatusCode(422), &error),
-            };
+        let scoped_roots = match resolve_admin_search_source_scope(&payload, &settings, None) {
+            Ok(roots) => roots,
+            Err(error) => return error_json(StatusCode(422), &error),
+        };
         let search_request = match build_admin_knowledge_search_request(
             payload,
             &settings,
@@ -4071,9 +4155,9 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        match self.admin_store.dvr_recording_settings() {
+        match self.harborlink_dvr_settings() {
             Ok(settings) => ok_json(&settings),
-            Err(error) => error_json(StatusCode(500), &error),
+            Err(error) => error_json(StatusCode(502), &error),
         }
     }
 
@@ -4089,29 +4173,26 @@ impl AdminApi {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
         };
-        let previous = match self.admin_store.dvr_recording_settings() {
-            Ok(settings) => settings,
-            Err(error) => return error_json(StatusCode(500), &error),
-        };
-        let state = match self.admin_store.save_dvr_recording_settings(settings) {
-            Ok(state) => state,
-            Err(error) => return error_json(StatusCode(422), &error),
-        };
-        let link_settings = match serde_json::to_value(&state.dvr) {
+        let settings = sanitize_dvr_recording_settings(settings);
+        let link_settings = match serde_json::to_value(&settings) {
             Ok(value) => value,
             Err(error) => {
-                let _ = self.admin_store.save_dvr_recording_settings(previous);
                 return error_json(
                     StatusCode(500),
                     &format!("failed to serialize DVR settings: {error}"),
                 );
             }
         };
-        if let Err(error) = self.harborlink_media.save_dvr_settings(&link_settings) {
-            let _ = self.admin_store.save_dvr_recording_settings(previous);
-            return error_json(StatusCode(502), &error);
+        match self.harborlink_media.save_dvr_settings(&link_settings) {
+            Ok(settings) => match serde_json::from_value::<DvrRecordingSettings>(settings) {
+                Ok(settings) => ok_json(&sanitize_dvr_recording_settings(settings)),
+                Err(error) => error_json(
+                    StatusCode(502),
+                    &format!("HarborLink returned invalid DVR settings: {error}"),
+                ),
+            },
+            Err(error) => error_json(StatusCode(502), &error),
         }
-        ok_json(&state.dvr)
     }
 
     fn handle_dvr_recordings_status(
@@ -4121,9 +4202,9 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        let settings = match self.admin_store.dvr_recording_settings() {
+        let mut settings = match self.harborlink_dvr_settings() {
             Ok(settings) => settings,
-            Err(error) => return error_json(StatusCode(500), &error),
+            Err(error) => return error_json(StatusCode(502), &error),
         };
         let devices = match self.hub().load_registered_cameras() {
             Ok(devices) => devices,
@@ -4148,6 +4229,11 @@ impl AdminApi {
                 }),
             }
         }
+        settings.enabled_device_ids = statuses
+            .iter()
+            .filter(|status| status.status == "recording")
+            .map(|status| status.device_id.clone())
+            .collect();
         ok_json(&build_status_response(settings, statuses, devices.len()))
     }
 
@@ -4159,13 +4245,10 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        let settings = match self.admin_store.dvr_recording_settings() {
+        let settings = match self.harborlink_dvr_settings() {
             Ok(settings) => settings,
-            Err(error) => return error_json(StatusCode(500), &error),
+            Err(error) => return error_json(StatusCode(502), &error),
         };
-        if let Err(error) = self.harborlink_media.apply_dvr_retention() {
-            return error_json(StatusCode(502), &error);
-        }
         let devices = match self.hub().load_registered_cameras() {
             Ok(devices) => devices,
             Err(error) => return error_json(StatusCode(500), &error),
@@ -4201,6 +4284,13 @@ impl AdminApi {
             media_library_root: settings.media_library_root,
             segments,
         })
+    }
+
+    fn harborlink_dvr_settings(&self) -> Result<DvrRecordingSettings, String> {
+        let settings = self.harborlink_media.dvr_settings()?;
+        serde_json::from_value(settings)
+            .map(sanitize_dvr_recording_settings)
+            .map_err(|error| format!("HarborLink returned invalid DVR settings: {error}"))
     }
 
     fn handle_dvr_artifact(
@@ -5174,6 +5264,363 @@ impl AdminApi {
             }
             Err(error) => error_json(StatusCode(422), &error),
         }
+    }
+
+    fn handle_start_detection_job(
+        &self,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let body: DetectionJobStartRequest = match read_json_body_limited(request, 16 * 1024) {
+            Ok(body) => body,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let config = match normalize_detection_job_start(body) {
+            Ok(config) => config,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        if let Err(error) =
+            self.authorize_camera_action(hints, &config.camera_id, AccessAction::CameraView)
+        {
+            return error_json(StatusCode(403), &error);
+        }
+        if let Err(error) = self.load_camera_device(&config.camera_id) {
+            if error.contains("device not found") {
+                return error_json(StatusCode(404), &error);
+            }
+            return error_json(StatusCode(422), &error);
+        }
+
+        let mut jobs = match self.detection_jobs.lock() {
+            Ok(jobs) => jobs,
+            Err(_) => return error_json(StatusCode(503), "detection job state is unavailable"),
+        };
+        for runtime in jobs
+            .values_mut()
+            .filter(|runtime| runtime.projection.camera_id == config.camera_id)
+        {
+            self.refresh_detection_job(runtime);
+        }
+        if jobs.values().any(|runtime| {
+            runtime.projection.camera_id == config.camera_id
+                && runtime.projection.status == "running"
+        }) {
+            return error_json(
+                StatusCode(409),
+                "an active detection job already exists for this camera",
+            );
+        }
+        prune_detection_job_history(&mut jobs);
+
+        let lease = match self.harborlink_media.start_detection_lease(
+            &config.camera_id,
+            &config.stream_profile,
+            config.ttl_seconds,
+        ) {
+            Ok(lease) => lease,
+            Err(error) => return error_json(StatusCode(502), &error),
+        };
+        let source = match lease.local_rtsp_url.as_deref() {
+            Some(source) if source.starts_with("rtsp://127.0.0.1:") => source,
+            _ => {
+                let _ = self
+                    .harborlink_media
+                    .stop_detection_lease(&config.camera_id, &lease.lease_id);
+                return error_json(
+                    StatusCode(502),
+                    "HarborLink did not return a loopback detection source",
+                );
+            }
+        };
+
+        let job_id = format!("yolo-{}", Uuid::new_v4().simple());
+        let output_root = env::var("HARBOR_K3_YOLO_OUTPUT_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(DEFAULT_DETECTION_OUTPUT_ROOT));
+        let output_dir = output_root.join(&job_id);
+        if let Err(error) = fs::create_dir_all(&output_dir) {
+            let _ = self
+                .harborlink_media
+                .stop_detection_lease(&config.camera_id, &lease.lease_id);
+            return error_json(
+                StatusCode(500),
+                &format!("failed to create detection output directory: {error}"),
+            );
+        }
+        let stderr_path = output_dir.join("worker.stderr.log");
+        let stderr = match fs::File::create(&stderr_path) {
+            Ok(stderr) => stderr,
+            Err(error) => {
+                let _ = self
+                    .harborlink_media
+                    .stop_detection_lease(&config.camera_id, &lease.lease_id);
+                cleanup_detection_job_output_dir(&output_dir);
+                return error_json(
+                    StatusCode(500),
+                    &format!("failed to create detection worker log: {error}"),
+                );
+            }
+        };
+        let python = env::var("HARBOR_K3_YOLO_PYTHON").unwrap_or_else(|_| "python3".to_string());
+        let worker = env::var("HARBOR_K3_YOLO_WORKER")
+            .unwrap_or_else(|_| DEFAULT_DETECTION_WORKER.to_string());
+        let model = env::var("HARBOR_K3_YOLO_MODEL")
+            .unwrap_or_else(|_| DEFAULT_DETECTION_MODEL.to_string());
+        let labels = env::var("HARBOR_K3_YOLO_LABELS")
+            .unwrap_or_else(|_| DEFAULT_DETECTION_LABELS.to_string());
+        let child = Command::new(python)
+            .arg(worker)
+            .arg("--source")
+            .arg(source)
+            .arg("--model")
+            .arg(model)
+            .arg("--labels")
+            .arg(labels)
+            .arg("--output-dir")
+            .arg(&output_dir)
+            .arg("--target-label")
+            .arg(&config.target_label)
+            .arg("--provider")
+            .arg("cpu")
+            .arg("--max-fps")
+            .arg(config.max_fps.to_string())
+            .arg("--conf-threshold")
+            .arg(config.confidence.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr))
+            .spawn();
+        let child = match child {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = self
+                    .harborlink_media
+                    .stop_detection_lease(&config.camera_id, &lease.lease_id);
+                cleanup_detection_job_output_dir(&output_dir);
+                return error_json(
+                    StatusCode(500),
+                    &format!("failed to start detection worker: {error}"),
+                );
+            }
+        };
+
+        let projection = DetectionJobProjection {
+            job_id: job_id.clone(),
+            camera_id: config.camera_id,
+            status: "running".to_string(),
+            target_labels: vec![config.target_label],
+            stream_profile: config.stream_profile,
+            max_fps: config.max_fps,
+            confidence: config.confidence,
+            lease_id: lease.lease_id,
+            started_at: lease.started_at,
+            updated_at: lease.updated_at,
+            expires_at: lease.expires_at,
+            latest_result: None,
+            metrics: None,
+            message: None,
+        };
+        jobs.insert(
+            job_id,
+            DetectionJobRuntime {
+                projection: projection.clone(),
+                output_dir,
+                child: Some(child),
+            },
+        );
+        ok_json(&projection)
+    }
+
+    fn handle_get_detection_job(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let job_id = match parse_detection_job_path(path, None) {
+            Some(job_id) => job_id,
+            None => return error_json(StatusCode(400), "invalid detection job path"),
+        };
+        let camera_id = match self.detection_job_camera_id(&job_id) {
+            Ok(camera_id) => camera_id,
+            Err((status, error)) => return error_json(status, &error),
+        };
+        if let Err(error) =
+            self.authorize_camera_action(hints, &camera_id, AccessAction::CameraView)
+        {
+            return error_json(StatusCode(403), &error);
+        }
+        let mut jobs = match self.detection_jobs.lock() {
+            Ok(jobs) => jobs,
+            Err(_) => return error_json(StatusCode(503), "detection job state is unavailable"),
+        };
+        let Some(runtime) = jobs.get_mut(&job_id) else {
+            return error_json(StatusCode(404), "detection job was not found");
+        };
+        self.refresh_detection_job(runtime);
+        ok_json(&runtime.projection)
+    }
+
+    fn handle_renew_detection_job(
+        &self,
+        path: &str,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let job_id = match parse_detection_job_path(path, Some("/renew")) {
+            Some(job_id) => job_id,
+            None => return error_json(StatusCode(400), "invalid detection job renew path"),
+        };
+        let body = match read_json_body_or_default::<DetectionJobRenewRequest>(request) {
+            Ok(body) => body,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let ttl_seconds = body
+            .ttl_seconds
+            .unwrap_or(DEFAULT_DETECTION_JOB_TTL_SECONDS);
+        if !(MIN_DETECTION_JOB_TTL_SECONDS..=MAX_DETECTION_JOB_TTL_SECONDS).contains(&ttl_seconds) {
+            return error_json(StatusCode(400), "ttl_seconds must be between 60 and 900");
+        }
+        let camera_id = match self.detection_job_camera_id(&job_id) {
+            Ok(camera_id) => camera_id,
+            Err((status, error)) => return error_json(status, &error),
+        };
+        if let Err(error) =
+            self.authorize_camera_action(hints, &camera_id, AccessAction::CameraView)
+        {
+            return error_json(StatusCode(403), &error);
+        }
+        let mut jobs = match self.detection_jobs.lock() {
+            Ok(jobs) => jobs,
+            Err(_) => return error_json(StatusCode(503), "detection job state is unavailable"),
+        };
+        let Some(runtime) = jobs.get_mut(&job_id) else {
+            return error_json(StatusCode(404), "detection job was not found");
+        };
+        self.refresh_detection_job(runtime);
+        if runtime.projection.status != "running" {
+            return error_json(
+                StatusCode(409),
+                "only a running detection job can be renewed",
+            );
+        }
+        match self.harborlink_media.renew_detection_lease(
+            &runtime.projection.camera_id,
+            &runtime.projection.lease_id,
+            ttl_seconds,
+        ) {
+            Ok(lease) => {
+                runtime.projection.expires_at = lease.expires_at;
+                runtime.projection.updated_at = lease.updated_at;
+                ok_json(&runtime.projection)
+            }
+            Err(error) => error_json(StatusCode(502), &error),
+        }
+    }
+
+    fn handle_stop_detection_job(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let job_id = match parse_detection_job_path(path, None) {
+            Some(job_id) => job_id,
+            None => return error_json(StatusCode(400), "invalid detection job path"),
+        };
+        let camera_id = match self.detection_job_camera_id(&job_id) {
+            Ok(camera_id) => camera_id,
+            Err((status, error)) => return error_json(status, &error),
+        };
+        if let Err(error) =
+            self.authorize_camera_action(hints, &camera_id, AccessAction::CameraView)
+        {
+            return error_json(StatusCode(403), &error);
+        }
+        let mut jobs = match self.detection_jobs.lock() {
+            Ok(jobs) => jobs,
+            Err(_) => return error_json(StatusCode(503), "detection job state is unavailable"),
+        };
+        let Some(runtime) = jobs.get_mut(&job_id) else {
+            return error_json(StatusCode(404), "detection job was not found");
+        };
+        self.refresh_detection_job(runtime);
+        if runtime.projection.status == "running" {
+            stop_detection_child(runtime);
+            let lease_result = self
+                .harborlink_media
+                .stop_detection_lease(&runtime.projection.camera_id, &runtime.projection.lease_id);
+            runtime.projection.status = "stopped".to_string();
+            runtime.projection.updated_at = current_rfc3339_timestamp();
+            runtime.projection.message = lease_result.err().map(|error| {
+                format!(
+                    "worker stopped; detection lease cleanup was incomplete: {}",
+                    redact_admin_string(&error)
+                )
+            });
+        }
+        refresh_detection_job_outputs(runtime);
+        ok_json(&runtime.projection)
+    }
+
+    fn detection_job_camera_id(&self, job_id: &str) -> Result<String, (StatusCode, String)> {
+        let jobs = self.detection_jobs.lock().map_err(|_| {
+            (
+                StatusCode(503),
+                "detection job state is unavailable".to_string(),
+            )
+        })?;
+        jobs.get(job_id)
+            .map(|runtime| runtime.projection.camera_id.clone())
+            .ok_or((StatusCode(404), "detection job was not found".to_string()))
+    }
+
+    fn refresh_detection_job(&self, runtime: &mut DetectionJobRuntime) {
+        if runtime.projection.status == "running"
+            && detection_job_has_expired(&runtime.projection.expires_at)
+        {
+            stop_detection_child(runtime);
+            let _ = self
+                .harborlink_media
+                .stop_detection_lease(&runtime.projection.camera_id, &runtime.projection.lease_id);
+            runtime.projection.status = "expired".to_string();
+            runtime.projection.updated_at = current_rfc3339_timestamp();
+            runtime.projection.message = Some("detection lease expired".to_string());
+        } else if runtime.projection.status == "running" {
+            let process_status = runtime.child.as_mut().map(Child::try_wait);
+            match process_status {
+                Some(Ok(Some(status))) => {
+                    runtime.child = None;
+                    let _ = self.harborlink_media.stop_detection_lease(
+                        &runtime.projection.camera_id,
+                        &runtime.projection.lease_id,
+                    );
+                    runtime.projection.status = if status.success() {
+                        "completed".to_string()
+                    } else {
+                        "failed".to_string()
+                    };
+                    runtime.projection.updated_at = current_rfc3339_timestamp();
+                    runtime.projection.message = Some(match status.code() {
+                        Some(code) => format!("detection worker exited with code {code}"),
+                        None => "detection worker exited without a status code".to_string(),
+                    });
+                }
+                Some(Err(error)) => {
+                    stop_detection_child(runtime);
+                    let _ = self.harborlink_media.stop_detection_lease(
+                        &runtime.projection.camera_id,
+                        &runtime.projection.lease_id,
+                    );
+                    runtime.projection.status = "failed".to_string();
+                    runtime.projection.updated_at = current_rfc3339_timestamp();
+                    runtime.projection.message = Some(format!(
+                        "failed to inspect detection worker: {}",
+                        redact_admin_string(&error.to_string())
+                    ));
+                }
+                Some(Ok(None)) | None => {}
+            }
+        }
+        refresh_detection_job_outputs(runtime);
     }
 
     fn handle_list_local_vision_events(
@@ -7774,9 +8221,9 @@ impl AdminApi {
             }
             Err(error) => return error_json(StatusCode(422), &error),
         };
-        let previous_settings = match self.admin_store.dvr_recording_settings() {
+        let mut settings = match self.harborlink_dvr_settings() {
             Ok(settings) => settings,
-            Err(error) => return error_json(StatusCode(500), &error),
+            Err(error) => return error_json(StatusCode(502), &error),
         };
         let status = match self
             .harborlink_media
@@ -7785,7 +8232,6 @@ impl AdminApi {
             Ok(status) => status,
             Err(error) => return error_json(StatusCode(502), &error),
         };
-        let mut settings = previous_settings;
         if !settings
             .enabled_device_ids
             .iter()
@@ -7793,19 +8239,6 @@ impl AdminApi {
         {
             settings.enabled_device_ids.push(device_id.clone());
         }
-        let settings = match self.admin_store.save_dvr_recording_settings(settings) {
-            Ok(state) => state.dvr,
-            Err(error) => {
-                let rollback = self.harborlink_media.stop_recording(&device_id);
-                let message = match rollback {
-                    Ok(_) => error,
-                    Err(rollback_error) => {
-                        format!("{error}; HarborLink rollback failed: {rollback_error}")
-                    }
-                };
-                return error_json(StatusCode(422), &message);
-            }
-        };
         ok_json(&build_dvr_recording_action_response(
             settings,
             status,
@@ -7835,41 +8268,17 @@ impl AdminApi {
             }
             Err(error) => return error_json(StatusCode(422), &error),
         };
-        let previous_settings = match self.admin_store.dvr_recording_settings() {
+        let mut settings = match self.harborlink_dvr_settings() {
             Ok(settings) => settings,
-            Err(error) => return error_json(StatusCode(500), &error),
+            Err(error) => return error_json(StatusCode(502), &error),
         };
-        let was_enabled = previous_settings
-            .enabled_device_ids
-            .iter()
-            .any(|enabled| enabled == &device_id);
         let status = match self.harborlink_media.stop_recording(&device_id) {
             Ok(status) => status,
             Err(error) => return error_json(StatusCode(502), &error),
         };
-        let rollback_stream_profile = recording_profile_from_stream_kind(&status.stream_kind);
-        let mut settings = previous_settings;
         settings
             .enabled_device_ids
             .retain(|enabled| enabled != &device_id);
-        let settings = match self.admin_store.save_dvr_recording_settings(settings) {
-            Ok(state) => state.dvr,
-            Err(error) => {
-                let rollback = was_enabled
-                    .then(|| {
-                        self.harborlink_media
-                            .start_recording(&device_id, rollback_stream_profile)
-                    })
-                    .transpose();
-                let message = match rollback {
-                    Ok(_) => error,
-                    Err(rollback_error) => {
-                        format!("{error}; HarborLink rollback failed: {rollback_error}")
-                    }
-                };
-                return error_json(StatusCode(422), &message);
-            }
-        };
         ok_json(&build_dvr_recording_action_response(
             settings,
             status,
@@ -9324,6 +9733,136 @@ fn parse_local_vision_event_notify_path(path: &str) -> Option<String> {
     percent_decode_path_segment(event_id).ok()
 }
 
+fn normalize_detection_job_start(
+    request: DetectionJobStartRequest,
+) -> Result<DetectionJobConfig, String> {
+    let camera_id = request.camera_id.trim().to_string();
+    if camera_id.is_empty() || camera_id.len() > 128 || camera_id.chars().any(char::is_control) {
+        return Err("camera_id is invalid".to_string());
+    }
+    let target_labels = request
+        .target_labels
+        .iter()
+        .map(|label| label.trim().to_ascii_lowercase())
+        .filter(|label| !label.is_empty())
+        .collect::<Vec<_>>();
+    if target_labels.iter().any(|label| label != "cat") {
+        return Err("this deployment only supports target_labels=[\"cat\"]".to_string());
+    }
+    let ttl_seconds = request
+        .duration_seconds
+        .unwrap_or(DEFAULT_DETECTION_JOB_TTL_SECONDS);
+    if !(MIN_DETECTION_JOB_TTL_SECONDS..=MAX_DETECTION_JOB_TTL_SECONDS).contains(&ttl_seconds) {
+        return Err("duration_seconds must be between 60 and 900".to_string());
+    }
+    let max_fps = request.max_fps.unwrap_or(DEFAULT_DETECTION_MAX_FPS);
+    if !max_fps.is_finite() || !(0.0..=MAX_DETECTION_MAX_FPS).contains(&max_fps) || max_fps == 0.0 {
+        return Err("max_fps must be greater than 0 and at most 10".to_string());
+    }
+    let confidence = request.confidence.unwrap_or(DEFAULT_DETECTION_CONFIDENCE);
+    if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) || confidence == 0.0 {
+        return Err("confidence must be greater than 0 and at most 1".to_string());
+    }
+    let stream_profile = request
+        .stream_profile
+        .unwrap_or_else(|| "sub".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(stream_profile.as_str(), "main" | "sub") {
+        return Err("stream_profile must be main or sub".to_string());
+    }
+    Ok(DetectionJobConfig {
+        camera_id,
+        target_label: "cat".to_string(),
+        ttl_seconds,
+        max_fps,
+        confidence,
+        stream_profile,
+    })
+}
+
+fn parse_detection_job_path(path: &str, suffix: Option<&str>) -> Option<String> {
+    let trimmed = path.strip_prefix("/api/vision/detection-jobs/")?;
+    let job_id = match suffix {
+        Some(suffix) => trimmed.strip_suffix(suffix)?,
+        None => trimmed,
+    }
+    .trim();
+    if job_id.is_empty() || job_id.contains('/') {
+        return None;
+    }
+    let job_id = percent_decode_path_segment(job_id).ok()?;
+    (job_id.starts_with("yolo-")
+        && job_id.len() <= 96
+        && job_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-'))
+    .then_some(job_id)
+}
+
+fn detection_job_has_expired(expires_at: &str) -> bool {
+    OffsetDateTime::parse(expires_at.trim(), &Rfc3339)
+        .map(|timestamp| timestamp <= OffsetDateTime::now_utc())
+        .unwrap_or(false)
+}
+
+fn stop_detection_child(runtime: &mut DetectionJobRuntime) {
+    let Some(mut child) = runtime.child.take() else {
+        return;
+    };
+    match child.try_wait() {
+        Ok(Some(_)) => {}
+        Ok(None) | Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn refresh_detection_job_outputs(runtime: &mut DetectionJobRuntime) {
+    runtime.projection.latest_result =
+        read_detection_job_json(&runtime.output_dir.join("latest.json"));
+    runtime.projection.metrics = read_detection_job_json(&runtime.output_dir.join("metrics.json"));
+}
+
+fn prune_detection_job_history(jobs: &mut HashMap<String, DetectionJobRuntime>) {
+    while jobs.len() >= MAX_DETECTION_JOB_HISTORY {
+        let Some(job_id) = jobs
+            .iter()
+            .filter(|(_, runtime)| runtime.projection.status != "running")
+            .min_by_key(|(_, runtime)| runtime.projection.updated_at.as_str())
+            .map(|(job_id, _)| job_id.clone())
+        else {
+            return;
+        };
+        if let Some(runtime) = jobs.remove(&job_id) {
+            cleanup_detection_job_output_dir(&runtime.output_dir);
+        }
+    }
+}
+
+fn cleanup_detection_job_output_dir(output_dir: &Path) {
+    for file_name in [
+        "latest.json",
+        "latest.jpg",
+        "metrics.json",
+        "worker.stderr.log",
+    ] {
+        let _ = fs::remove_file(output_dir.join(file_name));
+    }
+    let _ = fs::remove_dir(output_dir);
+}
+
+fn read_detection_job_json(path: &Path) -> Option<Value> {
+    const MAX_DETECTION_RESULT_BYTES: u64 = 1024 * 1024;
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_DETECTION_RESULT_BYTES {
+        return None;
+    }
+    let contents = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
 fn parse_local_vision_event_vlm_enrich_path(path: &str) -> Option<String> {
     let trimmed = path.strip_prefix("/api/vision/events/")?;
     let event_id = trimmed.strip_suffix("/vlm-enrich")?.trim();
@@ -10514,6 +11053,8 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/models/store"
         || path == "/api/models/local-catalog"
         || path == "/api/models/policies"
+        || path == "/api/vision/detection-jobs"
+        || path.starts_with("/api/vision/detection-jobs/")
         || path == "/api/vision/events"
         || path == "/api/vision/vlm/status"
         || path == "/api/vision/events/latest/vlm-enrich"
@@ -19704,14 +20245,6 @@ impl CameraStreamProfile {
     }
 }
 
-fn recording_profile_from_stream_kind(stream_kind: &str) -> Option<&'static str> {
-    match stream_kind {
-        "main" | "mainstream" => Some("main"),
-        "sub" | "substream" => Some("sub"),
-        _ => None,
-    }
-}
-
 fn dvr_recording_status_from_harborlink(
     status: HarborLinkRecordingStatus,
     public_origin: &str,
@@ -19833,16 +20366,17 @@ mod tests {
         local_model_catalog_item, local_model_catalog_specs, mime_type_for_path,
         model_download_huggingface_endpoint, model_download_huggingface_endpoints,
         model_download_jobs_status, model_hardware_recommendation, model_snapshot_file_allowed,
-        normalize_unified_admin_path, notification_delivery_error_to_harbor_app_error,
+        normalize_detection_job_start, normalize_unified_admin_path,
+        notification_delivery_error_to_harbor_app_error,
         overlay_model_endpoints_with_runtime_truth, parse_approval_decision_path,
         parse_camera_analyze_path, parse_camera_hls_live_renew_path,
         parse_camera_hls_live_start_path, parse_camera_hls_live_status_path,
         parse_camera_hls_live_stop_path, parse_camera_live_page_path,
         parse_camera_live_stream_path, parse_camera_recording_start_path,
         parse_camera_recording_stop_path, parse_camera_share_link_path, parse_camera_snapshot_path,
-        parse_camera_task_snapshot_path, parse_device_credential_status_path,
-        parse_device_credentials_path, parse_device_evidence_path,
-        parse_device_metadata_patch_path, parse_device_rtsp_check_path,
+        parse_camera_task_snapshot_path, parse_detection_job_path,
+        parse_device_credential_status_path, parse_device_credentials_path,
+        parse_device_evidence_path, parse_device_metadata_patch_path, parse_device_rtsp_check_path,
         parse_device_validation_run_path, parse_harbor_app_lifecycle_path, parse_harbor_app_path,
         parse_json_body_limited, parse_knowledge_index_job_cancel_path,
         parse_local_vision_event_notify_path, parse_member_default_delivery_surface_update_path,
@@ -19852,25 +20386,26 @@ mod tests {
         parse_optional_unix_seconds, parse_share_link_revoke_path,
         parse_shared_camera_live_page_path, parse_shared_camera_live_stream_path,
         parse_static_byte_range, percent_decode_path_segment, preview_static_file_response,
-        probe_local_model_runtime, recording_profile_from_stream_kind,
-        redact_account_management_snapshot, redact_admin_string, redact_bridge_provider_config,
-        redact_camera_device_projection, redact_model_endpoint_response, redact_state_snapshot,
-        redact_stream_url_credentials, redact_value_stream_credentials,
-        redacted_general_message_nsp_route_summary, redacted_home_assistant_task_api_event_summary,
-        release_item, request_identity_hints, resolve_harbor_assistant_asset_path,
-        resolve_knowledge_preview_path, run_knowledge_index_jobs, run_model_download_job,
-        run_model_download_transfer, sanitized_outreach_delivery_request_audit,
-        service_overloaded_response, url_encode_path_segment,
-        validate_home_assistant_service_fields, validate_home_assistant_service_smoke,
-        validate_outreach_delivery_request, AdminApi, CameraLiveSessionProjection,
-        CameraStreamProfile, HarborLinkHomeAssistantStatus, HarborLinkLiveSession,
-        HarborLinkMediaClient, HarborLinkRecordingArtifact, HarborLinkRecordingStatus,
-        HomeAssistantServiceSmokeRequest, HomeGuardianEvaluationQueue, KnowledgeSearchApiRequest,
-        LocalModelRuntimeProjection, ManualAddRequest, ModelRuntimeActivationRequest,
-        ModelRuntimeActivationResult, OutreachDeliveryRecipientRequest, OutreachDeliveryRequest,
-        VisionIngestLimiter, DEFAULT_HF_ENDPOINT, HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS,
-        HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS, MAX_VISION_EVENT_INGEST_INFLIGHT,
-        PRIVACY_GATEWAY_AUDIT_ACTION,
+        probe_local_model_runtime, prune_detection_job_history, redact_account_management_snapshot,
+        redact_admin_string, redact_bridge_provider_config, redact_camera_device_projection,
+        redact_model_endpoint_response, redact_state_snapshot, redact_stream_url_credentials,
+        redact_value_stream_credentials, redacted_general_message_nsp_route_summary,
+        redacted_home_assistant_task_api_event_summary, release_item, request_identity_hints,
+        resolve_harbor_assistant_asset_path, resolve_knowledge_preview_path,
+        run_knowledge_index_jobs, run_model_download_job, run_model_download_transfer,
+        sanitized_outreach_delivery_request_audit, service_overloaded_response,
+        url_encode_path_segment, validate_home_assistant_service_fields,
+        validate_home_assistant_service_smoke, validate_outreach_delivery_request, AdminApi,
+        CameraLiveSessionProjection, CameraStreamProfile, DetectionJobProjection,
+        DetectionJobRuntime, DetectionJobStartRequest, HarborLinkHomeAssistantStatus,
+        HarborLinkLiveSession, HarborLinkMediaClient, HarborLinkRecordingArtifact,
+        HarborLinkRecordingStatus, HomeAssistantServiceSmokeRequest, HomeGuardianEvaluationQueue,
+        KnowledgeSearchApiRequest, LocalModelRuntimeProjection, ManualAddRequest,
+        ModelRuntimeActivationRequest, ModelRuntimeActivationResult,
+        OutreachDeliveryRecipientRequest, OutreachDeliveryRequest, VisionIngestLimiter,
+        DEFAULT_HF_ENDPOINT, HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS,
+        HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS, MAX_DETECTION_JOB_HISTORY,
+        MAX_VISION_EVENT_INGEST_INFLIGHT, PRIVACY_GATEWAY_AUDIT_ACTION,
     };
     use harborbeacon_local_agent::connectors::notifications::{
         NotificationDeliveryError, NotificationDestinationKind, NotificationRecipientIdType,
@@ -19913,7 +20448,7 @@ mod tests {
         VISION_EVENT_STORE_PATH_ENV,
     };
     use serde_json::{json, Value};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -20486,6 +21021,110 @@ mod tests {
             parse_local_vision_event_notify_path("/api/vision/events/event/1/notify"),
             None
         );
+    }
+
+    #[test]
+    fn detection_job_path_accepts_only_safe_job_identifiers() {
+        assert_eq!(
+            parse_detection_job_path(
+                "/api/vision/detection-jobs/yolo-0123456789abcdef/renew",
+                Some("/renew")
+            ),
+            Some("yolo-0123456789abcdef".to_string())
+        );
+        assert_eq!(
+            parse_detection_job_path("/api/vision/detection-jobs/yolo-0123456789abcdef", None),
+            Some("yolo-0123456789abcdef".to_string())
+        );
+        assert_eq!(
+            parse_detection_job_path("/api/vision/detection-jobs/yolo-safe/extra", None),
+            None
+        );
+    }
+
+    #[test]
+    fn detection_job_request_is_cat_only_and_bounded() {
+        let config = normalize_detection_job_start(DetectionJobStartRequest {
+            camera_id: "camera.252".to_string(),
+            target_labels: Vec::new(),
+            duration_seconds: None,
+            max_fps: None,
+            confidence: None,
+            stream_profile: None,
+        })
+        .expect("default request");
+        assert_eq!(config.target_label, "cat");
+        assert_eq!(config.ttl_seconds, 60);
+        assert_eq!(config.max_fps, 5.0);
+        assert_eq!(config.stream_profile, "sub");
+
+        let error = normalize_detection_job_start(DetectionJobStartRequest {
+            camera_id: "camera.252".to_string(),
+            target_labels: vec!["person".to_string()],
+            duration_seconds: Some(60),
+            max_fps: Some(5.0),
+            confidence: Some(0.35),
+            stream_profile: Some("sub".to_string()),
+        })
+        .expect_err("non-cat label must be rejected");
+        assert!(error.contains("cat"));
+
+        let error = normalize_detection_job_start(DetectionJobStartRequest {
+            camera_id: "camera.252".to_string(),
+            target_labels: vec!["cat".to_string()],
+            duration_seconds: Some(901),
+            max_fps: Some(5.0),
+            confidence: Some(0.35),
+            stream_profile: Some("sub".to_string()),
+        })
+        .expect_err("unbounded duration must be rejected");
+        assert!(error.contains("900"));
+    }
+
+    #[test]
+    fn detection_job_history_is_bounded_without_removing_running_jobs() {
+        let mut jobs = HashMap::new();
+        for index in 0..=MAX_DETECTION_JOB_HISTORY {
+            let job_id = format!("yolo-{index:032x}");
+            let status = if index == MAX_DETECTION_JOB_HISTORY {
+                "running"
+            } else {
+                "completed"
+            };
+            jobs.insert(
+                job_id.clone(),
+                DetectionJobRuntime {
+                    projection: DetectionJobProjection {
+                        job_id,
+                        camera_id: format!("camera-{index}"),
+                        status: status.to_string(),
+                        target_labels: vec!["cat".to_string()],
+                        stream_profile: "sub".to_string(),
+                        max_fps: 5.0,
+                        confidence: 0.35,
+                        lease_id: format!("detect-{index:032x}"),
+                        started_at: format!("2026-07-23T00:{:02}:00Z", index % 60),
+                        updated_at: format!("2026-07-23T00:{:02}:00Z", index % 60),
+                        expires_at: "2026-07-23T00:15:00Z".to_string(),
+                        latest_result: None,
+                        metrics: None,
+                        message: None,
+                    },
+                    output_dir: std::env::temp_dir().join(format!(
+                        "harborbeacon-prune-unit-missing-{}-{index}",
+                        std::process::id()
+                    )),
+                    child: None,
+                },
+            );
+        }
+
+        prune_detection_job_history(&mut jobs);
+
+        assert_eq!(jobs.len(), MAX_DETECTION_JOB_HISTORY - 1);
+        assert!(jobs
+            .values()
+            .any(|runtime| runtime.projection.status == "running"));
     }
 
     #[test]
@@ -21285,7 +21924,7 @@ mod tests {
     }
 
     #[test]
-    fn camera_stream_profiles_are_validated_and_recording_rollbacks_preserve_kind() {
+    fn camera_stream_profiles_are_validated() {
         assert_eq!(
             CameraStreamProfile::parse("main").map(CameraStreamProfile::as_str),
             Ok("main")
@@ -21295,11 +21934,6 @@ mod tests {
             Ok("sub")
         );
         assert!(CameraStreamProfile::parse("invalid").is_err());
-        assert_eq!(
-            recording_profile_from_stream_kind("mainstream"),
-            Some("main")
-        );
-        assert_eq!(recording_profile_from_stream_kind("substream"), Some("sub"));
     }
 
     #[test]

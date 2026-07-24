@@ -46,7 +46,7 @@ use self::system_readiness_actions::build_general_message_readiness_summary;
 #[cfg(test)]
 use self::vision_event_actions::build_redacted_vision_event_summary;
 
-use crate::connectors::harborlink_media::HarborLinkMediaClient;
+use crate::connectors::harborlink_media::{harborlink_request_scope, HarborLinkMediaClient};
 use crate::connectors::home_assistant::{
     normalize_home_assistant_service_action_request,
     validate_home_assistant_service_action_request, HomeAssistantClient, HomeAssistantEntity,
@@ -690,6 +690,8 @@ impl TaskApiService {
         if request.trace_id.trim().is_empty() {
             request.trace_id = request.task_id.clone();
         }
+        let business_request_id = format!("task:{}:{}", request.task_id, request.step_id);
+        let _harborlink_request_scope = harborlink_request_scope(Some(&business_request_id));
         let _ = self.admin_store.record_member_interactive_surface(
             &request.source.user_id,
             &request.source.channel,

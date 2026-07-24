@@ -2,6 +2,8 @@ use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
@@ -16,6 +18,29 @@ const DEFAULT_HARBORLINK_LOCAL_API_TOKEN_FILE: &str =
     "/run/credentials/harboros-beacon.service/harborlink-local-api-token";
 const HARBORLINK_CONTRACT_VERSION: &str = "1.0";
 const HARBORLINK_CUTOVER_MODE: &str = "harborlink";
+
+thread_local! {
+    static HARBORLINK_BUSINESS_REQUEST_ID: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+pub struct HarborLinkRequestScope {
+    previous: Option<String>,
+}
+
+impl Drop for HarborLinkRequestScope {
+    fn drop(&mut self) {
+        HARBORLINK_BUSINESS_REQUEST_ID.with(|request_id| {
+            *request_id.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+pub fn harborlink_request_scope(request_id: Option<&str>) -> HarborLinkRequestScope {
+    let request_id = normalize_business_request_id(request_id);
+    let previous =
+        HARBORLINK_BUSINESS_REQUEST_ID.with(|current| current.borrow_mut().replace(request_id));
+    HarborLinkRequestScope { previous }
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -67,6 +92,12 @@ struct StartLiveSessionRequest<'a> {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct StartDetectionLeaseRequest<'a> {
+    stream_profile: &'a str,
+    ttl_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct StartRecordingRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_profile: Option<&'a str>,
@@ -85,6 +116,18 @@ pub struct HarborLinkLiveSession {
     pub updated_at: String,
     pub expires_at: Option<String>,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HarborLinkDetectionLease {
+    pub camera_id: String,
+    pub lease_id: String,
+    pub status: String,
+    pub stream_profile: String,
+    pub local_rtsp_url: Option<String>,
+    pub started_at: String,
+    pub updated_at: String,
+    pub expires_at: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -133,14 +176,6 @@ pub struct HarborLinkRecordingArtifact {
     pub stream_kind: String,
     pub modified_at_epoch_ms: u128,
     pub preview_url: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HarborLinkRetentionResult {
-    pub retention_days: u32,
-    pub removed_files: usize,
-    pub reclaimed_bytes: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -369,6 +404,84 @@ impl HarborLinkMediaClient {
             .send_harborlink()
             .map_err(unavailable_error)?;
         decode_session_response(response)
+    }
+
+    pub fn start_detection_lease(
+        &self,
+        camera_id: &str,
+        stream_profile: &str,
+        ttl_seconds: u64,
+    ) -> Result<HarborLinkDetectionLease, String> {
+        let response = self
+            .request(
+                reqwest::Method::POST,
+                self.detection_lease_collection_endpoint(camera_id),
+                true,
+            )
+            .timeout(Duration::from_secs(4))
+            .json(&StartDetectionLeaseRequest {
+                stream_profile,
+                ttl_seconds,
+            })
+            .send_harborlink()
+            .map_err(unavailable_error)?;
+        decode_json_response(response, "detection lease")
+    }
+
+    pub fn detection_lease_status(
+        &self,
+        camera_id: &str,
+        lease_id: &str,
+    ) -> Result<HarborLinkDetectionLease, String> {
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                self.detection_lease_endpoint(camera_id, lease_id),
+                false,
+            )
+            .timeout(Duration::from_secs(4))
+            .send_harborlink()
+            .map_err(unavailable_error)?;
+        decode_json_response(response, "detection lease")
+    }
+
+    pub fn renew_detection_lease(
+        &self,
+        camera_id: &str,
+        lease_id: &str,
+        ttl_seconds: u64,
+    ) -> Result<HarborLinkDetectionLease, String> {
+        let response = self
+            .request(
+                reqwest::Method::POST,
+                format!(
+                    "{}/renew",
+                    self.detection_lease_endpoint(camera_id, lease_id)
+                ),
+                true,
+            )
+            .timeout(Duration::from_secs(4))
+            .json(&json!({ "ttl_seconds": ttl_seconds }))
+            .send_harborlink()
+            .map_err(unavailable_error)?;
+        decode_json_response(response, "detection lease")
+    }
+
+    pub fn stop_detection_lease(
+        &self,
+        camera_id: &str,
+        lease_id: &str,
+    ) -> Result<HarborLinkDetectionLease, String> {
+        let response = self
+            .request(
+                reqwest::Method::DELETE,
+                self.detection_lease_endpoint(camera_id, lease_id),
+                true,
+            )
+            .timeout(Duration::from_secs(4))
+            .send_harborlink()
+            .map_err(unavailable_error)?;
+        decode_json_response(response, "detection lease")
     }
 
     pub fn capture_snapshot(&self, camera_id: &str) -> Result<Vec<u8>, String> {
@@ -699,6 +812,19 @@ impl HarborLinkMediaClient {
         decode_json_response(response, "DVR settings update")
     }
 
+    pub fn dvr_settings(&self) -> Result<Value, String> {
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                format!("{}/v1/dvr-settings", self.base_url),
+                false,
+            )
+            .timeout(Duration::from_secs(4))
+            .send_harborlink()
+            .map_err(unavailable_error)?;
+        decode_json_response(response, "DVR settings")
+    }
+
     pub fn recording_timeline(
         &self,
         camera_id: &str,
@@ -717,19 +843,6 @@ impl HarborLinkMediaClient {
             .send_harborlink()
             .map_err(unavailable_error)?;
         decode_json_response(response, "DVR timeline")
-    }
-
-    pub fn apply_dvr_retention(&self) -> Result<HarborLinkRetentionResult, String> {
-        let response = self
-            .request(
-                reqwest::Method::POST,
-                format!("{}/v1/dvr/retention/apply", self.base_url),
-                true,
-            )
-            .timeout(Duration::from_secs(30))
-            .send_harborlink()
-            .map_err(unavailable_error)?;
-        decode_json_response(response, "DVR retention")
     }
 
     pub fn delete_dvr_artifact(&self, artifact_id: &str) -> Result<Value, String> {
@@ -876,6 +989,7 @@ impl HarborLinkMediaClient {
     }
 
     fn request(&self, method: reqwest::Method, url: String, mutation: bool) -> RequestBuilder {
+        let request_id = mutation.then(|| operation_request_id(&method, &url));
         let mut request = self
             .http
             .request(method, url)
@@ -883,11 +997,8 @@ impl HarborLinkMediaClient {
         if let Some(token) = self.local_api_token.as_deref() {
             request = request.bearer_auth(token);
         }
-        if mutation {
-            request = request.header(
-                "X-Request-Id",
-                format!("beacon-{}", Uuid::new_v4().simple()),
-            );
+        if let Some(request_id) = request_id {
+            request = request.header("X-Request-Id", request_id);
         }
         request
     }
@@ -907,6 +1018,59 @@ impl HarborLinkMediaClient {
             encode_path_segment(session_id)
         )
     }
+
+    fn detection_lease_collection_endpoint(&self, camera_id: &str) -> String {
+        format!(
+            "{}/v1/cameras/{}/detection-leases",
+            self.base_url,
+            encode_path_segment(camera_id)
+        )
+    }
+
+    fn detection_lease_endpoint(&self, camera_id: &str, lease_id: &str) -> String {
+        format!(
+            "{}/{}",
+            self.detection_lease_collection_endpoint(camera_id),
+            encode_path_segment(lease_id)
+        )
+    }
+}
+
+fn normalize_business_request_id(request_id: Option<&str>) -> String {
+    let value = request_id.map(str::trim).unwrap_or_default();
+    if !value.is_empty()
+        && value.len() <= 80
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        value.to_string()
+    } else if value.is_empty() {
+        format!("beacon-{}", Uuid::new_v4().simple())
+    } else {
+        format!("beacon-{}", short_request_hash(value.as_bytes()))
+    }
+}
+
+fn operation_request_id(method: &reqwest::Method, url: &str) -> String {
+    let business_request_id = HARBORLINK_BUSINESS_REQUEST_ID.with(|request_id| {
+        request_id
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| normalize_business_request_id(None))
+    });
+    let operation = format!("{}\n{url}", method.as_str());
+    format!(
+        "{business_request_id}-{}",
+        short_request_hash(operation.as_bytes())
+    )
+}
+
+fn short_request_hash(value: &[u8]) -> String {
+    Sha256::digest(value)[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn read_local_api_token_from_env() -> Result<Option<String>, String> {
@@ -1079,8 +1243,9 @@ fn encode_path_segment(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        encode_path_segment, HarborLinkContractError, HarborLinkMediaClient,
-        StartLiveSessionRequest, StartRecordingRequest,
+        encode_path_segment, harborlink_request_scope, HarborLinkContractError,
+        HarborLinkMediaClient, StartDetectionLeaseRequest, StartLiveSessionRequest,
+        StartRecordingRequest,
     };
 
     #[test]
@@ -1109,6 +1274,24 @@ mod tests {
         assert!(body.get("rtsp_url").is_none());
         assert!(body.get("username").is_none());
         assert!(body.get("password").is_none());
+    }
+
+    #[test]
+    fn detection_lease_request_and_endpoint_never_contain_camera_credentials() {
+        let client = HarborLinkMediaClient::new("http://127.0.0.1:8790").expect("client");
+        let body = serde_json::to_value(StartDetectionLeaseRequest {
+            stream_profile: "sub",
+            ttl_seconds: 60,
+        })
+        .expect("serialize request");
+
+        assert_eq!(body["stream_profile"], "sub");
+        assert_eq!(body["ttl_seconds"], 60);
+        assert_eq!(body.as_object().map(|value| value.len()), Some(2));
+        assert_eq!(
+            client.detection_lease_endpoint("camera 1/left", "detect/lease"),
+            "http://127.0.0.1:8790/v1/cameras/camera%201%2Fleft/detection-leases/detect%2Flease"
+        );
     }
 
     #[test]
@@ -1155,6 +1338,32 @@ mod tests {
             retry.headers().get("X-Request-Id")
         );
         assert!(first.headers().get("X-Request-Id").is_some());
+    }
+
+    #[test]
+    fn business_request_id_is_stable_per_operation_and_distinct_between_operations() {
+        let client = HarborLinkMediaClient::new("http://127.0.0.1:8790").expect("client");
+        let _scope = harborlink_request_scope(Some("webui-business-operation-1"));
+        let build_request_id = |method, url: &str| {
+            client
+                .request(method, url.to_string(), true)
+                .build()
+                .expect("build request")
+                .headers()
+                .get("X-Request-Id")
+                .expect("request id")
+                .to_str()
+                .expect("request id text")
+                .to_string()
+        };
+        let start_url = "http://127.0.0.1:8790/v1/cameras/cam-1/recordings/current";
+        let first = build_request_id(reqwest::Method::POST, start_url);
+        let retry = build_request_id(reqwest::Method::POST, start_url);
+        let stop = build_request_id(reqwest::Method::DELETE, start_url);
+
+        assert_eq!(first, retry);
+        assert_ne!(first, stop);
+        assert!(first.starts_with("webui-business-operation-1-"));
     }
 
     #[test]

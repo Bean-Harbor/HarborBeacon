@@ -22,6 +22,7 @@ RestartSec=5s
 MemoryAccounting=true
 MemoryHigh=8G
 MemoryMax=12G
+RuntimeDirectory=harboros-beacon
 StateDirectory=harboros-beacon
 
 [Install]
