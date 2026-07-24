@@ -104,6 +104,7 @@ candle-nn = "0.10.2"
 candle-transformers = { version = "0.10.2", default-features = false }
 hf-hub = { version = "0.4.1", default-features = false, features = ["ureq"] }
 tokenizers = { version = "0.22.0", default-features = false }
+time = { version = "0.3.41", features = ["parsing"] }
 
 [patch.crates-io]
 rig-core = { path = "vendor/rig-core-0.8.0" }

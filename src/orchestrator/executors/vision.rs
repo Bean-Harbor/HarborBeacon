@@ -7,11 +7,11 @@ use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::adapters::rtsp::{CommandRtspAdapter, RtspProbeAdapter};
 use crate::connectors::ai_provider::{
     OpenAiCompatibleConfig, OpenAiCompatibleVisionClient, VisionDetectionRequest,
     VisionSidecarClient, VisionSidecarConfig, VisionSummaryRequest,
 };
+use crate::connectors::harborlink_media::HarborLinkMediaClient;
 use crate::connectors::storage::StorageTarget;
 use crate::domains::vision::{
     VisionAnalyzeCameraArgs, VisionAnalyzeCameraPayload, VisionDetection, VisionImageArtifact,
@@ -19,12 +19,11 @@ use crate::domains::vision::{
 };
 use crate::orchestrator::contracts::{Action, ExecutionResult, Route, StepStatus};
 use crate::orchestrator::router::Executor;
-use crate::runtime::media::{SnapshotCaptureRequest, SnapshotCaptureResult, SnapshotFormat};
+use crate::runtime::media::{SnapshotCaptureResult, SnapshotFormat};
 use crate::runtime::registry::{DeviceRegistryStore, ResolvedCameraTarget};
 
 pub struct VisionExecutor {
     registry_store: DeviceRegistryStore,
-    rtsp: Box<dyn RtspProbeAdapter>,
     python_bin: String,
     detector_script: PathBuf,
     bridge_script: PathBuf,
@@ -49,7 +48,6 @@ impl VisionExecutor {
         });
         Self {
             registry_store,
-            rtsp: Box::new(CommandRtspAdapter::default()),
             python_bin,
             detector_script,
             bridge_script,
@@ -179,15 +177,14 @@ impl VisionExecutor {
         &self,
         device: &ResolvedCameraTarget,
     ) -> Result<SnapshotCaptureResult, String> {
-        self.rtsp.capture_snapshot(
-            &SnapshotCaptureRequest::new(
-                device.device_id.clone(),
-                device.primary_stream.url.clone(),
-                SnapshotFormat::Jpeg,
-                StorageTarget::LocalDisk,
-            )
-            .with_snapshot_url(device.snapshot_url.clone()),
-        )
+        let bytes = HarborLinkMediaClient::from_env()?.capture_snapshot(&device.device_id)?;
+        Ok(SnapshotCaptureResult::new(
+            device.device_id.clone(),
+            SnapshotFormat::Jpeg,
+            base64::engine::general_purpose::STANDARD.encode(&bytes),
+            bytes.len(),
+            StorageTarget::LocalDisk,
+        ))
     }
 
     fn persist_snapshot(
@@ -829,7 +826,6 @@ mod tests {
 
         let executor = VisionExecutor {
             registry_store: DeviceRegistryStore::new(&artifact_root.join("registry.json")),
-            rtsp: Box::new(crate::adapters::rtsp::CommandRtspAdapter::default()),
             python_bin: "python3".to_string(),
             detector_script: artifact_root.join("detector.py"),
             bridge_script: artifact_root.join("bridge.sh"),

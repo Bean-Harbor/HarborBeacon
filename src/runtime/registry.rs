@@ -1517,9 +1517,6 @@ fn infer_discovery_source(bindings: &[&ProviderBinding]) -> String {
 
 fn same_camera_view(existing: &CameraDevice, incoming: &CameraDevice) -> bool {
     existing.device_id == incoming.device_id
-        || (existing.ip_address.is_some()
-            && existing.ip_address == incoming.ip_address
-            && existing.primary_stream.url == incoming.primary_stream.url)
         || existing.primary_stream.url == incoming.primary_stream.url
 }
 

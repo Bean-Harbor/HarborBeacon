@@ -10,11 +10,21 @@ date_stamp="${HARBORNAVI_BUILD_DATE:-$(date +%Y%m%d)}"
 release_label="${RELEASE_VERSION:-harbornavi-p1-capture-opt-${date_stamp}+riscv64}"
 debian_version="${DEBIAN_VERSION:-0.1.0+harbornavi.p1.captureopt.${date_stamp}.riscv64}"
 out_dir="${OUT_DIR:-${repo_root}/dist/harbornavi-k3-debs}"
-build_root="${repo_root}/target/harbornavi-k3-deb"
+package_work_parent="${PACKAGE_WORK_ROOT:-${TMPDIR:-/tmp}}"
+if [[ "$package_work_parent" =~ ^/mnt/[[:alpha:]](/|$) ]]; then
+  package_work_parent="/tmp"
+fi
+mkdir -p "$package_work_parent"
+build_root="$(mktemp -d "${package_work_parent%/}/harbornavi-k3-deb.XXXXXX")"
 pkg_name="harboros-beacon_${release_label}_${deb_arch}"
 pkg_dir="${build_root}/${pkg_name}"
 cargo_target_root="${CARGO_TARGET_DIR:-${repo_root}/target}"
 cargo_release_dir="${cargo_target_root}/${target}/release"
+
+cleanup_build_root() {
+  rm -rf -- "$build_root"
+}
+trap cleanup_build_root EXIT
 
 if [[ "$target" != "riscv64gc-unknown-linux-gnu" ]]; then
   echo "error: K3 package target must be riscv64gc-unknown-linux-gnu, got ${target}" >&2
@@ -44,7 +54,6 @@ cargo build --release --target "$target" --bin harbornavi-k3-local-vision-smoke
 cargo build --release --target "$target" --bin harbornavi-k3-multi-vision-smoke
 cargo build --release --target "$target" --bin harbornavi-ha-mqtt-event-contract-smoke
 
-rm -rf "$build_root"
 mkdir -p "$pkg_dir/DEBIAN"
 mkdir -p "$pkg_dir/usr/bin"
 mkdir -p "$pkg_dir/etc/systemd/system"
@@ -59,7 +68,10 @@ cp "${cargo_release_dir}/harbornavi-k3-multi-vision-smoke" "$pkg_dir/usr/bin/har
 cp "${cargo_release_dir}/harbornavi-ha-mqtt-event-contract-smoke" "$pkg_dir/usr/bin/harbornavi-ha-mqtt-event-contract-smoke"
 chmod 0755 "$pkg_dir/usr/bin/harboros-beacon" "$pkg_dir/usr/bin/harbor-model-api" "$pkg_dir/usr/bin/harbornavi-k3-local-vision-smoke" "$pkg_dir/usr/bin/harbornavi-k3-multi-vision-smoke" "$pkg_dir/usr/bin/harbornavi-ha-mqtt-event-contract-smoke"
 sed 's/\r$//' scripts/harbornavi_k3_yolov8_analyzer.py > "$pkg_dir/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py"
-chmod 0755 "$pkg_dir/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py"
+sed 's/\r$//' scripts/harbornavi_k3_yolo_stream_worker.py > "$pkg_dir/usr/lib/harboros-beacon/harbornavi_k3_yolo_stream_worker.py"
+chmod 0755 \
+  "$pkg_dir/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py" \
+  "$pkg_dir/usr/lib/harboros-beacon/harbornavi_k3_yolo_stream_worker.py"
 
 sed 's/\r$//' debian/harboros-beacon.service > "$pkg_dir/etc/systemd/system/harboros-beacon.service"
 sed 's/\r$//' debian/semantic-router.service > "$pkg_dir/etc/systemd/system/semantic-router.service"
@@ -68,7 +80,7 @@ sed \
   -e "s/VERSION_PLACEHOLDER/${debian_version}/g" \
   -e "s/ARCH_PLACEHOLDER/${deb_arch}/g" \
   debian/control \
-  | sed 's/^Depends: .*/Depends: libc6, openssl, ca-certificates, python3, python3-opencv, python3-spacemit-ort/' \
+  | sed 's/^Depends: .*/Depends: libc6, openssl, ca-certificates, harborlink (>= 0.1.0), python3, python3-opencv, python3-spacemit-ort/' \
   > "$pkg_dir/DEBIAN/control"
 printf 'X-HarborNavi-Version: %s\n' "$release_label" >> "$pkg_dir/DEBIAN/control"
 
@@ -83,6 +95,7 @@ debian_version=${debian_version}
 rust_target=${target}
 deb_arch=${deb_arch}
 analyzer=/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py
+stream_worker=/usr/lib/harboros-beacon/harbornavi_k3_yolo_stream_worker.py
 single_runner=/usr/bin/harbornavi-k3-local-vision-smoke
 multi_runner=/usr/bin/harbornavi-k3-multi-vision-smoke
 ha_mqtt_runner=/usr/bin/harbornavi-ha-mqtt-event-contract-smoke
@@ -99,7 +112,7 @@ EOF
 
 mkdir -p "$out_dir"
 find "$pkg_dir" -type d -exec chmod a-s,u=rwx,go=rx {} +
-dpkg-deb --build "$pkg_dir" "${out_dir}/${pkg_name}.deb"
+dpkg-deb --root-owner-group --build "$pkg_dir" "${out_dir}/${pkg_name}.deb"
 
 sha256sum "${out_dir}/${pkg_name}.deb" > "${out_dir}/${pkg_name}.deb.sha256"
 file "${cargo_release_dir}/harboros-beacon" > "${out_dir}/${pkg_name}.file.txt"

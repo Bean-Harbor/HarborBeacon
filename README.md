@@ -26,6 +26,16 @@ The project now includes a Rust runtime that compiles into a standalone binary f
 - Migrated scripts module: `src/scripts/`
 - Route priority: `middleware_api -> midcli -> browser -> mcp`
 
+### Southbound boundary
+
+Camera discovery, RTSP/ONVIF, Home Assistant, MediaMTX, live sessions, snapshots,
+clips, and DVR execution are owned by HarborLink. HarborBeacon keeps only task
+intent, approval, audit, logical camera identity, and knowledge-side metadata.
+The local HarborLink API defaults to `http://127.0.0.1:8790` and can be changed
+with `HARBORLINK_MEDIA_API_URL`; it never returns raw camera credentials or RTSP
+URLs to HarborBeacon. The standalone agent no longer accepts raw RTSP playback
+arguments or registers a direct camera discovery executor.
+
 Build and run:
 
 - `just build`

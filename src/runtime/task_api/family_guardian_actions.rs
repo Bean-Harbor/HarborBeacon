@@ -804,7 +804,7 @@ impl TaskApiService {
                 vec!["家庭守护状态".to_string()],
             ));
         };
-        let state = match self.admin_store.home_assistant_secret_state() {
+        let state = match self.admin_store.home_assistant_state() {
             Ok(state) => state,
             Err(error) => {
                 return Err(self.failed(

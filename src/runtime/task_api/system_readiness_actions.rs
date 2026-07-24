@@ -109,12 +109,13 @@ pub(super) fn build_general_message_readiness_summary(
             gateway_status,
         ),
         "home_assistant": {
-            "configured": !state.home_assistant.base_url.trim().is_empty()
-                && !state.home_assistant.access_token.trim().is_empty(),
+            "configured": state.home_assistant.enabled
+                && state.home_assistant.last_status != "not_configured",
             "enabled": state.home_assistant.enabled,
             "status": state.home_assistant.last_status,
-            "token_configured": !state.home_assistant.access_token.trim().is_empty(),
-            "token_redacted": !state.home_assistant.access_token.trim().is_empty(),
+            "token_configured": state.home_assistant.enabled,
+            "token_redacted": state.home_assistant.enabled,
+            "managed_by_harborlink": true,
             "last_sync_at": state.home_assistant.last_sync_at,
             "entity_count": state.home_assistant.entity_count,
             "service_count": state.home_assistant.service_count,
