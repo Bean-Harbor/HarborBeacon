@@ -122,9 +122,6 @@ use harborbeacon_local_agent::runtime::hub::{
     CameraConnectRequest, CameraHubService, HubManualAddSummary, HubScanRequest, HubScanSummary,
     HubStateSnapshot,
 };
-use harborbeacon_local_agent::runtime::knowledge::{
-    KnowledgeSearchRequest, KnowledgeSearchService,
-};
 use harborbeacon_local_agent::runtime::knowledge_index::{
     load_embedding_store, KnowledgeEmbeddingWarmupStats, KnowledgeIndexConfig, KnowledgeIndexEntry,
     KnowledgeIndexManifest, KnowledgeIndexService, KnowledgeIndexSnapshot, KnowledgeModality,
@@ -2430,9 +2427,6 @@ impl AdminApi {
             Method::Post if path == "/api/knowledge/search" => self
                 .handle_knowledge_search(&mut request, &identity_hints)
                 .boxed(),
-            Method::Post if path == "/api/knowledge/answer" => self
-                .handle_knowledge_answer(&mut request, &identity_hints)
-                .boxed(),
             Method::Get if path == "/api/knowledge/preview" => self
                 .handle_knowledge_preview(&raw_url, &identity_hints)
                 .boxed(),
@@ -3973,47 +3967,6 @@ impl AdminApi {
         }
     }
 
-    fn handle_knowledge_search(
-        &self,
-        request: &mut Request,
-        hints: &AccessIdentityHints,
-    ) -> Response<std::io::Cursor<Vec<u8>>> {
-        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
-            return error_json(StatusCode(403), &error);
-        }
-        let payload: KnowledgeSearchApiRequest = match read_json_body(request) {
-            Ok(payload) => payload,
-            Err(error) => return error_json(StatusCode(400), &error),
-        };
-        let settings = match self.admin_store.knowledge_settings() {
-            Ok(settings) => settings,
-            Err(error) => return error_json(StatusCode(500), &error),
-        };
-        let focus_paths = match self.resolve_dvr_search_focus_paths(&payload) {
-            Ok(paths) => paths,
-            Err(error) => return error_json(StatusCode(422), &error),
-        };
-        let dvr_settings = self.admin_store.dvr_recording_settings().ok();
-        let scoped_roots =
-            match resolve_admin_search_source_scope(&payload, &settings, dvr_settings.as_ref()) {
-                Ok(roots) => roots,
-                Err(error) => return error_json(StatusCode(422), &error),
-            };
-        let search_request = match build_admin_knowledge_search_request(
-            payload,
-            &settings,
-            focus_paths,
-            scoped_roots,
-        ) {
-            Ok(request) => request,
-            Err(error) => return error_json(StatusCode(422), &error),
-        };
-        match KnowledgeSearchService::search(search_request) {
-            Ok(response) => ok_json(&response),
-            Err(error) => error_json(StatusCode(422), &error),
-        }
-    }
-
     fn handle_knowledge_suggestions(
         &self,
         hints: &AccessIdentityHints,
@@ -4275,7 +4228,7 @@ impl AdminApi {
         }
     }
 
-    fn handle_knowledge_answer(
+    fn handle_knowledge_search(
         &self,
         request: &mut Request,
         hints: &AccessIdentityHints,
@@ -4291,7 +4244,7 @@ impl AdminApi {
         if payload.query.trim().is_empty() {
             return error_json(
                 StatusCode(422),
-                "Harbor Assistant answer requires a non-empty query.",
+                "Harbor Assistant search requires a non-empty query.",
             );
         }
         let settings = match self.admin_store.knowledge_settings() {
@@ -10593,7 +10546,6 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/knowledge/suggestions"
         || path.starts_with("/api/knowledge/conversations/")
         || path == "/api/knowledge/search"
-        || path == "/api/knowledge/answer"
         || path == "/api/knowledge/preview"
         || path == "/api/knowledge/index/run"
         || path == "/api/knowledge/index/status"
@@ -12135,41 +12087,6 @@ fn resolve_admin_search_source_scope(
             scope
         )),
     }
-}
-
-fn build_admin_knowledge_search_request(
-    payload: KnowledgeSearchApiRequest,
-    settings: &KnowledgeSettings,
-    focus_paths: Vec<String>,
-    scoped_roots: Vec<String>,
-) -> Result<KnowledgeSearchRequest, String> {
-    let query = payload.query.trim();
-    if query.is_empty() {
-        return Err("Harbor Assistant Search search requires a non-empty query.".to_string());
-    }
-    let configured_roots = settings.enabled_source_root_paths();
-    if configured_roots.is_empty() {
-        return Err("No enabled knowledge source roots are configured.".to_string());
-    }
-    let mut request = KnowledgeSearchRequest::new(query.to_string());
-    request.configured_roots = configured_roots.clone();
-    request.roots = if scoped_roots.is_empty() {
-        configured_roots
-    } else {
-        scoped_roots
-    };
-    request.index_root = non_empty_string(&settings.index_root);
-    request.include_documents = payload.include_documents.unwrap_or(true);
-    request.include_images = payload.include_images.unwrap_or(true);
-    request.include_videos = payload.include_videos.unwrap_or(true);
-    request.limit = payload.limit.unwrap_or(24).clamp(1, 50);
-    request.privacy_level = settings.privacy_level;
-    request.resource_profile = settings.default_resource_profile;
-    request.retrieval = settings.retrieval.clone();
-    request.require_embeddings = false;
-    request.latency_budget_ms = None;
-    request.focus_paths = focus_paths;
-    Ok(request)
 }
 
 #[derive(Debug, Deserialize)]
@@ -20559,7 +20476,7 @@ impl Drop for FfmpegMjpegStream {
 mod tests {
     use super::{
         apply_bridge_provider_binding_projection, authorize_gateway_service_request,
-        build_admin_knowledge_search_request, build_admin_rag_answer_task_request,
+        build_admin_rag_answer_task_request,
         build_default_notification_target_readiness, build_device_credential_status,
         build_feature_availability_response, build_files_browse_response,
         build_harboros_im_capability_map, build_harboros_status_response,
@@ -22408,7 +22325,7 @@ mod tests {
         assert!(is_admin_surface_path("/api/account-management"));
         assert!(is_admin_surface_path("/api/gateway/status"));
         assert!(is_admin_surface_path("/api/knowledge/search"));
-        assert!(is_admin_surface_path("/api/knowledge/answer"));
+        assert!(!is_admin_surface_path("/api/knowledge/answer"));
         assert!(is_admin_surface_path("/api/knowledge/preview"));
         assert!(is_admin_surface_path("/api/share-links"));
         assert!(is_admin_surface_path("/api/models/endpoints"));
@@ -24228,70 +24145,6 @@ mod tests {
     }
 
     #[test]
-    fn admin_knowledge_search_request_uses_enabled_roots_and_clamps_limit() {
-        let settings = KnowledgeSettings {
-            source_roots: vec![
-                KnowledgeSourceRoot {
-                    root_id: "enabled".to_string(),
-                    label: "Enabled".to_string(),
-                    path: "/mnt/source-a".to_string(),
-                    enabled: true,
-                    include: Vec::new(),
-                    exclude: Vec::new(),
-                    last_indexed_at: None,
-                },
-                KnowledgeSourceRoot {
-                    root_id: "disabled".to_string(),
-                    label: "Disabled".to_string(),
-                    path: "/mnt/source-b".to_string(),
-                    enabled: false,
-                    include: Vec::new(),
-                    exclude: Vec::new(),
-                    last_indexed_at: None,
-                },
-            ],
-            index_root: "/mnt/index".to_string(),
-            ..Default::default()
-        };
-
-        let request = build_admin_knowledge_search_request(
-            KnowledgeSearchApiRequest {
-                query: " 找到春天照片 ".to_string(),
-                conversation_id: None,
-                limit: Some(500),
-                include_documents: Some(false),
-                include_audio: None,
-                include_images: None,
-                include_videos: Some(true),
-                use_retrieval: None,
-                retrieval_mode: None,
-                source_scope: None,
-                source_root_ids: Vec::new(),
-                camera_id: None,
-                from: None,
-                to: None,
-            },
-            &settings,
-            vec!["/mnt/source-a/camera-main/segment.mp4".to_string()],
-            Vec::new(),
-        )
-        .expect("search request");
-
-        assert_eq!(request.query, "找到春天照片");
-        assert_eq!(request.limit, 50);
-        assert_eq!(request.configured_roots, vec!["/mnt/source-a".to_string()]);
-        assert_eq!(request.roots, vec!["/mnt/source-a".to_string()]);
-        assert!(!request.include_documents);
-        assert!(request.include_images);
-        assert!(request.include_videos);
-        assert_eq!(request.index_root.as_deref(), Some("/mnt/index"));
-        assert_eq!(
-            request.focus_paths,
-            vec!["/mnt/source-a/camera-main/segment.mp4"]
-        );
-    }
-
-    #[test]
     fn rag_answer_request_scopes_each_conversation_to_its_own_session() {
         let principal = AccessPrincipal {
             workspace_id: "home-1".to_string(),
@@ -24327,6 +24180,8 @@ mod tests {
             "harbor-assistant-search:user-1:conv-2"
         );
         assert_eq!(request.source.surface, HARBOR_ASSISTANT_SEARCH_SURFACE);
+        assert_eq!(request.intent.domain, "rag");
+        assert_eq!(request.intent.action, "answer");
         assert_eq!(
             request.args["modalities"],
             json!(["document", "audio", "image", "video"])
