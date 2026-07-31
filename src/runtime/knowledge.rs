@@ -1474,7 +1474,7 @@ fn candidate_has_retrieval_signal(
     if candidate
         .hit
         .lexical_score
-        .is_some_and(|score| score >= settings.lexical_min_score)
+        .is_some_and(|score| score > f32::EPSILON && score >= settings.lexical_min_score)
     {
         return true;
     }

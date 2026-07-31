@@ -38,7 +38,10 @@ pub fn build(
 
 pub fn search(path: &Path, query: &[f32], top_k: usize) -> Result<Vec<SearchResult>, String> {
     if !path.is_file() {
-        return Err(format!("knowledge HNSW index not found: {}", path.display()));
+        return Err(format!(
+            "knowledge HNSW index not found: {}",
+            path.display()
+        ));
     }
     let cached = index_cache()
         .read()
@@ -48,11 +51,10 @@ pub fn search(path: &Path, query: &[f32], top_k: usize) -> Result<Vec<SearchResu
     let index = if let Some(index) = cached {
         index
     } else {
-        let loaded = Arc::new(
-            persist::load_mmap(path, Cosine).map_err(|error| {
+        let loaded =
+            Arc::new(persist::load_mmap(path, Cosine).map_err(|error| {
                 format!("failed to load HNSW index {}: {error}", path.display())
-            })?,
-        );
+            })?);
         let mut cache = index_cache()
             .write()
             .map_err(|_| "knowledge HNSW cache lock is poisoned".to_string())?;
@@ -62,11 +64,7 @@ pub fn search(path: &Path, query: &[f32], top_k: usize) -> Result<Vec<SearchResu
             .or_insert_with(|| Arc::clone(&loaded))
             .clone()
     };
-    Ok(index.search(
-        query,
-        top_k.max(1),
-        HNSW_EF_SEARCH.max(top_k.max(1)),
-    ))
+    Ok(index.search(query, top_k.max(1), HNSW_EF_SEARCH.max(top_k.max(1))))
 }
 
 #[cfg(test)]

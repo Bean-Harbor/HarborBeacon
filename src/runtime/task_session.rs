@@ -1856,7 +1856,10 @@ mod tests {
             .expect("prune sessions");
         assert_eq!(removed, vec!["sess-old"]);
         assert!(store.load_session("sess-old").expect("load old").is_none());
-        assert!(store.load_task_run("task-old").expect("load old task").is_none());
+        assert!(store
+            .load_task_run("task-old")
+            .expect("load old task")
+            .is_none());
         assert!(store.load_session("sess-new").expect("load new").is_some());
         assert!(store
             .load_session("sess-other")

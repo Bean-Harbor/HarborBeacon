@@ -56,8 +56,7 @@ static LLM_TOKENIZER: OnceLock<Option<Tokenizer>> = OnceLock::new();
 
 pub fn llm_text_token_count(text: &str) -> usize {
     let tokenizer = LLM_TOKENIZER.get_or_init(|| {
-        env_trimmed(LLM_TOKENIZER_PATH_ENV)
-            .and_then(|path| Tokenizer::from_file(path).ok())
+        env_trimmed(LLM_TOKENIZER_PATH_ENV).and_then(|path| Tokenizer::from_file(path).ok())
     });
     tokenizer
         .as_ref()
@@ -2208,9 +2207,7 @@ fn endpoint_uses_openai_compatible_api(endpoint: &ModelEndpoint) -> bool {
 fn embedding_model_name_from_endpoint(endpoint: &ModelEndpoint) -> Option<String> {
     metadata_string(&endpoint.metadata, "runtime_embedding_model")
         .or_else(|| metadata_string(&endpoint.metadata, "model"))
-        .or_else(|| {
-            (!endpoint.model_name.trim().is_empty()).then_some(endpoint.model_name.clone())
-        })
+        .or_else(|| (!endpoint.model_name.trim().is_empty()).then_some(endpoint.model_name.clone()))
 }
 
 pub fn embedding_endpoint_identity_with_state(
@@ -2449,11 +2446,12 @@ mod tests {
 
     use super::{
         clear_local_runtime_projection_cache, connectivity_url,
+        embedding_endpoint_identity_with_state, embedding_query_input,
         endpoint_uses_openai_compatible_api, openai_compatible_config_from_endpoint,
-        embedding_endpoint_identity_with_state, embedding_query_input, redact_model_endpoint,
-        run_embedding_with_state, run_llm_text_with_state, run_llm_text_with_state_and_options,
-        run_rerank_with_state, run_vlm_summary_with_state, semantic_router_local_only_model_state,
-        test_model_endpoint, vlm_endpoint_readiness, LlmTextOptions, RERANK_POLICY_ID,
+        redact_model_endpoint, run_embedding_with_state, run_llm_text_with_state,
+        run_llm_text_with_state_and_options, run_rerank_with_state, run_vlm_summary_with_state,
+        semantic_router_local_only_model_state, test_model_endpoint, vlm_endpoint_readiness,
+        LlmTextOptions, RERANK_POLICY_ID,
     };
     use crate::control_plane::models::{
         ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, ModelRoutePolicy,

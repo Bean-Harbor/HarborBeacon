@@ -527,8 +527,8 @@ impl KnowledgeIndexService {
             }
         };
         let original_schema_version = store.schema_version;
-        let vector_file_ready = embedding_vector_path(&embedding_store_path, &store)
-            .is_ok_and(|path| path.is_file());
+        let vector_file_ready =
+            embedding_vector_path(&embedding_store_path, &store).is_ok_and(|path| path.is_file());
         let hnsw_missing = !store.entries.is_empty()
             && match embedding_hnsw_path(&embedding_store_path, &store) {
                 Ok(path) => !path.is_file(),
@@ -559,8 +559,7 @@ impl KnowledgeIndexService {
                 }
             }
         }
-        let mut dirty =
-            store.schema_version != EMBEDDING_STORE_SCHEMA_VERSION || hnsw_missing;
+        let mut dirty = store.schema_version != EMBEDDING_STORE_SCHEMA_VERSION || hnsw_missing;
         store.schema_version = EMBEDDING_STORE_SCHEMA_VERSION;
         store.root = snapshot.root.to_string_lossy().into_owned();
 
@@ -591,8 +590,7 @@ impl KnowledgeIndexService {
                 })
                 .find(|text| !text.is_empty());
             if let Some(probe_text) = probe_text {
-                let execution =
-                    run_embedding_with_context_retry(&probe_text, model_center_state);
+                let execution = run_embedding_with_context_retry(&probe_text, model_center_state);
                 if execution.available && !execution.vector.is_empty() {
                     let execution_model_name = execution
                         .model_name
@@ -1570,11 +1568,7 @@ fn embedding_store_needs_compaction(store: &KnowledgeEmbeddingStore) -> bool {
         .iter()
         .filter(|entry| entry.superseded)
         .count();
-    let active_count = store
-        .entries
-        .len()
-        .saturating_sub(superseded_count)
-        .max(1);
+    let active_count = store.entries.len().saturating_sub(superseded_count).max(1);
     delta_count >= EMBEDDING_COMPACTION_MIN_DELTA
         || superseded_count >= EMBEDDING_COMPACTION_MIN_DELTA
         || delta_count.saturating_mul(100)
@@ -1685,9 +1679,7 @@ fn save_embedding_store_owned(
         })?;
         Some(file_name)
     };
-    let hnsw_entry_count = hnsw_index_file_name
-        .as_ref()
-        .map(|_| store.entries.len());
+    let hnsw_entry_count = hnsw_index_file_name.as_ref().map(|_| store.entries.len());
 
     let compact_store = KnowledgeEmbeddingStore {
         schema_version: EMBEDDING_STORE_SCHEMA_VERSION,
@@ -1919,9 +1911,8 @@ fn search_embedding_store(
     let use_hnsw = matches!(
         store.schema_version,
         EMBEDDING_STORE_SCHEMA_VERSION | HNSW_SNAPSHOT_EMBEDDING_STORE_SCHEMA_VERSION
-    )
-        && !env::var(VECTOR_SEARCH_MODE_ENV)
-            .is_ok_and(|value| value.eq_ignore_ascii_case("exact"));
+    ) && !env::var(VECTOR_SEARCH_MODE_ENV)
+        .is_ok_and(|value| value.eq_ignore_ascii_case("exact"));
     if use_hnsw {
         let base_count = store
             .hnsw_entry_count
@@ -3675,17 +3666,16 @@ fn system_time_to_millis(value: SystemTime) -> Option<u128> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_text_chunk_hierarchy, detect_video_scene_timestamps,
-        embedding_context_limit_error, embedding_store_matches_identity, extract_video_keyframes,
-        format_keyframe_percent, lexical_query_terms, load_embedding_store,
-        load_embedding_store_with_vectors,
+        build_text_chunk_hierarchy, detect_video_scene_timestamps, embedding_context_limit_error,
+        embedding_store_matches_identity, extract_video_keyframes, format_keyframe_percent,
+        lexical_query_terms, load_embedding_store, load_embedding_store_with_vectors,
         merge_video_keyframe_targets, parse_video_frame_quality, parse_video_scene_timestamps,
         rebuild_embedding_hnsw, save_embedding_store, save_embedding_store_incremental,
         truncate_embedding_retry_input, video_frame_rejection_reason, video_keyframe_count,
-        video_keyframe_targets, KnowledgeEmbeddingEntry, KnowledgeEmbeddingStore,
-        KnowledgeIndexConfig, KnowledgeIndexManifest, KnowledgeIndexService,
-        KnowledgeIndexTextSource, KnowledgeModality, VideoFrameQuality,
-        write_compact_embedding_store, EMBEDDING_STORE_SCHEMA_VERSION, INDEX_SCHEMA_VERSION,
+        video_keyframe_targets, write_compact_embedding_store, KnowledgeEmbeddingEntry,
+        KnowledgeEmbeddingStore, KnowledgeIndexConfig, KnowledgeIndexManifest,
+        KnowledgeIndexService, KnowledgeIndexTextSource, KnowledgeModality, VideoFrameQuality,
+        EMBEDDING_STORE_SCHEMA_VERSION, INDEX_SCHEMA_VERSION,
     };
     use crate::runtime::model_center::EmbeddingEndpointIdentity;
     use std::collections::HashSet;
@@ -3940,12 +3930,8 @@ mod tests {
             superseded: false,
             vector: vec![0.95, 0.05],
         });
-        save_embedding_store_incremental(
-            &path,
-            &mut incremental,
-            EMBEDDING_STORE_SCHEMA_VERSION,
-        )
-        .expect("append incremental vectors");
+        save_embedding_store_incremental(&path, &mut incremental, EMBEDDING_STORE_SCHEMA_VERSION)
+            .expect("append incremental vectors");
 
         let updated = load_embedding_store(&path).expect("load incremental metadata");
         assert_eq!(updated.hnsw_index_file_name, base_hnsw_file);

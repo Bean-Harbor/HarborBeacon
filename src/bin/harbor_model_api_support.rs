@@ -1276,12 +1276,11 @@ impl CandleBackend {
 
     fn health(&self, config: &ModelApiConfig) -> HealthReport {
         let chat_state = candle_runtime_state_summary(&self.chat_state, "chat");
-        let embedding_state =
-            candle_runtime_state_summary(&self.embedding_state, "embedding");
+        let embedding_state = candle_runtime_state_summary(&self.embedding_state, "embedding");
         let chat_available =
             chat_state.loaded || local_model_assets_available(&self.config.chat_model_id);
-        let embedding_available = embedding_state.loaded
-            || local_model_assets_available(&self.config.embedding_model_id);
+        let embedding_available =
+            embedding_state.loaded || local_model_assets_available(&self.config.embedding_model_id);
         let mut notes = vec![CANDLE_CANDIDATE_NOTE.to_string()];
         if chat_state.loaded || embedding_state.loaded {
             notes.push("model weights are loaded".to_string());
@@ -1290,11 +1289,19 @@ impl CandleBackend {
         }
         notes.push(format!(
             "chat model weights are {}",
-            if chat_state.loaded { "loaded" } else { "not loaded" }
+            if chat_state.loaded {
+                "loaded"
+            } else {
+                "not loaded"
+            }
         ));
         notes.push(format!(
             "embedding model weights are {}",
-            if embedding_state.loaded { "loaded" } else { "not loaded" }
+            if embedding_state.loaded {
+                "loaded"
+            } else {
+                "not loaded"
+            }
         ));
         if !chat_available {
             notes.push(format!(
@@ -1333,8 +1340,7 @@ impl CandleBackend {
             // be stale endpoint configuration and must not be reported as
             // runtime truth.
             chat_model: chat_available.then(|| self.config.chat_model_id.clone()),
-            embedding_model: embedding_available
-                .then(|| self.config.embedding_model_id.clone()),
+            embedding_model: embedding_available.then(|| self.config.embedding_model_id.clone()),
             note: Some(notes.join("; ")),
             ready: true,
         }

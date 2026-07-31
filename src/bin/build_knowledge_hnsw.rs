@@ -6,13 +6,10 @@ use harborbeacon_local_agent::runtime::knowledge_index::rebuild_embedding_hnsw;
 use serde_json::json;
 
 fn main() {
-    let store_path = env::args_os()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            eprintln!("usage: build-knowledge-hnsw <embedding-store.json>");
-            std::process::exit(2);
-        });
+    let store_path = env::args_os().nth(1).map(PathBuf::from).unwrap_or_else(|| {
+        eprintln!("usage: build-knowledge-hnsw <embedding-store.json>");
+        std::process::exit(2);
+    });
     let started = Instant::now();
     match rebuild_embedding_hnsw(&store_path) {
         Ok(hnsw_path) => {

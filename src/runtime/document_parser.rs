@@ -14,9 +14,7 @@ use serde::{Deserialize, Serialize};
 const MAX_NATIVE_TEXT_BYTES: u64 = 512 * 1024;
 const NATIVE_PARSER_KEY: &str = "harbor_native:v1";
 const MARKITDOWN_PARSER_KEY: &str = "markitdown:0.1.11:v1";
-const NATIVE_EXTENSIONS: &[&str] = &[
-    "txt", "md", "markdown", "json", "csv", "yaml", "yml", "log",
-];
+const NATIVE_EXTENSIONS: &[&str] = &["txt", "md", "markdown", "json", "csv", "yaml", "yml", "log"];
 const MARKITDOWN_EXTENSIONS: &[&str] = &[
     "html", "htm", "xml", "rss", "atom", "pdf", "docx", "pptx", "xlsx", "zip",
 ];
@@ -223,7 +221,9 @@ impl DocumentParser for MarkItDownDocumentParser {
         let mut requires_advanced_parser = false;
 
         if extension == "pdf" {
-            let source_size = fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0);
+            let source_size = fs::metadata(path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
             if pdf_needs_advanced_parser(source_size, &text) {
                 requires_advanced_parser = true;
                 warnings.push(
@@ -364,12 +364,10 @@ fn flush_paragraph(
     }
     let block_type = if text.starts_with("```") {
         ParsedBlockKind::Code
-    } else if text.lines().all(|line| {
-        matches!(
-            line.trim_start().chars().next(),
-            Some('-' | '*' | '+')
-        )
-    }) {
+    } else if text
+        .lines()
+        .all(|line| matches!(line.trim_start().chars().next(), Some('-' | '*' | '+')))
+    {
         ParsedBlockKind::List
     } else if text.lines().filter(|line| line.contains('|')).count() >= 2 {
         ParsedBlockKind::Table
@@ -390,7 +388,10 @@ fn flush_paragraph(
 
 fn markdown_heading(line: &str) -> Option<(usize, &str)> {
     let trimmed = line.trim_start();
-    let level = trimmed.chars().take_while(|character| *character == '#').count();
+    let level = trimmed
+        .chars()
+        .take_while(|character| *character == '#')
+        .count();
     if !(1..=6).contains(&level) {
         return None;
     }

@@ -93,10 +93,7 @@ pub fn runtime_available() -> bool {
     runtime_config().is_ok()
 }
 
-pub fn transcribe_cached(
-    audio_path: &Path,
-    index_root: &Path,
-) -> Result<AsrTranscript, AsrError> {
+pub fn transcribe_cached(audio_path: &Path, index_root: &Path) -> Result<AsrTranscript, AsrError> {
     // Knowledge roots can be refreshed by separate background jobs. Serialize
     // ASR execution so concurrent roots cannot load multiple CPU models and
     // exhaust a small server with no swap.
@@ -270,8 +267,7 @@ fn transcribe_with_config(
             ffmpeg_resolution_hint()
         ))
     })?;
-    let work_dir =
-        env::temp_dir().join(format!("harborbeacon-asr-{}", Uuid::new_v4().as_simple()));
+    let work_dir = env::temp_dir().join(format!("harborbeacon-asr-{}", Uuid::new_v4().as_simple()));
     fs::create_dir_all(&work_dir).map_err(|error| {
         AsrError::Failed(format!(
             "cannot create temporary ASR directory {}: {error}",
@@ -538,9 +534,9 @@ fn load_cache(path: &Path) -> Option<CachedTranscript> {
 }
 
 fn persist_cache(path: &Path, cached: &CachedTranscript) -> Result<(), AsrError> {
-    let parent = path.parent().ok_or_else(|| {
-        AsrError::Failed(format!("invalid ASR cache path {}", path.display()))
-    })?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| AsrError::Failed(format!("invalid ASR cache path {}", path.display())))?;
     fs::create_dir_all(parent).map_err(|error| {
         AsrError::Failed(format!(
             "cannot create ASR cache directory {}: {error}",

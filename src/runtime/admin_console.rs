@@ -2413,7 +2413,10 @@ pub fn sanitize_knowledge_settings(settings: KnowledgeSettings) -> KnowledgeSett
         conversation: KnowledgeConversationSettings {
             history_limit: settings.conversation.history_limit.clamp(1, 100),
             context_turn_limit: settings.conversation.context_turn_limit.clamp(0, 20),
-            context_token_limit: settings.conversation.context_token_limit.clamp(4_096, 8_192),
+            context_token_limit: settings
+                .conversation
+                .context_token_limit
+                .clamp(4_096, 8_192),
         },
     }
 }
@@ -3102,7 +3105,9 @@ pub fn sanitize_model_center_state(state: AdminModelCenterState) -> AdminModelCe
         capability_bindings.push(ModelCapabilityBindingRecord {
             capability_id,
             desired_model_id,
-            active_model_id: binding.active_model_id.and_then(|value| non_empty_opt(&value)),
+            active_model_id: binding
+                .active_model_id
+                .and_then(|value| non_empty_opt(&value)),
             transition_status: non_empty_opt(&binding.transition_status)
                 .unwrap_or_else(default_model_transition_status),
             last_error: binding.last_error.and_then(|value| non_empty_opt(&value)),
@@ -3285,22 +3290,10 @@ fn align_embedding_endpoint_identity_with_runtime(endpoint: &mut ModelEndpoint) 
 
     endpoint.provider_key = provider_key.to_string();
     endpoint.model_name = runtime_model_id.clone();
-    set_model_endpoint_metadata_string(
-        endpoint,
-        "catalog_model_id",
-        runtime_model_id.clone(),
-    );
+    set_model_endpoint_metadata_string(endpoint, "catalog_model_id", runtime_model_id.clone());
     set_model_endpoint_metadata_string(endpoint, "model", runtime_model_id.clone());
-    set_model_endpoint_metadata_string(
-        endpoint,
-        "runtime_model_id",
-        runtime_model_id.clone(),
-    );
-    set_model_endpoint_metadata_string(
-        endpoint,
-        "runtime_embedding_model",
-        runtime_model_id,
-    );
+    set_model_endpoint_metadata_string(endpoint, "runtime_model_id", runtime_model_id.clone());
+    set_model_endpoint_metadata_string(endpoint, "runtime_embedding_model", runtime_model_id);
 }
 
 fn normalize_builtin_local_model_api_endpoint(endpoint: &mut ModelEndpoint) {
@@ -5851,11 +5844,9 @@ mod tests {
         sanitize_model_center_state, sync_platform_from_legacy, user_default_delivery_surface,
         user_recent_interactive_surface, AdminConsoleState, AdminConsoleStore, AdminDefaults,
         AdminModelCenterState, AutomationRuleReview, BridgeProviderCapabilities,
-        BridgeProviderConfig, DeviceCredentialSecret, DeviceEvidenceRecord,
-        IdentityBindingRecord, KnowledgeSettings, KnowledgeSourceRoot,
-        ModelCapabilityBindingRecord, RemoteViewConfig, BRIDGE_PROVIDER_ACCOUNT_ID,
-        LOCAL_RTSP_CREDENTIAL_ID,
-        LOCAL_RTSP_PROVIDER_ACCOUNT_ID,
+        BridgeProviderConfig, DeviceCredentialSecret, DeviceEvidenceRecord, IdentityBindingRecord,
+        KnowledgeSettings, KnowledgeSourceRoot, ModelCapabilityBindingRecord, RemoteViewConfig,
+        BRIDGE_PROVIDER_ACCOUNT_ID, LOCAL_RTSP_CREDENTIAL_ID, LOCAL_RTSP_PROVIDER_ACCOUNT_ID,
     };
 
     #[test]
