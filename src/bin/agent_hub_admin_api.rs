@@ -84,8 +84,7 @@ use harborbeacon_local_agent::runtime::admin_console::{
     DeviceCredentialSecret, DeviceEvidenceRecord, GatewayStatusSummary, HomeAssistantAdminState,
     HomeAssistantConfigUpdate, KnowledgeConversationSettings, KnowledgeIndexJobRecord,
     KnowledgeRetrievalSettings, KnowledgeSettings, KnowledgeSourceRoot, ModelDownloadJobRecord,
-    ModelRuntimeRecord,
-    NotificationTargetRecord, RagResourceProfile,
+    ModelRuntimeRecord, NotificationTargetRecord, RagResourceProfile,
 };
 use harborbeacon_local_agent::runtime::discovery::RtspProbeRequest;
 use harborbeacon_local_agent::runtime::dvr::{
@@ -127,7 +126,7 @@ use harborbeacon_local_agent::runtime::knowledge::{
     KnowledgeSearchRequest, KnowledgeSearchService,
 };
 use harborbeacon_local_agent::runtime::knowledge_index::{
-    load_embedding_store, KnowledgeEmbeddingWarmupStats, KnowledgeIndexConfig,
+    load_embedding_store, KnowledgeEmbeddingWarmupStats, KnowledgeIndexConfig, KnowledgeIndexEntry,
     KnowledgeIndexManifest, KnowledgeIndexService, KnowledgeIndexSnapshot, KnowledgeModality,
 };
 use harborbeacon_local_agent::runtime::media::{SnapshotCaptureRequest, SnapshotFormat};
@@ -1285,6 +1284,19 @@ struct KnowledgeIndexRunResponse {
     errors: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+struct KnowledgeSuggestion {
+    subject: String,
+    kind: String,
+    filter: String,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+struct KnowledgeSuggestionsResponse {
+    generated_at: String,
+    suggestions: Vec<KnowledgeSuggestion>,
+}
+
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 struct KnowledgeSearchApiRequest {
     query: String,
@@ -1294,6 +1306,8 @@ struct KnowledgeSearchApiRequest {
     limit: Option<usize>,
     #[serde(default)]
     include_documents: Option<bool>,
+    #[serde(default)]
+    include_audio: Option<bool>,
     #[serde(default)]
     include_images: Option<bool>,
     #[serde(default)]
@@ -1336,6 +1350,8 @@ struct KnowledgeIndexStatusResponse {
     index_root_writable: bool,
     manifest_count: usize,
     manifest_entry_count: usize,
+    supported_file_count: Option<usize>,
+    unindexed_file_count: Option<usize>,
     document_count: usize,
     image_count: usize,
     audio_count: usize,
@@ -1369,6 +1385,7 @@ struct KnowledgeIndexRootStatus {
 struct KnowledgeIndexStorageSummary {
     manifest_count: usize,
     manifest_entry_count: usize,
+    supported_file_count: Option<usize>,
     document_count: usize,
     image_count: usize,
     audio_count: usize,
@@ -2398,9 +2415,12 @@ impl AdminApi {
             Method::Patch if path == "/api/knowledge/conversation-settings" => self
                 .handle_save_knowledge_conversation_settings(&mut request, &identity_hints)
                 .boxed(),
-            Method::Get if path == "/api/knowledge/conversations" => self
-                .handle_knowledge_conversations(&identity_hints)
-                .boxed(),
+            Method::Get if path == "/api/knowledge/conversations" => {
+                self.handle_knowledge_conversations(&identity_hints).boxed()
+            }
+            Method::Get if path == "/api/knowledge/suggestions" => {
+                self.handle_knowledge_suggestions(&identity_hints).boxed()
+            }
             Method::Get if path.starts_with("/api/knowledge/conversations/") => self
                 .handle_knowledge_conversation(&path, &identity_hints)
                 .boxed(),
@@ -3994,6 +4014,68 @@ impl AdminApi {
         }
     }
 
+    fn handle_knowledge_suggestions(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let settings = match self.admin_store.knowledge_settings() {
+            Ok(settings) => settings,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let service = match KnowledgeIndexService::from_config(
+            match KnowledgeIndexConfig::new(settings.index_root.clone()) {
+                Ok(config) => config,
+                Err(error) => return error_json(StatusCode(422), &error),
+            },
+        ) {
+            Ok(service) => service,
+            Err(error) => return error_json(StatusCode(422), &error),
+        };
+        let mut entries = Vec::new();
+        for root in settings
+            .source_roots
+            .iter()
+            .filter(|root| root.enabled && !root.path.trim().is_empty())
+        {
+            let Ok(snapshot) = service.load_existing(Path::new(root.path.trim())) else {
+                continue;
+            };
+            let mut compact_entries = snapshot.manifest.entries.iter().collect::<Vec<_>>();
+            compact_entries.sort_by(|left, right| {
+                right
+                    .file_signature
+                    .modified_unix_millis
+                    .cmp(&left.file_signature.modified_unix_millis)
+                    .then(left.path.cmp(&right.path))
+            });
+            let mut per_modality = HashMap::<KnowledgeModality, usize>::new();
+            let selected_paths = compact_entries
+                .into_iter()
+                .filter(|entry| {
+                    let count = per_modality.entry(entry.modality).or_default();
+                    if *count >= 16 {
+                        return false;
+                    }
+                    *count += 1;
+                    true
+                })
+                .map(|entry| entry.path.replace('\\', "/"))
+                .collect::<HashSet<_>>();
+            if let Ok(mut payload_entries) =
+                service.load_entry_payloads(&snapshot, Some(&selected_paths))
+            {
+                entries.append(&mut payload_entries);
+            }
+        }
+        ok_json(&KnowledgeSuggestionsResponse {
+            generated_at: now_unix_string(),
+            suggestions: build_knowledge_suggestions(entries, 4),
+        })
+    }
+
     fn handle_knowledge_retrieval_settings(
         &self,
         hints: &AccessIdentityHints,
@@ -4052,17 +4134,23 @@ impl AdminApi {
         settings.conversation = KnowledgeConversationSettings {
             history_limit: update.history_limit,
             context_turn_limit: update.context_turn_limit,
+            context_token_limit: update
+                .context_token_limit
+                .unwrap_or(settings.conversation.context_token_limit),
         };
         match validate_knowledge_settings(settings)
             .and_then(|settings| self.admin_store.save_knowledge_settings(settings))
         {
             Ok(state) => {
                 let conversation = state.knowledge.conversation;
-                let _ = self.task_service.conversation_store().prune_sessions_for_user_surface(
-                    &principal.user_id,
-                    HARBOR_ASSISTANT_SEARCH_SURFACE,
-                    conversation.history_limit,
-                );
+                let _ = self
+                    .task_service
+                    .conversation_store()
+                    .prune_sessions_for_user_surface(
+                        &principal.user_id,
+                        HARBOR_ASSISTANT_SEARCH_SURFACE,
+                        conversation.history_limit,
+                    );
                 ok_json(&conversation)
             }
             Err(error) => error_json(StatusCode(422), &error),
@@ -4084,10 +4172,9 @@ impl AdminApi {
             .unwrap_or(10)
             .clamp(1, 100);
         let store = self.task_service.conversation_store();
-        let sessions = match store.sessions_for_user_surface(
-            &principal.user_id,
-            HARBOR_ASSISTANT_SEARCH_SURFACE,
-        ) {
+        let sessions = match store
+            .sessions_for_user_surface(&principal.user_id, HARBOR_ASSISTANT_SEARCH_SURFACE)
+        {
             Ok(sessions) => sessions,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -4137,7 +4224,10 @@ impl AdminApi {
         let session = match store.load_session(&session_id) {
             Ok(Some(session))
                 if session.user_id == principal.user_id
-                    && session.surface == HARBOR_ASSISTANT_SEARCH_SURFACE => session,
+                    && session.surface == HARBOR_ASSISTANT_SEARCH_SURFACE =>
+            {
+                session
+            }
             Ok(_) => return error_json(StatusCode(404), "conversation not found"),
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -4213,14 +4303,11 @@ impl AdminApi {
             Err(error) => return error_json(StatusCode(422), &error),
         };
         let dvr_settings = self.admin_store.dvr_recording_settings().ok();
-        let roots = match resolve_admin_search_source_scope(
-            &payload,
-            &settings,
-            dvr_settings.as_ref(),
-        ) {
-            Ok(roots) => roots,
-            Err(error) => return error_json(StatusCode(422), &error),
-        };
+        let roots =
+            match resolve_admin_search_source_scope(&payload, &settings, dvr_settings.as_ref()) {
+                Ok(roots) => roots,
+                Err(error) => return error_json(StatusCode(422), &error),
+            };
         let task_request =
             build_admin_rag_answer_task_request(&principal, payload, focus_paths, roots);
         let conversation_id = task_request.source.conversation_id.clone();
@@ -4234,12 +4321,20 @@ impl AdminApi {
                 "conversation_context_turn_limit".to_string(),
                 json!(settings.conversation.context_turn_limit),
             );
+            data.insert(
+                "conversation_context_token_limit".to_string(),
+                json!(settings.conversation.context_token_limit),
+            );
         }
-        if let Err(error) = self.task_service.conversation_store().prune_sessions_for_user_surface(
-            &principal.user_id,
-            HARBOR_ASSISTANT_SEARCH_SURFACE,
-            settings.conversation.history_limit,
-        ) {
+        if let Err(error) = self
+            .task_service
+            .conversation_store()
+            .prune_sessions_for_user_surface(
+                &principal.user_id,
+                HARBOR_ASSISTANT_SEARCH_SURFACE,
+                settings.conversation.history_limit,
+            )
+        {
             if let Some(data) = response.result.data.as_object_mut() {
                 data.insert(
                     "conversation_history_warning".to_string(),
@@ -6655,14 +6750,14 @@ impl AdminApi {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
         };
-        let previous_active_model_id = self
-            .admin_store
-            .load_or_create_state()
-            .ok()
-            .and_then(|state| {
-                model_capability_assignment(&state.models, &capability_id)
-                    .and_then(|binding| binding.active_model_id.clone())
-            });
+        let previous_active_model_id =
+            self.admin_store
+                .load_or_create_state()
+                .ok()
+                .and_then(|state| {
+                    model_capability_assignment(&state.models, &capability_id)
+                        .and_then(|binding| binding.active_model_id.clone())
+                });
         if let Err(error) = self.admin_store.save_model_capability_assignment(
             &capability_id,
             &body.model_id,
@@ -6672,20 +6767,20 @@ impl AdminApi {
         ) {
             return error_json(StatusCode(422), &error);
         }
-        let activation = match self.activate_selected_model_capability(&capability_id, &body.model_id)
-        {
-            Ok(result) => result,
-            Err(error) => {
-                let _ = self.admin_store.save_model_capability_assignment(
-                    &capability_id,
-                    &body.model_id,
-                    previous_active_model_id.as_deref(),
-                    "failed",
-                    Some(&error),
-                );
-                return error_json(StatusCode(422), &error);
-            }
-        };
+        let activation =
+            match self.activate_selected_model_capability(&capability_id, &body.model_id) {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = self.admin_store.save_model_capability_assignment(
+                        &capability_id,
+                        &body.model_id,
+                        previous_active_model_id.as_deref(),
+                        "failed",
+                        Some(&error),
+                    );
+                    return error_json(StatusCode(422), &error);
+                }
+            };
         let (active_model_id, transition_status, last_error) = if activation.activated {
             (Some(body.model_id.as_str()), "ready", None)
         } else {
@@ -10495,6 +10590,7 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/knowledge/settings"
         || path == "/api/knowledge/conversation-settings"
         || path == "/api/knowledge/conversations"
+        || path == "/api/knowledge/suggestions"
         || path.starts_with("/api/knowledge/conversations/")
         || path == "/api/knowledge/search"
         || path == "/api/knowledge/answer"
@@ -11572,8 +11668,9 @@ fn run_knowledge_index_jobs(
         }
     };
 
+    let embedding_warmup_enabled = settings.retrieval.vector_weight > f32::EPSILON;
     for job in jobs {
-        run_knowledge_index_job(&store, &service, job);
+        run_knowledge_index_job(&store, &service, job, embedding_warmup_enabled);
     }
 }
 
@@ -11654,6 +11751,7 @@ fn run_knowledge_index_job(
     store: &AdminConsoleStore,
     service: &KnowledgeIndexService,
     mut job: KnowledgeIndexJobRecord,
+    embedding_warmup_enabled: bool,
 ) {
     if knowledge_index_job_cancel_requested(store, &job.job_id) {
         cancel_knowledge_index_job(store, job, "canceled_before_start");
@@ -11703,12 +11801,21 @@ fn run_knowledge_index_job(
                 fail_knowledge_index_job(store, job, "job_state_write_failed", error);
                 return;
             }
-            let model_center_state = load_model_center_state();
-            let embedding_warmup = run_knowledge_embedding_warmup_with_timeout(
-                service,
-                &snapshot,
-                &model_center_state,
-            );
+            let embedding_warmup = if embedding_warmup_enabled {
+                let model_center_state = load_model_center_state();
+                run_knowledge_embedding_warmup_with_timeout(service, &snapshot, &model_center_state)
+            } else {
+                let total = service.embedding_warmup_candidate_count(&snapshot);
+                KnowledgeEmbeddingWarmupStats {
+                    total,
+                    completed: 0,
+                    skipped: total,
+                    failed: 0,
+                    degraded: false,
+                    persist_error: None,
+                    last_error: None,
+                }
+            };
             if knowledge_index_job_cancel_requested(store, &job.job_id) {
                 cancel_knowledge_index_job(store, job, "canceled_after_embedding_warmup");
                 return;
@@ -11843,6 +11950,10 @@ fn build_knowledge_index_status_response(
         index_root_writable,
         manifest_count: storage_summary.manifest_count,
         manifest_entry_count: storage_summary.manifest_entry_count,
+        supported_file_count: storage_summary.supported_file_count,
+        unindexed_file_count: storage_summary
+            .supported_file_count
+            .map(|count| count.saturating_sub(storage_summary.manifest_entry_count)),
         document_count: storage_summary.document_count,
         image_count: storage_summary.image_count,
         audio_count: storage_summary.audio_count,
@@ -11878,7 +11989,11 @@ fn knowledge_index_storage_summary(index_path: &Path) -> KnowledgeIndexStorageSu
         if file_name.ends_with(".embeddings.json") {
             summary.embedding_cache_count += 1;
             if let Ok(store) = load_embedding_store(&path) {
-                summary.embedding_entry_count += store.entries.len();
+                summary.embedding_entry_count += store
+                    .entries
+                    .iter()
+                    .filter(|entry| !entry.superseded)
+                    .count();
             }
             continue;
         }
@@ -11893,6 +12008,15 @@ fn knowledge_index_storage_summary(index_path: &Path) -> KnowledgeIndexStorageSu
         };
         summary.manifest_count += 1;
         summary.manifest_entry_count += manifest.entries.len();
+        summary.supported_file_count = match (
+            summary.manifest_count,
+            summary.supported_file_count,
+            manifest.supported_file_count,
+        ) {
+            (1, None, Some(count)) => Some(count),
+            (_, Some(total), Some(count)) => Some(total.saturating_add(count)),
+            _ => None,
+        };
         for indexed_entry in &manifest.entries {
             match indexed_entry.modality {
                 KnowledgeModality::Document => summary.document_count += 1,
@@ -11958,9 +12082,8 @@ fn resolve_admin_search_source_scope(
                 .ok_or_else(|| {
                     format!("Knowledge source root is not enabled or configured: {root_id}")
                 })?;
-            let path = non_empty_string(&root.path).ok_or_else(|| {
-                format!("Knowledge source root has no usable path: {root_id}")
-            })?;
+            let path = non_empty_string(&root.path)
+                .ok_or_else(|| format!("Knowledge source root has no usable path: {root_id}"))?;
             resolved_roots.push(path);
         }
         return Ok(resolved_roots);
@@ -12053,6 +12176,8 @@ fn build_admin_knowledge_search_request(
 struct KnowledgeConversationSettingsUpdate {
     history_limit: usize,
     context_turn_limit: usize,
+    #[serde(default)]
+    context_token_limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -12094,6 +12219,9 @@ fn build_admin_rag_answer_task_request(
     let mut modalities = Vec::new();
     if payload.include_documents.unwrap_or(true) {
         modalities.push("document");
+    }
+    if payload.include_audio.unwrap_or(false) {
+        modalities.push("audio");
     }
     if payload.include_images.unwrap_or(true) {
         modalities.push("image");
@@ -15483,9 +15611,7 @@ fn build_model_capability_status(
         .unwrap_or_else(|| match (cloud_runtime_ready, model_kind) {
             (true, _) => true,
             (false, ModelKind::Llm) => runtime.chat_model_loaded.unwrap_or(runtime_ready),
-            (false, ModelKind::Embedder) => {
-                runtime.embedding_model_loaded.unwrap_or(runtime_ready)
-            }
+            (false, ModelKind::Embedder) => runtime.embedding_model_loaded.unwrap_or(runtime_ready),
             (false, _) => runtime_model_id.is_some(),
         });
     // Capability readiness and the displayed serving model must come from the
@@ -15644,10 +15770,7 @@ fn local_model_catalog_specs() -> Vec<LocalModelCatalogSpec> {
             repo_id: Some("Qwen/Qwen3.5-4B"),
             revision: "main",
             file_policy: "runtime_snapshot",
-            runtime_profiles: &[
-                "vllm-openai-compatible",
-                "sglang-openai-compatible",
-            ],
+            runtime_profiles: &["vllm-openai-compatible", "sglang-openai-compatible"],
             expected_capabilities: &["llm", "vlm", "image_text_to_text"],
             acceptance_note: Some("primary-live-test"),
         },
@@ -15692,9 +15815,12 @@ fn local_model_catalog_specs() -> Vec<LocalModelCatalogSpec> {
             repo_id: Some("Qwen/Qwen3-Embedding-0.6B"),
             revision: "main",
             file_policy: "runtime_snapshot",
-            runtime_profiles: &["openai-compatible-embedding"],
+            runtime_profiles: &[
+                "llama-cpp-openai-compatible-embedding",
+                "openai-compatible-embedding",
+            ],
             expected_capabilities: &["embedding"],
-            acceptance_note: Some("retrieval-quality-upgrade"),
+            acceptance_note: Some("llama-cpp-retrieval-quality-upgrade"),
         },
         LocalModelCatalogSpec {
             model_id: "Qwen/Qwen2.5-0.5B-Instruct",
@@ -16111,8 +16237,7 @@ fn configured_external_runtime_model_id(
         })
         .find_map(|endpoint| {
             let runtime_model_id = probe_local_openai_compatible_serving_model(endpoint)?;
-            let canonical_model_id =
-                canonical_catalog_model_id(&runtime_model_id, catalog_models)?;
+            let canonical_model_id = canonical_catalog_model_id(&runtime_model_id, catalog_models)?;
             (canonical_model_id == desired_model_id).then_some(runtime_model_id)
         })
 }
@@ -16137,8 +16262,7 @@ fn probe_local_endpoint_runtime_model(
     }
     let base_url = metadata_string_value(&endpoint.metadata, "base_url")?;
     let normalized = base_url.trim().trim_end_matches('/');
-    if !(normalized.starts_with("http://127.0.0.1:")
-        || normalized.starts_with("http://localhost:"))
+    if !(normalized.starts_with("http://127.0.0.1:") || normalized.starts_with("http://localhost:"))
     {
         return None;
     }
@@ -16213,7 +16337,10 @@ fn probe_local_endpoint_runtime_model(
         .ok()?
         .json::<Value>()
         .ok()?;
-    if !health.get("ready").and_then(Value::as_bool).unwrap_or(false)
+    if !health
+        .get("ready")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
         || !health
             .pointer("/backend/ready")
             .and_then(Value::as_bool)
@@ -16233,7 +16360,11 @@ fn probe_local_endpoint_runtime_model(
     let loaded = health
         .pointer(loaded_field)
         .and_then(Value::as_bool)
-        .or_else(|| health.pointer("/backend/model_loaded").and_then(Value::as_bool))
+        .or_else(|| {
+            health
+                .pointer("/backend/model_loaded")
+                .and_then(Value::as_bool)
+        })
         .unwrap_or(true);
     Some(ProbedEndpointRuntimeModel { model_id, loaded })
 }
@@ -18874,7 +19005,10 @@ fn model_endpoint_uses_external_runtime(endpoint: &ModelEndpoint) -> bool {
     let backend_kind = metadata_string_value(&endpoint.metadata, "runtime_backend_kind")
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if matches!(backend_kind.as_str(), "vllm" | "sglang" | "openai_proxy") {
+    if matches!(
+        backend_kind.as_str(),
+        "vllm" | "sglang" | "openai_proxy" | "llama.cpp" | "llamacpp"
+    ) {
         return true;
     }
     endpoint
@@ -18889,6 +19023,7 @@ fn model_endpoint_uses_external_runtime(endpoint: &ModelEndpoint) -> bool {
                 profile.trim().to_ascii_lowercase().as_str(),
                 "vllm-openai-compatible"
                     | "sglang-openai-compatible"
+                    | "llama.cpp-openai-compatible"
                     | "openai-compatible-embedding"
                     | "openai-compatible-vlm"
             )
@@ -19049,6 +19184,117 @@ fn task_error_message(response: &TaskResponse) -> String {
 fn non_empty_string(value: &str) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn build_knowledge_suggestions(
+    mut entries: Vec<KnowledgeIndexEntry>,
+    limit: usize,
+) -> Vec<KnowledgeSuggestion> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    entries.sort_by(|left, right| {
+        right
+            .file_signature
+            .modified_unix_millis
+            .cmp(&left.file_signature.modified_unix_millis)
+            .then(left.path.cmp(&right.path))
+    });
+
+    let mut suggestions = Vec::new();
+    let mut used_modalities = HashSet::new();
+    let mut used_subjects = HashSet::new();
+    for prefer_new_modality in [true, false] {
+        for entry in &entries {
+            if suggestions.len() >= limit {
+                break;
+            }
+            if prefer_new_modality && used_modalities.contains(&entry.modality) {
+                continue;
+            }
+            let subject = knowledge_suggestion_subject(entry);
+            let normalized_subject = subject.to_lowercase();
+            if subject.is_empty() || used_subjects.contains(&normalized_subject) {
+                continue;
+            }
+            let (kind, filter) = match entry.modality {
+                KnowledgeModality::Document => ("summarize", "text"),
+                KnowledgeModality::Audio => ("summarize", "audio"),
+                KnowledgeModality::Image => ("describe", "images"),
+                KnowledgeModality::Video => ("describe", "videos"),
+            };
+            suggestions.push(KnowledgeSuggestion {
+                subject,
+                kind: kind.to_string(),
+                filter: filter.to_string(),
+            });
+            used_modalities.insert(entry.modality);
+            used_subjects.insert(normalized_subject);
+        }
+    }
+    suggestions
+}
+
+fn knowledge_suggestion_subject(entry: &KnowledgeIndexEntry) -> String {
+    let title = entry.title.trim();
+    let section = entry
+        .chunks
+        .iter()
+        .flat_map(|chunk| chunk.section_path.iter().rev())
+        .map(|value| value.trim())
+        .find(|value| !value.is_empty() && !value.eq_ignore_ascii_case(title));
+    let semantic_subject = entry
+        .text_sources
+        .iter()
+        .map(|source| source.text.as_str())
+        .chain(entry.chunks.iter().map(|chunk| chunk.text.as_str()))
+        .find_map(compact_knowledge_suggestion_text);
+    let subject = match (entry.modality, title.is_empty(), section, semantic_subject) {
+        (_, _, _, Some(subject)) => subject,
+        (KnowledgeModality::Document, false, Some(section), None) => {
+            format!("{title} — {section}")
+        }
+        (_, false, _, None) => title.to_string(),
+        (_, true, Some(section), None) => section.to_string(),
+        (_, true, None, None) => return String::new(),
+    };
+    subject.chars().take(72).collect()
+}
+
+fn compact_knowledge_suggestion_text(text: &str) -> Option<String> {
+    let visible = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("<!--"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut visible = visible.trim();
+    if visible.starts_with('[') {
+        if let Some(end) = visible.find(']') {
+            visible = visible[(end + 1)..].trim();
+        }
+    }
+    if visible.to_ascii_lowercase().starts_with("keyframe ") {
+        if let Some(end) = visible.find(':') {
+            visible = visible[(end + 1)..].trim();
+        }
+    }
+    let visible = visible.trim_matches(|ch| matches!(ch, '"' | '\'' | '“' | '”' | '‘' | '’'));
+    if visible.is_empty() {
+        return None;
+    }
+    let boundary = visible
+        .char_indices()
+        .find(|(index, ch)| {
+            *index >= 12 && matches!(ch, '。' | '！' | '？' | '；' | ',' | '，' | ';' | '!' | '?')
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(visible.len());
+    let compact = visible[..boundary]
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '“' | '”' | '‘' | '’'));
+    let compact = compact.chars().take(56).collect::<String>();
+    (!compact.is_empty()).then_some(compact)
 }
 
 fn now_unix_string() -> String {
@@ -20314,12 +20560,12 @@ mod tests {
     use super::{
         apply_bridge_provider_binding_projection, authorize_gateway_service_request,
         build_admin_knowledge_search_request, build_admin_rag_answer_task_request,
-        build_default_notification_target_readiness,
-        build_device_credential_status, build_feature_availability_response,
-        build_files_browse_response, build_harboros_im_capability_map,
-        build_harboros_status_response, build_hardware_readiness_response,
-        build_home_assistant_operator_audit, build_inference_health_alias_response,
-        build_knowledge_index_job, build_knowledge_index_status_response,
+        build_default_notification_target_readiness, build_device_credential_status,
+        build_feature_availability_response, build_files_browse_response,
+        build_harboros_im_capability_map, build_harboros_status_response,
+        build_hardware_readiness_response, build_home_assistant_operator_audit,
+        build_inference_health_alias_response, build_knowledge_index_job,
+        build_knowledge_index_status_response, build_knowledge_suggestions,
         build_local_model_catalog, build_local_vision_event_notification_blocked_response,
         build_model_capabilities_response, build_outreach_delivery_notification_request,
         build_rag_readiness_response, build_redacted_diagnostics_bundle,
@@ -20328,7 +20574,6 @@ mod tests {
         default_model_download_target_path_in_root, default_model_endpoints,
         embedding_warmup_timeout_stats, ensure_local_admin_access, ensure_local_camera_access,
         harbor_assistant_build_missing_response, hardware_class_for_probe, has_forwarding_headers,
-        HARBOR_ASSISTANT_SEARCH_SURFACE,
         huggingface_download_should_fallback_to_plain_http, huggingface_resolve_url,
         identity_query_suffix, is_admin_surface_path, is_harbor_assistant_client_route,
         is_harbor_assistant_surface_path, is_safe_live_asset_name,
@@ -20336,7 +20581,8 @@ mod tests {
         live_bridge_provider_from_setup_status, local_model_catalog_item,
         local_model_catalog_specs, mime_type_for_path, model_download_huggingface_endpoint,
         model_download_huggingface_endpoints, model_download_jobs_status,
-        model_hardware_recommendation, model_snapshot_file_allowed,
+        model_endpoint_uses_external_runtime, model_hardware_recommendation,
+        model_snapshot_file_allowed,
         normalize_harbor_assistant_conversation_id, normalize_unified_admin_path,
         notification_delivery_error_to_harbor_app_error,
         overlay_model_endpoints_with_runtime_truth, parse_approval_decision_path,
@@ -20349,21 +20595,20 @@ mod tests {
         parse_device_credentials_path, parse_device_evidence_path,
         parse_device_metadata_patch_path, parse_device_rtsp_check_path,
         parse_device_validation_run_path, parse_harbor_app_lifecycle_path, parse_harbor_app_path,
-        parse_json_body_limited, parse_knowledge_index_job_cancel_path,
-        parse_local_vision_event_notify_path, parse_member_default_delivery_surface_update_path,
-        parse_member_role_update_path, parse_model_download_cancel_path,
-        parse_model_download_job_path, parse_model_endpoint_path, parse_model_endpoint_test_path,
-        parse_model_runtime_install_path, parse_notification_target_delete_path,
-        parse_harbor_assistant_conversation_path, parse_optional_unix_seconds,
-        parse_share_link_revoke_path,
-        parse_shared_camera_live_page_path, parse_shared_camera_live_stream_path,
-        percent_decode_path_segment, probe_local_model_runtime,
-        probe_local_openai_compatible_serving_model, redact_account_management_snapshot,
-        resolve_admin_search_source_scope,
-        redact_admin_string, redact_bridge_provider_config, redact_camera_device_projection,
-        redact_model_endpoint_response, redact_state_snapshot, redact_stream_url_credentials,
-        redact_value_stream_credentials, redacted_general_message_nsp_route_summary,
-        redacted_home_assistant_task_api_event_summary, release_item, request_identity_hints,
+        parse_harbor_assistant_conversation_path, parse_json_body_limited,
+        parse_knowledge_index_job_cancel_path, parse_local_vision_event_notify_path,
+        parse_member_default_delivery_surface_update_path, parse_member_role_update_path,
+        parse_model_download_cancel_path, parse_model_download_job_path, parse_model_endpoint_path,
+        parse_model_endpoint_test_path, parse_model_runtime_install_path,
+        parse_notification_target_delete_path, parse_optional_unix_seconds,
+        parse_share_link_revoke_path, parse_shared_camera_live_page_path,
+        parse_shared_camera_live_stream_path, percent_decode_path_segment,
+        probe_local_model_runtime, probe_local_openai_compatible_serving_model,
+        redact_account_management_snapshot, redact_admin_string, redact_bridge_provider_config,
+        redact_camera_device_projection, redact_model_endpoint_response, redact_state_snapshot,
+        redact_stream_url_credentials, redact_value_stream_credentials,
+        redacted_general_message_nsp_route_summary, redacted_home_assistant_task_api_event_summary,
+        release_item, request_identity_hints, resolve_admin_search_source_scope,
         resolve_harbor_assistant_asset_path, resolve_knowledge_preview_path,
         run_knowledge_index_jobs, run_model_download_job, run_model_download_transfer,
         sanitized_outreach_delivery_request_audit, scan_request_task_args,
@@ -20373,9 +20618,9 @@ mod tests {
         HomeGuardianEvaluationQueue, KnowledgeSearchApiRequest, LocalModelRuntimeProjection,
         ManualAddRequest, ModelRuntimeActivationRequest, ModelRuntimeActivationResult,
         OutreachDeliveryRecipientRequest, OutreachDeliveryRequest, VisionIngestLimiter,
-        DEFAULT_HF_ENDPOINT, HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS,
-        HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS, MAX_VISION_EVENT_INGEST_INFLIGHT,
-        PRIVACY_GATEWAY_AUDIT_ACTION,
+        DEFAULT_HF_ENDPOINT, HARBOR_ASSISTANT_SEARCH_SURFACE,
+        HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS, HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS,
+        MAX_VISION_EVENT_INGEST_INFLIGHT, PRIVACY_GATEWAY_AUDIT_ACTION,
     };
     use harborbeacon_local_agent::connectors::notifications::{
         NotificationDeliveryError, NotificationDestinationKind, NotificationRecipientIdType,
@@ -20405,7 +20650,8 @@ mod tests {
     };
     use harborbeacon_local_agent::runtime::hub::CameraHubService;
     use harborbeacon_local_agent::runtime::knowledge_index::{
-        KnowledgeIndexConfig, KnowledgeIndexService,
+        KnowledgeFileSignature, KnowledgeIndexChunk, KnowledgeIndexConfig, KnowledgeIndexEntry,
+        KnowledgeIndexService, KnowledgeIndexTextSource, KnowledgeModality,
     };
     use harborbeacon_local_agent::runtime::privacy_gateway::PRIVACY_GATEWAY_POLICY_VERSION;
     use harborbeacon_local_agent::runtime::registry::{CameraDevice, DeviceRegistryStore};
@@ -20571,7 +20817,10 @@ mod tests {
             payload["content"]["structured_payload"]["recipient"]["contact_email_configured"],
             json!(true)
         );
-        assert_eq!(payload["content"]["structured_payload"]["app_id"], json!("ops"));
+        assert_eq!(
+            payload["content"]["structured_payload"]["app_id"],
+            json!("ops")
+        );
         assert!(encoded.contains("creator@example.com"));
         assert!(!encoded.contains("gw_route_feishu_mail_default"));
         assert!(!structured_payload.contains("creator@example.com"));
@@ -22947,6 +23196,20 @@ mod tests {
             .iter()
             .any(|profile| profile == "harbor-candle"));
 
+        let qwen_embedding = catalog
+            .models
+            .iter()
+            .find(|item| item.model_id == "Qwen/Qwen3-Embedding-0.6B")
+            .expect("qwen embedding catalog model");
+        assert!(qwen_embedding
+            .runtime_profiles
+            .iter()
+            .any(|profile| profile == "llama-cpp-openai-compatible-embedding"));
+        assert_eq!(
+            qwen_embedding.acceptance_note.as_deref(),
+            Some("llama-cpp-retrieval-quality-upgrade")
+        );
+
         let smolvlm = catalog
             .models
             .iter()
@@ -23121,6 +23384,63 @@ mod tests {
         assert!(router.runtime_installable);
         assert_eq!(router.next_action, "选择或安装模型");
         assert!(router.current_model.is_none());
+    }
+
+    #[test]
+    fn knowledge_suggestions_use_current_index_subjects_and_diverse_modalities() {
+        let entry = |title: &str, section: &str, modality: KnowledgeModality, modified| {
+            KnowledgeIndexEntry {
+                modality,
+                path: format!("/knowledge/{title}"),
+                title: title.to_string(),
+                searchable_text: section.to_string(),
+                parent_chunks: Vec::new(),
+                chunks: vec![KnowledgeIndexChunk {
+                    section_path: vec![section.to_string()],
+                    ..KnowledgeIndexChunk::default()
+                }],
+                text_sources: vec![KnowledgeIndexTextSource {
+                    source_kind: "test".to_string(),
+                    source_path: None,
+                    provider_key: None,
+                    text: section.to_string(),
+                }],
+                sidecar_path: None,
+                file_signature: KnowledgeFileSignature {
+                    modified_unix_millis: modified,
+                    size_bytes: 100,
+                },
+                sidecar_signature: None,
+                processing_warnings: Vec::new(),
+                parser_key: None,
+                requires_advanced_parser: false,
+            }
+        };
+        let suggestions = build_knowledge_suggestions(
+            vec![
+                entry(
+                    "家庭旅行计划.md",
+                    "行程安排",
+                    KnowledgeModality::Document,
+                    30,
+                ),
+                entry(
+                    "花园春景.jpg",
+                    "花园里的郁金香",
+                    KnowledgeModality::Image,
+                    20,
+                ),
+                entry("会议记录.md", "预算讨论", KnowledgeModality::Document, 10),
+            ],
+            4,
+        );
+
+        assert_eq!(suggestions.len(), 3);
+        assert_eq!(suggestions[0].subject, "行程安排");
+        assert_eq!(suggestions[0].filter, "text");
+        assert_eq!(suggestions[1].subject, "花园里的郁金香");
+        assert_eq!(suggestions[1].filter, "images");
+        assert_eq!(suggestions[2].subject, "预算讨论");
     }
 
     #[test]
@@ -23829,6 +24149,7 @@ mod tests {
                     "size_bytes": 0
                 },
                 "generated_at": "200",
+                "supported_file_count": 5,
                 "directories": [],
                 "entries": [{
                     "modality": "document",
@@ -23870,7 +24191,7 @@ mod tests {
         fs::write(
             index_root.join("root-a.embeddings.json"),
             serde_json::to_string(&json!({
-                "schema_version": 1,
+                "schema_version": 3,
                 "root": "/tmp/root-a",
                 "entries": [{
                     "key": "chunk-1",
@@ -23890,6 +24211,8 @@ mod tests {
 
         assert_eq!(response.manifest_count, 1);
         assert_eq!(response.manifest_entry_count, 3);
+        assert_eq!(response.supported_file_count, Some(5));
+        assert_eq!(response.unindexed_file_count, Some(2));
         assert_eq!(response.document_count, 1);
         assert_eq!(response.image_count, 2);
         assert_eq!(response.content_indexed_image_count, 1);
@@ -23937,6 +24260,7 @@ mod tests {
                 conversation_id: None,
                 limit: Some(500),
                 include_documents: Some(false),
+                include_audio: None,
                 include_images: None,
                 include_videos: Some(true),
                 use_retrieval: None,
@@ -23982,6 +24306,7 @@ mod tests {
                 conversation_id: Some("conv-2".to_string()),
                 limit: None,
                 include_documents: None,
+                include_audio: Some(true),
                 include_images: None,
                 include_videos: None,
                 use_retrieval: None,
@@ -24002,12 +24327,14 @@ mod tests {
             "harbor-assistant-search:user-1:conv-2"
         );
         assert_eq!(request.source.surface, HARBOR_ASSISTANT_SEARCH_SURFACE);
+        assert_eq!(
+            request.args["modalities"],
+            json!(["document", "audio", "image", "video"])
+        );
         assert!(normalize_harbor_assistant_conversation_id("../bad").is_none());
         assert_eq!(
-            parse_harbor_assistant_conversation_path(
-                "/api/knowledge/conversations/conv-2"
-            )
-            .as_deref(),
+            parse_harbor_assistant_conversation_path("/api/knowledge/conversations/conv-2")
+                .as_deref(),
             Some("conv-2")
         );
     }
@@ -24042,6 +24369,7 @@ mod tests {
             conversation_id: None,
             limit: None,
             include_documents: Some(true),
+            include_audio: None,
             include_images: Some(false),
             include_videos: Some(false),
             use_retrieval: Some(true),
@@ -24060,9 +24388,11 @@ mod tests {
 
         let mut disabled_payload = payload;
         disabled_payload.source_root_ids = vec!["disabled".to_string()];
-        assert!(resolve_admin_search_source_scope(&disabled_payload, &settings, None)
-            .unwrap_err()
-            .contains("not enabled or configured"));
+        assert!(
+            resolve_admin_search_source_scope(&disabled_payload, &settings, None)
+                .unwrap_err()
+                .contains("not enabled or configured")
+        );
     }
 
     #[test]
@@ -24072,6 +24402,7 @@ mod tests {
             conversation_id: None,
             limit: None,
             include_documents: None,
+            include_audio: None,
             include_images: None,
             include_videos: Some(true),
             use_retrieval: None,
@@ -24904,6 +25235,21 @@ mod tests {
             .find(|endpoint| endpoint.model_endpoint_id == "vlm-local-openai-compatible")
             .expect("vlm endpoint");
         assert_eq!(vlm.status, ModelEndpointStatus::Disabled);
+    }
+
+    #[test]
+    fn llama_cpp_profile_is_treated_as_external_openai_runtime() {
+        let mut endpoint = default_model_endpoints()
+            .into_iter()
+            .find(|endpoint| endpoint.model_kind == ModelKind::Llm)
+            .expect("default llm endpoint");
+
+        endpoint.metadata["runtime_backend_kind"] = json!("llama.cpp");
+        assert!(model_endpoint_uses_external_runtime(&endpoint));
+
+        endpoint.metadata["runtime_backend_kind"] = json!("");
+        endpoint.metadata["runtime_profiles"] = json!(["llama.cpp-openai-compatible"]);
+        assert!(model_endpoint_uses_external_runtime(&endpoint));
     }
 
     #[test]

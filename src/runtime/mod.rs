@@ -2,8 +2,10 @@
 
 pub mod access_control;
 pub mod admin_console;
+pub mod asr;
 pub mod automation;
 pub mod discovery;
+pub mod document_parser;
 pub mod dvr;
 pub mod events;
 pub mod evt_readiness;
@@ -13,6 +15,8 @@ pub mod home_guardian;
 pub mod hub;
 pub mod knowledge;
 pub mod knowledge_index;
+mod lexical_index;
+mod vector_index;
 pub mod media;
 pub mod media_tools;
 pub mod model_center;

@@ -359,12 +359,18 @@ fn default_conversation_context_turn_limit() -> usize {
     3
 }
 
+fn default_conversation_context_token_limit() -> usize {
+    8_192
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KnowledgeConversationSettings {
     #[serde(default = "default_conversation_history_limit")]
     pub history_limit: usize,
     #[serde(default = "default_conversation_context_turn_limit")]
     pub context_turn_limit: usize,
+    #[serde(default = "default_conversation_context_token_limit")]
+    pub context_token_limit: usize,
 }
 
 impl Default for KnowledgeConversationSettings {
@@ -372,6 +378,7 @@ impl Default for KnowledgeConversationSettings {
         Self {
             history_limit: default_conversation_history_limit(),
             context_turn_limit: default_conversation_context_turn_limit(),
+            context_token_limit: default_conversation_context_token_limit(),
         }
     }
 }
@@ -2469,6 +2476,7 @@ pub fn sanitize_knowledge_settings(settings: KnowledgeSettings) -> KnowledgeSett
         conversation: KnowledgeConversationSettings {
             history_limit: settings.conversation.history_limit.clamp(1, 100),
             context_turn_limit: settings.conversation.context_turn_limit.clamp(0, 20),
+            context_token_limit: settings.conversation.context_token_limit.clamp(4_096, 8_192),
         },
     }
 }
@@ -3336,7 +3344,63 @@ pub fn sanitize_model_endpoint(mut endpoint: ModelEndpoint) -> Result<ModelEndpo
     endpoint.cost_policy = normalize_json_object(endpoint.cost_policy);
     endpoint.metadata = normalize_json_object(endpoint.metadata);
     normalize_builtin_local_model_api_endpoint(&mut endpoint);
+    align_embedding_endpoint_identity_with_runtime(&mut endpoint);
     Ok(endpoint)
+}
+
+fn align_embedding_endpoint_identity_with_runtime(endpoint: &mut ModelEndpoint) {
+    if endpoint.model_endpoint_id != "embed-local-openai-compatible"
+        || endpoint.model_kind != ModelKind::Embedder
+        || !model_endpoint_metadata_bool(endpoint, "runtime_ready")
+    {
+        return;
+    }
+
+    let Some(runtime_model_id) = model_endpoint_metadata_string(endpoint, "runtime_model_id")
+    else {
+        return;
+    };
+    let Some(runtime_embedding_model) =
+        model_endpoint_metadata_string(endpoint, "runtime_embedding_model")
+    else {
+        return;
+    };
+    let Some(served_model) = model_endpoint_metadata_string(endpoint, "model") else {
+        return;
+    };
+    if runtime_model_id != runtime_embedding_model || runtime_model_id != served_model {
+        return;
+    }
+
+    let normalized = runtime_model_id.to_ascii_lowercase();
+    let provider_key = if normalized.contains("qwen") {
+        "qwen"
+    } else if normalized.contains("bge") {
+        "bge"
+    } else if normalized.contains("jina") {
+        "jina"
+    } else {
+        return;
+    };
+
+    endpoint.provider_key = provider_key.to_string();
+    endpoint.model_name = runtime_model_id.clone();
+    set_model_endpoint_metadata_string(
+        endpoint,
+        "catalog_model_id",
+        runtime_model_id.clone(),
+    );
+    set_model_endpoint_metadata_string(endpoint, "model", runtime_model_id.clone());
+    set_model_endpoint_metadata_string(
+        endpoint,
+        "runtime_model_id",
+        runtime_model_id.clone(),
+    );
+    set_model_endpoint_metadata_string(
+        endpoint,
+        "runtime_embedding_model",
+        runtime_model_id,
+    );
 }
 
 fn normalize_builtin_local_model_api_endpoint(endpoint: &mut ModelEndpoint) {
@@ -6071,6 +6135,7 @@ mod tests {
         assert!(settings.retrieval.mmr_enabled);
         assert_eq!(settings.conversation.history_limit, 10);
         assert_eq!(settings.conversation.context_turn_limit, 3);
+        assert_eq!(settings.conversation.context_token_limit, 8_192);
     }
 
     #[test]
@@ -7247,6 +7312,89 @@ mod tests {
             json!("http://127.0.0.1:4174/api/inference/healthz")
         );
         assert_eq!(endpoint.metadata["legacy_model_api_migrated"], json!(true));
+    }
+
+    #[test]
+    fn sanitize_model_center_aligns_embedding_identity_with_ready_runtime() {
+        let state = AdminModelCenterState {
+            endpoints: vec![ModelEndpoint {
+                model_endpoint_id: "embed-local-openai-compatible".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Embedder,
+                endpoint_kind: ModelEndpointKind::Local,
+                provider_key: "bge".to_string(),
+                model_name: "bge-m3".to_string(),
+                capability_tags: vec!["embeddings".to_string(), "local_first".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({
+                    "catalog_model_id": "bge-m3",
+                    "model": "Qwen/Qwen3-Embedding-0.6B",
+                    "runtime_model_id": "Qwen/Qwen3-Embedding-0.6B",
+                    "runtime_embedding_model": "Qwen/Qwen3-Embedding-0.6B",
+                    "runtime_ready": true,
+                }),
+            }],
+            route_policies: default_model_route_policies(),
+            model_store_root: default_model_store_root(),
+            capability_bindings: Vec::new(),
+            runtimes: Vec::new(),
+        };
+
+        let sanitized = sanitize_model_center_state(state);
+        let endpoint = sanitized
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "embed-local-openai-compatible")
+            .expect("embed endpoint");
+
+        assert_eq!(endpoint.provider_key, "qwen");
+        assert_eq!(endpoint.model_name, "Qwen/Qwen3-Embedding-0.6B");
+        assert_eq!(
+            endpoint.metadata["catalog_model_id"],
+            json!("Qwen/Qwen3-Embedding-0.6B")
+        );
+    }
+
+    #[test]
+    fn sanitize_model_center_does_not_align_inconsistent_embedding_runtime() {
+        let state = AdminModelCenterState {
+            endpoints: vec![ModelEndpoint {
+                model_endpoint_id: "embed-local-openai-compatible".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Embedder,
+                endpoint_kind: ModelEndpointKind::Local,
+                provider_key: "bge".to_string(),
+                model_name: "bge-m3".to_string(),
+                capability_tags: vec!["embeddings".to_string(), "local_first".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({
+                    "catalog_model_id": "bge-m3",
+                    "model": "Qwen/Qwen3-Embedding-0.6B",
+                    "runtime_model_id": "Qwen/Qwen3-Embedding-0.6B",
+                    "runtime_embedding_model": "bge-m3",
+                    "runtime_ready": true,
+                }),
+            }],
+            route_policies: default_model_route_policies(),
+            model_store_root: default_model_store_root(),
+            capability_bindings: Vec::new(),
+            runtimes: Vec::new(),
+        };
+
+        let sanitized = sanitize_model_center_state(state);
+        let endpoint = sanitized
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "embed-local-openai-compatible")
+            .expect("embed endpoint");
+
+        assert_eq!(endpoint.provider_key, "bge");
+        assert_eq!(endpoint.model_name, "bge-m3");
+        assert_eq!(endpoint.metadata["catalog_model_id"], json!("bge-m3"));
     }
 
     #[test]

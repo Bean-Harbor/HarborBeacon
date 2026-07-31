@@ -14,6 +14,7 @@ use reqwest::blocking::Client;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokenizers::Tokenizer;
 
 use crate::connectors::ai_provider::{
     EmbeddingRequest, OpenAiCompatibleConfig, OpenAiCompatibleEmbeddingClient,
@@ -45,11 +46,71 @@ const SEMANTIC_ROUTER_TOKEN_ENV: &str = "HARBOR_SEMANTIC_ROUTER_TOKEN";
 const MODEL_API_TOKEN_ENV: &str = "HARBOR_MODEL_API_TOKEN";
 const DEFAULT_SEMANTIC_ROUTER_BASE_URL: &str = "http://127.0.0.1:4176/v1";
 const DEFAULT_SEMANTIC_ROUTER_MODEL: &str = "Qwen/Qwen2.5-0.5B-Instruct";
+const LLM_TOKENIZER_PATH_ENV: &str = "HARBOR_LLM_TOKENIZER_PATH";
 static VLM_EXECUTION_BUSY: AtomicBool = AtomicBool::new(false);
 static VLM_EXECUTION_STARTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static VLM_EXECUTION_BUSY_TOTAL: AtomicU64 = AtomicU64::new(0);
 static VLM_EXECUTION_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static VLM_EXECUTION_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static LLM_TOKENIZER: OnceLock<Option<Tokenizer>> = OnceLock::new();
+
+pub fn llm_text_token_count(text: &str) -> usize {
+    let tokenizer = LLM_TOKENIZER.get_or_init(|| {
+        env_trimmed(LLM_TOKENIZER_PATH_ENV)
+            .and_then(|path| Tokenizer::from_file(path).ok())
+    });
+    tokenizer
+        .as_ref()
+        .and_then(|tokenizer| tokenizer.encode(text, false).ok())
+        .map(|encoding| encoding.len())
+        .unwrap_or_else(|| conservative_text_token_count(text))
+}
+
+pub fn truncate_llm_text_to_tokens(text: &str, max_tokens: usize) -> String {
+    if max_tokens == 0 {
+        return String::new();
+    }
+    if llm_text_token_count(text) <= max_tokens {
+        return text.to_string();
+    }
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut low = 0usize;
+    let mut high = chars.len();
+    while low < high {
+        let mid = (low + high + 1) / 2;
+        let candidate = chars[..mid].iter().collect::<String>();
+        if llm_text_token_count(&candidate) <= max_tokens.saturating_sub(1) {
+            low = mid;
+        } else {
+            high = mid.saturating_sub(1);
+        }
+    }
+    let mut truncated = chars[..low].iter().collect::<String>();
+    truncated.push('…');
+    while !truncated.is_empty() && llm_text_token_count(&truncated) > max_tokens {
+        truncated.pop();
+    }
+    truncated
+}
+
+fn conservative_text_token_count(text: &str) -> usize {
+    let mut count = 0usize;
+    let mut ascii_run = 0usize;
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            ascii_run += 1;
+        } else {
+            if ascii_run > 0 {
+                count += ascii_run.div_ceil(3);
+                ascii_run = 0;
+            }
+            if !ch.is_whitespace() {
+                count += 1;
+            }
+        }
+    }
+    count + ascii_run.div_ceil(3)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelEndpointTestResult {
@@ -1418,6 +1479,23 @@ pub fn run_embedding_with_state(text: &str, state: &AdminModelCenterState) -> Em
     }
 }
 
+pub fn run_query_embedding_with_state(
+    text: &str,
+    state: &AdminModelCenterState,
+) -> EmbeddingExecution {
+    let prepared = resolve_endpoint(state, ModelKind::Embedder, EMBED_POLICY_ID)
+        .map(|endpoint| embedding_query_input(&endpoint, text))
+        .unwrap_or_else(|| text.to_string());
+    run_embedding_with_state(&prepared, state)
+}
+
+fn embedding_query_input(endpoint: &ModelEndpoint, text: &str) -> String {
+    let query = text.trim();
+    metadata_string(&endpoint.metadata, "query_instruction")
+        .map(|instruction| format!("Instruct: {instruction}\nQuery:{query}"))
+        .unwrap_or_else(|| query.to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct LocalRuntimeProjection {
     base_url: String,
@@ -2372,10 +2450,10 @@ mod tests {
     use super::{
         clear_local_runtime_projection_cache, connectivity_url,
         endpoint_uses_openai_compatible_api, openai_compatible_config_from_endpoint,
-        embedding_endpoint_identity_with_state, redact_model_endpoint, run_embedding_with_state,
-        run_llm_text_with_state, run_llm_text_with_state_and_options, run_rerank_with_state,
-        run_vlm_summary_with_state, semantic_router_local_only_model_state, test_model_endpoint,
-        vlm_endpoint_readiness, LlmTextOptions, RERANK_POLICY_ID,
+        embedding_endpoint_identity_with_state, embedding_query_input, redact_model_endpoint,
+        run_embedding_with_state, run_llm_text_with_state, run_llm_text_with_state_and_options,
+        run_rerank_with_state, run_vlm_summary_with_state, semantic_router_local_only_model_state,
+        test_model_endpoint, vlm_endpoint_readiness, LlmTextOptions, RERANK_POLICY_ID,
     };
     use crate::control_plane::models::{
         ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, ModelRoutePolicy,
@@ -2402,12 +2480,17 @@ mod tests {
                 "base_url": "http://127.0.0.1:8092/v1",
                 "runtime_profiles": ["openai-compatible-embedding"],
                 "runtime_embedding_model": "jina-embeddings-v2-base-zh",
+                "query_instruction": "Given a web search query, retrieve relevant passages that answer the query",
             }),
         };
 
         assert!(endpoint_uses_openai_compatible_api(&endpoint));
         let config = openai_compatible_config_from_endpoint(&endpoint).expect("embedding config");
         assert_eq!(config.model, "jina-embeddings-v2-base-zh");
+        assert_eq!(
+            embedding_query_input(&endpoint, "  如何安装 HarborOS？ "),
+            "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:如何安装 HarborOS？"
+        );
     }
 
     #[test]
