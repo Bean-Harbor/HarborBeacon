@@ -53,7 +53,7 @@ impl TaskApiService {
             }
             HomeAssistantNaturalAction::Request(action) => action,
         };
-        let state = match self.admin_store.home_assistant_secret_state() {
+        let state = match self.admin_store.home_assistant_state() {
             Ok(state) => state,
             Err(error) => {
                 return self.general_message_home_assistant_action_response(

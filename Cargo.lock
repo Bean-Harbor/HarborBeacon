@@ -1408,6 +1408,7 @@ dependencies = [
  "sha2",
  "tantivy",
  "thiserror 2.0.18",
+ "time",
  "tiny_http",
  "tokenizers",
  "tungstenite",

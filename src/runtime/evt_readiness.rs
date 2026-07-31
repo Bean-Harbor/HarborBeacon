@@ -580,8 +580,8 @@ fn evt_default_target_readiness(
 }
 
 fn evt_home_assistant_readiness(state: &AdminConsoleState) -> Value {
-    let configured = !state.home_assistant.base_url.trim().is_empty()
-        && !state.home_assistant.access_token.trim().is_empty();
+    let configured =
+        state.home_assistant.enabled && state.home_assistant.last_status != "not_configured";
     json!({
         "configured": configured,
         "enabled": state.home_assistant.enabled,
@@ -590,9 +590,10 @@ fn evt_home_assistant_readiness(state: &AdminConsoleState) -> Value {
         "entity_count": state.home_assistant.entity_count,
         "service_count": state.home_assistant.service_count,
         "exposed_domains": state.home_assistant.exposed_domains,
-        "token_configured": !state.home_assistant.access_token.trim().is_empty(),
-        "token_redacted": !state.home_assistant.access_token.trim().is_empty(),
+        "token_configured": configured,
+        "token_redacted": configured,
         "base_url_redacted": configured,
+        "managed_by_harborlink": true,
         "redacted": true,
     })
 }
@@ -1316,8 +1317,8 @@ mod tests {
             platform_hint: "weixin".to_string(),
             is_default: true,
         });
-        state.home_assistant.base_url = "http://homeassistant.local:8123".to_string();
-        state.home_assistant.access_token = "secret-ha-token".to_string();
+        state.home_assistant.enabled = true;
+        state.home_assistant.last_status = "configured_in_harborlink".to_string();
         let readiness = build_evt_readiness_from_state(
             &state,
             1,

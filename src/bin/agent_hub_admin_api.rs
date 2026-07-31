@@ -2,17 +2,16 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use base64::Engine as _;
 use hf_hub::{
     api::{sync::ApiBuilder as HfApiBuilder, Progress as HfProgress},
     Cache as HfCache, Repo, RepoType,
@@ -22,16 +21,21 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tiny_http::{Header, Method, Request, Response, ResponseBox, Server, StatusCode};
 use uuid::Uuid;
 
-use harborbeacon_local_agent::adapters::rtsp::{CommandRtspAdapter, RtspProbeAdapter};
+use harborbeacon_local_agent::connectors::harborlink_media::{
+    harborlink_request_scope, HarborLinkCredentialStatus, HarborLinkHomeAssistantStatus,
+    HarborLinkLiveSession, HarborLinkMediaClient, HarborLinkRecordingArtifact,
+    HarborLinkRecordingStatus,
+};
 #[cfg(test)]
 use harborbeacon_local_agent::connectors::home_assistant::validate_home_assistant_service_fields as validate_home_assistant_service_fields_shared;
 use harborbeacon_local_agent::connectors::home_assistant::{
     normalize_home_assistant_service_action_request,
-    validate_home_assistant_service_action_request, HomeAssistantClient, HomeAssistantClientConfig,
-    HomeAssistantEntity, HomeAssistantServiceActionRequest, HomeAssistantServiceCallResponse,
+    validate_home_assistant_service_action_request, HomeAssistantClient, HomeAssistantEntity,
+    HomeAssistantServiceActionRequest, HomeAssistantServiceCallResponse,
     HomeAssistantServiceDomain,
 };
 use harborbeacon_local_agent::connectors::im_gateway::GatewayPlatformStatus;
@@ -42,7 +46,6 @@ use harborbeacon_local_agent::connectors::notifications::{
     NotificationPayloadFormat, NotificationRecipient, NotificationRecipientIdType,
     NotificationRequest, NotificationSource,
 };
-use harborbeacon_local_agent::connectors::storage::StorageTarget;
 use harborbeacon_local_agent::control_plane::apps::{
     build_harbor_app_registry_entry, validate_app_manifest, HarborAppExposure,
     HarborAppExposureRequest, HarborAppHealthResponse, HarborAppInstallRequest,
@@ -74,22 +77,20 @@ use harborbeacon_local_agent::runtime::access_control::{
     authorize_access, AccessAction, AccessIdentityHints, AccessPrincipal,
 };
 use harborbeacon_local_agent::runtime::admin_console::{
-    account_management_snapshot, dedupe_rtsp_paths, default_capture_subdirectory,
-    default_clip_length_seconds, default_keyframe_count, default_keyframe_interval_seconds,
-    default_model_endpoints, default_model_runtimes_for_store_root, default_model_store_root,
-    device_rtsp_credential_id, harboros_writable_root, normalize_delivery_surface,
-    path_is_same_or_inside, user_default_delivery_surface, user_recent_interactive_surface,
-    validate_knowledge_settings, AccountManagementSnapshot, AdminConsoleState, AdminConsoleStore,
-    AdminDefaults, AdminModelCenterState, AutomationRuleReview, BridgeProviderConfig,
-    DeviceCredentialSecret, DeviceEvidenceRecord, GatewayStatusSummary, HomeAssistantAdminState,
-    HomeAssistantConfigUpdate, KnowledgeConversationSettings, KnowledgeIndexJobRecord,
+    account_management_snapshot, default_capture_subdirectory, default_clip_length_seconds,
+    default_keyframe_count, default_keyframe_interval_seconds, default_model_endpoints,
+    default_model_runtimes_for_store_root, default_model_store_root, harboros_writable_root,
+    normalize_delivery_surface, path_is_same_or_inside, user_default_delivery_surface,
+    user_recent_interactive_surface, validate_knowledge_settings, AccountManagementSnapshot,
+    AdminConsoleState, AdminConsoleStore, AdminDefaults, AdminModelCenterState,
+    AutomationRuleReview, BridgeProviderConfig, DeviceEvidenceRecord, GatewayStatusSummary,
+    HomeAssistantAdminState, KnowledgeConversationSettings, KnowledgeIndexJobRecord,
     KnowledgeRetrievalSettings, KnowledgeSettings, KnowledgeSourceRoot, ModelDownloadJobRecord,
     ModelRuntimeRecord, NotificationTargetRecord, RagResourceProfile,
 };
-use harborbeacon_local_agent::runtime::discovery::RtspProbeRequest;
 use harborbeacon_local_agent::runtime::dvr::{
-    apply_retention_policy, build_status_response, dvr_media_preview_path, media_library_root_path,
-    scan_timeline, store_snapshot_bytes, DvrRecordingSettings, DvrRuntime, DvrTimelineSegment,
+    build_status_response, sanitize_dvr_recording_settings, DvrRecordingSettings,
+    DvrRecordingStatus, DvrRecordingStatusResponse, DvrTimelineResponse, DvrTimelineSegment,
 };
 use harborbeacon_local_agent::runtime::evt_readiness::{
     build_evt_evidence_bundle, build_evt_readiness_report, evt_preflight_workflow_summary,
@@ -119,15 +120,13 @@ use harborbeacon_local_agent::runtime::home_guardian::{
     HomeGuardianRuleEvaluationPlan,
 };
 use harborbeacon_local_agent::runtime::hub::{
-    CameraConnectRequest, CameraHubService, HubManualAddSummary, HubScanRequest, HubScanSummary,
-    HubStateSnapshot,
+    device_id_for_ip, CameraHubService, HubManualAddSummary, HubScanRequest, HubScanResultItem,
+    HubScanSummary, HubStateSnapshot,
 };
 use harborbeacon_local_agent::runtime::knowledge_index::{
     load_embedding_store, KnowledgeEmbeddingWarmupStats, KnowledgeIndexConfig, KnowledgeIndexEntry,
     KnowledgeIndexManifest, KnowledgeIndexService, KnowledgeIndexSnapshot, KnowledgeModality,
 };
-use harborbeacon_local_agent::runtime::media::{SnapshotCaptureRequest, SnapshotFormat};
-use harborbeacon_local_agent::runtime::media_tools::{ffmpeg_resolution_hint, resolve_ffmpeg_bin};
 use harborbeacon_local_agent::runtime::model_center::{
     load_model_center_state, redact_model_endpoint, run_vlm_summary_with_state,
     test_model_endpoint, vlm_endpoint_readiness, vlm_execution_runtime_snapshot,
@@ -135,7 +134,8 @@ use harborbeacon_local_agent::runtime::model_center::{
 };
 use harborbeacon_local_agent::runtime::privacy_gateway::PRIVACY_GATEWAY_POLICY_VERSION;
 use harborbeacon_local_agent::runtime::registry::{
-    CameraCapabilities, CameraDevice, DeviceRegistryStore, HomeAssistantRegistryEntity,
+    CameraCapabilities, CameraDevice, DeviceRegistryStore, DeviceStatus,
+    HomeAssistantRegistryEntity, StreamTransport,
 };
 use harborbeacon_local_agent::runtime::remote_view;
 use harborbeacon_local_agent::runtime::task_api::{
@@ -165,6 +165,18 @@ const ADMIN_HTTP_REQUEST_QUEUE_CAPACITY: usize = 256;
 const MAX_VISION_EVENT_INGEST_INFLIGHT: usize = 8;
 const HOME_GUARDIAN_ACTIVITY_LIMIT: usize = 500;
 const MAX_FAMILY_MEMORY_FEEDBACK_JSON_BYTES: usize = 32 * 1024;
+const DEFAULT_DETECTION_JOB_TTL_SECONDS: u64 = 60;
+const MIN_DETECTION_JOB_TTL_SECONDS: u64 = 60;
+const MAX_DETECTION_JOB_TTL_SECONDS: u64 = 900;
+const MAX_DETECTION_JOB_HISTORY: usize = 64;
+const DEFAULT_DETECTION_MAX_FPS: f64 = 5.0;
+const MAX_DETECTION_MAX_FPS: f64 = 10.0;
+const DEFAULT_DETECTION_CONFIDENCE: f64 = 0.35;
+const DEFAULT_DETECTION_WORKER: &str =
+    "/usr/lib/harboros-beacon/harbornavi_k3_yolo_stream_worker.py";
+const DEFAULT_DETECTION_MODEL: &str = "/var/lib/harboros-beacon/models/yolov8n_192x320.q.onnx";
+const DEFAULT_DETECTION_LABELS: &str = "/var/lib/harboros-beacon/models/label.txt";
+const DEFAULT_DETECTION_OUTPUT_ROOT: &str = "/run/harboros-beacon/detection-jobs";
 
 #[derive(Debug, Clone)]
 struct Cli {
@@ -282,8 +294,7 @@ impl Cli {
 pub struct AdminApi {
     admin_store: AdminConsoleStore,
     task_service: TaskApiService,
-    dvr_runtime: DvrRuntime,
-    hls_live_runtime: HlsLiveRuntime,
+    harborlink_media: HarborLinkMediaClient,
     harbor_assistant_dist: PathBuf,
     public_origin: String,
     model_runtime_activation: Option<ModelRuntimeActivationHandler>,
@@ -301,6 +312,7 @@ pub struct AdminApi {
     guardian_action_runs: Arc<Mutex<HashMap<String, u64>>>,
     guardian_rule_cache: Arc<Mutex<HomeGuardianRuleCache>>,
     guardian_activity_log_lock: Arc<Mutex<()>>,
+    detection_jobs: Arc<Mutex<HashMap<String, DetectionJobRuntime>>>,
     http_runtime: HttpRuntimeCounters,
     vision_ingest_limiter: VisionIngestLimiter,
 }
@@ -635,11 +647,19 @@ struct HomeAssistantConfigRequest {
     #[serde(default)]
     enabled: bool,
     #[serde(default)]
-    base_url: String,
+    base_url: Option<String>,
     #[serde(default)]
     access_token: Option<String>,
     #[serde(default)]
-    exposed_domains: Vec<String>,
+    exposed_domains: Option<Vec<String>>,
+    #[serde(default)]
+    allowed_entities: Option<Vec<String>>,
+    #[serde(default)]
+    allowed_cameras: Option<Vec<String>>,
+    #[serde(default)]
+    camera_entity_bindings: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    clear_access_token: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -647,9 +667,14 @@ struct HomeAssistantStatusResponse {
     configured: bool,
     enabled: bool,
     base_url: String,
+    managed_by_harborlink: bool,
+    harborlink_available: bool,
     token_configured: bool,
     token_redacted: bool,
     exposed_domains: Vec<String>,
+    allowed_entities: Vec<String>,
+    allowed_cameras: Vec<String>,
+    camera_entity_bindings: BTreeMap<String, String>,
     status: String,
     #[serde(default)]
     last_error: Option<String>,
@@ -1732,6 +1757,22 @@ struct DeviceCredentialStatusResponse {
     last_verified_at: Option<String>,
 }
 
+impl DeviceCredentialStatusResponse {
+    fn from_harborlink(status: HarborLinkCredentialStatus) -> Self {
+        Self {
+            device_id: status.camera_id,
+            configured: status.configured,
+            redacted: status.configured,
+            username: None,
+            rtsp_port: None,
+            path_count: status.rtsp_path_count,
+            source: "harborlink".to_string(),
+            updated_at: None,
+            last_verified_at: status.last_verified_at,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Clone)]
 struct RtspCheckResponse {
     device_id: String,
@@ -1771,6 +1812,59 @@ struct DeviceValidationRunResponse {
     evidence: DeviceEvidenceResponse,
 }
 
+#[derive(Debug, Deserialize)]
+struct DetectionJobStartRequest {
+    camera_id: String,
+    #[serde(default)]
+    target_labels: Vec<String>,
+    duration_seconds: Option<u64>,
+    max_fps: Option<f64>,
+    confidence: Option<f64>,
+    stream_profile: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DetectionJobRenewRequest {
+    ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DetectionJobConfig {
+    camera_id: String,
+    target_label: String,
+    ttl_seconds: u64,
+    max_fps: f64,
+    confidence: f64,
+    stream_profile: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DetectionJobProjection {
+    job_id: String,
+    camera_id: String,
+    status: String,
+    target_labels: Vec<String>,
+    stream_profile: String,
+    max_fps: f64,
+    confidence: f64,
+    lease_id: String,
+    started_at: String,
+    updated_at: String,
+    expires_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metrics: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+struct DetectionJobRuntime {
+    projection: DetectionJobProjection,
+    output_dir: PathBuf,
+    child: Option<Child>,
+}
+
 type StateResponse = HubStateSnapshot;
 type ScanRequest = HubScanRequest;
 type ScanResponse = HubScanSummary;
@@ -1788,8 +1882,8 @@ impl AdminApi {
         let api = Self {
             admin_store,
             task_service,
-            dvr_runtime: DvrRuntime::default(),
-            hls_live_runtime: HlsLiveRuntime::default(),
+            harborlink_media: HarborLinkMediaClient::from_env()
+                .unwrap_or_else(|error| fail(&error)),
             harbor_assistant_dist,
             public_origin,
             model_runtime_activation: None,
@@ -1807,6 +1901,7 @@ impl AdminApi {
             guardian_action_runs: Arc::new(Mutex::new(HashMap::new())),
             guardian_rule_cache: Arc::new(Mutex::new(HomeGuardianRuleCache::default())),
             guardian_activity_log_lock: Arc::new(Mutex::new(())),
+            detection_jobs: Arc::new(Mutex::new(HashMap::new())),
             http_runtime: HttpRuntimeCounters::new(),
             vision_ingest_limiter: VisionIngestLimiter::new(),
         };
@@ -1820,6 +1915,12 @@ impl AdminApi {
         handler: ModelRuntimeActivationHandler,
     ) -> Self {
         self.model_runtime_activation = Some(handler);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_harborlink_media_client(mut self, client: HarborLinkMediaClient) -> Self {
+        self.harborlink_media = client;
         self
     }
 
@@ -2316,6 +2417,9 @@ impl AdminApi {
         let remote_addr = request.remote_addr().copied();
         let headers = request.headers().to_vec();
         let identity_hints = request_identity_hints(&raw_url, &headers);
+        let business_request_id = header_value(&headers, "X-Request-Id")
+            .or_else(|| header_value(&headers, "Idempotency-Key"));
+        let _harborlink_request_scope = harborlink_request_scope(business_request_id.as_deref());
 
         if is_admin_surface_path(path.as_str()) || is_harbor_assistant_surface_path(path.as_str()) {
             if let Err(error) = ensure_local_admin_access(remote_addr, &headers) {
@@ -2427,9 +2531,9 @@ impl AdminApi {
             Method::Post if path == "/api/knowledge/search" => self
                 .handle_knowledge_search(&mut request, &identity_hints)
                 .boxed(),
-            Method::Get if path == "/api/knowledge/preview" => self
-                .handle_knowledge_preview(&raw_url, &identity_hints)
-                .boxed(),
+            Method::Get if path == "/api/knowledge/preview" => {
+                self.handle_knowledge_preview(&raw_url, &headers, &identity_hints)
+            }
             Method::Post if path == "/api/knowledge/index/run" => {
                 self.handle_run_knowledge_index(&identity_hints).boxed()
             }
@@ -2460,12 +2564,21 @@ impl AdminApi {
             Method::Get if path == "/api/cameras/recordings/timeline" => self
                 .handle_dvr_recordings_timeline(&raw_url, &identity_hints)
                 .boxed(),
+            Method::Get if path.starts_with("/api/cameras/recordings/artifacts/") => {
+                self.handle_dvr_artifact(&path, &headers, &identity_hints)
+            }
+            Method::Delete if path.starts_with("/api/cameras/recordings/artifacts/") => self
+                .handle_delete_dvr_artifact(&path, &identity_hints)
+                .boxed(),
             Method::Get if path == "/api/harboros/status" => {
                 self.handle_harboros_status(&identity_hints).boxed()
             }
             Method::Get if path == "/api/harboros/im-capability-map" => self
                 .handle_harboros_im_capability_map(&identity_hints)
                 .boxed(),
+            Method::Get if path == "/api/harbor-link/capabilities" => {
+                self.handle_harborlink_capabilities(&identity_hints).boxed()
+            }
             Method::Get if path == "/api/home-assistant/status" => {
                 self.handle_home_assistant_status(&identity_hints).boxed()
             }
@@ -2526,6 +2639,21 @@ impl AdminApi {
             Method::Get if path == "/api/feature-availability" => {
                 self.handle_feature_availability(&identity_hints).boxed()
             }
+            Method::Post if path == "/api/vision/detection-jobs" => self
+                .handle_start_detection_job(&mut request, &identity_hints)
+                .boxed(),
+            Method::Post
+                if path.starts_with("/api/vision/detection-jobs/") && path.ends_with("/renew") =>
+            {
+                self.handle_renew_detection_job(&path, &mut request, &identity_hints)
+                    .boxed()
+            }
+            Method::Get if path.starts_with("/api/vision/detection-jobs/") => self
+                .handle_get_detection_job(&path, &identity_hints)
+                .boxed(),
+            Method::Delete if path.starts_with("/api/vision/detection-jobs/") => self
+                .handle_stop_detection_job(&path, &identity_hints)
+                .boxed(),
             Method::Get if path == "/api/vision/events" => self
                 .handle_list_local_vision_events(&raw_url, &identity_hints)
                 .boxed(),
@@ -2633,11 +2761,27 @@ impl AdminApi {
                 .handle_live_view_page(&raw_url, &path, remote_addr, &headers, &identity_hints)
                 .boxed(),
             Method::Post if path.starts_with("/api/cameras/") && path.ends_with("/live/start") => {
-                self.handle_camera_hls_live_start(&path, remote_addr, &headers, &identity_hints)
-                    .boxed()
+                self.handle_camera_live_start(
+                    &path,
+                    &mut request,
+                    remote_addr,
+                    &headers,
+                    &identity_hints,
+                )
+                .boxed()
+            }
+            Method::Post if path.starts_with("/api/cameras/") && path.ends_with("/live/renew") => {
+                self.handle_camera_live_renew(
+                    &path,
+                    &mut request,
+                    remote_addr,
+                    &headers,
+                    &identity_hints,
+                )
+                .boxed()
             }
             Method::Post if path.starts_with("/api/cameras/") && path.ends_with("/live/stop") => {
-                self.handle_camera_hls_live_stop(
+                self.handle_camera_live_stop(
                     &path,
                     &mut request,
                     remote_addr,
@@ -2647,7 +2791,7 @@ impl AdminApi {
                 .boxed()
             }
             Method::Get if path.starts_with("/api/cameras/") && path.ends_with("/live/status") => {
-                self.handle_camera_hls_live_status(
+                self.handle_camera_live_status(
                     &raw_url,
                     &path,
                     remote_addr,
@@ -2655,9 +2799,6 @@ impl AdminApi {
                     &identity_hints,
                 )
                 .boxed()
-            }
-            Method::Get if parse_camera_hls_live_asset_path(&path).is_some() => {
-                self.handle_camera_hls_live_asset(&path, remote_addr, &headers, &identity_hints)
             }
             Method::Get if path.starts_with("/api/cameras/") && path.ends_with("/live.mjpeg") => {
                 self.handle_camera_live_mjpeg(&path, remote_addr, &headers, &identity_hints)
@@ -2821,7 +2962,7 @@ impl AdminApi {
             Method::Post
                 if path.starts_with("/api/cameras/") && path.ends_with("/recordings/start") =>
             {
-                self.handle_dvr_recording_start(&path, &identity_hints)
+                self.handle_dvr_recording_start(&path, &mut request, &identity_hints)
                     .boxed()
             }
             Method::Post
@@ -2835,8 +2976,12 @@ impl AdminApi {
                     .boxed()
             }
             Method::Post if path.starts_with("/api/cameras/") && path.ends_with("/snapshot") => {
-                self.handle_camera_task_snapshot(&path, &identity_hints)
-                    .boxed()
+                self.handle_camera_task_snapshot(
+                    &path,
+                    &identity_hints,
+                    business_request_id.as_deref(),
+                )
+                .boxed()
             }
             Method::Post if path.starts_with("/api/cameras/") && path.ends_with("/analyze") => {
                 self.handle_camera_analyze(&path, &identity_hints).boxed()
@@ -2881,7 +3026,10 @@ impl AdminApi {
                         );
                     }
                     let device_credential_statuses =
-                        build_device_credential_statuses(&state, &payload.devices);
+                        match self.harborlink_credential_statuses(&payload.devices) {
+                            Ok(statuses) => statuses,
+                            Err(error) => return error_json(StatusCode(502), &error),
+                        };
                     ok_json(&AdminStateResponse {
                         state: redact_state_snapshot(payload),
                         account_management: redact_account_management_snapshot(account_management),
@@ -4255,12 +4403,10 @@ impl AdminApi {
             Ok(paths) => paths,
             Err(error) => return error_json(StatusCode(422), &error),
         };
-        let dvr_settings = self.admin_store.dvr_recording_settings().ok();
-        let roots =
-            match resolve_admin_search_source_scope(&payload, &settings, dvr_settings.as_ref()) {
-                Ok(roots) => roots,
-                Err(error) => return error_json(StatusCode(422), &error),
-            };
+        let roots = match resolve_admin_search_source_scope(&payload, &settings, None) {
+            Ok(roots) => roots,
+            Err(error) => return error_json(StatusCode(422), &error),
+        };
         let task_request =
             build_admin_rag_answer_task_request(&principal, payload, focus_paths, roots);
         let conversation_id = task_request.source.conversation_id.clone();
@@ -4315,65 +4461,38 @@ impl AdminApi {
                 return Err("DVR search time filter has from greater than to.".to_string());
             }
         }
-        let settings = self.admin_store.dvr_recording_settings()?;
-        if let Err(error) = apply_retention_policy(&settings) {
-            return Err(error);
-        }
-        let devices = self.hub().load_registered_cameras()?;
-        let camera_id = payload.camera_id.as_deref().and_then(non_empty_string);
-        let timeline = scan_timeline(
-            &settings,
-            &devices,
-            camera_id.as_deref(),
-            from_secs,
-            to_secs,
-            None,
-        )?;
-        let focus_paths = timeline
-            .segments
-            .into_iter()
-            .map(|segment| segment.file_path)
-            .collect::<Vec<_>>();
-        if focus_paths.is_empty() {
-            return Err(
-                "No DVR recording segments matched the requested camera/time scope.".to_string(),
-            );
-        }
-        Ok(focus_paths)
+        let _ = (from_secs, to_secs);
+        Err(
+            "DVR content search is owned by the HarborLink artifact contract and is not a Beacon filesystem search scope."
+                .to_string(),
+        )
     }
 
     fn handle_knowledge_preview(
         &self,
         raw_url: &str,
+        headers: &[Header],
         hints: &AccessIdentityHints,
-    ) -> Response<std::io::Cursor<Vec<u8>>> {
+    ) -> ResponseBox {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
-            return error_json(StatusCode(403), &error);
+            return error_json(StatusCode(403), &error).boxed();
         }
         let requested_path = match parse_query_param(raw_url, "path")
             .and_then(percent_decode_optional_query_value)
             .and_then(|value| non_empty_string(&value))
         {
             Some(path) => path,
-            None => return error_json(StatusCode(400), "knowledge preview requires path"),
+            None => return error_json(StatusCode(400), "knowledge preview requires path").boxed(),
         };
         let settings = match self.admin_store.knowledge_settings() {
             Ok(settings) => settings,
-            Err(error) => return error_json(StatusCode(500), &error),
+            Err(error) => return error_json(StatusCode(500), &error).boxed(),
         };
         let preview_path = match resolve_knowledge_preview_path(&requested_path, &settings) {
             Ok(path) => path,
-            Err(error) => match self
-                .admin_store
-                .dvr_recording_settings()
-                .ok()
-                .and_then(|settings| dvr_media_preview_path(&settings, &requested_path).ok())
-            {
-                Some(path) => path,
-                None => return error_json(error.status, &error.message),
-            },
+            Err(error) => return error_json(error.status, &error.message).boxed(),
         };
-        static_file_response(&preview_path)
+        preview_static_file_response(&preview_path, header_value(headers, "Range").as_deref())
     }
 
     fn handle_dvr_recording_settings(
@@ -4383,9 +4502,9 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        match self.admin_store.dvr_recording_settings() {
+        match self.harborlink_dvr_settings() {
             Ok(settings) => ok_json(&settings),
-            Err(error) => error_json(StatusCode(500), &error),
+            Err(error) => error_json(StatusCode(502), &error),
         }
     }
 
@@ -4401,9 +4520,25 @@ impl AdminApi {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
         };
-        match self.admin_store.save_dvr_recording_settings(settings) {
-            Ok(state) => ok_json(&state.dvr),
-            Err(error) => error_json(StatusCode(422), &error),
+        let settings = sanitize_dvr_recording_settings(settings);
+        let link_settings = match serde_json::to_value(&settings) {
+            Ok(value) => value,
+            Err(error) => {
+                return error_json(
+                    StatusCode(500),
+                    &format!("failed to serialize DVR settings: {error}"),
+                );
+            }
+        };
+        match self.harborlink_media.save_dvr_settings(&link_settings) {
+            Ok(settings) => match serde_json::from_value::<DvrRecordingSettings>(settings) {
+                Ok(settings) => ok_json(&sanitize_dvr_recording_settings(settings)),
+                Err(error) => error_json(
+                    StatusCode(502),
+                    &format!("HarborLink returned invalid DVR settings: {error}"),
+                ),
+            },
+            Err(error) => error_json(StatusCode(502), &error),
         }
     }
 
@@ -4414,22 +4549,38 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        let settings = match self.admin_store.dvr_recording_settings() {
+        let mut settings = match self.harborlink_dvr_settings() {
             Ok(settings) => settings,
-            Err(error) => return error_json(StatusCode(500), &error),
+            Err(error) => return error_json(StatusCode(502), &error),
         };
         let devices = match self.hub().load_registered_cameras() {
             Ok(devices) => devices,
             Err(error) => return error_json(StatusCode(500), &error),
         };
-        let statuses =
-            match self
-                .dvr_runtime
-                .statuses(&devices, &settings, Some(&self.public_origin))
-            {
-                Ok(statuses) => statuses,
-                Err(error) => return error_json(StatusCode(500), &error),
-            };
+        let mut statuses = Vec::with_capacity(devices.len());
+        for device in &devices {
+            match self.harborlink_media.recording_status(&device.device_id) {
+                Ok(status) => statuses.push(dvr_recording_status_from_harborlink(
+                    status,
+                    &self.public_origin,
+                )),
+                Err(error) => statuses.push(DvrRecordingStatus {
+                    device_id: device.device_id.clone(),
+                    status: "degraded".to_string(),
+                    started_at: None,
+                    updated_at: None,
+                    stream_kind: String::new(),
+                    last_segment_path: None,
+                    live_mjpeg_url: None,
+                    message: format!("HarborLink recording status unavailable: {error}"),
+                }),
+            }
+        }
+        settings.enabled_device_ids = statuses
+            .iter()
+            .filter(|status| status.status == "recording")
+            .map(|status| status.device_id.clone())
+            .collect();
         ok_json(&build_status_response(settings, statuses, devices.len()))
     }
 
@@ -4441,13 +4592,10 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        let settings = match self.admin_store.dvr_recording_settings() {
+        let settings = match self.harborlink_dvr_settings() {
             Ok(settings) => settings,
-            Err(error) => return error_json(StatusCode(500), &error),
+            Err(error) => return error_json(StatusCode(502), &error),
         };
-        if let Err(error) = apply_retention_policy(&settings) {
-            return error_json(StatusCode(422), &error);
-        }
         let devices = match self.hub().load_registered_cameras() {
             Ok(devices) => devices,
             Err(error) => return error_json(StatusCode(500), &error),
@@ -4458,17 +4606,126 @@ impl AdminApi {
         let from_secs =
             parse_query_param(raw_url, "from").and_then(|value| value.parse::<u64>().ok());
         let to_secs = parse_query_param(raw_url, "to").and_then(|value| value.parse::<u64>().ok());
-        match scan_timeline(
-            &settings,
-            &devices,
-            device_id.as_deref(),
-            from_secs,
-            to_secs,
-            Some(&self.public_origin),
-        ) {
-            Ok(response) => ok_json(&response),
-            Err(error) => error_json(StatusCode(422), &error),
+        if let Some(device_id) = device_id.as_deref() {
+            if !devices.iter().any(|device| device.device_id == device_id) {
+                return error_json(StatusCode(404), "camera device not found");
+            }
         }
+        let mut segments = Vec::new();
+        for device in devices
+            .iter()
+            .filter(|device| device_id.as_deref().is_none_or(|id| device.device_id == id))
+        {
+            let artifacts = match self.harborlink_media.recording_timeline(&device.device_id) {
+                Ok(artifacts) => artifacts,
+                Err(error) => return error_json(StatusCode(502), &error),
+            };
+            segments.extend(artifacts.into_iter().filter_map(|artifact| {
+                dvr_timeline_segment_from_harborlink(artifact, from_secs, to_secs)
+            }));
+        }
+        segments.sort_by(|left, right| right.started_at.cmp(&left.started_at));
+        ok_json(&DvrTimelineResponse {
+            generated_at: current_rfc3339_timestamp(),
+            recording_root: settings.recording_root,
+            media_library_root: settings.media_library_root,
+            segments,
+        })
+    }
+
+    fn harborlink_dvr_settings(&self) -> Result<DvrRecordingSettings, String> {
+        let settings = self.harborlink_media.dvr_settings()?;
+        serde_json::from_value(settings)
+            .map(sanitize_dvr_recording_settings)
+            .map_err(|error| format!("HarborLink returned invalid DVR settings: {error}"))
+    }
+
+    fn handle_dvr_artifact(
+        &self,
+        path: &str,
+        headers: &[Header],
+        hints: &AccessIdentityHints,
+    ) -> ResponseBox {
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error).boxed(),
+        };
+        let artifact_id = match parse_dvr_artifact_path(path) {
+            Some(artifact_id) => artifact_id,
+            None => return error_json(StatusCode(400), "invalid DVR artifact path").boxed(),
+        };
+        let range = header_value(headers, "Range");
+        let response = match self
+            .harborlink_media
+            .open_dvr_artifact(&artifact_id, range.as_deref())
+        {
+            Ok(response) => response,
+            Err(error) => return error_json(StatusCode(502), &error).boxed(),
+        };
+        let status = StatusCode(response.status().as_u16());
+        let content_length = response
+            .content_length()
+            .and_then(|value| usize::try_from(value).ok());
+        let mut forwarded_headers = Vec::new();
+        for name in [
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::CONTENT_RANGE,
+            reqwest::header::ACCEPT_RANGES,
+            reqwest::header::CONTENT_DISPOSITION,
+        ] {
+            if let Some(value) = response
+                .headers()
+                .get(&name)
+                .and_then(|value| value.to_str().ok())
+            {
+                if let Ok(header) = Header::from_bytes(name.as_str().as_bytes(), value.as_bytes()) {
+                    forwarded_headers.push(header);
+                }
+            }
+        }
+        self.record_admin_audit(
+            &principal,
+            "dvr_artifact",
+            &artifact_id,
+            "dvr_artifact.read",
+            json!({"range": range}),
+            json!({"status": status.0, "streamed": true}),
+        );
+        Response::new(
+            status,
+            forwarded_headers,
+            Box::new(response),
+            content_length,
+            None,
+        )
+    }
+
+    fn handle_delete_dvr_artifact(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
+        let artifact_id = match parse_dvr_artifact_path(path) {
+            Some(artifact_id) => artifact_id,
+            None => return error_json(StatusCode(400), "invalid DVR artifact path"),
+        };
+        let result = match self.harborlink_media.delete_dvr_artifact(&artifact_id) {
+            Ok(result) => result,
+            Err(error) => return error_json(StatusCode(502), &error),
+        };
+        self.record_admin_audit(
+            &principal,
+            "dvr_artifact",
+            &artifact_id,
+            "dvr_artifact.delete",
+            json!({"artifact_id": artifact_id}),
+            result.clone(),
+        );
+        ok_json(&result)
     }
 
     fn handle_run_knowledge_index(
@@ -4646,6 +4903,32 @@ impl AdminApi {
         ok_json(&build_harboros_im_capability_map())
     }
 
+    fn handle_harborlink_capabilities(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        match self.harborlink_media.capabilities() {
+            Ok(capabilities) => ok_json(&capabilities),
+            Err(error) => ok_json(&json!({
+                "ok": false,
+                "status": "degraded",
+                "contractVersion": "1.0",
+                "dependency": "harborlink",
+                "error": redact_admin_string(&error),
+                "features": {
+                    "homeAssistant": { "status": "degraded" },
+                    "camera": { "status": "degraded" },
+                    "recording": { "status": "degraded" },
+                    "hls": { "status": "degraded" },
+                    "webrtc": { "status": "degraded" }
+                }
+            })),
+        }
+    }
+
     fn handle_home_assistant_status(
         &self,
         hints: &AccessIdentityHints,
@@ -4653,9 +4936,20 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        match self.admin_store.home_assistant_state() {
-            Ok(state) => ok_json(&build_home_assistant_status_response(&state)),
-            Err(error) => error_json(StatusCode(500), &error),
+        let state = match self.admin_store.home_assistant_state() {
+            Ok(state) => state,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        match self.harborlink_media.home_assistant_status() {
+            Ok(link) => ok_json(&build_home_assistant_status_response_with_link(
+                &state, &link,
+            )),
+            Err(error) => {
+                let mut response = build_home_assistant_status_response(&state);
+                response.status = "degraded".to_string();
+                response.last_error = Some(error);
+                ok_json(&response)
+            }
         }
     }
 
@@ -4671,18 +4965,33 @@ impl AdminApi {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
         };
-        let update = HomeAssistantConfigUpdate {
-            enabled: body.enabled,
-            base_url: body.base_url,
-            access_token: body.access_token,
-            exposed_domains: body.exposed_domains,
+        let access_token = body
+            .access_token
+            .as_deref()
+            .filter(|token| !token.trim().is_empty() && !looks_redacted_secret(token));
+        let link_status = match self.harborlink_media.save_home_assistant(
+            body.enabled,
+            body.base_url.as_deref(),
+            access_token,
+            body.exposed_domains.as_deref(),
+            body.allowed_entities.as_deref(),
+            body.allowed_cameras.as_deref(),
+            body.camera_entity_bindings.as_ref(),
+            body.clear_access_token,
+        ) {
+            Ok(status) => status,
+            Err(error) => return error_json(StatusCode(502), &error),
         };
-        match self.admin_store.save_home_assistant_config(update) {
+        match self.admin_store.save_home_assistant_orchestration_state(
+            link_status.enabled,
+            link_status.exposed_domains.clone(),
+        ) {
             Ok(state) => ok_json(&HomeAssistantConfigResponse {
-                status: build_home_assistant_status_response(
+                status: build_home_assistant_status_response_with_link(
                     &harborbeacon_local_agent::runtime::admin_console::redact_home_assistant_state(
                         state.home_assistant,
                     ),
+                    &link_status,
                 ),
             }),
             Err(error) => error_json(StatusCode(422), &error),
@@ -4696,7 +5005,7 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
             return error_json(StatusCode(403), &error);
         }
-        let state = match self.admin_store.home_assistant_secret_state() {
+        let state = match self.admin_store.home_assistant_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -4712,14 +5021,17 @@ impl AdminApi {
             test.error.clone(),
         );
         match persisted {
-            Ok(state) => ok_json(&json!({
-                "test": test,
-                "status": build_home_assistant_status_response(
-                    &harborbeacon_local_agent::runtime::admin_console::redact_home_assistant_state(
+            Ok(state) => {
+                let state =
+                    harborbeacon_local_agent::runtime::admin_console::redact_home_assistant_state(
                         state.home_assistant,
-                    ),
-                ),
-            })),
+                    );
+                let status = match self.harborlink_media.home_assistant_status() {
+                    Ok(link) => build_home_assistant_status_response_with_link(&state, &link),
+                    Err(error) => build_home_assistant_degraded_status(&state, error),
+                };
+                ok_json(&json!({ "test": test, "status": status }))
+            }
             Err(error) => error_json(StatusCode(500), &error),
         }
     }
@@ -4731,7 +5043,7 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
             return error_json(StatusCode(403), &error);
         }
-        let state = match self.admin_store.home_assistant_secret_state() {
+        let state = match self.admin_store.home_assistant_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -4766,15 +5078,21 @@ impl AdminApi {
             .admin_store
             .record_home_assistant_sync(entities.len(), service_count)
         {
-            Ok(state) => ok_json(&HomeAssistantSyncResponse {
-                status: build_home_assistant_status_response(
-                    &harborbeacon_local_agent::runtime::admin_console::redact_home_assistant_state(
+            Ok(state) => {
+                let state =
+                    harborbeacon_local_agent::runtime::admin_console::redact_home_assistant_state(
                         state.home_assistant,
-                    ),
-                ),
-                entities,
-                service_domains: services,
-            }),
+                    );
+                let status = match self.harborlink_media.home_assistant_status() {
+                    Ok(link) => build_home_assistant_status_response_with_link(&state, &link),
+                    Err(error) => build_home_assistant_degraded_status(&state, error),
+                };
+                ok_json(&HomeAssistantSyncResponse {
+                    status,
+                    entities,
+                    service_domains: services,
+                })
+            }
             Err(error) => error_json(StatusCode(500), &error),
         }
     }
@@ -4786,7 +5104,7 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        let state = match self.admin_store.home_assistant_secret_state() {
+        let state = match self.admin_store.home_assistant_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -4809,7 +5127,7 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        let state = match self.admin_store.home_assistant_secret_state() {
+        let state = match self.admin_store.home_assistant_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -4835,7 +5153,7 @@ impl AdminApi {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
         };
-        let state = match self.admin_store.home_assistant_secret_state() {
+        let state = match self.admin_store.home_assistant_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -4904,7 +5222,7 @@ impl AdminApi {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
         };
-        let state = match self.admin_store.home_assistant_secret_state() {
+        let state = match self.admin_store.home_assistant_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -5293,6 +5611,363 @@ impl AdminApi {
             }
             Err(error) => error_json(StatusCode(422), &error),
         }
+    }
+
+    fn handle_start_detection_job(
+        &self,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let body: DetectionJobStartRequest = match read_json_body_limited(request, 16 * 1024) {
+            Ok(body) => body,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let config = match normalize_detection_job_start(body) {
+            Ok(config) => config,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        if let Err(error) =
+            self.authorize_camera_action(hints, &config.camera_id, AccessAction::CameraView)
+        {
+            return error_json(StatusCode(403), &error);
+        }
+        if let Err(error) = self.load_camera_device(&config.camera_id) {
+            if error.contains("device not found") {
+                return error_json(StatusCode(404), &error);
+            }
+            return error_json(StatusCode(422), &error);
+        }
+
+        let mut jobs = match self.detection_jobs.lock() {
+            Ok(jobs) => jobs,
+            Err(_) => return error_json(StatusCode(503), "detection job state is unavailable"),
+        };
+        for runtime in jobs
+            .values_mut()
+            .filter(|runtime| runtime.projection.camera_id == config.camera_id)
+        {
+            self.refresh_detection_job(runtime);
+        }
+        if jobs.values().any(|runtime| {
+            runtime.projection.camera_id == config.camera_id
+                && runtime.projection.status == "running"
+        }) {
+            return error_json(
+                StatusCode(409),
+                "an active detection job already exists for this camera",
+            );
+        }
+        prune_detection_job_history(&mut jobs);
+
+        let lease = match self.harborlink_media.start_detection_lease(
+            &config.camera_id,
+            &config.stream_profile,
+            config.ttl_seconds,
+        ) {
+            Ok(lease) => lease,
+            Err(error) => return error_json(StatusCode(502), &error),
+        };
+        let source = match lease.local_rtsp_url.as_deref() {
+            Some(source) if source.starts_with("rtsp://127.0.0.1:") => source,
+            _ => {
+                let _ = self
+                    .harborlink_media
+                    .stop_detection_lease(&config.camera_id, &lease.lease_id);
+                return error_json(
+                    StatusCode(502),
+                    "HarborLink did not return a loopback detection source",
+                );
+            }
+        };
+
+        let job_id = format!("yolo-{}", Uuid::new_v4().simple());
+        let output_root = env::var("HARBOR_K3_YOLO_OUTPUT_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(DEFAULT_DETECTION_OUTPUT_ROOT));
+        let output_dir = output_root.join(&job_id);
+        if let Err(error) = fs::create_dir_all(&output_dir) {
+            let _ = self
+                .harborlink_media
+                .stop_detection_lease(&config.camera_id, &lease.lease_id);
+            return error_json(
+                StatusCode(500),
+                &format!("failed to create detection output directory: {error}"),
+            );
+        }
+        let stderr_path = output_dir.join("worker.stderr.log");
+        let stderr = match fs::File::create(&stderr_path) {
+            Ok(stderr) => stderr,
+            Err(error) => {
+                let _ = self
+                    .harborlink_media
+                    .stop_detection_lease(&config.camera_id, &lease.lease_id);
+                cleanup_detection_job_output_dir(&output_dir);
+                return error_json(
+                    StatusCode(500),
+                    &format!("failed to create detection worker log: {error}"),
+                );
+            }
+        };
+        let python = env::var("HARBOR_K3_YOLO_PYTHON").unwrap_or_else(|_| "python3".to_string());
+        let worker = env::var("HARBOR_K3_YOLO_WORKER")
+            .unwrap_or_else(|_| DEFAULT_DETECTION_WORKER.to_string());
+        let model = env::var("HARBOR_K3_YOLO_MODEL")
+            .unwrap_or_else(|_| DEFAULT_DETECTION_MODEL.to_string());
+        let labels = env::var("HARBOR_K3_YOLO_LABELS")
+            .unwrap_or_else(|_| DEFAULT_DETECTION_LABELS.to_string());
+        let child = Command::new(python)
+            .arg(worker)
+            .arg("--source")
+            .arg(source)
+            .arg("--model")
+            .arg(model)
+            .arg("--labels")
+            .arg(labels)
+            .arg("--output-dir")
+            .arg(&output_dir)
+            .arg("--target-label")
+            .arg(&config.target_label)
+            .arg("--provider")
+            .arg("cpu")
+            .arg("--max-fps")
+            .arg(config.max_fps.to_string())
+            .arg("--conf-threshold")
+            .arg(config.confidence.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr))
+            .spawn();
+        let child = match child {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = self
+                    .harborlink_media
+                    .stop_detection_lease(&config.camera_id, &lease.lease_id);
+                cleanup_detection_job_output_dir(&output_dir);
+                return error_json(
+                    StatusCode(500),
+                    &format!("failed to start detection worker: {error}"),
+                );
+            }
+        };
+
+        let projection = DetectionJobProjection {
+            job_id: job_id.clone(),
+            camera_id: config.camera_id,
+            status: "running".to_string(),
+            target_labels: vec![config.target_label],
+            stream_profile: config.stream_profile,
+            max_fps: config.max_fps,
+            confidence: config.confidence,
+            lease_id: lease.lease_id,
+            started_at: lease.started_at,
+            updated_at: lease.updated_at,
+            expires_at: lease.expires_at,
+            latest_result: None,
+            metrics: None,
+            message: None,
+        };
+        jobs.insert(
+            job_id,
+            DetectionJobRuntime {
+                projection: projection.clone(),
+                output_dir,
+                child: Some(child),
+            },
+        );
+        ok_json(&projection)
+    }
+
+    fn handle_get_detection_job(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let job_id = match parse_detection_job_path(path, None) {
+            Some(job_id) => job_id,
+            None => return error_json(StatusCode(400), "invalid detection job path"),
+        };
+        let camera_id = match self.detection_job_camera_id(&job_id) {
+            Ok(camera_id) => camera_id,
+            Err((status, error)) => return error_json(status, &error),
+        };
+        if let Err(error) =
+            self.authorize_camera_action(hints, &camera_id, AccessAction::CameraView)
+        {
+            return error_json(StatusCode(403), &error);
+        }
+        let mut jobs = match self.detection_jobs.lock() {
+            Ok(jobs) => jobs,
+            Err(_) => return error_json(StatusCode(503), "detection job state is unavailable"),
+        };
+        let Some(runtime) = jobs.get_mut(&job_id) else {
+            return error_json(StatusCode(404), "detection job was not found");
+        };
+        self.refresh_detection_job(runtime);
+        ok_json(&runtime.projection)
+    }
+
+    fn handle_renew_detection_job(
+        &self,
+        path: &str,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let job_id = match parse_detection_job_path(path, Some("/renew")) {
+            Some(job_id) => job_id,
+            None => return error_json(StatusCode(400), "invalid detection job renew path"),
+        };
+        let body = match read_json_body_or_default::<DetectionJobRenewRequest>(request) {
+            Ok(body) => body,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let ttl_seconds = body
+            .ttl_seconds
+            .unwrap_or(DEFAULT_DETECTION_JOB_TTL_SECONDS);
+        if !(MIN_DETECTION_JOB_TTL_SECONDS..=MAX_DETECTION_JOB_TTL_SECONDS).contains(&ttl_seconds) {
+            return error_json(StatusCode(400), "ttl_seconds must be between 60 and 900");
+        }
+        let camera_id = match self.detection_job_camera_id(&job_id) {
+            Ok(camera_id) => camera_id,
+            Err((status, error)) => return error_json(status, &error),
+        };
+        if let Err(error) =
+            self.authorize_camera_action(hints, &camera_id, AccessAction::CameraView)
+        {
+            return error_json(StatusCode(403), &error);
+        }
+        let mut jobs = match self.detection_jobs.lock() {
+            Ok(jobs) => jobs,
+            Err(_) => return error_json(StatusCode(503), "detection job state is unavailable"),
+        };
+        let Some(runtime) = jobs.get_mut(&job_id) else {
+            return error_json(StatusCode(404), "detection job was not found");
+        };
+        self.refresh_detection_job(runtime);
+        if runtime.projection.status != "running" {
+            return error_json(
+                StatusCode(409),
+                "only a running detection job can be renewed",
+            );
+        }
+        match self.harborlink_media.renew_detection_lease(
+            &runtime.projection.camera_id,
+            &runtime.projection.lease_id,
+            ttl_seconds,
+        ) {
+            Ok(lease) => {
+                runtime.projection.expires_at = lease.expires_at;
+                runtime.projection.updated_at = lease.updated_at;
+                ok_json(&runtime.projection)
+            }
+            Err(error) => error_json(StatusCode(502), &error),
+        }
+    }
+
+    fn handle_stop_detection_job(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let job_id = match parse_detection_job_path(path, None) {
+            Some(job_id) => job_id,
+            None => return error_json(StatusCode(400), "invalid detection job path"),
+        };
+        let camera_id = match self.detection_job_camera_id(&job_id) {
+            Ok(camera_id) => camera_id,
+            Err((status, error)) => return error_json(status, &error),
+        };
+        if let Err(error) =
+            self.authorize_camera_action(hints, &camera_id, AccessAction::CameraView)
+        {
+            return error_json(StatusCode(403), &error);
+        }
+        let mut jobs = match self.detection_jobs.lock() {
+            Ok(jobs) => jobs,
+            Err(_) => return error_json(StatusCode(503), "detection job state is unavailable"),
+        };
+        let Some(runtime) = jobs.get_mut(&job_id) else {
+            return error_json(StatusCode(404), "detection job was not found");
+        };
+        self.refresh_detection_job(runtime);
+        if runtime.projection.status == "running" {
+            stop_detection_child(runtime);
+            let lease_result = self
+                .harborlink_media
+                .stop_detection_lease(&runtime.projection.camera_id, &runtime.projection.lease_id);
+            runtime.projection.status = "stopped".to_string();
+            runtime.projection.updated_at = current_rfc3339_timestamp();
+            runtime.projection.message = lease_result.err().map(|error| {
+                format!(
+                    "worker stopped; detection lease cleanup was incomplete: {}",
+                    redact_admin_string(&error)
+                )
+            });
+        }
+        refresh_detection_job_outputs(runtime);
+        ok_json(&runtime.projection)
+    }
+
+    fn detection_job_camera_id(&self, job_id: &str) -> Result<String, (StatusCode, String)> {
+        let jobs = self.detection_jobs.lock().map_err(|_| {
+            (
+                StatusCode(503),
+                "detection job state is unavailable".to_string(),
+            )
+        })?;
+        jobs.get(job_id)
+            .map(|runtime| runtime.projection.camera_id.clone())
+            .ok_or((StatusCode(404), "detection job was not found".to_string()))
+    }
+
+    fn refresh_detection_job(&self, runtime: &mut DetectionJobRuntime) {
+        if runtime.projection.status == "running"
+            && detection_job_has_expired(&runtime.projection.expires_at)
+        {
+            stop_detection_child(runtime);
+            let _ = self
+                .harborlink_media
+                .stop_detection_lease(&runtime.projection.camera_id, &runtime.projection.lease_id);
+            runtime.projection.status = "expired".to_string();
+            runtime.projection.updated_at = current_rfc3339_timestamp();
+            runtime.projection.message = Some("detection lease expired".to_string());
+        } else if runtime.projection.status == "running" {
+            let process_status = runtime.child.as_mut().map(Child::try_wait);
+            match process_status {
+                Some(Ok(Some(status))) => {
+                    runtime.child = None;
+                    let _ = self.harborlink_media.stop_detection_lease(
+                        &runtime.projection.camera_id,
+                        &runtime.projection.lease_id,
+                    );
+                    runtime.projection.status = if status.success() {
+                        "completed".to_string()
+                    } else {
+                        "failed".to_string()
+                    };
+                    runtime.projection.updated_at = current_rfc3339_timestamp();
+                    runtime.projection.message = Some(match status.code() {
+                        Some(code) => format!("detection worker exited with code {code}"),
+                        None => "detection worker exited without a status code".to_string(),
+                    });
+                }
+                Some(Err(error)) => {
+                    stop_detection_child(runtime);
+                    let _ = self.harborlink_media.stop_detection_lease(
+                        &runtime.projection.camera_id,
+                        &runtime.projection.lease_id,
+                    );
+                    runtime.projection.status = "failed".to_string();
+                    runtime.projection.updated_at = current_rfc3339_timestamp();
+                    runtime.projection.message = Some(format!(
+                        "failed to inspect detection worker: {}",
+                        redact_admin_string(&error.to_string())
+                    ));
+                }
+                Some(Ok(None)) | None => {}
+            }
+        }
+        refresh_detection_job_outputs(runtime);
     }
 
     fn handle_list_local_vision_events(
@@ -6167,7 +6842,7 @@ impl AdminApi {
             service: guardian_request.service,
             fields: json!({}),
         };
-        let state = match self.admin_store.home_assistant_secret_state() {
+        let state = match self.admin_store.home_assistant_state() {
             Ok(state) => state,
             Err(error) => {
                 return json!({
@@ -7651,16 +8326,15 @@ impl AdminApi {
         {
             return error_json(StatusCode(403), &error);
         }
-        let device = match self.load_camera_device(&device_id) {
-            Ok(device) => device,
-            Err(error) if error.contains("device not found") => {
-                return error_json(StatusCode(404), &error)
+        if let Err(error) = self.load_camera_device(&device_id) {
+            if error.contains("device not found") {
+                return error_json(StatusCode(404), &error);
             }
-            Err(error) => return error_json(StatusCode(422), &error),
-        };
-        match self.admin_store.load_state() {
-            Ok(state) => ok_json(&build_device_credential_status(&state, &device)),
-            Err(error) => error_json(StatusCode(500), &error),
+            return error_json(StatusCode(422), &error);
+        }
+        match self.harborlink_media.credential_status(&device_id) {
+            Ok(status) => ok_json(&DeviceCredentialStatusResponse::from_harborlink(status)),
+            Err(error) => error_json(StatusCode(502), &error),
         }
     }
 
@@ -7704,68 +8378,33 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
             return error_json(StatusCode(403), &error);
         }
-        let device = match self.load_camera_device(&device_id) {
-            Ok(device) => device,
-            Err(error) if error.contains("device not found") => {
-                return error_json(StatusCode(404), &error)
+        if let Err(error) = self.load_camera_device(&device_id) {
+            if error.contains("device not found") {
+                return error_json(StatusCode(404), &error);
             }
-            Err(error) => return error_json(StatusCode(422), &error),
-        };
+            return error_json(StatusCode(422), &error);
+        }
         let body: DeviceCredentialsRequest = match read_json_body(request) {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
         };
 
-        let state = match self.admin_store.load_state() {
-            Ok(state) => state,
-            Err(error) => return error_json(StatusCode(500), &error),
-        };
-        let existing = state
-            .device_credentials
-            .iter()
-            .find(|credential| credential.device_id == device_id);
-        let username = body
-            .username
-            .as_deref()
-            .and_then(non_empty_string)
-            .or_else(|| existing.map(|credential| credential.username.clone()))
-            .or_else(|| non_empty_string(&state.defaults.rtsp_username))
-            .unwrap_or_default();
+        let username = body.username.as_deref().and_then(non_empty_string);
         let password = body
             .password
             .as_deref()
             .and_then(non_empty_string)
-            .or_else(|| existing.map(|credential| credential.password.clone()))
-            .or_else(|| non_empty_string(&state.defaults.rtsp_password))
-            .unwrap_or_default();
-        let rtsp_port = body
-            .rtsp_port
-            .filter(|port| *port > 0)
-            .or_else(|| existing.and_then(|credential| credential.rtsp_port))
-            .or_else(|| rtsp_port_from_url(&device.primary_stream.url))
-            .or(Some(state.defaults.rtsp_port));
-        let rtsp_paths = if body.rtsp_paths.is_empty() {
-            existing
-                .map(|credential| credential.rtsp_paths.clone())
-                .filter(|paths| !paths.is_empty())
-                .or_else(|| rtsp_path_from_url(&device.primary_stream.url).map(|path| vec![path]))
-                .unwrap_or_else(|| state.defaults.rtsp_paths.clone())
-        } else {
-            body.rtsp_paths
-        };
-
-        let credential = DeviceCredentialSecret {
-            device_id: device_id.clone(),
-            username,
-            password,
-            rtsp_port,
-            rtsp_paths: dedupe_rtsp_paths(rtsp_paths),
-            updated_at: Some(now_unix_string()),
-            last_verified_at: existing.and_then(|credential| credential.last_verified_at.clone()),
-        };
-        match self.admin_store.save_device_credential(credential) {
-            Ok(state) => ok_json(&build_device_credential_status(&state, &device)),
-            Err(error) => error_json(StatusCode(422), &error),
+            .filter(|value| !looks_redacted_secret(value));
+        let rtsp_paths = (!body.rtsp_paths.is_empty()).then_some(body.rtsp_paths.as_slice());
+        match self.harborlink_media.save_camera_credential(
+            &device_id,
+            username.as_deref(),
+            password.as_deref(),
+            body.rtsp_port.filter(|port| *port > 0),
+            rtsp_paths,
+        ) {
+            Ok(status) => ok_json(&DeviceCredentialStatusResponse::from_harborlink(status)),
+            Err(error) => error_json(StatusCode(502), &error),
         }
     }
 
@@ -7852,18 +8491,32 @@ impl AdminApi {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
         };
+        let rtsp_username = non_empty_string(&body.rtsp_username);
+        let rtsp_password =
+            non_empty_string(&body.rtsp_password).filter(|value| !looks_redacted_secret(value));
+        let link_settings = match self.harborlink_media.save_discovery_settings(
+            &body.cidr,
+            &body.discovery,
+            body.rtsp_port.filter(|port| *port > 0),
+            &body.rtsp_paths,
+            rtsp_username.as_deref(),
+            rtsp_password.as_deref(),
+        ) {
+            Ok(settings) => settings,
+            Err(error) => return error_json(StatusCode(502), &error),
+        };
 
         let defaults = AdminDefaults {
-            cidr: body.cidr,
-            discovery: body.discovery,
+            cidr: link_settings.network_cidr,
+            discovery: link_settings.protocol,
             recording: body.recording,
             capture: body.capture,
             ai: body.ai,
             notification_channel: body.notification_channel,
-            rtsp_username: body.rtsp_username,
-            rtsp_password: body.rtsp_password,
-            rtsp_port: body.rtsp_port.unwrap_or(554),
-            rtsp_paths: body.rtsp_paths,
+            rtsp_username: String::new(),
+            rtsp_password: String::new(),
+            rtsp_port: link_settings.rtsp_port.unwrap_or(554),
+            rtsp_paths: link_settings.rtsp_paths,
             selected_camera_device_id: body.selected_camera_device_id,
             capture_subdirectory: body
                 .capture_subdirectory
@@ -7911,6 +8564,7 @@ impl AdminApi {
         &self,
         path: &str,
         hints: &AccessIdentityHints,
+        business_request_id: Option<&str>,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
         let device_id = match parse_camera_task_snapshot_path(path) {
             Some(device_id) => device_id,
@@ -7922,11 +8576,11 @@ impl AdminApi {
                 Err(error) => return error_json(StatusCode(403), &error),
             };
 
-        let task_response =
-            redact_camera_task_response(self.snapshot_camera(&principal, &device_id));
-        let media_item = self.store_dvr_snapshot_media_item(&device_id).ok();
+        let task_response = self.snapshot_camera(&principal, &device_id, business_request_id);
+        let media_item = snapshot_artifact_from_task_response(&task_response)
+            .and_then(|artifact| dvr_timeline_segment_from_harborlink(artifact, None, None));
         ok_json(&CameraTaskResponse {
-            task_response,
+            task_response: redact_camera_task_response(task_response),
             media_item,
         })
     }
@@ -7957,28 +8611,48 @@ impl AdminApi {
     fn handle_dvr_recording_start(
         &self,
         path: &str,
+        request: &mut Request,
         hints: &AccessIdentityHints,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
         let device_id = match parse_camera_recording_start_path(path) {
             Some(device_id) => device_id,
             None => return error_json(StatusCode(400), "invalid camera recording start path"),
         };
+        let body: RecordingStartRequest = match read_json_body_or_default(request) {
+            Ok(body) => body,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let stream_profile = match body
+            .stream_profile
+            .as_deref()
+            .map(CameraStreamProfile::parse)
+            .transpose()
+        {
+            Ok(profile) => profile,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
         if let Err(error) =
             self.authorize_camera_action(hints, &device_id, AccessAction::CameraOperate)
         {
             return error_json(StatusCode(403), &error);
         }
-        let device = match self.load_camera_device(&device_id) {
-            Ok(device) => device,
+        let camera_count = match self.registered_camera_count(&device_id) {
+            Ok(camera_count) => camera_count,
             Err(error) if error.contains("device not found") => {
                 return error_json(StatusCode(404), &error)
             }
             Err(error) => return error_json(StatusCode(422), &error),
         };
-        let device = self.camera_device_with_runtime_credentials(&device);
-        let mut settings = match self.admin_store.dvr_recording_settings() {
+        let mut settings = match self.harborlink_dvr_settings() {
             Ok(settings) => settings,
-            Err(error) => return error_json(StatusCode(500), &error),
+            Err(error) => return error_json(StatusCode(502), &error),
+        };
+        let status = match self
+            .harborlink_media
+            .start_recording(&device_id, stream_profile.map(CameraStreamProfile::as_str))
+        {
+            Ok(status) => status,
+            Err(error) => return error_json(StatusCode(502), &error),
         };
         if !settings
             .enabled_device_ids
@@ -7987,17 +8661,12 @@ impl AdminApi {
         {
             settings.enabled_device_ids.push(device_id.clone());
         }
-        let settings = match self.admin_store.save_dvr_recording_settings(settings) {
-            Ok(state) => state.dvr,
-            Err(error) => return error_json(StatusCode(422), &error),
-        };
-        match self
-            .dvr_runtime
-            .start_recording(&device, &settings, Some(&self.public_origin))
-        {
-            Ok(status) => ok_json(&status),
-            Err(error) => error_json(StatusCode(422), &error),
-        }
+        ok_json(&build_dvr_recording_action_response(
+            settings,
+            status,
+            camera_count,
+            &self.public_origin,
+        ))
     }
 
     fn handle_dvr_recording_stop(
@@ -8014,30 +8683,30 @@ impl AdminApi {
         {
             return error_json(StatusCode(403), &error);
         }
-        if let Err(error) = self.load_camera_device(&device_id) {
-            return if error.contains("device not found") {
-                error_json(StatusCode(404), &error)
-            } else {
-                error_json(StatusCode(422), &error)
-            };
-        }
-        let mut settings = match self.admin_store.dvr_recording_settings() {
+        let camera_count = match self.registered_camera_count(&device_id) {
+            Ok(camera_count) => camera_count,
+            Err(error) if error.contains("device not found") => {
+                return error_json(StatusCode(404), &error)
+            }
+            Err(error) => return error_json(StatusCode(422), &error),
+        };
+        let mut settings = match self.harborlink_dvr_settings() {
             Ok(settings) => settings,
-            Err(error) => return error_json(StatusCode(500), &error),
+            Err(error) => return error_json(StatusCode(502), &error),
+        };
+        let status = match self.harborlink_media.stop_recording(&device_id) {
+            Ok(status) => status,
+            Err(error) => return error_json(StatusCode(502), &error),
         };
         settings
             .enabled_device_ids
             .retain(|enabled| enabled != &device_id);
-        if let Err(error) = self.admin_store.save_dvr_recording_settings(settings) {
-            return error_json(StatusCode(422), &error);
-        }
-        match self
-            .dvr_runtime
-            .stop_recording(&device_id, Some(&self.public_origin))
-        {
-            Ok(status) => ok_json(&status),
-            Err(error) => error_json(StatusCode(500), &error),
-        }
+        ok_json(&build_dvr_recording_action_response(
+            settings,
+            status,
+            camera_count,
+            &self.public_origin,
+        ))
     }
 
     fn handle_revoke_share_link(
@@ -8117,9 +8786,10 @@ impl AdminApi {
         }
     }
 
-    fn handle_camera_hls_live_start(
+    fn handle_camera_live_start(
         &self,
         path: &str,
+        request: &mut Request,
         remote_addr: Option<SocketAddr>,
         headers: &[Header],
         hints: &AccessIdentityHints,
@@ -8132,30 +8802,46 @@ impl AdminApi {
             Some(device_id) => device_id,
             None => return error_json(StatusCode(400), "invalid live start path"),
         };
-        if let Err(error) =
-            self.authorize_camera_action(hints, &device_id, AccessAction::CameraView)
+        let body: LiveStartRequest = match read_json_body_or_default(request) {
+            Ok(body) => body,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let stream_profile = match CameraStreamProfile::parse_or_sub(body.stream_profile.as_deref())
         {
+            Ok(profile) => profile,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let state = match self.admin_store.load_or_create_state() {
+            Ok(state) => state,
+            Err(error) => return error_json(StatusCode(422), &error),
+        };
+        if let Err(error) = authorize_access(
+            &state,
+            hints,
+            AccessAction::CameraView,
+            &format!("camera:{device_id}"),
+            true,
+        ) {
             return error_json(StatusCode(403), &error);
         }
 
-        let device = match self.load_camera_device(&device_id) {
-            Ok(device) => self.camera_device_with_runtime_credentials(&device),
-            Err(error) if error.contains("device not found") => {
-                return error_json(StatusCode(404), &error)
+        if let Err(error) = self.load_camera_device(&device_id) {
+            if error.contains("device not found") {
+                return error_json(StatusCode(404), &error);
             }
-            Err(error) => return error_json(StatusCode(422), &error),
-        };
+            return error_json(StatusCode(422), &error);
+        }
 
         match self
-            .hls_live_runtime
-            .start_session(&device.device_id, &device.primary_stream.url)
+            .harborlink_media
+            .start_live_session(&device_id, stream_profile.as_str(), 300)
         {
-            Ok(session) => ok_json(&session.to_response(&self.public_origin)),
-            Err(error) => error_json(StatusCode(422), &error),
+            Ok(session) => ok_json(&CameraLiveSessionProjection::from_harborlink(session)),
+            Err(error) => error_json(StatusCode(502), &error),
         }
     }
 
-    fn handle_camera_hls_live_status(
+    fn handle_camera_live_status(
         &self,
         raw_url: &str,
         path: &str,
@@ -8176,16 +8862,18 @@ impl AdminApi {
         {
             return error_json(StatusCode(403), &error);
         }
-        let session_id = parse_query_param(raw_url, "session_id");
-        ok_json(
-            &self
-                .hls_live_runtime
-                .status(&device_id, session_id.as_deref())
-                .to_response(&self.public_origin),
-        )
+        let session_id =
+            parse_query_param(raw_url, "session_id").unwrap_or_else(|| "current".to_string());
+        match self
+            .harborlink_media
+            .live_session_status(&device_id, &session_id)
+        {
+            Ok(session) => ok_json(&CameraLiveSessionProjection::from_harborlink(session)),
+            Err(error) => error_json(StatusCode(502), &error),
+        }
     }
 
-    fn handle_camera_hls_live_stop(
+    fn handle_camera_live_stop(
         &self,
         path: &str,
         request: &mut Request,
@@ -8210,80 +8898,48 @@ impl AdminApi {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
         };
-        ok_json(
-            &self
-                .hls_live_runtime
-                .stop_session(&device_id, payload.session_id.as_deref())
-                .to_response(&self.public_origin),
-        )
+        match self
+            .harborlink_media
+            .stop_live_session(&device_id, payload.session_id.as_deref())
+        {
+            Ok(session) => ok_json(&CameraLiveSessionProjection::from_harborlink(session)),
+            Err(error) => error_json(StatusCode(502), &error),
+        }
     }
 
-    fn handle_camera_hls_live_asset(
+    fn handle_camera_live_renew(
         &self,
         path: &str,
+        request: &mut Request,
         remote_addr: Option<SocketAddr>,
         headers: &[Header],
         hints: &AccessIdentityHints,
-    ) -> ResponseBox {
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
         if let Err(error) = ensure_local_camera_access(remote_addr, headers) {
-            return error_json(StatusCode(403), &error).boxed();
+            return error_json(StatusCode(403), &error);
         }
-
-        let (device_id, session_id, asset_name) = match parse_camera_hls_live_asset_path(path) {
-            Some(parts) => parts,
-            None => return error_json(StatusCode(400), "invalid live asset path").boxed(),
+        let device_id = match parse_camera_hls_live_renew_path(path) {
+            Some(device_id) => device_id,
+            None => return error_json(StatusCode(400), "invalid live renew path"),
         };
         if let Err(error) =
             self.authorize_camera_action(hints, &device_id, AccessAction::CameraView)
         {
-            return error_json(StatusCode(403), &error).boxed();
+            return error_json(StatusCode(403), &error);
         }
-
-        let asset_path =
-            match self
-                .hls_live_runtime
-                .asset_path(&device_id, &session_id, &asset_name)
-            {
-                Ok(path) => path,
-                Err(error) if error.contains("not found") => {
-                    return error_json(StatusCode(404), &error).boxed()
-                }
-                Err(error) => return error_json(StatusCode(422), &error).boxed(),
-            };
-
-        let file = match fs::File::open(&asset_path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return error_json(StatusCode(404), "live asset not found").boxed()
-            }
-            Err(error) => {
-                return error_json(
-                    StatusCode(422),
-                    &format!("failed to read live asset: {error}"),
-                )
-                .boxed()
-            }
+        let payload = match read_json_body::<LiveRenewRequest>(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
         };
-
-        let metadata = file.metadata().ok();
-        let headers = vec![
-            Header::from_bytes(
-                b"Content-Type".as_slice(),
-                live_asset_mime_type(&asset_name).as_bytes(),
-            )
-            .expect("header"),
-            Header::from_bytes(b"X-Accel-Buffering".as_slice(), b"no".as_slice()).expect("header"),
-        ];
-        let mut response = Response::new(
-            StatusCode(200),
-            headers,
-            file,
-            metadata.map(|value| value.len() as usize),
-            None,
-        )
-        .boxed();
-        add_common_headers(&mut response);
-        response
+        let ttl_seconds = payload.ttl_seconds.unwrap_or(300).clamp(60, 900);
+        match self.harborlink_media.renew_live_session(
+            &device_id,
+            payload.session_id.trim(),
+            ttl_seconds,
+        ) {
+            Ok(session) => ok_json(&CameraLiveSessionProjection::from_harborlink(session)),
+            Err(error) => error_json(StatusCode(502), &error),
+        }
     }
 
     fn handle_camera_live_mjpeg(
@@ -8307,19 +8963,10 @@ impl AdminApi {
             return error_json(StatusCode(403), &error).boxed();
         }
 
-        let device = match self.load_camera_device(&device_id) {
-            Ok(device) => device,
-            Err(error) if error.contains("device not found") => {
-                return error_json(StatusCode(404), &error).boxed()
-            }
-            Err(error) => return error_json(StatusCode(422), &error).boxed(),
-        };
-
-        let device = self.camera_device_with_runtime_credentials(&device);
-        let stream = match FfmpegMjpegStream::spawn(&device.primary_stream.url) {
+        let stream = match self.harborlink_media.open_mjpeg(&device_id) {
             Ok(stream) => stream,
             Err(error) => {
-                return error_json(StatusCode(422), &format!("打开实时画面失败: {error}")).boxed()
+                return error_json(StatusCode(502), &format!("打开实时画面失败: {error}")).boxed()
             }
         };
 
@@ -8345,19 +8992,10 @@ impl AdminApi {
             Ok(claims) => claims,
             Err(error) => return error_json(StatusCode(403), &error).boxed(),
         };
-        let device = match self.load_camera_device(&claims.device_id) {
-            Ok(device) => device,
-            Err(error) if error.contains("device not found") => {
-                return error_json(StatusCode(404), &error).boxed()
-            }
-            Err(error) => return error_json(StatusCode(422), &error).boxed(),
-        };
-
-        let device = self.camera_device_with_runtime_credentials(&device);
-        let stream = match FfmpegMjpegStream::spawn(&device.primary_stream.url) {
+        let stream = match self.harborlink_media.open_mjpeg(&claims.device_id) {
             Ok(stream) => stream,
             Err(error) => {
-                return error_json(StatusCode(422), &format!("打开共享实时画面失败: {error}"))
+                return error_json(StatusCode(502), &format!("打开共享实时画面失败: {error}"))
                     .boxed()
             }
         };
@@ -8407,37 +9045,93 @@ impl AdminApi {
 
     fn scan(
         &self,
-        principal: &AccessPrincipal,
+        _principal: &AccessPrincipal,
         request: ScanRequest,
     ) -> Result<ScanResponse, String> {
-        let response = self
-            .task_service
-            .handle_task(self.build_camera_task_request(
-                principal,
-                "scan",
-                "扫描摄像头",
-                scan_request_task_args(&request),
-            ));
-        if response.status != TaskStatus::Completed {
-            return Err(task_error_message(&response));
-        }
+        let admin_state = self.admin_store.load_state()?;
+        let network_cidr = request
+            .cidr
+            .as_deref()
+            .and_then(non_empty_string)
+            .unwrap_or_else(|| admin_state.defaults.cidr.clone());
+        let username = request.rtsp_username.as_deref().and_then(non_empty_string);
+        let password = request
+            .rtsp_password
+            .as_deref()
+            .and_then(non_empty_string)
+            .filter(|value| !looks_redacted_secret(value));
+        let discovery = self.harborlink_media.discover_cameras(
+            &network_cidr,
+            request.protocol.as_deref(),
+            request.rtsp_port.filter(|port| *port > 0),
+            username.as_deref(),
+            password.as_deref(),
+            &[],
+        )?;
 
+        let registry_store = self.admin_store.registry_store();
+        let mut registered_devices = registry_store.load_devices()?;
+        let mut results = Vec::new();
+        for camera in discovery.cameras {
+            if camera.registered {
+                let mut device = CameraDevice::new(
+                    camera.camera_id.clone(),
+                    camera.display_name.clone(),
+                    format!("harborlink://camera/{}", camera.camera_id),
+                );
+                device.status = if camera.reachable {
+                    DeviceStatus::Online
+                } else {
+                    DeviceStatus::Unknown
+                };
+                device.vendor = camera.vendor.clone();
+                device.model = camera.model.clone();
+                device.discovery_source = "harborlink".to_string();
+                device.primary_stream.transport = StreamTransport::Webrtc;
+                device.primary_stream.requires_auth = camera.requires_auth;
+                device.capabilities.stream = true;
+                device.capabilities.snapshot = camera.protocol == "onvif";
+                device.capabilities.ptz = camera.protocol == "onvif";
+                if let Some(existing) = registered_devices
+                    .iter_mut()
+                    .find(|existing| existing.device_id == camera.camera_id)
+                {
+                    device.room = existing.room.clone();
+                    *existing = device;
+                } else {
+                    registered_devices.push(device);
+                }
+            }
+            results.push(HubScanResultItem {
+                candidate_id: camera.candidate_id,
+                device_id: camera.registered.then_some(camera.camera_id),
+                name: camera.display_name,
+                room: "待确认".to_string(),
+                ip: camera.ip_address,
+                port: camera.port,
+                protocol: format!("HarborLink {}", camera.protocol.to_ascii_uppercase()),
+                note: if camera.reachable {
+                    "HarborLink 已完成南向发现和 RTSP 验证。".to_string()
+                } else {
+                    "HarborLink 已发现设备，RTSP 仍需凭据或路径确认。".to_string()
+                },
+                reachable: camera.reachable,
+                registered: camera.registered,
+                requires_auth: camera.requires_auth,
+                vendor: camera.vendor,
+                model: camera.model,
+                rtsp_paths: camera.rtsp_paths,
+            });
+        }
+        registry_store.save_devices(&registered_devices)?;
         let state = self.current_state()?;
-        let results = parse_scan_results(&response.result.data)?;
-        let scanned_hosts = response
-            .result
-            .data
-            .pointer("/summary/scanned_hosts")
-            .and_then(Value::as_u64)
-            .map(|value| value as usize)
-            .unwrap_or_default();
 
         Ok(HubScanSummary {
             binding: state.binding,
             defaults: state.defaults,
             devices: state.devices,
             results,
-            scanned_hosts,
+            scanned_hosts: discovery.scanned_hosts,
         })
     }
 
@@ -8471,21 +9165,15 @@ impl AdminApi {
             .unwrap_or_default();
 
         if principal_skips_manual_camera_connect_approval(principal) {
-            return self.hub().manual_add(
-                CameraConnectRequest {
-                    name,
-                    room,
-                    ip,
-                    path_candidates,
-                    username,
-                    password,
-                    port,
-                    snapshot_url,
-                    discovery_source: "admin_console_manual_add".to_string(),
-                    vendor: None,
-                    model: None,
-                },
-                Some(&self.public_origin),
+            return self.manual_add_via_harborlink(
+                name,
+                room,
+                ip,
+                path_candidates,
+                username,
+                password,
+                port,
+                snapshot_url,
             );
         }
 
@@ -8522,6 +9210,105 @@ impl AdminApi {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn manual_add_via_harborlink(
+        &self,
+        name: String,
+        room: Option<String>,
+        ip: String,
+        mut path_candidates: Vec<String>,
+        username: Option<String>,
+        password: Option<String>,
+        port: Option<u16>,
+        snapshot_url: Option<String>,
+    ) -> Result<ManualAddResponse, String> {
+        let ip = ip.trim();
+        if ip.is_empty() {
+            return Err("IP 地址不能为空".to_string());
+        }
+        if path_candidates.is_empty() {
+            path_candidates = vec!["/stream1".to_string(), "/stream2".to_string()];
+        }
+        for path in &mut path_candidates {
+            let trimmed = path.trim();
+            *path = if trimmed.starts_with('/') {
+                trimmed.to_string()
+            } else {
+                format!("/{trimmed}")
+            };
+        }
+        path_candidates.sort();
+        path_candidates.dedup();
+        let port = port.filter(|value| *value > 0).unwrap_or(554);
+        let camera_id = device_id_for_ip(ip);
+        let display_name = non_empty_string(&name).unwrap_or_else(|| format!("Camera {ip}"));
+        let registration = self.harborlink_media.register_camera(
+            &camera_id,
+            &json!({
+                "displayName": display_name,
+                "room": room,
+                "ipAddress": ip,
+                "discoverySource": "admin_console_manual_add",
+                "snapshotUrl": snapshot_url,
+                "username": username.as_deref().and_then(|value| non_empty_string(value)),
+                "password": password.as_deref().and_then(|value| {
+                    non_empty_string(value).filter(|value| !looks_redacted_secret(value))
+                }),
+                "rtspPort": port,
+                "rtspPaths": path_candidates,
+                "capabilities": {
+                    "snapshot": snapshot_url.is_some(),
+                    "stream": true,
+                    "ptz": false,
+                    "audio": false,
+                },
+            }),
+        )?;
+        if !registration.registered || !registration.check.reachable {
+            return Err(registration
+                .check
+                .error_message
+                .unwrap_or_else(|| "RTSP 验证失败，未发现可用视频流".to_string()));
+        }
+        let check = registration.check;
+
+        let mut device = CameraDevice::new(
+            camera_id.clone(),
+            display_name,
+            format!("harborlink://camera/{camera_id}"),
+        );
+        device.status = DeviceStatus::Online;
+        device.room = room.and_then(|value| non_empty_string(&value));
+        device.ip_address = Some(ip.to_string());
+        device.discovery_source = "harborlink".to_string();
+        device.primary_stream.transport = StreamTransport::Webrtc;
+        device.primary_stream.requires_auth = check.requires_auth;
+        device.capabilities = check.capabilities;
+        device.snapshot_url = None;
+        device.onvif_device_service_url = None;
+        device.last_seen_at = Some(check.checked_at);
+
+        let registry_store = self.admin_store.registry_store();
+        let mut devices = registry_store.load_devices()?;
+        if let Some(existing) = devices
+            .iter_mut()
+            .find(|existing| existing.device_id == camera_id)
+        {
+            *existing = device.clone();
+        } else {
+            devices.push(device.clone());
+        }
+        registry_store.save_devices(&devices)?;
+        let state = self.current_state()?;
+        Ok(HubManualAddSummary {
+            binding: state.binding,
+            defaults: state.defaults,
+            device,
+            devices: state.devices,
+            note: "摄像头已由 HarborLink 验证并注册，HarborBeacon 仅保留逻辑设备身份。".to_string(),
+        })
+    }
+
     fn patch_device_metadata(
         &self,
         device_id: &str,
@@ -8536,6 +9323,50 @@ impl AdminApi {
             return Err(format!("device not found: {device_id}"));
         };
 
+        let stream_url_update = request
+            .primary_stream_url
+            .as_deref()
+            .and_then(non_empty_string)
+            .filter(|value| !is_harborlink_stream_placeholder(value))
+            .map(|value| {
+                let url = Url::parse(&value).map_err(|_| {
+                    "primary stream URL must be RTSP or an unchanged HarborLink projection"
+                        .to_string()
+                })?;
+                if !matches!(url.scheme(), "rtsp" | "rtsps") {
+                    return Err(
+                        "primary stream URL must be RTSP or an unchanged HarborLink projection"
+                            .to_string(),
+                    );
+                }
+                Ok(value)
+            })
+            .transpose()?;
+        self.harborlink_media.update_camera_metadata(
+            device_id,
+            &json!({
+                "displayName": request.name,
+                "room": request.room,
+                "vendor": request.vendor,
+                "model": request.model,
+                "ipAddress": request.ip_address,
+                "snapshotUrl": request.snapshot_url,
+                "mainStreamUrl": stream_url_update,
+                "requiresAuth": request.requires_auth,
+            }),
+        )?;
+        if request.rtsp_path.is_some() || request.rtsp_port.is_some() {
+            let rtsp_paths = request.rtsp_path.as_deref().and_then(non_empty_string);
+            let rtsp_paths = rtsp_paths.map(|path| vec![path]);
+            self.harborlink_media.save_camera_credential(
+                device_id,
+                None,
+                None,
+                request.rtsp_port.filter(|port| *port > 0),
+                rtsp_paths.as_deref(),
+            )?;
+        }
+
         if let Some(name) = request.name.as_deref().and_then(non_empty_string) {
             device.name = name;
         }
@@ -8548,30 +9379,25 @@ impl AdminApi {
         if let Some(model) = request.model {
             device.model = non_empty_string(&model);
         }
-        if let Some(ip_address) = request.ip_address {
-            device.ip_address = non_empty_string(&ip_address);
-        }
-        if let Some(snapshot_url) = request.snapshot_url {
-            device.snapshot_url = non_empty_string(&snapshot_url);
-            if device.snapshot_url.is_some() {
-                device.capabilities.snapshot = true;
-            }
+        if request
+            .snapshot_url
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            device.capabilities.snapshot = true;
         }
         if let Some(requires_auth) = request.requires_auth {
             device.primary_stream.requires_auth = requires_auth;
         }
-        if let Some(primary_stream_url) = request
-            .primary_stream_url
-            .as_deref()
-            .and_then(non_empty_string)
-        {
-            device.primary_stream.url = primary_stream_url;
-            device.capabilities.stream = true;
-        } else if request.rtsp_path.is_some() || request.rtsp_port.is_some() {
-            device.primary_stream.url =
-                build_rtsp_url_from_patch(device, request.rtsp_path.as_deref(), request.rtsp_port)?;
+        if stream_url_update.is_some() {
             device.capabilities.stream = true;
         }
+        device.ip_address = None;
+        device.snapshot_url = None;
+        device.onvif_device_service_url = None;
+        device.primary_stream.url = format!("harborlink://camera/{device_id}");
+        device.primary_stream.transport = StreamTransport::Webrtc;
+        device.discovery_source = "harborlink".to_string();
 
         registry_store.save_devices(&devices)?;
         self.current_state()
@@ -8586,9 +9412,8 @@ impl AdminApi {
             return Err(format!("device not found: {device_id}"));
         }
 
-        let _ = self
-            .dvr_runtime
-            .stop_recording(device_id, Some(&self.public_origin));
+        let _ = self.harborlink_media.stop_recording(device_id);
+        self.harborlink_media.remove_camera(device_id)?;
         registry_store.save_devices(&devices)?;
         self.admin_store.forget_device(device_id)?;
         self.current_state()
@@ -8606,16 +9431,29 @@ impl AdminApi {
             ))
     }
 
-    fn snapshot_camera(&self, principal: &AccessPrincipal, device_id: &str) -> TaskResponse {
-        self.task_service
-            .handle_task(self.build_camera_task_request(
-                principal,
-                "snapshot",
-                "抓拍摄像头画面",
-                json!({
-                    "device_id": device_id,
-                }),
-            ))
+    fn snapshot_camera(
+        &self,
+        principal: &AccessPrincipal,
+        device_id: &str,
+        business_request_id: Option<&str>,
+    ) -> TaskResponse {
+        let mut request = self.build_camera_task_request(
+            principal,
+            "snapshot",
+            "抓拍摄像头画面",
+            json!({
+                "device_id": device_id,
+            }),
+        );
+        if let Some(request_id) = business_request_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            request.task_id = format!("task-camera-snapshot-{}", short_sha256(request_id));
+            request.trace_id = request.task_id.clone();
+            request.step_id = "snapshot".to_string();
+        }
+        self.task_service.handle_task(request)
     }
 
     fn share_camera_link(&self, principal: &AccessPrincipal, device_id: &str) -> TaskResponse {
@@ -8631,42 +9469,21 @@ impl AdminApi {
     }
 
     fn capture_camera_snapshot(&self, device_id: &str) -> Result<Vec<u8>, String> {
-        let device = self.load_camera_device(device_id)?;
-        let device = self.camera_device_with_runtime_credentials(&device);
-        let adapter = CommandRtspAdapter::default();
-        let result = adapter.capture_snapshot(
-            &SnapshotCaptureRequest::new(
-                device.device_id,
-                device.primary_stream.url,
-                SnapshotFormat::Jpeg,
-                StorageTarget::LocalDisk,
-            )
-            .with_snapshot_url(device.snapshot_url),
-        )?;
-
-        base64::engine::general_purpose::STANDARD
-            .decode(result.bytes_base64.as_bytes())
-            .map_err(|error| format!("snapshot bytes decode failed: {error}"))
+        self.harborlink_media.capture_snapshot(device_id)
     }
 
-    fn camera_device_with_runtime_credentials(&self, device: &CameraDevice) -> CameraDevice {
-        let Ok(state) = self.admin_store.load_state() else {
-            return device.clone();
-        };
-        let Some(stream_url) = camera_stream_url_with_credentials(device, &state) else {
-            return device.clone();
-        };
-        let mut resolved = device.clone();
-        resolved.primary_stream.url = stream_url;
-        resolved.primary_stream.requires_auth = true;
-        resolved
-    }
-
-    fn store_dvr_snapshot_media_item(&self, device_id: &str) -> Result<DvrTimelineSegment, String> {
-        let settings = self.admin_store.dvr_recording_settings()?;
-        let device = self.load_camera_device(device_id)?;
-        let bytes = self.capture_camera_snapshot(device_id)?;
-        store_snapshot_bytes(&settings, &device, &bytes, Some(&self.public_origin))
+    fn harborlink_credential_statuses(
+        &self,
+        devices: &[CameraDevice],
+    ) -> Result<Vec<DeviceCredentialStatusResponse>, String> {
+        devices
+            .iter()
+            .map(|device| {
+                self.harborlink_media
+                    .credential_status(&device.device_id)
+                    .map(DeviceCredentialStatusResponse::from_harborlink)
+            })
+            .collect()
     }
 
     fn load_camera_device(
@@ -8680,77 +9497,43 @@ impl AdminApi {
             .ok_or_else(|| format!("device not found: {device_id}"))
     }
 
+    fn registered_camera_count(&self, device_id: &str) -> Result<usize, String> {
+        let devices = self.hub().load_registered_cameras()?;
+        if devices.iter().any(|device| device.device_id == device_id) {
+            Ok(devices.len())
+        } else {
+            Err(format!("device not found: {device_id}"))
+        }
+    }
+
     fn check_device_rtsp(
         &self,
         device: &CameraDevice,
         request: RtspCheckRequest,
     ) -> Result<RtspCheckResponse, String> {
-        let state = self.admin_store.load_state()?;
-        let credential = state
-            .device_credentials
-            .iter()
-            .find(|credential| credential.device_id == device.device_id);
-        let ip_address = device
-            .ip_address
-            .clone()
-            .or_else(|| rtsp_host_from_url(&device.primary_stream.url))
-            .ok_or_else(|| format!("device {} does not expose an RTSP host", device.device_id))?;
-        let rtsp_port = request
-            .rtsp_port
-            .filter(|port| *port > 0)
-            .or_else(|| credential.and_then(|credential| credential.rtsp_port))
-            .or_else(|| rtsp_port_from_url(&device.primary_stream.url))
-            .unwrap_or(state.defaults.rtsp_port);
-        let username = request
-            .username
-            .as_deref()
-            .and_then(non_empty_string)
-            .or_else(|| credential.and_then(|credential| non_empty_string(&credential.username)))
-            .or_else(|| non_empty_string(&state.defaults.rtsp_username));
+        let username = request.username.as_deref().and_then(non_empty_string);
         let password = request
             .password
             .as_deref()
             .and_then(non_empty_string)
-            .or_else(|| credential.and_then(|credential| non_empty_string(&credential.password)))
-            .or_else(|| non_empty_string(&state.defaults.rtsp_password));
-        let path_candidates = if request.rtsp_paths.is_empty() {
-            credential
-                .map(|credential| credential.rtsp_paths.clone())
-                .filter(|paths| !paths.is_empty())
-                .or_else(|| rtsp_path_from_url(&device.primary_stream.url).map(|path| vec![path]))
-                .unwrap_or_else(|| state.defaults.rtsp_paths.clone())
-        } else {
-            request.rtsp_paths
-        };
-
-        let adapter = CommandRtspAdapter::default();
-        let checked_at = now_unix_string();
-        let result = adapter.probe(&RtspProbeRequest {
-            candidate_id: format!("rtsp-check-{}", device.device_id),
-            ip_address,
-            port: rtsp_port,
-            username,
-            password,
-            path_candidates: dedupe_rtsp_paths(path_candidates),
-        })?;
-        if result.reachable {
-            let _ = self
-                .admin_store
-                .mark_device_credential_verified(&device.device_id, checked_at.clone());
-        }
-
+            .filter(|value| !looks_redacted_secret(value));
+        let rtsp_paths = (!request.rtsp_paths.is_empty()).then_some(request.rtsp_paths.as_slice());
+        let result = self.harborlink_media.check_rtsp(
+            &device.device_id,
+            username.as_deref(),
+            password.as_deref(),
+            request.rtsp_port.filter(|port| *port > 0),
+            rtsp_paths,
+        )?;
         Ok(RtspCheckResponse {
-            device_id: device.device_id.clone(),
+            device_id: result.camera_id,
             reachable: result.reachable,
-            stream_url: result
-                .stream_url
-                .as_deref()
-                .map(redact_stream_url_credentials),
-            transport: format!("{:?}", result.transport).to_lowercase(),
+            stream_url: None,
+            transport: result.transport,
             requires_auth: result.requires_auth,
             capabilities: result.capabilities,
             error_message: result.error_message,
-            checked_at,
+            checked_at: result.checked_at,
         })
     }
 
@@ -8777,7 +9560,7 @@ impl AdminApi {
             .record_device_evidence(rtsp_check.clone())?;
 
         let snapshot_check = if device_has_snapshot_path(device) {
-            let response = self.snapshot_camera(principal, &device.device_id);
+            let response = self.snapshot_camera(principal, &device.device_id, None);
             build_snapshot_check_evidence(device, &response, Some(&validation_id))
         } else {
             build_snapshot_skipped_evidence(
@@ -8812,8 +9595,9 @@ impl AdminApi {
         &self,
         device: &CameraDevice,
     ) -> Result<DeviceEvidenceResponse, String> {
-        let state = self.admin_store.load_state()?;
-        let credential_status = build_device_credential_status(&state, device);
+        let credential_status = DeviceCredentialStatusResponse::from_harborlink(
+            self.harborlink_media.credential_status(&device.device_id)?,
+        );
         let share_links = self.list_share_links(Some(&device.device_id))?;
         let mut evidence = self.admin_store.list_device_evidence(&device.device_id)?;
         if let Some(snapshot_evidence) = self.latest_snapshot_asset_evidence(device)? {
@@ -9068,16 +9852,6 @@ impl AdminApi {
             message: None,
         }
     }
-}
-
-fn scan_request_task_args(request: &ScanRequest) -> Value {
-    json!({
-        "cidr": request.cidr,
-        "protocol": request.protocol,
-        "rtsp_port": request.rtsp_port,
-        "rtsp_username": request.rtsp_username,
-        "rtsp_password": request.rtsp_password,
-    })
 }
 
 fn principal_skips_manual_camera_connect_approval(principal: &AccessPrincipal) -> bool {
@@ -9392,6 +10166,136 @@ fn parse_local_vision_event_notify_path(path: &str) -> Option<String> {
         return None;
     }
     percent_decode_path_segment(event_id).ok()
+}
+
+fn normalize_detection_job_start(
+    request: DetectionJobStartRequest,
+) -> Result<DetectionJobConfig, String> {
+    let camera_id = request.camera_id.trim().to_string();
+    if camera_id.is_empty() || camera_id.len() > 128 || camera_id.chars().any(char::is_control) {
+        return Err("camera_id is invalid".to_string());
+    }
+    let target_labels = request
+        .target_labels
+        .iter()
+        .map(|label| label.trim().to_ascii_lowercase())
+        .filter(|label| !label.is_empty())
+        .collect::<Vec<_>>();
+    if target_labels.iter().any(|label| label != "cat") {
+        return Err("this deployment only supports target_labels=[\"cat\"]".to_string());
+    }
+    let ttl_seconds = request
+        .duration_seconds
+        .unwrap_or(DEFAULT_DETECTION_JOB_TTL_SECONDS);
+    if !(MIN_DETECTION_JOB_TTL_SECONDS..=MAX_DETECTION_JOB_TTL_SECONDS).contains(&ttl_seconds) {
+        return Err("duration_seconds must be between 60 and 900".to_string());
+    }
+    let max_fps = request.max_fps.unwrap_or(DEFAULT_DETECTION_MAX_FPS);
+    if !max_fps.is_finite() || !(0.0..=MAX_DETECTION_MAX_FPS).contains(&max_fps) || max_fps == 0.0 {
+        return Err("max_fps must be greater than 0 and at most 10".to_string());
+    }
+    let confidence = request.confidence.unwrap_or(DEFAULT_DETECTION_CONFIDENCE);
+    if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) || confidence == 0.0 {
+        return Err("confidence must be greater than 0 and at most 1".to_string());
+    }
+    let stream_profile = request
+        .stream_profile
+        .unwrap_or_else(|| "sub".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(stream_profile.as_str(), "main" | "sub") {
+        return Err("stream_profile must be main or sub".to_string());
+    }
+    Ok(DetectionJobConfig {
+        camera_id,
+        target_label: "cat".to_string(),
+        ttl_seconds,
+        max_fps,
+        confidence,
+        stream_profile,
+    })
+}
+
+fn parse_detection_job_path(path: &str, suffix: Option<&str>) -> Option<String> {
+    let trimmed = path.strip_prefix("/api/vision/detection-jobs/")?;
+    let job_id = match suffix {
+        Some(suffix) => trimmed.strip_suffix(suffix)?,
+        None => trimmed,
+    }
+    .trim();
+    if job_id.is_empty() || job_id.contains('/') {
+        return None;
+    }
+    let job_id = percent_decode_path_segment(job_id).ok()?;
+    (job_id.starts_with("yolo-")
+        && job_id.len() <= 96
+        && job_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-'))
+    .then_some(job_id)
+}
+
+fn detection_job_has_expired(expires_at: &str) -> bool {
+    OffsetDateTime::parse(expires_at.trim(), &Rfc3339)
+        .map(|timestamp| timestamp <= OffsetDateTime::now_utc())
+        .unwrap_or(false)
+}
+
+fn stop_detection_child(runtime: &mut DetectionJobRuntime) {
+    let Some(mut child) = runtime.child.take() else {
+        return;
+    };
+    match child.try_wait() {
+        Ok(Some(_)) => {}
+        Ok(None) | Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn refresh_detection_job_outputs(runtime: &mut DetectionJobRuntime) {
+    runtime.projection.latest_result =
+        read_detection_job_json(&runtime.output_dir.join("latest.json"));
+    runtime.projection.metrics = read_detection_job_json(&runtime.output_dir.join("metrics.json"));
+}
+
+fn prune_detection_job_history(jobs: &mut HashMap<String, DetectionJobRuntime>) {
+    while jobs.len() >= MAX_DETECTION_JOB_HISTORY {
+        let Some(job_id) = jobs
+            .iter()
+            .filter(|(_, runtime)| runtime.projection.status != "running")
+            .min_by_key(|(_, runtime)| runtime.projection.updated_at.as_str())
+            .map(|(job_id, _)| job_id.clone())
+        else {
+            return;
+        };
+        if let Some(runtime) = jobs.remove(&job_id) {
+            cleanup_detection_job_output_dir(&runtime.output_dir);
+        }
+    }
+}
+
+fn cleanup_detection_job_output_dir(output_dir: &Path) {
+    for file_name in [
+        "latest.json",
+        "latest.jpg",
+        "metrics.json",
+        "worker.stderr.log",
+    ] {
+        let _ = fs::remove_file(output_dir.join(file_name));
+    }
+    let _ = fs::remove_dir(output_dir);
+}
+
+fn read_detection_job_json(path: &Path) -> Option<Value> {
+    const MAX_DETECTION_RESULT_BYTES: u64 = 1024 * 1024;
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_DETECTION_RESULT_BYTES {
+        return None;
+    }
+    let contents = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&contents).ok()
 }
 
 fn parse_local_vision_event_vlm_enrich_path(path: &str) -> Option<String> {
@@ -10395,6 +11299,17 @@ fn no_content() -> Response<std::io::Cursor<Vec<u8>>> {
 }
 
 fn error_json(status: StatusCode, message: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    if let Ok(projection) = serde_json::from_str::<Value>(message) {
+        if projection.get("code").and_then(Value::as_str).is_some() {
+            let projected_status = projection
+                .get("statusCode")
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok())
+                .map(StatusCode)
+                .unwrap_or(status);
+            return json_response(projected_status, &json!({ "error": projection }));
+        }
+    }
     json_response(status, &json!({ "error": message }))
 }
 
@@ -10555,8 +11470,10 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/cameras/recording-settings"
         || path == "/api/cameras/recordings/status"
         || path == "/api/cameras/recordings/timeline"
+        || path.starts_with("/api/cameras/recordings/artifacts/")
         || path == "/api/harboros/status"
         || path == "/api/harboros/im-capability-map"
+        || path == "/api/harbor-link/capabilities"
         || path == "/api/home-assistant/status"
         || path == "/api/home-assistant/config"
         || path == "/api/home-assistant/test"
@@ -10575,6 +11492,8 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/models/store"
         || path == "/api/models/local-catalog"
         || path == "/api/models/policies"
+        || path == "/api/vision/detection-jobs"
+        || path.starts_with("/api/vision/detection-jobs/")
         || path == "/api/vision/events"
         || path == "/api/vision/vlm/status"
         || path == "/api/vision/events/latest/vlm-enrich"
@@ -10608,8 +11527,8 @@ fn is_admin_surface_path(path: &str) -> bool {
         || (path.starts_with("/api/cameras/") && path.ends_with("/live.mjpeg"))
         || (path.starts_with("/api/cameras/") && path.ends_with("/live/start"))
         || (path.starts_with("/api/cameras/") && path.ends_with("/live/stop"))
+        || (path.starts_with("/api/cameras/") && path.ends_with("/live/renew"))
         || (path.starts_with("/api/cameras/") && path.ends_with("/live/status"))
-        || parse_camera_hls_live_asset_path(path).is_some()
         || (path.starts_with("/api/cameras/") && path.ends_with("/recordings/start"))
         || (path.starts_with("/api/cameras/") && path.ends_with("/recordings/stop"))
         || (path.starts_with("/api/share-links/") && path.ends_with("/revoke"))
@@ -10709,17 +11628,79 @@ fn mime_type_for_path(path: &Path) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StaticByteRange {
+    start: u64,
+    end: u64,
+}
+
 fn static_file_response(path: &Path) -> Response<std::io::Cursor<Vec<u8>>> {
-    let body = match fs::read(path) {
-        Ok(payload) => payload,
+    static_file_response_with_options(path, None, false)
+}
+
+fn preview_static_file_response(path: &Path, range_header: Option<&str>) -> ResponseBox {
+    let file_size = match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
+        Ok(_) => return error_json(StatusCode(404), "static file path is not a file").boxed(),
         Err(error) => {
             return error_json(
                 StatusCode(500),
-                &format!("failed to read static file {}: {error}", path.display()),
+                &format!("failed to inspect static file {}: {error}", path.display()),
             )
+            .boxed()
         }
     };
-    let mut response = Response::from_data(body).with_status_code(StatusCode(200));
+    let requested_range = match range_header.map(|value| parse_static_byte_range(value, file_size))
+    {
+        Some(Ok(range)) => Some(range),
+        Some(Err(())) => return range_not_satisfiable_response(path, file_size).boxed(),
+        None => None,
+    };
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            return error_json(
+                StatusCode(500),
+                &format!("failed to open static file {}: {error}", path.display()),
+            )
+            .boxed()
+        }
+    };
+    let (reader, status, content_range, body_len): (
+        Box<dyn Read + Send>,
+        StatusCode,
+        Option<String>,
+        u64,
+    ) = match requested_range {
+        Some(range) => {
+            if let Err(error) = file.seek(SeekFrom::Start(range.start)) {
+                return error_json(
+                    StatusCode(500),
+                    &format!("failed to seek static file {}: {error}", path.display()),
+                )
+                .boxed();
+            }
+            let byte_count = range.end - range.start + 1;
+            (
+                Box::new(file.take(byte_count)),
+                StatusCode(206),
+                Some(format!("bytes {}-{}/{}", range.start, range.end, file_size)),
+                byte_count,
+            )
+        }
+        None => (Box::new(file), StatusCode(200), None, file_size),
+    };
+    let body_len = match usize::try_from(body_len) {
+        Ok(value) => value,
+        Err(_) => {
+            return error_json(
+                StatusCode(413),
+                "static file is too large for this platform",
+            )
+            .boxed()
+        }
+    };
+    let mut response = Response::new(status, Vec::new(), reader, Some(body_len), None);
     add_common_headers(&mut response);
     response.add_header(
         Header::from_bytes(
@@ -10728,7 +11709,210 @@ fn static_file_response(path: &Path) -> Response<std::io::Cursor<Vec<u8>>> {
         )
         .expect("header"),
     );
+    response.add_header(
+        Header::from_bytes(b"Accept-Ranges".as_slice(), b"bytes".as_slice()).expect("header"),
+    );
+    response.add_header(
+        Header::from_bytes(
+            b"Content-Disposition".as_slice(),
+            inline_content_disposition(path).as_bytes(),
+        )
+        .expect("header"),
+    );
+    if let Some(value) = content_range {
+        response.add_header(
+            Header::from_bytes(b"Content-Range".as_slice(), value.as_bytes()).expect("header"),
+        );
+    }
     response
+}
+
+fn static_file_response_with_options(
+    path: &Path,
+    range_header: Option<&str>,
+    include_download_filename: bool,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let file_size = match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
+        Ok(_) => return error_json(StatusCode(404), "static file path is not a file"),
+        Err(error) => {
+            return error_json(
+                StatusCode(500),
+                &format!("failed to inspect static file {}: {error}", path.display()),
+            )
+        }
+    };
+    let requested_range = match range_header.map(|value| parse_static_byte_range(value, file_size))
+    {
+        Some(Ok(range)) => Some(range),
+        Some(Err(())) => return range_not_satisfiable_response(path, file_size),
+        None => None,
+    };
+    let (body, status, content_range) = match requested_range {
+        Some(range) => {
+            let body = match read_static_file_range(path, range) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return error_json(
+                        StatusCode(500),
+                        &format!(
+                            "failed to read static file range {}: {error}",
+                            path.display()
+                        ),
+                    )
+                }
+            };
+            (
+                body,
+                StatusCode(206),
+                Some(format!("bytes {}-{}/{}", range.start, range.end, file_size)),
+            )
+        }
+        None => match fs::read(path) {
+            Ok(payload) => (payload, StatusCode(200), None),
+            Err(error) => {
+                return error_json(
+                    StatusCode(500),
+                    &format!("failed to read static file {}: {error}", path.display()),
+                )
+            }
+        },
+    };
+    let body_len = body.len().to_string();
+    let mut response = Response::from_data(body).with_status_code(status);
+    add_common_headers(&mut response);
+    response.add_header(
+        Header::from_bytes(
+            b"Content-Type".as_slice(),
+            mime_type_for_path(path).as_bytes(),
+        )
+        .expect("header"),
+    );
+    response.add_header(
+        Header::from_bytes(b"Content-Length".as_slice(), body_len.as_bytes()).expect("header"),
+    );
+    if include_download_filename {
+        response.add_header(
+            Header::from_bytes(b"Accept-Ranges".as_slice(), b"bytes".as_slice()).expect("header"),
+        );
+        response.add_header(
+            Header::from_bytes(
+                b"Content-Disposition".as_slice(),
+                inline_content_disposition(path).as_bytes(),
+            )
+            .expect("header"),
+        );
+    }
+    if let Some(value) = content_range {
+        response.add_header(
+            Header::from_bytes(b"Content-Range".as_slice(), value.as_bytes()).expect("header"),
+        );
+    }
+    response
+}
+
+fn range_not_satisfiable_response(
+    path: &Path,
+    file_size: u64,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let mut response = Response::from_data(Vec::new()).with_status_code(StatusCode(416));
+    add_common_headers(&mut response);
+    response.add_header(
+        Header::from_bytes(
+            b"Content-Type".as_slice(),
+            mime_type_for_path(path).as_bytes(),
+        )
+        .expect("header"),
+    );
+    response.add_header(
+        Header::from_bytes(b"Content-Length".as_slice(), b"0".as_slice()).expect("header"),
+    );
+    response.add_header(
+        Header::from_bytes(b"Accept-Ranges".as_slice(), b"bytes".as_slice()).expect("header"),
+    );
+    response.add_header(
+        Header::from_bytes(
+            b"Content-Range".as_slice(),
+            format!("bytes */{file_size}").as_bytes(),
+        )
+        .expect("header"),
+    );
+    response.add_header(
+        Header::from_bytes(
+            b"Content-Disposition".as_slice(),
+            inline_content_disposition(path).as_bytes(),
+        )
+        .expect("header"),
+    );
+    response
+}
+
+fn parse_static_byte_range(header_value: &str, file_size: u64) -> Result<StaticByteRange, ()> {
+    if file_size == 0 {
+        return Err(());
+    }
+    let range_spec = header_value.trim().strip_prefix("bytes=").ok_or(())?.trim();
+    if range_spec.contains(',') {
+        return Err(());
+    }
+    let (start_raw, end_raw) = range_spec.split_once('-').ok_or(())?;
+    if start_raw.is_empty() {
+        let suffix_len = end_raw.trim().parse::<u64>().map_err(|_| ())?;
+        if suffix_len == 0 {
+            return Err(());
+        }
+        let start = file_size.saturating_sub(suffix_len);
+        return Ok(StaticByteRange {
+            start,
+            end: file_size - 1,
+        });
+    }
+    let start = start_raw.trim().parse::<u64>().map_err(|_| ())?;
+    if start >= file_size {
+        return Err(());
+    }
+    let end = if end_raw.trim().is_empty() {
+        file_size - 1
+    } else {
+        end_raw.trim().parse::<u64>().map_err(|_| ())?
+    };
+    if end < start {
+        return Err(());
+    }
+    Ok(StaticByteRange {
+        start,
+        end: end.min(file_size - 1),
+    })
+}
+
+fn read_static_file_range(path: &Path, range: StaticByteRange) -> std::io::Result<Vec<u8>> {
+    let mut file = fs::File::open(path)?;
+    file.seek(SeekFrom::Start(range.start))?;
+    let byte_count = range.end - range.start + 1;
+    let mut body = vec![0_u8; byte_count as usize];
+    file.read_exact(&mut body)?;
+    Ok(body)
+}
+
+fn inline_content_disposition(path: &Path) -> String {
+    let filename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("media");
+    format!(
+        "inline; filename=\"{}\"",
+        sanitize_header_filename(filename)
+    )
+}
+
+fn sanitize_header_filename(filename: &str) -> String {
+    filename
+        .chars()
+        .map(|value| match value {
+            '"' | '\\' | '\r' | '\n' => '_',
+            _ => value,
+        })
+        .collect()
 }
 
 fn harbor_assistant_build_missing_response(dist_root: &Path) -> Response<std::io::Cursor<Vec<u8>>> {
@@ -12013,7 +13197,7 @@ fn knowledge_index_storage_summary(index_path: &Path) -> KnowledgeIndexStorageSu
 fn resolve_admin_search_source_scope(
     payload: &KnowledgeSearchApiRequest,
     settings: &KnowledgeSettings,
-    dvr_settings: Option<&DvrRecordingSettings>,
+    _dvr_settings: Option<&DvrRecordingSettings>,
 ) -> Result<Vec<String>, String> {
     let requested_root_ids = payload
         .source_root_ids
@@ -12052,32 +13236,20 @@ fn resolve_admin_search_source_scope(
     if scope == "all" {
         return Ok(Vec::new());
     }
-    let dvr_root = dvr_settings
-        .map(|settings| {
-            media_library_root_path(settings)
-                .to_string_lossy()
-                .into_owned()
-        })
-        .and_then(|path| non_empty_string(&path));
     match scope.as_str() {
-        "dvr_library" => dvr_root
-            .map(|path| vec![path])
-            .ok_or_else(|| "DVR media library source scope requires DVR settings.".to_string()),
+        "dvr_library" => Err(
+            "DVR media is owned by HarborLink and cannot be exposed as a Beacon filesystem scope."
+                .to_string(),
+        ),
         "nas_files" => {
-            let dvr_root = dvr_root.unwrap_or_default();
             let roots = settings
                 .source_roots
                 .iter()
                 .filter(|root| root.enabled)
                 .filter_map(|root| non_empty_string(&root.path))
-                .filter(|root_path| {
-                    dvr_root.is_empty()
-                        || (!path_is_same_or_inside(root_path, &dvr_root)
-                            && !path_is_same_or_inside(&dvr_root, root_path))
-                })
                 .collect::<Vec<_>>();
             if roots.is_empty() {
-                Err("No NAS source roots are configured outside the DVR media library.".to_string())
+                Err("No enabled NAS source roots are configured.".to_string())
             } else {
                 Ok(roots)
             }
@@ -13784,9 +14956,14 @@ fn build_redacted_diagnostics_bundle(
             configured: home_assistant.configured,
             enabled: home_assistant.enabled,
             base_url: home_assistant.base_url.clone(),
+            managed_by_harborlink: home_assistant.managed_by_harborlink,
+            harborlink_available: home_assistant.harborlink_available,
             token_configured: home_assistant.token_configured,
             token_redacted: true,
             exposed_domains: home_assistant.exposed_domains.clone(),
+            allowed_entities: home_assistant.allowed_entities.clone(),
+            allowed_cameras: home_assistant.allowed_cameras.clone(),
+            camera_entity_bindings: home_assistant.camera_entity_bindings.clone(),
             status: home_assistant.status.clone(),
             last_error: home_assistant
                 .last_error
@@ -14016,14 +15193,24 @@ fn command_available(command: &str) -> bool {
 fn build_home_assistant_status_response(
     state: &HomeAssistantAdminState,
 ) -> HomeAssistantStatusResponse {
-    let token_configured = !state.access_token.trim().is_empty();
+    let managed_by_harborlink = state.enabled && state.last_status != "not_configured";
+    let token_configured = managed_by_harborlink;
     HomeAssistantStatusResponse {
-        configured: !state.base_url.trim().is_empty() && token_configured,
+        configured: managed_by_harborlink,
         enabled: state.enabled,
-        base_url: state.base_url.clone(),
+        base_url: if managed_by_harborlink {
+            "harborlink://home-assistant".to_string()
+        } else {
+            String::new()
+        },
+        managed_by_harborlink,
+        harborlink_available: false,
         token_configured,
         token_redacted: token_configured,
         exposed_domains: state.exposed_domains.clone(),
+        allowed_entities: Vec::new(),
+        allowed_cameras: Vec::new(),
+        camera_entity_bindings: BTreeMap::new(),
         status: state.last_status.clone(),
         last_error: state.last_error.clone(),
         last_test_at: state.last_test_at.clone(),
@@ -14035,17 +15222,46 @@ fn build_home_assistant_status_response(
     }
 }
 
+fn build_home_assistant_status_response_with_link(
+    state: &HomeAssistantAdminState,
+    link: &HarborLinkHomeAssistantStatus,
+) -> HomeAssistantStatusResponse {
+    let mut response = build_home_assistant_status_response(state);
+    response.configured = link.configured;
+    response.enabled = link.enabled;
+    response.base_url = if link.base_url_configured {
+        "harborlink://home-assistant".to_string()
+    } else {
+        String::new()
+    };
+    response.managed_by_harborlink = link.base_url_configured || link.token_configured;
+    response.harborlink_available = true;
+    response.token_configured = link.token_configured;
+    response.token_redacted = link.token_configured;
+    response.exposed_domains = link.exposed_domains.clone();
+    response.allowed_entities = link.allowed_entities.clone();
+    response.allowed_cameras = link.allowed_cameras.clone();
+    response.camera_entity_bindings = link.camera_entity_bindings.clone();
+    response
+}
+
+fn build_home_assistant_degraded_status(
+    state: &HomeAssistantAdminState,
+    error: String,
+) -> HomeAssistantStatusResponse {
+    let mut response = build_home_assistant_status_response(state);
+    response.status = "degraded".to_string();
+    response.last_error = Some(error);
+    response
+}
+
 fn home_assistant_client_from_state(
     state: &HomeAssistantAdminState,
 ) -> Result<HomeAssistantClient, String> {
     if !state.enabled {
         return Err("Home Assistant integration is disabled".to_string());
     }
-    let config = HomeAssistantClientConfig::new(&state.base_url, &state.access_token);
-    if !config.configured() {
-        return Err("Home Assistant base URL and access token are required".to_string());
-    }
-    HomeAssistantClient::new(config)
+    HomeAssistantClient::from_harborlink_env()
 }
 
 fn filter_home_assistant_entities(
@@ -17725,64 +18941,6 @@ fn build_rtsp_url_from_patch(
     Ok(format!("rtsp://{host}:{port}{path}"))
 }
 
-fn camera_stream_url_with_credentials(
-    device: &CameraDevice,
-    state: &AdminConsoleState,
-) -> Option<String> {
-    let credential = state
-        .device_credentials
-        .iter()
-        .find(|credential| credential.device_id == device.device_id);
-    let username = credential
-        .and_then(|credential| non_empty_string(&credential.username))
-        .or_else(|| non_empty_string(&state.defaults.rtsp_username));
-    let password = credential
-        .and_then(|credential| non_empty_string(&credential.password))
-        .or_else(|| non_empty_string(&state.defaults.rtsp_password));
-    if username.is_none() && password.is_none() {
-        return None;
-    }
-
-    let host = device
-        .ip_address
-        .clone()
-        .or_else(|| rtsp_host_from_url(&device.primary_stream.url))?;
-    let port = credential
-        .and_then(|credential| credential.rtsp_port)
-        .or_else(|| rtsp_port_from_url(&device.primary_stream.url))
-        .unwrap_or(state.defaults.rtsp_port);
-    let path = credential
-        .and_then(|credential| {
-            credential
-                .rtsp_paths
-                .iter()
-                .find_map(|path| non_empty_string(path))
-        })
-        .or_else(|| rtsp_path_from_url(&device.primary_stream.url))
-        .or_else(|| {
-            state
-                .defaults
-                .rtsp_paths
-                .iter()
-                .find_map(|path| non_empty_string(path))
-        })
-        .unwrap_or_else(|| "/stream1".to_string());
-    let path = if path.starts_with('/') {
-        path
-    } else {
-        format!("/{path}")
-    };
-
-    let mut url = Url::parse(&format!("rtsp://{host}:{port}{path}")).ok()?;
-    if let Some(username) = username {
-        let _ = url.set_username(&username);
-    }
-    if let Some(password) = password {
-        let _ = url.set_password(Some(&password));
-    }
-    Some(url.to_string())
-}
-
 fn redact_secret_json_value(mut value: Value) -> Value {
     redact_secret_json_value_in_place(&mut value);
     value
@@ -17863,6 +19021,12 @@ fn redact_camera_primary_stream_url(value: &str) -> String {
     } else {
         redact_stream_url_credentials(value)
     }
+}
+
+fn is_harborlink_stream_placeholder(value: &str) -> bool {
+    let value = value.trim();
+    value.starts_with("harborlink://")
+        || matches!(value, "__harbor_redacted_rtsp_url__" | "[REDACTED]")
 }
 
 fn redact_camera_task_response(mut response: TaskResponse) -> TaskResponse {
@@ -19098,6 +20262,15 @@ fn task_error_message(response: &TaskResponse) -> String {
         .unwrap_or_else(|| response.result.message.clone())
 }
 
+fn parse_connected_device(data: &Value) -> Result<CameraDevice, String> {
+    let value = data
+        .pointer("/device")
+        .cloned()
+        .ok_or_else(|| "task response missing connected device payload".to_string())?;
+    serde_json::from_value(value)
+        .map_err(|error| format!("failed to parse connected camera from task response: {error}"))
+}
+
 fn non_empty_string(value: &str) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
@@ -19214,73 +20387,15 @@ fn compact_knowledge_suggestion_text(text: &str) -> Option<String> {
     (!compact.is_empty()).then_some(compact)
 }
 
+fn looks_redacted_secret(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "redacted" | "********" | "••••••••" | "<redacted>" | "__harbor_redacted__"
+    )
+}
+
 fn now_unix_string() -> String {
     remote_view::now_unix_secs().to_string()
-}
-
-fn build_device_credential_statuses(
-    state: &AdminConsoleState,
-    devices: &[CameraDevice],
-) -> Vec<DeviceCredentialStatusResponse> {
-    devices
-        .iter()
-        .map(|device| build_device_credential_status(state, device))
-        .collect()
-}
-
-fn build_device_credential_status(
-    state: &AdminConsoleState,
-    device: &CameraDevice,
-) -> DeviceCredentialStatusResponse {
-    let credential = state
-        .device_credentials
-        .iter()
-        .find(|credential| credential.device_id == device.device_id);
-    let fallback_configured = state.defaults.selected_camera_device_id.as_deref()
-        == Some(device.device_id.as_str())
-        && !state.defaults.rtsp_password.trim().is_empty();
-    let platform_credential_configured = state.platform.credentials.iter().any(|credential| {
-        credential.credential_id == device_rtsp_credential_id(&device.device_id)
-            || credential
-                .scope
-                .get("device_id")
-                .and_then(Value::as_str)
-                .is_some_and(|value| value == device.device_id)
-    });
-    let configured = credential.is_some_and(|credential| !credential.password.trim().is_empty())
-        || platform_credential_configured
-        || fallback_configured;
-    let username = credential
-        .and_then(|credential| non_empty_string(&credential.username))
-        .or_else(|| fallback_configured.then(|| state.defaults.rtsp_username.clone()))
-        .and_then(|value| non_empty_string(&value));
-    let rtsp_port = credential
-        .and_then(|credential| credential.rtsp_port)
-        .or_else(|| fallback_configured.then_some(state.defaults.rtsp_port))
-        .or_else(|| rtsp_port_from_url(&device.primary_stream.url));
-    let path_count = credential
-        .map(|credential| credential.rtsp_paths.len())
-        .filter(|count| *count > 0)
-        .or_else(|| rtsp_path_from_url(&device.primary_stream.url).map(|_| 1))
-        .unwrap_or_else(|| state.defaults.rtsp_paths.len());
-
-    DeviceCredentialStatusResponse {
-        device_id: device.device_id.clone(),
-        configured,
-        redacted: configured,
-        username,
-        rtsp_port,
-        path_count,
-        source: if credential.is_some() {
-            "device_rtsp".to_string()
-        } else if fallback_configured {
-            "default_rtsp".to_string()
-        } else {
-            "none".to_string()
-        },
-        updated_at: credential.and_then(|credential| credential.updated_at.clone()),
-        last_verified_at: credential.and_then(|credential| credential.last_verified_at.clone()),
-    }
 }
 
 fn build_rtsp_check_evidence(
@@ -19770,26 +20885,6 @@ fn redact_query_like_secret(value: &str, key: &str) -> String {
     output
 }
 
-fn parse_scan_results(
-    data: &Value,
-) -> Result<Vec<harborbeacon_local_agent::runtime::hub::HubScanResultItem>, String> {
-    let value = data
-        .pointer("/candidates")
-        .cloned()
-        .unwrap_or_else(|| Value::Array(Vec::new()));
-    serde_json::from_value(value)
-        .map_err(|error| format!("failed to parse camera scan results from task response: {error}"))
-}
-
-fn parse_connected_device(data: &Value) -> Result<CameraDevice, String> {
-    let value = data
-        .pointer("/device")
-        .cloned()
-        .ok_or_else(|| "task response missing connected device payload".to_string())?;
-    serde_json::from_value(value)
-        .map_err(|error| format!("failed to parse connected camera from task response: {error}"))
-}
-
 fn parse_camera_snapshot_path(path: &str) -> Option<String> {
     let trimmed = path.strip_prefix("/api/cameras/")?;
     let device_id = trimmed.strip_suffix("/snapshot.jpg")?;
@@ -19818,6 +20913,10 @@ fn parse_camera_hls_live_stop_path(path: &str) -> Option<String> {
     parse_camera_live_action_path(path, "/live/stop")
 }
 
+fn parse_camera_hls_live_renew_path(path: &str) -> Option<String> {
+    parse_camera_live_action_path(path, "/live/renew")
+}
+
 fn parse_camera_hls_live_status_path(path: &str) -> Option<String> {
     parse_camera_live_action_path(path, "/live/status")
 }
@@ -19830,24 +20929,6 @@ fn parse_camera_live_action_path(path: &str, suffix: &str) -> Option<String> {
     } else {
         percent_decode_path_segment(device_id).ok()
     }
-}
-
-fn parse_camera_hls_live_asset_path(path: &str) -> Option<(String, String, String)> {
-    let trimmed = path.strip_prefix("/api/cameras/")?;
-    let (device_id, rest) = trimmed.split_once("/live/")?;
-    let (session_id, asset_name) = rest.split_once('/')?;
-    if device_id.is_empty() || session_id.is_empty() || !session_id.starts_with("live-") {
-        return None;
-    }
-    let asset_name = percent_decode_path_segment(asset_name).ok()?;
-    if !is_safe_live_asset_name(&asset_name) {
-        return None;
-    }
-    Some((
-        percent_decode_path_segment(device_id).ok()?,
-        percent_decode_path_segment(session_id).ok()?,
-        asset_name,
-    ))
 }
 
 fn parse_camera_analyze_path(path: &str) -> Option<String> {
@@ -19886,6 +20967,15 @@ fn parse_camera_recording_start_path(path: &str) -> Option<String> {
 
 fn parse_camera_recording_stop_path(path: &str) -> Option<String> {
     parse_camera_recording_action_path(path, "/recordings/stop")
+}
+
+fn parse_dvr_artifact_path(path: &str) -> Option<String> {
+    let artifact_id = path.strip_prefix("/api/cameras/recordings/artifacts/")?;
+    if artifact_id.is_empty() || artifact_id.contains('/') {
+        None
+    } else {
+        percent_decode_path_segment(artifact_id).ok()
+    }
 }
 
 fn parse_camera_recording_action_path(path: &str, suffix: &str) -> Option<String> {
@@ -19991,6 +21081,72 @@ fn url_encode_path_segment(value: &str) -> String {
     encoded
 }
 
+fn current_rfc3339_timestamp() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+fn dvr_timeline_segment_from_harborlink(
+    artifact: HarborLinkRecordingArtifact,
+    from_secs: Option<u64>,
+    to_secs: Option<u64>,
+) -> Option<DvrTimelineSegment> {
+    let modified_secs = u64::try_from(artifact.modified_at_epoch_ms / 1_000).unwrap_or(u64::MAX);
+    if from_secs.is_some_and(|from| modified_secs < from)
+        || to_secs.is_some_and(|to| modified_secs > to)
+    {
+        return None;
+    }
+    let started_at_epoch_ms = if artifact.started_at_epoch_ms == 0 {
+        artifact.modified_at_epoch_ms
+    } else {
+        artifact.started_at_epoch_ms
+    };
+    let ended_at_epoch_ms = if artifact.ended_at_epoch_ms == 0 {
+        artifact.modified_at_epoch_ms
+    } else {
+        artifact.ended_at_epoch_ms
+    };
+    let started_at = (started_at_epoch_ms / 1_000).to_string();
+    let ended_at = (ended_at_epoch_ms / 1_000).to_string();
+    let artifact_id = artifact.artifact_id;
+    let is_snapshot = artifact.kind == "snapshot";
+    let replay_url = format!(
+        "/api/cameras/recordings/artifacts/{}",
+        url_encode_path_segment(&artifact_id)
+    );
+    Some(DvrTimelineSegment {
+        device_id: artifact.camera_id,
+        file_path: format!("harborlink://dvr/{artifact_id}"),
+        sidecar_path: None,
+        media_kind: artifact.kind,
+        stream_kind: artifact.stream_kind,
+        started_at: started_at.clone(),
+        created_at: started_at,
+        ended_at,
+        duration_seconds: artifact.duration_seconds,
+        duration_actual_seconds: Some(artifact.duration_seconds),
+        retention_expires_at: String::new(),
+        size_bytes: artifact.byte_size,
+        replay_url: Some(replay_url.clone()),
+        thumbnail_url: is_snapshot.then_some(replay_url),
+        playable: artifact.mime_type.starts_with("video/")
+            || artifact.mime_type.starts_with("image/"),
+        indexed: false,
+    })
+}
+
+fn snapshot_artifact_from_task_response(
+    response: &TaskResponse,
+) -> Option<HarborLinkRecordingArtifact> {
+    let artifact = response
+        .result
+        .data
+        .pointer("/snapshot/harborlink_artifact")?;
+    serde_json::from_value(artifact.clone()).ok()
+}
+
 fn percent_decode_path_segment(value: &str) -> Result<String, String> {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
@@ -20027,8 +21183,89 @@ struct LiveStopRequest {
     session_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct LiveRenewRequest {
+    session_id: String,
+    #[serde(default)]
+    ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LiveStartRequest {
+    stream_profile: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RecordingStartRequest {
+    stream_profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CameraStreamProfile {
+    Sub,
+    Main,
+}
+
+impl CameraStreamProfile {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "sub" | "low" | "secondary" | "continuous" | "preview" => Ok(Self::Sub),
+            "main" | "high" | "primary" | "hd" => Ok(Self::Main),
+            _ => Err(format!("unsupported camera stream profile: {value}")),
+        }
+    }
+
+    fn parse_or_sub(value: Option<&str>) -> Result<Self, String> {
+        match value.and_then(non_empty_string) {
+            Some(value) => Self::parse(&value),
+            None => Ok(Self::Sub),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sub => "sub",
+            Self::Main => "main",
+        }
+    }
+}
+
+fn dvr_recording_status_from_harborlink(
+    status: HarborLinkRecordingStatus,
+    public_origin: &str,
+) -> DvrRecordingStatus {
+    let live_mjpeg_url = Some(format!(
+        "{}/api/cameras/{}/live.mjpeg",
+        public_origin.trim_end_matches('/'),
+        url_encode_path_segment(&status.device_id)
+    ));
+    DvrRecordingStatus {
+        device_id: status.device_id,
+        status: status.status,
+        started_at: status.started_at,
+        updated_at: status.updated_at,
+        stream_kind: status.stream_kind,
+        last_segment_path: status.last_segment_path,
+        live_mjpeg_url,
+        message: status.message,
+    }
+}
+
+fn build_dvr_recording_action_response(
+    settings: DvrRecordingSettings,
+    status: HarborLinkRecordingStatus,
+    camera_count: usize,
+    public_origin: &str,
+) -> DvrRecordingStatusResponse {
+    build_status_response(
+        settings,
+        vec![dvr_recording_status_from_harborlink(status, public_origin)],
+        camera_count,
+    )
+}
+
 #[derive(Debug, Clone, Serialize)]
-struct HlsLiveSessionProjection {
+struct CameraLiveSessionProjection {
     device_id: String,
     session_id: Option<String>,
     status: String,
@@ -20036,440 +21273,56 @@ struct HlsLiveSessionProjection {
     playlist_ready: bool,
     mode: String,
     codec: String,
+    stream_profile: String,
     started_at: Option<String>,
     updated_at: String,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    webrtc_url: Option<String>,
+    webrtc_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    webrtc_message: Option<String>,
 }
 
-impl HlsLiveSessionProjection {
-    fn stopped(device_id: &str, message: impl Into<String>) -> Self {
-        Self {
-            device_id: device_id.to_string(),
-            session_id: None,
-            status: "stopped".to_string(),
-            playlist_url: None,
-            playlist_ready: false,
-            mode: "hls_fmp4".to_string(),
-            codec: "h264_copy".to_string(),
-            started_at: None,
-            updated_at: current_unix_secs().to_string(),
-            message: message.into(),
-        }
-    }
-
-    fn to_response(&self, _public_origin: &str) -> Self {
-        self.clone()
-    }
-}
-
-struct HlsLiveSession {
-    device_id: String,
-    session_id: String,
-    root: PathBuf,
-    started_at: String,
-    child: Child,
-}
-
-#[derive(Clone, Default)]
-struct HlsLiveRuntime {
-    inner: Arc<Mutex<HlsLiveRuntimeInner>>,
-}
-
-#[derive(Default)]
-struct HlsLiveRuntimeInner {
-    sessions: HashMap<String, HlsLiveSession>,
-    device_sessions: HashMap<String, String>,
-}
-
-impl HlsLiveRuntime {
-    fn start_session(
-        &self,
-        device_id: &str,
-        stream_url: &str,
-    ) -> Result<HlsLiveSessionProjection, String> {
-        if stream_url.trim().is_empty() {
-            return Err("camera RTSP stream is not configured".to_string());
-        }
-        let ffmpeg_bin = resolve_ffmpeg_bin()
-            .ok_or_else(|| format!("当前机器缺少 ffmpeg，{}", ffmpeg_resolution_hint()))?;
-        let session_id = format!("live-{}", Uuid::new_v4().as_simple());
-        let root = hls_live_root()
-            .join(safe_live_path_segment(device_id))
-            .join(&session_id);
-        if root.exists() {
-            fs::remove_dir_all(&root)
-                .map_err(|error| format!("failed to reset live session directory: {error}"))?;
-        }
-        fs::create_dir_all(&root)
-            .map_err(|error| format!("failed to create live session directory: {error}"))?;
-
-        let playlist_path = root.join("index.m3u8");
-        let mut child = Command::new(&ffmpeg_bin)
-            .current_dir(&root)
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-nostdin",
-                "-rtsp_transport",
-                "tcp",
-                "-fflags",
-                "nobuffer",
-                "-flags",
-                "low_delay",
-                "-i",
-                stream_url,
-                "-map",
-                "0:v:0",
-                "-an",
-                "-c:v",
-                "copy",
-                "-f",
-                "hls",
-                "-hls_time",
-                "1",
-                "-hls_list_size",
-                "6",
-                "-hls_flags",
-                "delete_segments+omit_endlist+independent_segments",
-                "-hls_segment_type",
-                "fmp4",
-                "-hls_fmp4_init_filename",
-                "init.mp4",
-                "-hls_segment_filename",
-                "segment_%05d.m4s",
-                "index.m3u8",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|error| format!("启动 H.264 live remux ffmpeg 失败: {error}"))?;
-
-        for _ in 0..20 {
-            if playlist_path.exists() {
-                break;
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    let _ = fs::remove_dir_all(&root);
-                    return Err(format!(
-                        "H.264 live remux exited before playlist was ready: {status}"
-                    ));
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(100)),
-                Err(error) => {
-                    let _ = fs::remove_dir_all(&root);
-                    return Err(format!("failed to check live remux process: {error}"));
-                }
-            }
-        }
-
-        let session = HlsLiveSession {
-            device_id: device_id.to_string(),
-            session_id: session_id.clone(),
-            root,
-            started_at: current_unix_secs().to_string(),
-            child,
-        };
-
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| "live session lock is poisoned".to_string())?;
-        if let Some(existing_session_id) = inner.device_sessions.remove(device_id) {
-            if let Some(mut existing) = inner.sessions.remove(&existing_session_id) {
-                stop_hls_live_session(&mut existing);
-            }
-        }
-        inner
-            .device_sessions
-            .insert(device_id.to_string(), session_id.clone());
-        inner.sessions.insert(session_id.clone(), session);
-        Ok(self.projection_locked(&mut inner, device_id, Some(&session_id)))
-    }
-
-    fn status(&self, device_id: &str, session_id: Option<&str>) -> HlsLiveSessionProjection {
-        let Ok(mut inner) = self.inner.lock() else {
-            return HlsLiveSessionProjection::stopped(
-                device_id,
-                "live session lock is unavailable",
-            );
-        };
-        self.projection_locked(&mut inner, device_id, session_id)
-    }
-
-    fn stop_session(&self, device_id: &str, session_id: Option<&str>) -> HlsLiveSessionProjection {
-        let Ok(mut inner) = self.inner.lock() else {
-            return HlsLiveSessionProjection::stopped(
-                device_id,
-                "live session lock is unavailable",
-            );
-        };
-        let Some(session_id) = session_id
-            .map(str::to_string)
-            .or_else(|| inner.device_sessions.get(device_id).cloned())
-        else {
-            return HlsLiveSessionProjection::stopped(device_id, "no live session is running");
-        };
-        let Some(mut session) = inner.sessions.remove(&session_id) else {
-            inner.device_sessions.remove(device_id);
-            return HlsLiveSessionProjection::stopped(
-                device_id,
-                "live session was already stopped",
-            );
-        };
-        inner.device_sessions.remove(&session.device_id);
-        stop_hls_live_session(&mut session);
-        HlsLiveSessionProjection {
-            device_id: session.device_id,
-            session_id: Some(session.session_id),
-            status: "stopped".to_string(),
-            playlist_url: None,
-            playlist_ready: false,
-            mode: "hls_fmp4".to_string(),
-            codec: "h264_copy".to_string(),
-            started_at: Some(session.started_at),
-            updated_at: current_unix_secs().to_string(),
-            message: "live session stopped".to_string(),
-        }
-    }
-
-    fn asset_path(
-        &self,
-        device_id: &str,
-        session_id: &str,
-        asset_name: &str,
-    ) -> Result<PathBuf, String> {
-        if !is_safe_live_asset_name(asset_name) {
-            return Err("unsafe live asset path".to_string());
-        }
-        let inner = self
-            .inner
-            .lock()
-            .map_err(|_| "live session lock is poisoned".to_string())?;
-        let session = inner
-            .sessions
-            .get(session_id)
-            .ok_or_else(|| "live session not found".to_string())?;
-        if session.device_id != device_id {
-            return Err("live session not found for camera".to_string());
-        }
-        let path = session.root.join(asset_name);
-        if !path_is_same_or_inside(&path.to_string_lossy(), &session.root.to_string_lossy()) {
-            return Err("unsafe live asset path".to_string());
-        }
-        Ok(path)
-    }
-
-    fn projection_locked(
-        &self,
-        inner: &mut HlsLiveRuntimeInner,
-        device_id: &str,
-        session_id: Option<&str>,
-    ) -> HlsLiveSessionProjection {
-        let Some(session_id) = session_id
-            .map(str::to_string)
-            .or_else(|| inner.device_sessions.get(device_id).cloned())
-        else {
-            return HlsLiveSessionProjection::stopped(device_id, "no live session is running");
-        };
-
-        let Some(session) = inner.sessions.get_mut(&session_id) else {
-            inner.device_sessions.remove(device_id);
-            return HlsLiveSessionProjection::stopped(device_id, "live session is not registered");
-        };
-        if session.device_id != device_id {
-            return HlsLiveSessionProjection::stopped(
-                device_id,
-                "live session belongs to another camera",
-            );
-        }
-        match session.child.try_wait() {
-            Ok(Some(status)) => {
-                let mut session = inner
-                    .sessions
-                    .remove(&session_id)
-                    .expect("session exists after get_mut");
-                inner.device_sessions.remove(&session.device_id);
-                stop_hls_live_session(&mut session);
-                return HlsLiveSessionProjection {
-                    device_id: session.device_id,
-                    session_id: Some(session.session_id),
-                    status: "failed".to_string(),
-                    playlist_url: None,
-                    playlist_ready: false,
-                    mode: "hls_fmp4".to_string(),
-                    codec: "h264_copy".to_string(),
-                    started_at: Some(session.started_at),
-                    updated_at: current_unix_secs().to_string(),
-                    message: format!("live remux process exited: {status}"),
-                };
-            }
-            Ok(None) => {}
-            Err(error) => {
-                return HlsLiveSessionProjection {
-                    device_id: device_id.to_string(),
-                    session_id: Some(session_id),
-                    status: "degraded".to_string(),
-                    playlist_url: None,
-                    playlist_ready: false,
-                    mode: "hls_fmp4".to_string(),
-                    codec: "h264_copy".to_string(),
-                    started_at: Some(session.started_at.clone()),
-                    updated_at: current_unix_secs().to_string(),
-                    message: format!("failed to inspect live remux process: {error}"),
-                };
-            }
-        }
-
-        let playlist_ready = session.root.join("index.m3u8").exists();
-        HlsLiveSessionProjection {
-            device_id: session.device_id.clone(),
-            session_id: Some(session.session_id.clone()),
-            status: if playlist_ready {
-                "running"
-            } else {
-                "starting"
-            }
-            .to_string(),
-            playlist_url: Some(format!(
-                "/api/beacon/cameras/{}/live/{}/index.m3u8",
-                url_encode_path_segment(&session.device_id),
-                url_encode_path_segment(&session.session_id)
-            )),
-            playlist_ready,
-            mode: "hls_fmp4".to_string(),
-            codec: "h264_copy".to_string(),
-            started_at: Some(session.started_at.clone()),
-            updated_at: current_unix_secs().to_string(),
-            message: if playlist_ready {
-                "H.264 live remux is running"
-            } else {
-                "H.264 live remux is starting"
-            }
-            .to_string(),
-        }
-    }
-}
-
-fn stop_hls_live_session(session: &mut HlsLiveSession) {
-    let _ = session.child.kill();
-    let _ = session.child.wait();
-    let _ = fs::remove_dir_all(&session.root);
-}
-
-fn hls_live_root() -> PathBuf {
-    env::var("HARBORNAVI_LIVE_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/run/harbornavi/live"))
-}
-
-fn safe_live_path_segment(value: &str) -> String {
-    let mut output = String::with_capacity(value.len());
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-            output.push(ch);
+impl CameraLiveSessionProjection {
+    fn from_harborlink(session: HarborLinkLiveSession) -> Self {
+        let playlist_ready = session.status == "running" && session.hls_url.is_some();
+        let (webrtc_status, webrtc_message) = if session.status == "stopped" {
+            ("stopped".to_string(), None)
+        } else if session.status == "running" && session.webrtc_url.is_some() {
+            ("ready".to_string(), None)
         } else {
-            output.push('_');
+            (
+                "unavailable".to_string(),
+                Some("HarborLink WebRTC transport is not ready".to_string()),
+            )
+        };
+
+        Self {
+            device_id: session.camera_id,
+            session_id: session.session_id,
+            status: session.status,
+            playlist_url: session.hls_url,
+            playlist_ready,
+            mode: "harborlink_media".to_string(),
+            codec: "h264".to_string(),
+            stream_profile: session.stream_profile,
+            started_at: normalize_live_session_started_at(session.started_at),
+            updated_at: session.updated_at,
+            message: session.message,
+            webrtc_url: session.webrtc_url,
+            webrtc_status,
+            webrtc_message,
         }
     }
-    if output.is_empty() {
-        "camera".to_string()
-    } else {
-        output
-    }
 }
 
-fn is_safe_live_asset_name(value: &str) -> bool {
-    !value.is_empty()
-        && !value.contains('/')
-        && !value.contains('\\')
-        && !value.contains("..")
-        && matches!(
-            Path::new(value).extension().and_then(|ext| ext.to_str()),
-            Some("m3u8" | "m4s" | "mp4" | "ts")
-        )
-}
-
-fn live_asset_mime_type(value: &str) -> &'static str {
-    match Path::new(value).extension().and_then(|ext| ext.to_str()) {
-        Some("m3u8") => "application/vnd.apple.mpegurl",
-        Some("m4s") => "video/iso.segment",
-        Some("mp4") => "video/mp4",
-        Some("ts") => "video/mp2t",
-        _ => "application/octet-stream",
-    }
-}
-
-fn current_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0))
-        .as_secs()
-}
-
-struct FfmpegMjpegStream {
-    child: Child,
-    stdout: ChildStdout,
-}
-
-impl FfmpegMjpegStream {
-    fn spawn(stream_url: &str) -> Result<Self, String> {
-        let ffmpeg_bin = resolve_ffmpeg_bin()
-            .ok_or_else(|| format!("当前机器缺少 ffmpeg，{}", ffmpeg_resolution_hint()))?;
-
-        let mut child = Command::new(&ffmpeg_bin)
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-nostdin",
-                "-rtsp_transport",
-                "tcp",
-                "-fflags",
-                "nobuffer",
-                "-flags",
-                "low_delay",
-                "-i",
-                stream_url,
-                "-an",
-                "-vf",
-                "fps=5,scale=960:-2:flags=fast_bilinear",
-                "-q:v",
-                "6",
-                "-f",
-                "mpjpeg",
-                "-boundary_tag",
-                "ffmpeg",
-                "pipe:1",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|error| format!("启动实时转码 ffmpeg 失败: {error}"))?;
-
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "无法获取 ffmpeg 输出管道".to_string())?;
-
-        Ok(Self { child, stdout })
-    }
-}
-
-impl Read for FfmpegMjpegStream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.stdout.read(buf)
-    }
-}
-
-impl Drop for FfmpegMjpegStream {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
+fn normalize_live_session_started_at(started_at: Option<String>) -> Option<String> {
+    started_at.map(|value| {
+        OffsetDateTime::parse(value.trim(), &Rfc3339)
+            .map(|timestamp| timestamp.unix_timestamp().to_string())
+            .unwrap_or(value)
+    })
 }
 
 #[cfg(test)]
@@ -20477,40 +21330,42 @@ mod tests {
     use super::{
         apply_bridge_provider_binding_projection, authorize_gateway_service_request,
         build_admin_rag_answer_task_request,
-        build_default_notification_target_readiness, build_device_credential_status,
-        build_feature_availability_response, build_files_browse_response,
-        build_harboros_im_capability_map, build_harboros_status_response,
-        build_hardware_readiness_response, build_home_assistant_operator_audit,
+        build_default_notification_target_readiness, build_dvr_recording_action_response,
+        build_feature_availability_response,
+        build_files_browse_response, build_harboros_im_capability_map,
+        build_harboros_status_response, build_hardware_readiness_response,
+        build_home_assistant_operator_audit, build_home_assistant_status_response_with_link,
         build_inference_health_alias_response, build_knowledge_index_job,
-        build_knowledge_index_status_response, build_knowledge_suggestions,
-        build_local_model_catalog, build_local_vision_event_notification_blocked_response,
-        build_model_capabilities_response, build_outreach_delivery_notification_request,
-        build_rag_readiness_response, build_redacted_diagnostics_bundle,
-        build_release_readiness_response, build_rtsp_url_from_patch,
-        camera_stream_url_with_credentials, current_epoch_secs, default_model_download_target_path,
+        build_knowledge_index_status_response, build_knowledge_suggestions, build_local_model_catalog,
+        build_local_vision_event_notification_blocked_response, build_model_capabilities_response,
+        build_outreach_delivery_notification_request, build_rag_readiness_response,
+        build_redacted_diagnostics_bundle, build_release_readiness_response,
+        build_rtsp_url_from_patch, current_epoch_secs, default_model_download_target_path,
         default_model_download_target_path_in_root, default_model_endpoints,
-        embedding_warmup_timeout_stats, ensure_local_admin_access, ensure_local_camera_access,
+        dvr_timeline_segment_from_harborlink, embedding_warmup_timeout_stats,
+        ensure_local_admin_access, ensure_local_camera_access,
         harbor_assistant_build_missing_response, hardware_class_for_probe, has_forwarding_headers,
         huggingface_download_should_fallback_to_plain_http, huggingface_resolve_url,
         identity_query_suffix, is_admin_surface_path, is_harbor_assistant_client_route,
-        is_harbor_assistant_surface_path, is_safe_live_asset_name,
+        is_harbor_assistant_surface_path,
         knowledge_preview_mime_supported, latest_model_download_jobs,
         live_bridge_provider_from_setup_status, local_model_catalog_item,
         local_model_catalog_specs, mime_type_for_path, model_download_huggingface_endpoint,
         model_download_huggingface_endpoints, model_download_jobs_status,
         model_endpoint_uses_external_runtime, model_hardware_recommendation,
         model_snapshot_file_allowed,
-        normalize_harbor_assistant_conversation_id, normalize_unified_admin_path,
+        normalize_detection_job_start, normalize_harbor_assistant_conversation_id,
+        normalize_unified_admin_path,
         notification_delivery_error_to_harbor_app_error,
         overlay_model_endpoints_with_runtime_truth, parse_approval_decision_path,
-        parse_camera_analyze_path, parse_camera_hls_live_asset_path,
+        parse_camera_analyze_path, parse_camera_hls_live_renew_path,
         parse_camera_hls_live_start_path, parse_camera_hls_live_status_path,
         parse_camera_hls_live_stop_path, parse_camera_live_page_path,
         parse_camera_live_stream_path, parse_camera_recording_start_path,
         parse_camera_recording_stop_path, parse_camera_share_link_path, parse_camera_snapshot_path,
-        parse_camera_task_snapshot_path, parse_device_credential_status_path,
-        parse_device_credentials_path, parse_device_evidence_path,
-        parse_device_metadata_patch_path, parse_device_rtsp_check_path,
+        parse_camera_task_snapshot_path, parse_detection_job_path,
+        parse_device_credential_status_path, parse_device_credentials_path,
+        parse_device_evidence_path, parse_device_metadata_patch_path, parse_device_rtsp_check_path,
         parse_device_validation_run_path, parse_harbor_app_lifecycle_path, parse_harbor_app_path,
         parse_harbor_assistant_conversation_path, parse_json_body_limited,
         parse_knowledge_index_job_cancel_path, parse_local_vision_event_notify_path,
@@ -20519,8 +21374,10 @@ mod tests {
         parse_model_endpoint_test_path, parse_model_runtime_install_path,
         parse_notification_target_delete_path, parse_optional_unix_seconds,
         parse_share_link_revoke_path, parse_shared_camera_live_page_path,
-        parse_shared_camera_live_stream_path, percent_decode_path_segment,
+        parse_shared_camera_live_stream_path, parse_static_byte_range, percent_decode_path_segment,
+        preview_static_file_response,
         probe_local_model_runtime, probe_local_openai_compatible_serving_model,
+        prune_detection_job_history,
         redact_account_management_snapshot, redact_admin_string, redact_bridge_provider_config,
         redact_camera_device_projection, redact_model_endpoint_response, redact_state_snapshot,
         redact_stream_url_credentials, redact_value_stream_credentials,
@@ -20528,15 +21385,19 @@ mod tests {
         release_item, request_identity_hints, resolve_admin_search_source_scope,
         resolve_harbor_assistant_asset_path, resolve_knowledge_preview_path,
         run_knowledge_index_jobs, run_model_download_job, run_model_download_transfer,
-        sanitized_outreach_delivery_request_audit, scan_request_task_args,
-        service_overloaded_response, url_encode_path_segment,
+        sanitized_outreach_delivery_request_audit, service_overloaded_response,
+        snapshot_artifact_from_task_response, url_encode_path_segment,
         validate_home_assistant_service_fields, validate_home_assistant_service_smoke,
-        validate_outreach_delivery_request, AdminApi, HomeAssistantServiceSmokeRequest,
+        validate_outreach_delivery_request, AdminApi, CameraLiveSessionProjection,
+        CameraStreamProfile, DetectionJobProjection, DetectionJobRuntime, DetectionJobStartRequest,
+        HarborLinkHomeAssistantStatus, HarborLinkLiveSession, HarborLinkMediaClient,
+        HarborLinkRecordingArtifact, HarborLinkRecordingStatus, HomeAssistantServiceSmokeRequest,
         HomeGuardianEvaluationQueue, KnowledgeSearchApiRequest, LocalModelRuntimeProjection,
         ManualAddRequest, ModelRuntimeActivationRequest, ModelRuntimeActivationResult,
         OutreachDeliveryRecipientRequest, OutreachDeliveryRequest, VisionIngestLimiter,
         DEFAULT_HF_ENDPOINT, HARBOR_ASSISTANT_SEARCH_SURFACE,
         HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS, HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS,
+        MAX_DETECTION_JOB_HISTORY,
         MAX_VISION_EVENT_INGEST_INFLIGHT, PRIVACY_GATEWAY_AUDIT_ACTION,
     };
     use harborbeacon_local_agent::connectors::notifications::{
@@ -20560,11 +21421,12 @@ mod tests {
         AccessAction, AccessIdentityHints, AccessPrincipal,
     };
     use harborbeacon_local_agent::runtime::admin_console::{
-        default_model_route_policies, AdminConsoleState, AdminConsoleStore, AdminModelCenterState,
-        AutomationRuleReview, BridgeProviderConfig, DeviceCredentialSecret, DeviceEvidenceRecord,
-        HomeAssistantAdminState, KnowledgeSettings, KnowledgeSourceRoot, ModelDownloadJobRecord,
-        NotificationTargetRecord, RagResourceProfile, RemoteViewConfig,
+        default_model_route_policies, AdminConsoleStore, AdminModelCenterState,
+        AutomationRuleReview, BridgeProviderConfig, DeviceEvidenceRecord, HomeAssistantAdminState,
+        KnowledgeSettings, KnowledgeSourceRoot, ModelDownloadJobRecord, NotificationTargetRecord,
+        RagResourceProfile, RemoteViewConfig,
     };
+    use harborbeacon_local_agent::runtime::dvr::DvrRecordingSettings;
     use harborbeacon_local_agent::runtime::hub::CameraHubService;
     use harborbeacon_local_agent::runtime::knowledge_index::{
         KnowledgeFileSignature, KnowledgeIndexChunk, KnowledgeIndexConfig, KnowledgeIndexEntry,
@@ -20573,13 +21435,14 @@ mod tests {
     use harborbeacon_local_agent::runtime::privacy_gateway::PRIVACY_GATEWAY_POLICY_VERSION;
     use harborbeacon_local_agent::runtime::registry::{CameraDevice, DeviceRegistryStore};
     use harborbeacon_local_agent::runtime::remote_view;
-    use harborbeacon_local_agent::runtime::task_api::TaskApiService;
+    use harborbeacon_local_agent::runtime::task_api::{TaskApiService, TaskResponse, TaskStatus};
     use harborbeacon_local_agent::runtime::task_session::TaskConversationStore;
     use harborbeacon_local_agent::runtime::vision_event::{
         ingest_local_vision_event, LocalVisionEvent, SnapshotArtifact, StoredLocalVisionEvent,
         VISION_EVENT_STORE_PATH_ENV,
     };
     use serde_json::{json, Value};
+    use std::collections::{BTreeMap, HashMap};
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -21155,6 +22018,110 @@ mod tests {
     }
 
     #[test]
+    fn detection_job_path_accepts_only_safe_job_identifiers() {
+        assert_eq!(
+            parse_detection_job_path(
+                "/api/vision/detection-jobs/yolo-0123456789abcdef/renew",
+                Some("/renew")
+            ),
+            Some("yolo-0123456789abcdef".to_string())
+        );
+        assert_eq!(
+            parse_detection_job_path("/api/vision/detection-jobs/yolo-0123456789abcdef", None),
+            Some("yolo-0123456789abcdef".to_string())
+        );
+        assert_eq!(
+            parse_detection_job_path("/api/vision/detection-jobs/yolo-safe/extra", None),
+            None
+        );
+    }
+
+    #[test]
+    fn detection_job_request_is_cat_only_and_bounded() {
+        let config = normalize_detection_job_start(DetectionJobStartRequest {
+            camera_id: "camera.252".to_string(),
+            target_labels: Vec::new(),
+            duration_seconds: None,
+            max_fps: None,
+            confidence: None,
+            stream_profile: None,
+        })
+        .expect("default request");
+        assert_eq!(config.target_label, "cat");
+        assert_eq!(config.ttl_seconds, 60);
+        assert_eq!(config.max_fps, 5.0);
+        assert_eq!(config.stream_profile, "sub");
+
+        let error = normalize_detection_job_start(DetectionJobStartRequest {
+            camera_id: "camera.252".to_string(),
+            target_labels: vec!["person".to_string()],
+            duration_seconds: Some(60),
+            max_fps: Some(5.0),
+            confidence: Some(0.35),
+            stream_profile: Some("sub".to_string()),
+        })
+        .expect_err("non-cat label must be rejected");
+        assert!(error.contains("cat"));
+
+        let error = normalize_detection_job_start(DetectionJobStartRequest {
+            camera_id: "camera.252".to_string(),
+            target_labels: vec!["cat".to_string()],
+            duration_seconds: Some(901),
+            max_fps: Some(5.0),
+            confidence: Some(0.35),
+            stream_profile: Some("sub".to_string()),
+        })
+        .expect_err("unbounded duration must be rejected");
+        assert!(error.contains("900"));
+    }
+
+    #[test]
+    fn detection_job_history_is_bounded_without_removing_running_jobs() {
+        let mut jobs = HashMap::new();
+        for index in 0..=MAX_DETECTION_JOB_HISTORY {
+            let job_id = format!("yolo-{index:032x}");
+            let status = if index == MAX_DETECTION_JOB_HISTORY {
+                "running"
+            } else {
+                "completed"
+            };
+            jobs.insert(
+                job_id.clone(),
+                DetectionJobRuntime {
+                    projection: DetectionJobProjection {
+                        job_id,
+                        camera_id: format!("camera-{index}"),
+                        status: status.to_string(),
+                        target_labels: vec!["cat".to_string()],
+                        stream_profile: "sub".to_string(),
+                        max_fps: 5.0,
+                        confidence: 0.35,
+                        lease_id: format!("detect-{index:032x}"),
+                        started_at: format!("2026-07-23T00:{:02}:00Z", index % 60),
+                        updated_at: format!("2026-07-23T00:{:02}:00Z", index % 60),
+                        expires_at: "2026-07-23T00:15:00Z".to_string(),
+                        latest_result: None,
+                        metrics: None,
+                        message: None,
+                    },
+                    output_dir: std::env::temp_dir().join(format!(
+                        "harborbeacon-prune-unit-missing-{}-{index}",
+                        std::process::id()
+                    )),
+                    child: None,
+                },
+            );
+        }
+
+        prune_detection_job_history(&mut jobs);
+
+        assert_eq!(jobs.len(), MAX_DETECTION_JOB_HISTORY - 1);
+        assert!(jobs
+            .values()
+            .any(|runtime| runtime.projection.status == "running"));
+    }
+
+    #[test]
     fn notification_target_readiness_redacts_route_key() {
         let targets = vec![NotificationTargetRecord {
             target_id: "target-1".to_string(),
@@ -21515,9 +22482,14 @@ mod tests {
             configured: true,
             enabled: true,
             base_url: "http://homeassistant.local:8123".to_string(),
+            managed_by_harborlink: false,
+            harborlink_available: false,
             token_configured: true,
             token_redacted: true,
             exposed_domains: vec!["light".to_string()],
+            allowed_entities: Vec::new(),
+            allowed_cameras: Vec::new(),
+            camera_entity_bindings: BTreeMap::new(),
             status: "connected".to_string(),
             last_error: Some("token=secret".to_string()),
             last_test_at: None,
@@ -21860,6 +22832,125 @@ mod tests {
     }
 
     #[test]
+    fn harborlink_projections_preserve_beacon_northbound_contracts() {
+        let settings = serde_json::from_value::<DvrRecordingSettings>(json!({}))
+            .expect("default DVR settings");
+        let response = build_dvr_recording_action_response(
+            settings,
+            HarborLinkRecordingStatus {
+                device_id: "camera 1/left".to_string(),
+                status: "recording".to_string(),
+                started_at: Some("1".to_string()),
+                updated_at: Some("2".to_string()),
+                stream_kind: "sub".to_string(),
+                last_segment_path: None,
+                live_mjpeg_url: Some("http://127.0.0.1:8788/internal.mjpeg".to_string()),
+                message: "recording".to_string(),
+            },
+            3,
+            "http://harborbeacon.local:4174",
+        );
+
+        assert_eq!(response.capacity.camera_count, 3);
+        assert_eq!(response.statuses.len(), 1);
+        assert_eq!(response.statuses[0].device_id, "camera 1/left");
+        assert_eq!(
+            response.statuses[0].live_mjpeg_url.as_deref(),
+            Some("http://harborbeacon.local:4174/api/cameras/camera%201%2Fleft/live.mjpeg")
+        );
+
+        let snapshot_artifact = HarborLinkRecordingArtifact {
+            artifact_id: "snapshots~cam-1~2026~07~23~021258.jpg".to_string(),
+            camera_id: "cam-1".to_string(),
+            kind: "snapshot".to_string(),
+            mime_type: "image/jpeg".to_string(),
+            byte_size: 146_584,
+            started_at_epoch_ms: 1_784_772_778_000,
+            ended_at_epoch_ms: 1_784_772_778_000,
+            duration_seconds: 0,
+            stream_kind: "snapshot".to_string(),
+            modified_at_epoch_ms: 1_784_772_778_731,
+            preview_url: "/v1/dvr/artifacts/snapshot".to_string(),
+        };
+        let task_response = TaskResponse {
+            task_id: "task-snapshot".to_string(),
+            trace_id: "trace-snapshot".to_string(),
+            status: TaskStatus::Completed,
+            executor_used: "camera_hub_service".to_string(),
+            risk_level: harborbeacon_local_agent::orchestrator::contracts::RiskLevel::Low,
+            result: harborbeacon_local_agent::runtime::task_api::TaskResultEnvelope {
+                data: json!({
+                    "snapshot": {
+                        "harborlink_artifact": snapshot_artifact.clone(),
+                    }
+                }),
+                ..Default::default()
+            },
+            audit_ref: "audit-snapshot".to_string(),
+            missing_fields: Vec::new(),
+            prompt: None,
+            resume_token: None,
+        };
+        let extracted = snapshot_artifact_from_task_response(&task_response)
+            .expect("snapshot artifact from task response");
+        assert_eq!(extracted.artifact_id, snapshot_artifact.artifact_id);
+
+        let snapshot = dvr_timeline_segment_from_harborlink(snapshot_artifact, None, None)
+            .expect("snapshot projection");
+        assert_eq!(snapshot.media_kind, "snapshot");
+        assert_eq!(snapshot.started_at, "1784772778");
+        assert_eq!(snapshot.thumbnail_url, snapshot.replay_url);
+        assert!(snapshot.playable);
+
+        let home_assistant = build_home_assistant_status_response_with_link(
+            &HomeAssistantAdminState::default(),
+            &HarborLinkHomeAssistantStatus {
+                enabled: true,
+                configured: true,
+                base_url_configured: true,
+                token_configured: true,
+                allowed_entity_count: 0,
+                allowed_camera_count: 0,
+                allowed_entities: Vec::new(),
+                allowed_cameras: Vec::new(),
+                camera_entity_bindings: BTreeMap::new(),
+                exposed_domains: vec!["light".to_string()],
+            },
+        );
+        assert!(home_assistant.managed_by_harborlink);
+        assert_eq!(home_assistant.base_url, "harborlink://home-assistant");
+
+        let live_session = CameraLiveSessionProjection::from_harborlink(HarborLinkLiveSession {
+            camera_id: "cam-1".to_string(),
+            session_id: Some("live-test".to_string()),
+            status: "running".to_string(),
+            transport: "local_webrtc".to_string(),
+            stream_profile: "sub".to_string(),
+            webrtc_url: Some("/api/harbor-link/media/harbor-live-test/whep".to_string()),
+            hls_url: Some("/api/harbor-link/media/harbor-live-test-hls/index.m3u8".to_string()),
+            started_at: Some("2024-05-20T12:34:56Z".to_string()),
+            updated_at: "2024-05-20T12:34:57Z".to_string(),
+            expires_at: Some("2024-05-20T12:39:56Z".to_string()),
+            message: "running".to_string(),
+        });
+
+        assert_eq!(live_session.started_at.as_deref(), Some("1716208496"));
+    }
+
+    #[test]
+    fn camera_stream_profiles_are_validated() {
+        assert_eq!(
+            CameraStreamProfile::parse("main").map(CameraStreamProfile::as_str),
+            Ok("main")
+        );
+        assert_eq!(
+            CameraStreamProfile::parse_or_sub(None).map(CameraStreamProfile::as_str),
+            Ok("sub")
+        );
+        assert!(CameraStreamProfile::parse("invalid").is_err());
+    }
+
+    #[test]
     fn camera_paths_decode_percent_encoded_device_ids() {
         let encoded = "camera%201%2Fleft";
         assert_eq!(
@@ -21887,22 +22978,16 @@ mod tests {
             Some("camera 1/left".to_string())
         );
         assert_eq!(
+            parse_camera_hls_live_renew_path(&format!("/api/cameras/{encoded}/live/renew")),
+            Some("camera 1/left".to_string())
+        );
+        assert_eq!(
             parse_camera_hls_live_stop_path(&format!("/api/cameras/{encoded}/live/stop")),
             Some("camera 1/left".to_string())
         );
         assert_eq!(
             parse_camera_hls_live_status_path(&format!("/api/cameras/{encoded}/live/status")),
             Some("camera 1/left".to_string())
-        );
-        assert_eq!(
-            parse_camera_hls_live_asset_path(&format!(
-                "/api/cameras/{encoded}/live/live-abc123/index.m3u8"
-            )),
-            Some((
-                "camera 1/left".to_string(),
-                "live-abc123".to_string(),
-                "index.m3u8".to_string()
-            ))
         );
         assert_eq!(
             parse_camera_recording_start_path(&format!("/api/cameras/{encoded}/recordings/start")),
@@ -21915,34 +23000,6 @@ mod tests {
         assert_eq!(
             parse_camera_live_page_path(&format!("/live/cameras/{encoded}")),
             Some("camera 1/left".to_string())
-        );
-    }
-
-    #[test]
-    fn hls_live_asset_paths_reject_traversal() {
-        assert!(is_safe_live_asset_name("index.m3u8"));
-        assert!(is_safe_live_asset_name("segment_00001.m4s"));
-        assert!(is_safe_live_asset_name("init.mp4"));
-        assert!(!is_safe_live_asset_name("../index.m3u8"));
-        assert!(!is_safe_live_asset_name("nested/index.m3u8"));
-        assert!(!is_safe_live_asset_name("segment_00001.jpg"));
-        assert_eq!(
-            parse_camera_hls_live_asset_path(
-                "/api/cameras/cam-1/live/live-abc123/..%2Fsecret.m3u8"
-            ),
-            None
-        );
-        assert_eq!(
-            parse_camera_hls_live_asset_path(
-                "/api/cameras/cam-1/live/live-abc123/%2e%2e%2Fsecret.m3u8"
-            ),
-            None
-        );
-        assert_eq!(
-            parse_camera_hls_live_asset_path(
-                "/api/cameras/cam-1/live/live-abc123/nested/index.m3u8"
-            ),
-            None
         );
     }
 
@@ -21979,73 +23036,6 @@ mod tests {
                 "/api/devices/{encoded}/credential-status"
             )),
             Some("camera 1/left".to_string())
-        );
-    }
-
-    #[test]
-    fn device_credential_status_redacts_secret_projection() {
-        let mut state = AdminConsoleState::default();
-        state.device_credentials.push(DeviceCredentialSecret {
-            device_id: "cam-1".to_string(),
-            username: "admin".to_string(),
-            password: "secret".to_string(),
-            rtsp_port: Some(8554),
-            rtsp_paths: vec!["/stream1".to_string(), "/stream2".to_string()],
-            updated_at: Some("123".to_string()),
-            last_verified_at: Some("456".to_string()),
-        });
-        let device = CameraDevice::new("cam-1", "Living Room", "rtsp://192.168.3.73/stream1");
-
-        let status = build_device_credential_status(&state, &device);
-
-        assert!(status.configured);
-        assert!(status.redacted);
-        assert_eq!(status.username.as_deref(), Some("admin"));
-        assert_eq!(status.rtsp_port, Some(8554));
-        assert_eq!(status.path_count, 2);
-        assert_eq!(status.source, "device_rtsp");
-    }
-
-    #[test]
-    fn camera_stream_url_prefers_device_credentials_for_runtime_use() {
-        let mut state = AdminConsoleState::default();
-        state.defaults.rtsp_username = "default".to_string();
-        state.defaults.rtsp_password = "wrong".to_string();
-        state.defaults.rtsp_port = 554;
-        state.device_credentials.push(DeviceCredentialSecret {
-            device_id: "cam-1".to_string(),
-            username: "admin".to_string(),
-            password: "secret".to_string(),
-            rtsp_port: Some(8554),
-            rtsp_paths: vec!["stream2".to_string(), "/stream1".to_string()],
-            updated_at: Some("123".to_string()),
-            last_verified_at: None,
-        });
-        let mut device = CameraDevice::new("cam-1", "Living Room", "rtsp://192.168.3.73/stream1");
-        device.ip_address = Some("192.168.3.73".to_string());
-
-        let url = camera_stream_url_with_credentials(&device, &state).expect("stream url");
-
-        assert_eq!(url, "rtsp://admin:secret@192.168.3.73:8554/stream2");
-    }
-
-    #[test]
-    fn scan_request_task_args_preserve_rtsp_credentials_for_worker() {
-        let args = scan_request_task_args(&super::ScanRequest {
-            cidr: Some("192.168.3.231/32".to_string()),
-            protocol: Some("RTSP".to_string()),
-            rtsp_port: Some(554),
-            rtsp_username: Some("admin".to_string()),
-            rtsp_password: Some("fresh-secret".to_string()),
-        });
-
-        assert_eq!(
-            args.pointer("/rtsp_username").and_then(Value::as_str),
-            Some("admin")
-        );
-        assert_eq!(
-            args.pointer("/rtsp_password").and_then(Value::as_str),
-            Some("fresh-secret")
         );
     }
 
@@ -22366,6 +23356,7 @@ mod tests {
         assert!(is_admin_surface_path("/api/cameras/camera-1/snapshot.jpg"));
         assert!(is_admin_surface_path("/api/cameras/camera-1/live.mjpeg"));
         assert!(is_admin_surface_path("/api/cameras/camera-1/analyze"));
+        assert!(is_admin_surface_path("/api/harbor-link/capabilities"));
         assert!(is_admin_surface_path("/api/home-assistant/status"));
         assert!(is_admin_surface_path("/api/home-assistant/config"));
         assert!(is_admin_surface_path(
@@ -22544,6 +23535,74 @@ mod tests {
         assert!(!knowledge_preview_mime_supported(Path::new(
             "C:/tmp/data.json"
         )));
+    }
+
+    #[test]
+    fn static_byte_ranges_cover_explicit_open_and_suffix_requests() {
+        assert_eq!(
+            parse_static_byte_range("bytes=10-19", 100),
+            Ok(super::StaticByteRange { start: 10, end: 19 })
+        );
+        assert_eq!(
+            parse_static_byte_range("bytes=10-", 100),
+            Ok(super::StaticByteRange { start: 10, end: 99 })
+        );
+        assert_eq!(
+            parse_static_byte_range("bytes=-8", 100),
+            Ok(super::StaticByteRange { start: 92, end: 99 })
+        );
+        assert_eq!(
+            parse_static_byte_range("bytes=90-120", 100),
+            Ok(super::StaticByteRange { start: 90, end: 99 })
+        );
+        assert!(parse_static_byte_range("bytes=100-101", 100).is_err());
+        assert!(parse_static_byte_range("bytes=20-10", 100).is_err());
+        assert!(parse_static_byte_range("bytes=0-1,4-5", 100).is_err());
+    }
+
+    #[test]
+    fn preview_static_file_response_supports_browser_byte_ranges() {
+        let path = unique_store_path("knowledge-preview-range").with_extension("mp4");
+        fs::write(&path, b"0123456789").expect("write preview fixture");
+
+        let response = preview_static_file_response(&path, Some("bytes=2-5"));
+        let response_header = |name: &str| {
+            response
+                .headers()
+                .iter()
+                .find(|header| header.field.as_str().to_string().eq_ignore_ascii_case(name))
+                .map(|header| header.value.as_str().to_string())
+        };
+        assert_eq!(response.status_code(), StatusCode(206));
+        assert_eq!(response_header("Accept-Ranges").as_deref(), Some("bytes"));
+        assert_eq!(
+            response_header("Content-Range").as_deref(),
+            Some("bytes 2-5/10")
+        );
+        assert_eq!(response.data_length(), Some(4));
+        let mut body = Vec::new();
+        response
+            .into_reader()
+            .read_to_end(&mut body)
+            .expect("read ranged response");
+        assert_eq!(body, b"2345");
+
+        let invalid_response = preview_static_file_response(&path, Some("bytes=10-12"));
+        let invalid_content_range = invalid_response
+            .headers()
+            .iter()
+            .find(|header| {
+                header
+                    .field
+                    .as_str()
+                    .to_string()
+                    .eq_ignore_ascii_case("Content-Range")
+            })
+            .map(|header| header.value.as_str().to_string());
+        assert_eq!(invalid_response.status_code(), StatusCode(416));
+        assert_eq!(invalid_content_range.as_deref(), Some("bytes */10"));
+
+        fs::remove_file(path).expect("remove preview fixture");
     }
 
     #[test]
@@ -24660,17 +25719,6 @@ mod tests {
             .save_devices(&[device.clone()])
             .expect("save device");
         admin_store
-            .save_device_credential(DeviceCredentialSecret {
-                device_id: "cam-secret".to_string(),
-                username: "admin".to_string(),
-                password: "secret".to_string(),
-                rtsp_port: Some(554),
-                rtsp_paths: vec!["/stream1".to_string()],
-                updated_at: Some("100".to_string()),
-                last_verified_at: Some("101".to_string()),
-            })
-            .expect("save credential");
-        admin_store
             .record_device_evidence(DeviceEvidenceRecord {
                 evidence_id: "rtsp-evidence".to_string(),
                 device_id: "cam-secret".to_string(),
@@ -24726,16 +25774,49 @@ mod tests {
             )
             .expect("save share link");
 
+        let listener = TcpListener::bind("127.0.0.1:0").expect("HarborLink listener");
+        let harborlink_addr = listener.local_addr().expect("HarborLink address");
+        let harborlink_server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("HarborLink accept");
+            let mut buffer = [0_u8; 2048];
+            let read = stream.read(&mut buffer).expect("read HarborLink request");
+            let request = String::from_utf8_lossy(&buffer[..read]);
+            assert!(request.starts_with("GET /v1/cameras/cam-secret/credentials "));
+            let body = json!({
+                "cameraId": "cam-secret",
+                "configured": true,
+                "usernameConfigured": true,
+                "passwordConfigured": true,
+                "rtspPortConfigured": true,
+                "rtspPathCount": 1,
+                "lastVerifiedAt": "101"
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write HarborLink response");
+        });
+
         let task_service = TaskApiService::new(admin_store.clone(), conversation_store);
         let api = AdminApi::new(
             admin_store,
             task_service,
             PathBuf::from("frontend/harbor-assistant/dist/harbor-assistant"),
             "http://harborbeacon.local:4174".to_string(),
+        )
+        .with_harborlink_media_client(
+            HarborLinkMediaClient::new(format!("http://{harborlink_addr}"))
+                .expect("HarborLink client"),
         );
         let response = api
             .build_device_evidence_response(&device)
             .expect("evidence response");
+        harborlink_server.join().expect("HarborLink server");
         let payload = serde_json::to_string(&response).expect("serialize response");
 
         assert!(response.credential_status.configured);

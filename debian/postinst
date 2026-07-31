@@ -1,6 +1,13 @@
 #!/bin/bash
 set -e
 
+if ! getent group harborbeacon >/dev/null 2>&1; then
+  addgroup --system harborbeacon
+fi
+if ! id harborbeacon >/dev/null 2>&1; then
+  adduser --system --ingroup harborbeacon --home /var/lib/harboros-beacon --no-create-home harborbeacon
+fi
+
 ensure_shared_token_env() {
   local env_file="/etc/default/harboros-beacon-gate"
   if [ -f "$env_file" ]; then
@@ -96,6 +103,10 @@ ensure_semantic_router_runtime_env() {
 ensure_shared_token_env
 ensure_harborbeacon_runtime_env
 ensure_semantic_router_runtime_env
+install -d -o harborbeacon -g harborbeacon -m 0750 \
+  /var/lib/harboros-beacon /mnt/software/harborbeacon-agent-ci
+chown -R harborbeacon:harborbeacon \
+  /var/lib/harboros-beacon /mnt/software/harborbeacon-agent-ci
 systemctl daemon-reload
 systemctl enable semantic-router.service
 systemctl restart semantic-router.service
