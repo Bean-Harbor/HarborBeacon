@@ -3983,10 +3983,11 @@ impl TaskApiService {
             if !privacy_gateway_evaluation.decision.cloud_allowed {
                 degraded_reason.get_or_insert_with(|| "privacy_gateway_blocked".to_string());
                 warnings.extend(privacy_gateway_evaluation.decision.warnings.clone());
-                answer = format!(
-                    "Privacy Gateway 已阻断云端回答：{} [1]",
+                warnings.push(format!(
+                    "Privacy Gateway 已阻断云端回答：{}",
                     privacy_gateway_evaluation.decision.reason
-                );
+                ));
+                answer = build_limited_rag_answer(&query, &citations);
                 answer_generation_status = "privacy_gateway_blocked";
                 skip_model = true;
             } else if let Some(capsule) = privacy_gateway_evaluation.semantic_capsule.as_ref() {
@@ -3997,9 +3998,7 @@ impl TaskApiService {
                 warnings.push(
                     "Privacy Gateway 未能生成 semantic capsule，已跳过云端模型。".to_string(),
                 );
-                answer =
-                    "Privacy Gateway 未能生成可上云的 semantic capsule，已降级为本地引用摘要。[1]"
-                        .to_string();
+                answer = build_limited_rag_answer(&query, &citations);
                 answer_generation_status = "privacy_gateway_blocked";
                 skip_model = true;
             }
@@ -15476,16 +15475,6 @@ mod tests {
             invalid_deterministic.cited_indices,
             Some(std::collections::HashSet::from([1]))
         );
-
-        let privacy_blocked = super::finalize_rag_answer_citations(
-            "凭据是什么？",
-            "Privacy Gateway 已阻断云端回答：检测到敏感凭据。[1]",
-            "privacy_gateway_blocked",
-            &citations,
-        );
-        assert!(privacy_blocked.answer.contains("Privacy Gateway"));
-        assert_eq!(privacy_blocked.degraded_reason, None);
-        assert_eq!(privacy_blocked.warning, None);
     }
 
     #[test]
@@ -20060,7 +20049,17 @@ mod tests {
             false
         );
         assert_eq!(response.result.data["model"], Value::Null);
-        assert!(response.result.message.contains("Privacy Gateway"));
+        assert!(response.result.data["warnings"]
+            .as_array()
+            .is_some_and(|warnings| warnings
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|warning| { warning.contains("Privacy Gateway 已阻断云端回答") })));
+        assert_eq!(
+            response.result.data["citations"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert!(!response.result.message.contains("Privacy Gateway"));
 
         let _ = fs::remove_file(admin_path);
         let _ = fs::remove_file(registry_path);
