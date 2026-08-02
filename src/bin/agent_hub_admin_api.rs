@@ -7,7 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -67,8 +67,8 @@ use harborbeacon_local_agent::control_plane::models::{
 use harborbeacon_local_agent::control_plane::routing::{
     build_routing_status, RoutingRuntimeProjection,
 };
-use harborbeacon_local_agent::control_plane::tasks::TaskStepRun;
-use harborbeacon_local_agent::control_plane::users::{MembershipStatus, RoleKind};
+use harborbeacon_local_agent::control_plane::tasks::{TaskRun, TaskStepRun};
+use harborbeacon_local_agent::control_plane::users::{MembershipStatus, RoleKind, WorkspaceStatus};
 use harborbeacon_local_agent::orchestrator::executors::harbor_apps::{
     build_harbor_app_execution_plan, harbor_app_execution_plan_snapshot, HarborAppExecutorConfig,
     HarborAppLifecycleAction,
@@ -84,8 +84,9 @@ use harborbeacon_local_agent::runtime::admin_console::{
     user_recent_interactive_surface, validate_knowledge_settings, AccountManagementSnapshot,
     AdminConsoleState, AdminConsoleStore, AdminDefaults, AdminModelCenterState,
     AutomationRuleReview, BridgeProviderConfig, DeviceEvidenceRecord, GatewayStatusSummary,
-    HomeAssistantAdminState, KnowledgeIndexJobRecord, KnowledgeSettings, KnowledgeSourceRoot,
-    ModelDownloadJobRecord, ModelRuntimeRecord, NotificationTargetRecord, RagResourceProfile,
+    HomeAssistantAdminState, KnowledgeConversationSettings, KnowledgeIndexJobRecord,
+    KnowledgeRetrievalSettings, KnowledgeSettings, KnowledgeSourceRoot, ModelDownloadJobRecord,
+    ModelRuntimeRecord, NotificationTargetRecord, RagResourceProfile,
 };
 use harborbeacon_local_agent::runtime::dvr::{
     build_status_response, sanitize_dvr_recording_settings, DvrRecordingSettings,
@@ -122,11 +123,8 @@ use harborbeacon_local_agent::runtime::hub::{
     device_id_for_ip, CameraHubService, HubManualAddSummary, HubScanRequest, HubScanResultItem,
     HubScanSummary, HubStateSnapshot,
 };
-use harborbeacon_local_agent::runtime::knowledge::{
-    KnowledgeSearchRequest, KnowledgeSearchService,
-};
 use harborbeacon_local_agent::runtime::knowledge_index::{
-    load_embedding_store, KnowledgeEmbeddingWarmupStats, KnowledgeIndexConfig,
+    load_embedding_store, KnowledgeEmbeddingWarmupStats, KnowledgeIndexConfig, KnowledgeIndexEntry,
     KnowledgeIndexManifest, KnowledgeIndexService, KnowledgeIndexSnapshot, KnowledgeModality,
 };
 use harborbeacon_local_agent::runtime::model_center::{
@@ -153,6 +151,7 @@ use harborbeacon_local_agent::runtime::vision_event::{
 };
 
 const DEFAULT_HF_ENDPOINT: &str = "https://hf-mirror.com";
+const HARBORBEACON_WEB_API_TOKEN_ENV: &str = "HARBORBEACON_WEB_API_TOKEN";
 const KNOWLEDGE_EMBEDDING_WARMUP_TIMEOUT_MS_ENV: &str =
     "HARBORBEACON_KNOWLEDGE_EMBEDDING_WARMUP_TIMEOUT_MS";
 const DEFAULT_KNOWLEDGE_EMBEDDING_WARMUP_TIMEOUT_MS: u64 = 120_000;
@@ -179,6 +178,30 @@ const DEFAULT_DETECTION_WORKER: &str =
 const DEFAULT_DETECTION_MODEL: &str = "/var/lib/harboros-beacon/models/yolov8n_192x320.q.onnx";
 const DEFAULT_DETECTION_LABELS: &str = "/var/lib/harboros-beacon/models/label.txt";
 const DEFAULT_DETECTION_OUTPUT_ROOT: &str = "/run/harboros-beacon/detection-jobs";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GateAuthenticatedPrincipal(AccessPrincipal);
+
+impl GateAuthenticatedPrincipal {
+    fn access_principal(&self) -> &AccessPrincipal {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GatePrincipalAuthError {
+    status: StatusCode,
+    message: String,
+}
+
+impl GatePrincipalAuthError {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct Cli {
@@ -1308,19 +1331,42 @@ struct KnowledgeIndexRunResponse {
     errors: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+struct KnowledgeSuggestion {
+    subject: String,
+    kind: String,
+    filter: String,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+struct KnowledgeSuggestionsResponse {
+    generated_at: String,
+    suggestions: Vec<KnowledgeSuggestion>,
+}
+
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 struct KnowledgeSearchApiRequest {
     query: String,
+    #[serde(default)]
+    conversation_id: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
     #[serde(default)]
     include_documents: Option<bool>,
     #[serde(default)]
+    include_audio: Option<bool>,
+    #[serde(default)]
     include_images: Option<bool>,
     #[serde(default)]
     include_videos: Option<bool>,
     #[serde(default)]
+    use_retrieval: Option<bool>,
+    #[serde(default)]
+    retrieval_mode: Option<String>,
+    #[serde(default)]
     source_scope: Option<String>,
+    #[serde(default)]
+    source_root_ids: Vec<String>,
     #[serde(default)]
     camera_id: Option<String>,
     #[serde(default)]
@@ -1351,6 +1397,8 @@ struct KnowledgeIndexStatusResponse {
     index_root_writable: bool,
     manifest_count: usize,
     manifest_entry_count: usize,
+    supported_file_count: Option<usize>,
+    unindexed_file_count: Option<usize>,
     document_count: usize,
     image_count: usize,
     audio_count: usize,
@@ -1384,6 +1432,7 @@ struct KnowledgeIndexRootStatus {
 struct KnowledgeIndexStorageSummary {
     manifest_count: usize,
     manifest_entry_count: usize,
+    supported_file_count: Option<usize>,
     document_count: usize,
     image_count: usize,
     audio_count: usize,
@@ -1490,7 +1539,13 @@ struct ModelCapabilityStatus {
     label: String,
     model_kind: String,
     status: String,
+    desired_model_id: Option<String>,
+    active_model_id: Option<String>,
+    transition_status: String,
+    last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     selected_model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     runtime_model_id: Option<String>,
     current_model: Option<ModelCapabilityCurrentModel>,
     installed_models: Vec<ModelCapabilityInstallableModel>,
@@ -1599,6 +1654,8 @@ struct LocalModelRuntimeProjection {
     backend_kind: Option<String>,
     chat_model: Option<String>,
     embedding_model: Option<String>,
+    chat_model_loaded: Option<bool>,
+    embedding_model_loaded: Option<bool>,
     note: Option<String>,
     error: Option<String>,
 }
@@ -2337,6 +2394,39 @@ impl AdminApi {
         self.authorize_admin_action(hints, AccessAction::CameraOperate)
     }
 
+    fn authenticate_gate_principal(
+        &self,
+        raw_url: &str,
+        headers: &[Header],
+    ) -> Result<GateAuthenticatedPrincipal, GatePrincipalAuthError> {
+        let configured_token = env::var(HARBORBEACON_WEB_API_TOKEN_ENV).ok();
+        authenticate_gate_principal_with_workspace_loader(
+            configured_token.as_deref(),
+            raw_url,
+            headers,
+            || {
+                let state = self.admin_store.load_state().map_err(|error| {
+                    GatePrincipalAuthError::new(
+                        StatusCode(503),
+                        format!("failed to load active workspace: {error}"),
+                    )
+                })?;
+                state
+                    .platform
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.status == WorkspaceStatus::Active)
+                    .map(|workspace| workspace.workspace_id.clone())
+                    .ok_or_else(|| {
+                        GatePrincipalAuthError::new(
+                            StatusCode(503),
+                            "active workspace is not configured",
+                        )
+                    })
+            },
+        )
+    }
+
     fn authorize_camera_action(
         &self,
         hints: &AccessIdentityHints,
@@ -2384,7 +2474,12 @@ impl AdminApi {
         let path = raw_url.split('?').next().unwrap_or("/").to_string();
         let remote_addr = request.remote_addr().copied();
         let headers = request.headers().to_vec();
-        let identity_hints = request_identity_hints(&raw_url, &headers);
+        let requires_gate_principal = is_gate_principal_knowledge_endpoint(&method, path.as_str());
+        let identity_hints = if requires_gate_principal {
+            AccessIdentityHints::default()
+        } else {
+            request_identity_hints(&raw_url, &headers)
+        };
         let business_request_id = header_value(&headers, "X-Request-Id")
             .or_else(|| header_value(&headers, "Idempotency-Key"));
         let _harborlink_request_scope = harborlink_request_scope(business_request_id.as_deref());
@@ -2395,6 +2490,18 @@ impl AdminApi {
                 return;
             }
         }
+
+        let gate_principal = if requires_gate_principal {
+            match self.authenticate_gate_principal(&raw_url, &headers) {
+                Ok(principal) => Some(principal),
+                Err(error) => {
+                    let _ = request.respond(error_json(error.status, &error.message).boxed());
+                    return;
+                }
+            }
+        } else {
+            None
+        };
 
         let response = match method {
             Method::Get if path == "/healthz" => ok_json(&json!({"status":"ok"})).boxed(),
@@ -2475,8 +2582,41 @@ impl AdminApi {
             Method::Put if path == "/api/knowledge/settings" => self
                 .handle_save_knowledge_settings(&mut request, &identity_hints)
                 .boxed(),
+            Method::Get if path == "/api/knowledge/retrieval-settings" => self
+                .handle_knowledge_retrieval_settings(&identity_hints)
+                .boxed(),
+            Method::Patch if path == "/api/knowledge/retrieval-settings" => self
+                .handle_save_knowledge_retrieval_settings(&mut request, &identity_hints)
+                .boxed(),
+            Method::Patch if path == "/api/knowledge/conversation-settings" => self
+                .handle_save_knowledge_conversation_settings(
+                    &mut request,
+                    gate_principal.as_ref().expect("gate principal"),
+                )
+                .boxed(),
+            Method::Get if path == "/api/knowledge/conversations" => self
+                .handle_knowledge_conversations(gate_principal.as_ref().expect("gate principal"))
+                .boxed(),
+            Method::Get if path == "/api/knowledge/suggestions" => {
+                self.handle_knowledge_suggestions(&identity_hints).boxed()
+            }
+            Method::Get if is_knowledge_conversation_detail_path(&path) => self
+                .handle_knowledge_conversation(
+                    &path,
+                    gate_principal.as_ref().expect("gate principal"),
+                )
+                .boxed(),
+            Method::Delete if is_knowledge_conversation_detail_path(&path) => self
+                .handle_delete_knowledge_conversation(
+                    &path,
+                    gate_principal.as_ref().expect("gate principal"),
+                )
+                .boxed(),
             Method::Post if path == "/api/knowledge/search" => self
-                .handle_knowledge_search(&mut request, &identity_hints)
+                .handle_knowledge_search(
+                    &mut request,
+                    gate_principal.as_ref().expect("gate principal"),
+                )
                 .boxed(),
             Method::Get if path == "/api/knowledge/preview" => {
                 self.handle_knowledge_preview(&raw_url, &headers, &identity_hints)
@@ -4062,18 +4202,271 @@ impl AdminApi {
         }
     }
 
-    fn handle_knowledge_search(
+    fn handle_knowledge_suggestions(
         &self,
-        request: &mut Request,
         hints: &AccessIdentityHints,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
+        let settings = match self.admin_store.knowledge_settings() {
+            Ok(settings) => settings,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let service = match KnowledgeIndexService::from_config(
+            match KnowledgeIndexConfig::new(settings.index_root.clone()) {
+                Ok(config) => config,
+                Err(error) => return error_json(StatusCode(422), &error),
+            },
+        ) {
+            Ok(service) => service,
+            Err(error) => return error_json(StatusCode(422), &error),
+        };
+        let mut entries = Vec::new();
+        for root in settings
+            .source_roots
+            .iter()
+            .filter(|root| root.enabled && !root.path.trim().is_empty())
+        {
+            let Ok(snapshot) = service.load_existing(Path::new(root.path.trim())) else {
+                continue;
+            };
+            let mut compact_entries = snapshot.manifest.entries.iter().collect::<Vec<_>>();
+            compact_entries.sort_by(|left, right| {
+                right
+                    .file_signature
+                    .modified_unix_millis
+                    .cmp(&left.file_signature.modified_unix_millis)
+                    .then(left.path.cmp(&right.path))
+            });
+            let mut per_modality = HashMap::<KnowledgeModality, usize>::new();
+            let selected_paths = compact_entries
+                .into_iter()
+                .filter(|entry| {
+                    let count = per_modality.entry(entry.modality).or_default();
+                    if *count >= 16 {
+                        return false;
+                    }
+                    *count += 1;
+                    true
+                })
+                .map(|entry| entry.path.replace('\\', "/"))
+                .collect::<HashSet<_>>();
+            if let Ok(mut payload_entries) =
+                service.load_entry_payloads(&snapshot, Some(&selected_paths))
+            {
+                entries.append(&mut payload_entries);
+            }
+        }
+        ok_json(&KnowledgeSuggestionsResponse {
+            generated_at: now_unix_string(),
+            suggestions: build_knowledge_suggestions(entries, 4),
+        })
+    }
+
+    fn handle_knowledge_retrieval_settings(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        match self.admin_store.knowledge_settings() {
+            Ok(settings) => ok_json(&settings.retrieval),
+            Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
+    fn handle_save_knowledge_retrieval_settings(
+        &self,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        let retrieval: KnowledgeRetrievalSettings = match read_json_body(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let mut settings = match self.admin_store.knowledge_settings() {
+            Ok(settings) => settings,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        settings.retrieval = retrieval;
+        match validate_knowledge_settings(settings)
+            .and_then(|settings| self.admin_store.save_knowledge_settings(settings))
+        {
+            Ok(state) => ok_json(&state.knowledge.retrieval),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_save_knowledge_conversation_settings(
+        &self,
+        request: &mut Request,
+        gate_principal: &GateAuthenticatedPrincipal,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = gate_principal.access_principal();
+        let update: KnowledgeConversationSettingsUpdate = match read_json_body(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let mut settings = match self.admin_store.knowledge_settings() {
+            Ok(settings) => settings,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        settings.conversation = KnowledgeConversationSettings {
+            history_limit: update.history_limit,
+            context_turn_limit: update.context_turn_limit,
+            context_token_limit: update
+                .context_token_limit
+                .unwrap_or(settings.conversation.context_token_limit),
+        };
+        match validate_knowledge_settings(settings)
+            .and_then(|settings| self.admin_store.save_knowledge_settings(settings))
+        {
+            Ok(state) => {
+                let conversation = state.knowledge.conversation;
+                let _ = self
+                    .task_service
+                    .conversation_store()
+                    .prune_sessions_for_user_surface(
+                        &principal.user_id,
+                        HARBOR_ASSISTANT_SEARCH_SURFACE,
+                        conversation.history_limit,
+                    );
+                ok_json(&conversation)
+            }
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_knowledge_conversations(
+        &self,
+        gate_principal: &GateAuthenticatedPrincipal,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = gate_principal.access_principal();
+        let limit = self
+            .admin_store
+            .knowledge_settings()
+            .map(|settings| settings.conversation.history_limit)
+            .unwrap_or(10)
+            .clamp(1, 100);
+        let store = self.task_service.conversation_store();
+        let sessions = match store
+            .sessions_for_user_surface(&principal.user_id, HARBOR_ASSISTANT_SEARCH_SURFACE)
+        {
+            Ok(sessions) => sessions,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let conversations = sessions
+            .into_iter()
+            .filter(|session| {
+                normalize_harbor_assistant_conversation_id(&session.conversation_id).is_some()
+            })
+            .take(limit)
+            .filter_map(|session| {
+                let runs = store
+                    .recent_task_runs_for_session(&session.session_id, usize::MAX)
+                    .ok()?;
+                let oldest = runs.last()?;
+                Some(HarborAssistantConversationSummary {
+                    conversation_id: session.conversation_id,
+                    title: harbor_assistant_conversation_query(oldest)
+                        .chars()
+                        .take(48)
+                        .collect(),
+                    updated_at: runs.first().and_then(|run| run.started_at.clone()),
+                    turn_count: runs.len(),
+                })
+            })
+            .collect::<Vec<_>>();
+        ok_json(&json!({
+            "conversations": conversations,
+            "settings": self.admin_store.knowledge_settings().ok().map(|value| value.conversation),
+        }))
+    }
+
+    fn handle_knowledge_conversation(
+        &self,
+        path: &str,
+        gate_principal: &GateAuthenticatedPrincipal,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = gate_principal.access_principal();
+        let conversation_id = match parse_harbor_assistant_conversation_path(path) {
+            Some(value) => value,
+            None => return error_json(StatusCode(400), "invalid conversation id"),
+        };
+        let session_id = harbor_assistant_search_session_id(&principal.user_id, &conversation_id);
+        let store = self.task_service.conversation_store();
+        let session = match store.load_session(&session_id) {
+            Ok(Some(session))
+                if session.user_id == principal.user_id
+                    && session.surface == HARBOR_ASSISTANT_SEARCH_SURFACE =>
+            {
+                session
+            }
+            Ok(_) => return error_json(StatusCode(404), "conversation not found"),
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let mut runs = match store.recent_task_runs_for_session(&session.session_id, usize::MAX) {
+            Ok(runs) => runs,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        runs.reverse();
+        let turns = runs
+            .iter()
+            .filter_map(|run| harbor_assistant_conversation_turn(store, run))
+            .collect::<Vec<_>>();
+        ok_json(&HarborAssistantConversationDetail {
+            conversation_id,
+            turns,
+        })
+    }
+
+    fn handle_delete_knowledge_conversation(
+        &self,
+        path: &str,
+        gate_principal: &GateAuthenticatedPrincipal,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = gate_principal.access_principal();
+        let conversation_id = match parse_harbor_assistant_conversation_path(path) {
+            Some(value) => value,
+            None => return error_json(StatusCode(400), "invalid conversation id"),
+        };
+        let session_id = harbor_assistant_search_session_id(&principal.user_id, &conversation_id);
+        let store = self.task_service.conversation_store();
+        match store.load_session(&session_id) {
+            Ok(Some(session))
+                if session.user_id == principal.user_id
+                    && session.surface == HARBOR_ASSISTANT_SEARCH_SURFACE => {}
+            Ok(_) => return error_json(StatusCode(404), "conversation not found"),
+            Err(error) => return error_json(StatusCode(500), &error),
+        }
+        match store.delete_session_with_tasks(&session_id) {
+            Ok(true) => ok_json(&json!({ "deleted": true, "conversation_id": conversation_id })),
+            Ok(false) => error_json(StatusCode(404), "conversation not found"),
+            Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
+    fn handle_knowledge_search(
+        &self,
+        request: &mut Request,
+        gate_principal: &GateAuthenticatedPrincipal,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = gate_principal.access_principal();
         let payload: KnowledgeSearchApiRequest = match read_json_body(request) {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
         };
+        if payload.query.trim().is_empty() {
+            return error_json(
+                StatusCode(422),
+                "Harbor Assistant search requires a non-empty query.",
+            );
+        }
         let settings = match self.admin_store.knowledge_settings() {
             Ok(settings) => settings,
             Err(error) => return error_json(StatusCode(500), &error),
@@ -4082,23 +4475,45 @@ impl AdminApi {
             Ok(paths) => paths,
             Err(error) => return error_json(StatusCode(422), &error),
         };
-        let scoped_roots = match resolve_admin_search_source_scope(&payload, &settings, None) {
+        let roots = match resolve_admin_search_source_scope(&payload, &settings, None) {
             Ok(roots) => roots,
             Err(error) => return error_json(StatusCode(422), &error),
         };
-        let search_request = match build_admin_knowledge_search_request(
-            payload,
-            &settings,
-            focus_paths,
-            scoped_roots,
-        ) {
-            Ok(request) => request,
-            Err(error) => return error_json(StatusCode(422), &error),
-        };
-        match KnowledgeSearchService::search(search_request) {
-            Ok(response) => ok_json(&response),
-            Err(error) => error_json(StatusCode(422), &error),
+        let task_request =
+            build_admin_rag_answer_task_request(&principal, payload, focus_paths, roots);
+        let conversation_id = task_request.source.conversation_id.clone();
+        let mut response = self.task_service.handle_task(task_request);
+        if let Some(data) = response.result.data.as_object_mut() {
+            data.insert(
+                "conversation_id".to_string(),
+                Value::String(conversation_id),
+            );
+            data.insert(
+                "conversation_context_turn_limit".to_string(),
+                json!(settings.conversation.context_turn_limit),
+            );
+            data.insert(
+                "conversation_context_token_limit".to_string(),
+                json!(settings.conversation.context_token_limit),
+            );
         }
+        if let Err(error) = self
+            .task_service
+            .conversation_store()
+            .prune_sessions_for_user_surface(
+                &principal.user_id,
+                HARBOR_ASSISTANT_SEARCH_SURFACE,
+                settings.conversation.history_limit,
+            )
+        {
+            if let Some(data) = response.result.data.as_object_mut() {
+                data.insert(
+                    "conversation_history_warning".to_string(),
+                    Value::String(error),
+                );
+            }
+        }
+        ok_json(&response.result.data)
     }
 
     fn resolve_dvr_search_focus_paths(
@@ -7035,15 +7450,57 @@ impl AdminApi {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
         };
-        if let Err(error) = self.activate_selected_model_capability(&capability_id, &body.model_id)
-        {
+        let previous_active_model_id =
+            self.admin_store
+                .load_or_create_state()
+                .ok()
+                .and_then(|state| {
+                    model_capability_assignment(&state.models, &capability_id)
+                        .and_then(|binding| binding.active_model_id.clone())
+                });
+        if let Err(error) = self.admin_store.save_model_capability_assignment(
+            &capability_id,
+            &body.model_id,
+            previous_active_model_id.as_deref(),
+            "loading",
+            None,
+        ) {
             return error_json(StatusCode(422), &error);
         }
-        if let Err(error) = self
-            .admin_store
-            .save_model_capability_binding(&capability_id, &body.model_id)
-        {
+        let activation =
+            match self.activate_selected_model_capability(&capability_id, &body.model_id) {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = self.admin_store.save_model_capability_assignment(
+                        &capability_id,
+                        &body.model_id,
+                        previous_active_model_id.as_deref(),
+                        "failed",
+                        Some(&error),
+                    );
+                    return error_json(StatusCode(422), &error);
+                }
+            };
+        let (active_model_id, transition_status, last_error) = if activation.activated {
+            (Some(body.model_id.as_str()), "ready", None)
+        } else {
+            (
+                previous_active_model_id.as_deref(),
+                "failed",
+                Some(activation.message.as_str()),
+            )
+        };
+        if let Err(error) = self.admin_store.save_model_capability_assignment(
+            &capability_id,
+            &body.model_id,
+            active_model_id,
+            transition_status,
+            last_error,
+        ) {
             return error_json(StatusCode(422), &error);
+        }
+        if !activation.activated {
+            return error_json(StatusCode(422), &activation.message);
         }
         self.record_admin_audit(
             &principal,
@@ -7060,9 +7517,14 @@ impl AdminApi {
         &self,
         capability_id: &str,
         model_id: &str,
-    ) -> Result<(), String> {
+    ) -> Result<ModelRuntimeActivationResult, String> {
         let Some(capability_model_kind) = model_kind_for_capability(capability_id) else {
-            return Ok(());
+            return Ok(ModelRuntimeActivationResult {
+                activated: true,
+                status: "selected".to_string(),
+                message: "Capability selection does not require runtime activation.".to_string(),
+                runtime_model_id: Some(model_id.to_string()),
+            });
         };
         let state = self.admin_store.load_or_create_state()?;
         let download_jobs = self.admin_store.list_model_download_jobs()?;
@@ -7084,6 +7546,15 @@ impl AdminApi {
                 model.display_name, capability_id
             ));
         }
+        let Some(model_kind) = runtime_model_kind_for_capability(capability_id) else {
+            return Ok(ModelRuntimeActivationResult {
+                activated: true,
+                status: "selected".to_string(),
+                message: "Capability selection does not require runtime activation.".to_string(),
+                runtime_model_id: Some(model_id.to_string()),
+            });
+        };
+        let mut external_activation = None;
         if let Some(profile) = managed_runtime_profile_for_model(model) {
             let runtime_projection = LocalModelRuntimeProjection::default();
             let runtime_status =
@@ -7096,15 +7567,27 @@ impl AdminApi {
                 ));
             }
         } else if external_runtime_profile_for_model(model) {
-            return Err(format!(
-                "模型 {} 需要在高级设置配置 OpenAI-compatible runtime；Harbor 不会自动启动或接管外部 runtime",
-                model.display_name
-            ));
+            let runtime_model_id = configured_external_runtime_model_id(
+                &state.models.endpoints,
+                &catalog.models,
+                model_kind,
+                &model.model_id,
+            )
+            .ok_or_else(|| {
+                format!(
+                    "{} requires a configured and running OpenAI-compatible endpoint.",
+                    model.display_name
+                )
+            })?;
+            external_activation = Some(ModelRuntimeActivationResult {
+                activated: true,
+                status: "external_runtime_ready".to_string(),
+                message: format!(
+                    "Existing OpenAI-compatible runtime is already serving {runtime_model_id}."
+                ),
+                runtime_model_id: Some(runtime_model_id),
+            });
         }
-
-        let Some(model_kind) = runtime_model_kind_for_capability(capability_id) else {
-            return Ok(());
-        };
 
         let request = ModelRuntimeActivationRequest {
             capability_id: capability_id.to_string(),
@@ -7113,7 +7596,9 @@ impl AdminApi {
             local_path: model.local_path.clone(),
             runtime_profiles: model.runtime_profiles.clone(),
         };
-        let result = if let Some(handler) = self.model_runtime_activation.as_ref() {
+        let result = if let Some(result) = external_activation {
+            result
+        } else if let Some(handler) = self.model_runtime_activation.as_ref() {
             handler(request)?
         } else {
             ModelRuntimeActivationResult {
@@ -7123,7 +7608,8 @@ impl AdminApi {
                 runtime_model_id: None,
             }
         };
-        self.record_model_runtime_activation(model_kind, model, result)
+        self.record_model_runtime_activation(model_kind, model, result.clone())?;
+        Ok(result)
     }
 
     fn record_model_runtime_activation(
@@ -7154,14 +7640,20 @@ impl AdminApi {
         } else {
             ModelEndpointStatus::Degraded
         };
-        self.admin_store.patch_model_endpoint(
-            endpoint_id,
-            json!({
-                "model_name": model_name,
-                "status": status,
-                "metadata": metadata,
-            }),
-        )?;
+        let mut endpoint_patch = json!({
+            "model_name": model_name,
+            "status": status,
+            "metadata": metadata,
+        });
+        if managed_runtime_profile_for_model(model) == Some("harbor-candle") {
+            set_metadata_string(
+                &mut endpoint_patch,
+                "provider_key",
+                "openai_compatible".to_string(),
+            );
+        }
+        self.admin_store
+            .patch_model_endpoint(endpoint_id, endpoint_patch)?;
         Ok(())
     }
 
@@ -9446,6 +9938,14 @@ fn main() {
     let conversation_path = resolve_state_path(&cli.conversations);
     let registry_store = DeviceRegistryStore::new(device_registry_path);
     let admin_store = AdminConsoleStore::new(admin_state_path, registry_store);
+    let server = Server::http(&cli.bind).unwrap_or_else(|error| {
+        eprintln!("failed to start admin api on {}: {}", cli.bind, error);
+        std::process::exit(1);
+    });
+    if let Err(error) = reconcile_stale_knowledge_index_jobs(&admin_store) {
+        eprintln!("failed to reconcile interrupted knowledge index jobs: {error}");
+        std::process::exit(1);
+    }
     let conversation_store = TaskConversationStore::new(conversation_path);
     let task_service = TaskApiService::new(admin_store.clone(), conversation_store);
     let api = AdminApi::new(
@@ -9454,11 +9954,6 @@ fn main() {
         cli.harbor_assistant_dist,
         cli.public_origin,
     );
-
-    let server = Server::http(&cli.bind).unwrap_or_else(|error| {
-        eprintln!("failed to start admin api on {}: {}", cli.bind, error);
-        std::process::exit(1);
-    });
 
     println!("HarborBeacon admin API listening on http://{}", cli.bind);
     let (request_sender, request_receiver) =
@@ -9669,6 +10164,182 @@ fn request_identity_hints(url: &str, headers: &[Header]) -> AccessIdentityHints 
             .and_then(percent_decode_optional_query_value)
             .or_else(|| std::env::var("HARBOR_HARBOROS_USER").ok()),
     }
+}
+
+fn is_gate_principal_knowledge_endpoint(method: &Method, path: &str) -> bool {
+    matches!(
+        (method, path),
+        (&Method::Post, "/api/knowledge/search")
+            | (&Method::Get, "/api/knowledge/conversations")
+            | (&Method::Patch, "/api/knowledge/conversation-settings")
+    ) || (is_knowledge_conversation_detail_path(path)
+        && matches!(method, &Method::Get | &Method::Delete))
+}
+
+fn is_knowledge_conversation_detail_path(path: &str) -> bool {
+    path.strip_prefix("/api/knowledge/conversations/")
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
+fn authenticate_gate_principal_headers(
+    configured_token: Option<&str>,
+    raw_url: &str,
+    headers: &[Header],
+    active_workspace_id: &str,
+) -> Result<GateAuthenticatedPrincipal, GatePrincipalAuthError> {
+    authenticate_gate_principal_with_workspace_loader(configured_token, raw_url, headers, || {
+        Ok(active_workspace_id.to_string())
+    })
+}
+
+fn authenticate_gate_principal_with_workspace_loader(
+    configured_token: Option<&str>,
+    raw_url: &str,
+    headers: &[Header],
+    load_active_workspace: impl FnOnce() -> Result<String, GatePrincipalAuthError>,
+) -> Result<GateAuthenticatedPrincipal, GatePrincipalAuthError> {
+    validate_gate_service_bearer(configured_token, headers)?;
+    let active_workspace_id = load_active_workspace()?;
+    authenticate_gate_principal_identity(raw_url, headers, &active_workspace_id)
+}
+
+fn validate_gate_service_bearer(
+    configured_token: Option<&str>,
+    headers: &[Header],
+) -> Result<(), GatePrincipalAuthError> {
+    let expected_token = configured_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            GatePrincipalAuthError::new(
+                StatusCode(503),
+                format!("{HARBORBEACON_WEB_API_TOKEN_ENV} is not configured"),
+            )
+        })?;
+    let actual_token = header_value(headers, "Authorization")
+        .and_then(|value| parse_bearer_token(&value))
+        .ok_or_else(|| {
+            GatePrincipalAuthError::new(StatusCode(401), "missing or invalid bearer token")
+        })?;
+    if actual_token != expected_token {
+        return Err(GatePrincipalAuthError::new(
+            StatusCode(401),
+            "missing or invalid bearer token",
+        ));
+    }
+
+    Ok(())
+}
+
+fn authenticate_gate_principal_identity(
+    raw_url: &str,
+    headers: &[Header],
+    active_workspace_id: &str,
+) -> Result<GateAuthenticatedPrincipal, GatePrincipalAuthError> {
+    const LEGACY_IDENTITY_HEADERS: &[&str] = &[
+        "X-Harbor-User-Id",
+        "X-Harbor-Open-Id",
+        "X-HarborOS-User",
+        "X-Harbor-OS-User",
+    ];
+    const LEGACY_IDENTITY_QUERY_PARAMS: &[&str] = &[
+        "user_id",
+        "open_id",
+        "harboros_user",
+        "harboros_user_id",
+        "workspace_id",
+        "principal_id",
+        "account_id",
+    ];
+    if LEGACY_IDENTITY_HEADERS
+        .iter()
+        .any(|name| request_has_header(headers, name))
+        || LEGACY_IDENTITY_QUERY_PARAMS
+            .iter()
+            .any(|name| query_has_parameter(raw_url, name))
+    {
+        return Err(GatePrincipalAuthError::new(
+            StatusCode(400),
+            "legacy identity headers and query parameters are not accepted",
+        ));
+    }
+
+    let source = required_gate_principal_header(headers, "X-Harbor-Principal-Source")?;
+    let principal_id = required_gate_principal_header(headers, "X-Harbor-Principal-Id")?;
+    let roles = required_gate_principal_header(headers, "X-Harbor-Principal-Roles")?;
+    let workspace_id = required_gate_principal_header(headers, "X-Harbor-Workspace-Id")?;
+
+    if !source.eq_ignore_ascii_case("harboros") {
+        return Err(GatePrincipalAuthError::new(
+            StatusCode(403),
+            "principal source is not allowed",
+        ));
+    }
+    let uid = principal_id
+        .strip_prefix("harboros:uid:")
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| GatePrincipalAuthError::new(StatusCode(400), "principal id is malformed"))?;
+    if uid.to_string() != principal_id["harboros:uid:".len()..] {
+        return Err(GatePrincipalAuthError::new(
+            StatusCode(400),
+            "principal id is malformed",
+        ));
+    }
+    if !roles
+        .split(',')
+        .map(str::trim)
+        .any(|role| role.eq_ignore_ascii_case("FULL_ADMIN"))
+    {
+        return Err(GatePrincipalAuthError::new(
+            StatusCode(403),
+            "FULL_ADMIN role is required",
+        ));
+    }
+    if workspace_id != active_workspace_id {
+        return Err(GatePrincipalAuthError::new(
+            StatusCode(403),
+            "principal workspace does not match the active workspace",
+        ));
+    }
+
+    Ok(GateAuthenticatedPrincipal(AccessPrincipal {
+        workspace_id,
+        user_id: principal_id.clone(),
+        display_name: principal_id,
+        role_kind: RoleKind::Admin,
+    }))
+}
+
+fn required_gate_principal_header(
+    headers: &[Header],
+    name: &str,
+) -> Result<String, GatePrincipalAuthError> {
+    header_value(headers, name).ok_or_else(|| {
+        GatePrincipalAuthError::new(
+            StatusCode(400),
+            format!("missing required principal header {name}"),
+        )
+    })
+}
+
+fn request_has_header(headers: &[Header], name: &str) -> bool {
+    headers
+        .iter()
+        .any(|header| header.field.as_str().to_string().eq_ignore_ascii_case(name))
+}
+
+fn query_has_parameter(url: &str, key: &str) -> bool {
+    url.split_once('?')
+        .map(|(_, query)| {
+            query.split('&').any(|pair| {
+                let name = pair.split_once('=').map(|(name, _)| name).unwrap_or(pair);
+                percent_decode_path_segment(name)
+                    .map(|decoded| decoded.eq_ignore_ascii_case(key))
+                    .unwrap_or_else(|_| name.eq_ignore_ascii_case(key))
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn header_value(headers: &[Header], name: &str) -> Option<String> {
@@ -10999,7 +11670,7 @@ fn add_common_headers<R: Read>(response: &mut Response<R>) {
         ("Access-Control-Allow-Headers", "Content-Type"),
         (
             "Access-Control-Allow-Methods",
-            "GET, POST, PATCH, PUT, OPTIONS",
+            "GET, POST, PATCH, PUT, DELETE, OPTIONS",
         ),
         ("Cache-Control", "no-store"),
     ] {
@@ -11036,6 +11707,10 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path.starts_with("/api/family/memory/events/")
         || path == "/api/home-guardian/activity"
         || path == "/api/knowledge/settings"
+        || path == "/api/knowledge/conversation-settings"
+        || path == "/api/knowledge/conversations"
+        || path == "/api/knowledge/suggestions"
+        || path.starts_with("/api/knowledge/conversations/")
         || path == "/api/knowledge/search"
         || path == "/api/knowledge/preview"
         || path == "/api/knowledge/index/run"
@@ -11177,7 +11852,11 @@ fn resolve_harbor_assistant_asset_path(dist_root: &Path, request_path: &str) -> 
 }
 
 fn mime_type_for_path(path: &Path) -> &'static str {
-    match path.extension().and_then(|value| value.to_str()) {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase);
+    match extension.as_deref() {
         Some("html") => "text/html; charset=utf-8",
         Some("js") => "application/javascript; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
@@ -11193,6 +11872,12 @@ fn mime_type_for_path(path: &Path) -> &'static str {
         Some("mkv") => "video/x-matroska",
         Some("webm") => "video/webm",
         Some("avi") => "video/x-msvideo",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        Some("m4a") => "audio/mp4",
+        Some("flac") => "audio/flac",
+        Some("aac") => "audio/aac",
+        Some("ogg") | Some("opus") => "audio/ogg",
         Some("ico") => "image/x-icon",
         Some("txt") => "text/plain; charset=utf-8",
         Some("md") | Some("markdown") => "text/markdown; charset=utf-8",
@@ -12266,6 +12951,11 @@ fn build_hardware_readiness_response() -> HardwareReadinessResponse {
     }
 }
 
+// NVIDIA reports many retail "16 GB" and "24 GB" cards slightly below their
+// binary GiB equivalent (for example, a 16 GB RTX 5060 Ti reports 16,311 MiB).
+// Keep the product tiers in GiB while accepting this normal reporting variance.
+const GPU_MARKETING_CAPACITY_TOLERANCE_MIB: u64 = 256;
+
 fn hardware_class_for_probe(
     cpu_count: usize,
     memory_mb: Option<u64>,
@@ -12274,13 +12964,13 @@ fn hardware_class_for_probe(
 ) -> String {
     let memory_mb = memory_mb.unwrap_or_default();
     if let Some(vram) = gpu_vram_total_mb {
-        if vram >= 48 * 1024 {
+        if vram >= 48 * 1024 - GPU_MARKETING_CAPACITY_TOLERANCE_MIB {
             return "multi_gpu_or_remote".to_string();
         }
-        if vram >= 24 * 1024 {
+        if vram >= 24 * 1024 - GPU_MARKETING_CAPACITY_TOLERANCE_MIB {
             return "gpu_24gb_plus".to_string();
         }
-        if vram >= 16 * 1024 {
+        if vram >= 16 * 1024 - GPU_MARKETING_CAPACITY_TOLERANCE_MIB {
             return "gpu_16gb".to_string();
         }
         return "low_vram_gpu".to_string();
@@ -12339,6 +13029,31 @@ fn build_knowledge_index_job(
     }
 }
 
+fn reconcile_stale_knowledge_index_jobs(store: &AdminConsoleStore) -> Result<usize, String> {
+    let mut reconciled = 0usize;
+    for mut job in store.list_knowledge_index_jobs()? {
+        if !matches!(job.status.as_str(), "queued" | "running") {
+            continue;
+        }
+        let previous_status = job.status.clone();
+        job.status = "failed".to_string();
+        job.progress_percent = Some(100);
+        job.completed_at = Some(now_unix_string());
+        job.error_message = Some(
+            "Knowledge index job was interrupted by a service restart; retry the index refresh."
+                .to_string(),
+        );
+        job.checkpoint = json!({
+            "phase": "interrupted_by_restart",
+            "previous_status": previous_status,
+            "retryable": true,
+        });
+        store.save_knowledge_index_job(job)?;
+        reconciled += 1;
+    }
+    Ok(reconciled)
+}
+
 fn queued_knowledge_root_status(root: &KnowledgeSourceRoot) -> KnowledgeIndexRootStatus {
     let mut status = knowledge_root_status(root, None);
     status.status = "queued".to_string();
@@ -12375,8 +13090,9 @@ fn run_knowledge_index_jobs(
         }
     };
 
+    let embedding_warmup_enabled = settings.retrieval.vector_weight > f32::EPSILON;
     for job in jobs {
-        run_knowledge_index_job(&store, &service, job);
+        run_knowledge_index_job(&store, &service, job, embedding_warmup_enabled);
     }
 }
 
@@ -12389,74 +13105,25 @@ fn knowledge_embedding_warmup_timeout() -> Duration {
         .unwrap_or_else(|| Duration::from_millis(DEFAULT_KNOWLEDGE_EMBEDDING_WARMUP_TIMEOUT_MS))
 }
 
-fn embedding_warmup_timeout_stats(
-    total: usize,
-    timeout: Duration,
-) -> KnowledgeEmbeddingWarmupStats {
-    KnowledgeEmbeddingWarmupStats {
-        total,
-        completed: 0,
-        skipped: 0,
-        failed: total,
-        degraded: true,
-        persist_error: None,
-        last_error: Some(format!(
-            "Embedding warmup exceeded {} ms; index completed with degraded embedding cache.",
-            timeout.as_millis()
-        )),
-    }
-}
-
 fn run_knowledge_embedding_warmup_with_timeout(
     service: &KnowledgeIndexService,
     snapshot: &KnowledgeIndexSnapshot,
     model_center_state: &AdminModelCenterState,
 ) -> KnowledgeEmbeddingWarmupStats {
     let timeout = knowledge_embedding_warmup_timeout();
-    let total = service.embedding_warmup_candidate_count(snapshot);
-    let (sender, receiver) = sync_channel(1);
-    let worker_service = service.clone();
-    let worker_snapshot = snapshot.clone();
-    let worker_model_center_state = model_center_state.clone();
-
-    if let Err(error) = thread::Builder::new()
-        .name("harborbeacon-knowledge-embedding-warmup".to_string())
-        .spawn(move || {
-            let stats =
-                worker_service.warm_embedding_cache(&worker_snapshot, &worker_model_center_state);
-            let _ = sender.try_send(stats);
-        })
-    {
-        return KnowledgeEmbeddingWarmupStats {
-            total,
-            completed: 0,
-            skipped: 0,
-            failed: total,
-            degraded: true,
-            persist_error: None,
-            last_error: Some(format!("failed to spawn embedding warmup worker: {error}")),
-        };
-    }
-
-    match receiver.recv_timeout(timeout) {
-        Ok(stats) => stats,
-        Err(RecvTimeoutError::Timeout) => embedding_warmup_timeout_stats(total, timeout),
-        Err(RecvTimeoutError::Disconnected) => KnowledgeEmbeddingWarmupStats {
-            total,
-            completed: 0,
-            skipped: 0,
-            failed: total,
-            degraded: true,
-            persist_error: None,
-            last_error: Some("Embedding warmup worker exited without returning stats.".to_string()),
-        },
-    }
+    service.warm_embedding_cache_with_deadline(
+        snapshot,
+        model_center_state,
+        Instant::now() + timeout,
+        timeout,
+    )
 }
 
 fn run_knowledge_index_job(
     store: &AdminConsoleStore,
     service: &KnowledgeIndexService,
     mut job: KnowledgeIndexJobRecord,
+    embedding_warmup_enabled: bool,
 ) {
     if knowledge_index_job_cancel_requested(store, &job.job_id) {
         cancel_knowledge_index_job(store, job, "canceled_before_start");
@@ -12506,12 +13173,21 @@ fn run_knowledge_index_job(
                 fail_knowledge_index_job(store, job, "job_state_write_failed", error);
                 return;
             }
-            let model_center_state = load_model_center_state();
-            let embedding_warmup = run_knowledge_embedding_warmup_with_timeout(
-                service,
-                &snapshot,
-                &model_center_state,
-            );
+            let embedding_warmup = if embedding_warmup_enabled {
+                let model_center_state = load_model_center_state();
+                run_knowledge_embedding_warmup_with_timeout(service, &snapshot, &model_center_state)
+            } else {
+                let total = service.embedding_warmup_candidate_count(&snapshot);
+                KnowledgeEmbeddingWarmupStats {
+                    total,
+                    completed: 0,
+                    skipped: total,
+                    failed: 0,
+                    degraded: false,
+                    persist_error: None,
+                    last_error: None,
+                }
+            };
             if knowledge_index_job_cancel_requested(store, &job.job_id) {
                 cancel_knowledge_index_job(store, job, "canceled_after_embedding_warmup");
                 return;
@@ -12646,6 +13322,10 @@ fn build_knowledge_index_status_response(
         index_root_writable,
         manifest_count: storage_summary.manifest_count,
         manifest_entry_count: storage_summary.manifest_entry_count,
+        supported_file_count: storage_summary.supported_file_count,
+        unindexed_file_count: storage_summary
+            .supported_file_count
+            .map(|count| count.saturating_sub(storage_summary.manifest_entry_count)),
         document_count: storage_summary.document_count,
         image_count: storage_summary.image_count,
         audio_count: storage_summary.audio_count,
@@ -12681,7 +13361,11 @@ fn knowledge_index_storage_summary(index_path: &Path) -> KnowledgeIndexStorageSu
         if file_name.ends_with(".embeddings.json") {
             summary.embedding_cache_count += 1;
             if let Ok(store) = load_embedding_store(&path) {
-                summary.embedding_entry_count += store.entries.len();
+                summary.embedding_entry_count += store
+                    .entries
+                    .iter()
+                    .filter(|entry| !entry.superseded)
+                    .count();
             }
             continue;
         }
@@ -12696,6 +13380,15 @@ fn knowledge_index_storage_summary(index_path: &Path) -> KnowledgeIndexStorageSu
         };
         summary.manifest_count += 1;
         summary.manifest_entry_count += manifest.entries.len();
+        summary.supported_file_count = match (
+            summary.manifest_count,
+            summary.supported_file_count,
+            manifest.supported_file_count,
+        ) {
+            (1, None, Some(count)) => Some(count),
+            (_, Some(total), Some(count)) => Some(total.saturating_add(count)),
+            _ => None,
+        };
         for indexed_entry in &manifest.entries {
             match indexed_entry.modality {
                 KnowledgeModality::Document => summary.document_count += 1,
@@ -12742,6 +13435,32 @@ fn resolve_admin_search_source_scope(
     settings: &KnowledgeSettings,
     _dvr_settings: Option<&DvrRecordingSettings>,
 ) -> Result<Vec<String>, String> {
+    let requested_root_ids = payload
+        .source_root_ids
+        .iter()
+        .filter_map(|root_id| non_empty_string(root_id))
+        .collect::<Vec<_>>();
+    if !requested_root_ids.is_empty() {
+        let mut resolved_roots = Vec::new();
+        let mut seen_root_ids = HashSet::new();
+        for root_id in requested_root_ids {
+            if !seen_root_ids.insert(root_id.clone()) {
+                continue;
+            }
+            let root = settings
+                .source_roots
+                .iter()
+                .find(|root| root.root_id == root_id && root.enabled)
+                .ok_or_else(|| {
+                    format!("Knowledge source root is not enabled or configured: {root_id}")
+                })?;
+            let path = non_empty_string(&root.path)
+                .ok_or_else(|| format!("Knowledge source root has no usable path: {root_id}"))?;
+            resolved_roots.push(path);
+        }
+        return Ok(resolved_roots);
+    }
+
     let scope = payload
         .source_scope
         .as_deref()
@@ -12778,39 +13497,153 @@ fn resolve_admin_search_source_scope(
     }
 }
 
-fn build_admin_knowledge_search_request(
+#[derive(Debug, Deserialize)]
+struct KnowledgeConversationSettingsUpdate {
+    history_limit: usize,
+    context_turn_limit: usize,
+    #[serde(default)]
+    context_token_limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct HarborAssistantConversationSummary {
+    conversation_id: String,
+    title: String,
+    updated_at: Option<String>,
+    turn_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct HarborAssistantConversationTurn {
+    task_id: String,
+    query: String,
+    answer: String,
+    created_at: Option<String>,
+    response: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct HarborAssistantConversationDetail {
+    conversation_id: String,
+    turns: Vec<HarborAssistantConversationTurn>,
+}
+
+fn build_admin_rag_answer_task_request(
+    principal: &AccessPrincipal,
     payload: KnowledgeSearchApiRequest,
-    settings: &KnowledgeSettings,
     focus_paths: Vec<String>,
-    scoped_roots: Vec<String>,
-) -> Result<KnowledgeSearchRequest, String> {
-    let query = payload.query.trim();
-    if query.is_empty() {
-        return Err("Harbor Assistant Search search requires a non-empty query.".to_string());
+    roots: Vec<String>,
+) -> TaskRequest {
+    let query = payload.query.trim().to_string();
+    let conversation_id = payload
+        .conversation_id
+        .as_deref()
+        .and_then(normalize_harbor_assistant_conversation_id)
+        .unwrap_or_else(|| "default".to_string());
+    let session_id = harbor_assistant_search_session_id(&principal.user_id, &conversation_id);
+    let mut modalities = Vec::new();
+    if payload.include_documents.unwrap_or(true) {
+        modalities.push("document");
     }
-    let configured_roots = settings.enabled_source_root_paths();
-    if configured_roots.is_empty() {
-        return Err("No enabled knowledge source roots are configured.".to_string());
+    if payload.include_audio.unwrap_or(false) {
+        modalities.push("audio");
     }
-    let mut request = KnowledgeSearchRequest::new(query.to_string());
-    request.configured_roots = configured_roots.clone();
-    request.roots = if scoped_roots.is_empty() {
-        configured_roots
-    } else {
-        scoped_roots
-    };
-    request.index_root = non_empty_string(&settings.index_root);
-    request.include_documents = payload.include_documents.unwrap_or(true);
-    request.include_images = payload.include_images.unwrap_or(true);
-    request.include_videos = payload.include_videos.unwrap_or(true);
-    request.limit = payload.limit.unwrap_or(24).clamp(1, 50);
-    request.privacy_level = settings.privacy_level;
-    request.resource_profile = settings.default_resource_profile;
-    request.retrieval = settings.retrieval.clone();
-    request.require_embeddings = false;
-    request.latency_budget_ms = None;
-    request.focus_paths = focus_paths;
-    Ok(request)
+    if payload.include_images.unwrap_or(true) {
+        modalities.push("image");
+    }
+    if payload.include_videos.unwrap_or(true) {
+        modalities.push("video");
+    }
+    TaskRequest {
+        task_id: String::new(),
+        trace_id: String::new(),
+        step_id: String::new(),
+        source: TaskSource {
+            channel: "admin_api".to_string(),
+            surface: HARBOR_ASSISTANT_SEARCH_SURFACE.to_string(),
+            conversation_id,
+            user_id: principal.user_id.clone(),
+            session_id,
+            route_key: String::new(),
+        },
+        intent: TaskIntent {
+            domain: "rag".to_string(),
+            action: "answer".to_string(),
+            raw_text: query.clone(),
+        },
+        entity_refs: Value::Null,
+        args: json!({
+            "query": query,
+            "limit": payload.limit.map(|limit| limit.clamp(1, 50)),
+            "modalities": modalities,
+            "roots": roots,
+            "focus_paths": focus_paths,
+            "use_retrieval": payload.use_retrieval,
+            "retrieval_mode": payload.retrieval_mode.as_deref().unwrap_or("auto"),
+        }),
+        autonomy: Default::default(),
+        message: None,
+    }
+}
+
+const HARBOR_ASSISTANT_SEARCH_SURFACE: &str = "harbor_assistant_search";
+
+fn normalize_harbor_assistant_conversation_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()
+        && value.len() <= 64
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_')))
+    .then(|| value.to_string())
+}
+
+fn harbor_assistant_search_session_id(user_id: &str, conversation_id: &str) -> String {
+    format!("harbor-assistant-search:{user_id}:{conversation_id}")
+}
+
+fn parse_harbor_assistant_conversation_path(path: &str) -> Option<String> {
+    let raw = path.strip_prefix("/api/knowledge/conversations/")?;
+    if raw.is_empty() || raw.contains('/') {
+        return None;
+    }
+    let decoded = percent_decode_path_segment(raw).ok()?;
+    normalize_harbor_assistant_conversation_id(&decoded)
+}
+
+fn harbor_assistant_conversation_query(task_run: &TaskRun) -> String {
+    non_empty_string(&task_run.intent_text)
+        .or_else(|| {
+            task_run
+                .args
+                .pointer("/query")
+                .and_then(Value::as_str)
+                .and_then(non_empty_string)
+        })
+        .unwrap_or_default()
+}
+
+fn harbor_assistant_conversation_turn(
+    store: &TaskConversationStore,
+    task_run: &TaskRun,
+) -> Option<HarborAssistantConversationTurn> {
+    let step = task_run
+        .metadata
+        .pointer("/step_id")
+        .and_then(Value::as_str)
+        .and_then(|step_id| store.load_task_step(step_id).ok().flatten())?;
+    let response = step.output_payload.pointer("/data")?.clone();
+    let answer = response
+        .pointer("/answer")
+        .and_then(Value::as_str)
+        .and_then(non_empty_string)?;
+    Some(HarborAssistantConversationTurn {
+        task_id: task_run.task_id.clone(),
+        query: harbor_assistant_conversation_query(task_run),
+        answer,
+        created_at: task_run.started_at.clone(),
+        response,
+    })
 }
 
 fn parse_optional_unix_seconds(value: Option<&str>, field: &str) -> Result<Option<u64>, String> {
@@ -12871,7 +13704,7 @@ fn resolve_knowledge_preview_path(
         return Err(KnowledgePreviewError::new(
             StatusCode(415),
             format!(
-                "knowledge preview supports images, videos, text, and Markdown only: {}",
+                "knowledge preview supports images, videos, audio, text, and Markdown only: {}",
                 requested.display()
             ),
         ));
@@ -12949,6 +13782,7 @@ fn knowledge_preview_mime_supported(path: &Path) -> bool {
     let mime = mime_type_for_path(path);
     mime.starts_with("image/")
         || mime.starts_with("video/")
+        || mime.starts_with("audio/")
         || mime.starts_with("text/plain")
         || mime.starts_with("text/markdown")
 }
@@ -16044,7 +16878,8 @@ fn build_model_capability_status(
         model_kind,
     );
     let runtime_ready = model_capability_runtime_ready(model_kind, runtime, runtime_bound);
-    let selected_model_id = selected_model_id_for_capability(model_state, capability_id);
+    let assignment = model_capability_assignment(model_state, capability_id);
+    let desired_model_id = assignment.map(|value| value.desired_model_id.clone());
     let installable_models = catalog_models
         .iter()
         .filter(|model| {
@@ -16088,7 +16923,7 @@ fn build_model_capability_status(
     let installed_model = catalog_models
         .iter()
         .find(|model| {
-            selected_model_id
+            desired_model_id
                 .as_ref()
                 .is_some_and(|selected| selected == &model.model_id)
         })
@@ -16124,12 +16959,35 @@ fn build_model_capability_status(
         .as_ref()
         .map(|status| status.next_action.clone());
     let runtime_missing = required_runtime_profile.is_some() && !runtime_installed;
-    let endpoint_ready = endpoint.is_some_and(|value| value.status == ModelEndpointStatus::Active);
-    let ready = if runtime_bound {
-        runtime_ready
-    } else {
-        endpoint_ready
-    };
+    let endpoint_runtime_model = endpoint.and_then(probe_local_endpoint_runtime_model);
+    let projected_runtime_model = runtime_ready
+        .then(|| runtime_model_name_for_kind(model_kind, runtime))
+        .flatten();
+    let cloud_runtime_model = endpoint
+        .filter(|value| {
+            value.endpoint_kind == ModelEndpointKind::Cloud
+                && value.status == ModelEndpointStatus::Active
+        })
+        .and_then(|value| non_empty_string(&value.model_name));
+    let cloud_runtime_ready = cloud_runtime_model.is_some();
+    let runtime_model_id = endpoint_runtime_model
+        .as_ref()
+        .map(|model| model.model_id.clone())
+        .or(projected_runtime_model)
+        .or(cloud_runtime_model);
+    let runtime_model_loaded = endpoint_runtime_model
+        .as_ref()
+        .map(|model| model.loaded)
+        .unwrap_or_else(|| match (cloud_runtime_ready, model_kind) {
+            (true, _) => true,
+            (false, ModelKind::Llm) => runtime.chat_model_loaded.unwrap_or(runtime_ready),
+            (false, ModelKind::Embedder) => runtime.embedding_model_loaded.unwrap_or(runtime_ready),
+            (false, _) => runtime_model_id.is_some(),
+        });
+    // Capability readiness and the displayed serving model must come from the
+    // same runtime evidence. In particular, an external vLLM can serve LLM
+    // requests while the embedded Candle runtime is intentionally inactive.
+    let ready = runtime_model_id.is_some() && runtime_model_loaded;
     let unsupported =
         endpoint.is_none() && installable_models.is_empty() && capability_jobs.is_empty();
     let status = if ready {
@@ -16150,18 +17008,32 @@ fn build_model_capability_status(
         "needs_model"
     }
     .to_string();
-    let current_model = (status != "needs_model")
-        .then(|| {
-            endpoint.map(|endpoint| ModelCapabilityCurrentModel {
-                model_endpoint_id: endpoint.model_endpoint_id.clone(),
-                model_name: runtime_model_name_for_kind(model_kind, runtime)
-                    .unwrap_or_else(|| endpoint.model_name.clone()),
-                provider_key: endpoint.provider_key.clone(),
-                status: endpoint.status.as_str().to_string(),
-            })
+    // Local endpoint metadata and persisted capability assignments describe
+    // intent, not what is currently loaded, so they must not become runtime
+    // truth.
+    let active_model_id = runtime_model_id
+        .as_ref()
+        .and_then(|identity| canonical_catalog_model_id(identity, catalog_models));
+    let transition_status = assignment
+        .map(|value| value.transition_status.as_str())
+        .filter(|value| matches!(*value, "loading" | "failed"))
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if ready && active_model_id.is_some() {
+                "ready"
+            } else {
+                "unknown"
+            }
+            .to_string()
+        });
+    let current_model = active_model_id.as_ref().and_then(|active_model_id| {
+        endpoint.map(|endpoint| ModelCapabilityCurrentModel {
+            model_endpoint_id: endpoint.model_endpoint_id.clone(),
+            model_name: active_model_id.clone(),
+            provider_key: endpoint.provider_key.clone(),
+            status: endpoint.status.as_str().to_string(),
         })
-        .flatten();
-    let runtime_model_id = runtime_model_name_for_kind(model_kind, runtime);
+    });
     let policy = find_route_policy(route_policies, route_policy_id);
     let next_action = match status.as_str() {
         "ready" => "可以使用".to_string(),
@@ -16169,6 +17041,9 @@ fn build_model_capability_status(
         "needs_runtime" => runtime_next_action
             .clone()
             .unwrap_or_else(|| "安装 Harbor-managed runtime".to_string()),
+        "installed_not_running" if runtime_model_id.is_some() => {
+            "运行时已就绪，首次请求时按需加载模型".to_string()
+        }
         "installed_not_running" => "模型已安装，点击选择会自动切换并启动".to_string(),
         "unsupported" => "暂不支持该能力".to_string(),
         "degraded" => runtime
@@ -16182,6 +17057,7 @@ fn build_model_capability_status(
         format!("route_policy_status={}", policy_status_value(policy)),
         format!("runtime_bound={runtime_bound}"),
         format!("runtime_ready={runtime_ready}"),
+        format!("runtime_model_loaded={runtime_model_loaded}"),
     ];
     if let Some(profile) = required_runtime_profile {
         evidence.push(format!("required_runtime_profile={profile}"));
@@ -16208,7 +17084,11 @@ fn build_model_capability_status(
         label: label.to_string(),
         model_kind: model_kind.as_str().to_string(),
         status,
-        selected_model_id,
+        desired_model_id: desired_model_id.clone(),
+        active_model_id: active_model_id.clone(),
+        transition_status,
+        last_error: assignment.and_then(|value| value.last_error.clone()),
+        selected_model_id: desired_model_id,
         runtime_model_id,
         current_model,
         installed_models,
@@ -16305,9 +17185,12 @@ fn local_model_catalog_specs() -> Vec<LocalModelCatalogSpec> {
             repo_id: Some("Qwen/Qwen3-Embedding-0.6B"),
             revision: "main",
             file_policy: "runtime_snapshot",
-            runtime_profiles: &["openai-compatible-embedding"],
+            runtime_profiles: &[
+                "llama-cpp-openai-compatible-embedding",
+                "openai-compatible-embedding",
+            ],
             expected_capabilities: &["embedding"],
-            acceptance_note: Some("retrieval-quality-upgrade"),
+            acceptance_note: Some("llama-cpp-retrieval-quality-upgrade"),
         },
         LocalModelCatalogSpec {
             model_id: "Qwen/Qwen2.5-0.5B-Instruct",
@@ -16678,16 +17561,182 @@ fn catalog_model_matches_kind_or_capability(
             .any(|capability| capability.eq_ignore_ascii_case(capability_id))
 }
 
-fn selected_model_id_for_capability(
-    model_state: &AdminModelCenterState,
+fn model_capability_assignment<'a>(
+    model_state: &'a AdminModelCenterState,
     capability_id: &str,
-) -> Option<String> {
+) -> Option<&'a harborbeacon_local_agent::runtime::admin_console::ModelCapabilityBindingRecord> {
     model_state
         .capability_bindings
         .iter()
         .find(|binding| binding.capability_id == capability_id)
-        .map(|binding| binding.model_id.clone())
-        .and_then(|model_id| non_empty_string(&model_id))
+}
+
+fn canonical_catalog_model_id(
+    runtime_identity: &str,
+    catalog_models: &[LocalModelCatalogItem],
+) -> Option<String> {
+    let identity = runtime_identity.trim();
+    catalog_models
+        .iter()
+        .find(|model| {
+            model.model_id == identity
+                || model
+                    .local_path
+                    .as_deref()
+                    .is_some_and(|local_path| local_path == identity)
+        })
+        .map(|model| model.model_id.clone())
+        .or_else(|| non_empty_string(identity))
+}
+
+fn configured_external_runtime_model_id(
+    endpoints: &[ModelEndpoint],
+    catalog_models: &[LocalModelCatalogItem],
+    model_kind: ModelKind,
+    desired_model_id: &str,
+) -> Option<String> {
+    endpoints
+        .iter()
+        .filter(|endpoint| {
+            endpoint.endpoint_kind == ModelEndpointKind::Local
+                && endpoint.status == ModelEndpointStatus::Active
+                && endpoint.model_kind == model_kind
+                && endpoint
+                    .provider_key
+                    .eq_ignore_ascii_case("openai_compatible")
+        })
+        .find_map(|endpoint| {
+            let runtime_model_id = probe_local_openai_compatible_serving_model(endpoint)?;
+            let canonical_model_id = canonical_catalog_model_id(&runtime_model_id, catalog_models)?;
+            (canonical_model_id == desired_model_id).then_some(runtime_model_id)
+        })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProbedEndpointRuntimeModel {
+    model_id: String,
+    loaded: bool,
+}
+
+fn probe_local_openai_compatible_serving_model(endpoint: &ModelEndpoint) -> Option<String> {
+    probe_local_endpoint_runtime_model(endpoint).map(|model| model.model_id)
+}
+
+fn probe_local_endpoint_runtime_model(
+    endpoint: &ModelEndpoint,
+) -> Option<ProbedEndpointRuntimeModel> {
+    if endpoint.endpoint_kind != ModelEndpointKind::Local
+        || endpoint.status != ModelEndpointStatus::Active
+    {
+        return None;
+    }
+    let base_url = metadata_string_value(&endpoint.metadata, "base_url")?;
+    let normalized = base_url.trim().trim_end_matches('/');
+    if !(normalized.starts_with("http://127.0.0.1:") || normalized.starts_with("http://localhost:"))
+    {
+        return None;
+    }
+    let models_url = if normalized.ends_with("/v1") {
+        format!("{normalized}/models")
+    } else {
+        format!("{normalized}/v1/models")
+    };
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .ok()?;
+    let mut request = client.get(models_url);
+    if let Some(api_key) = metadata_string_value(&endpoint.metadata, "api_key")
+        .filter(|value| !value.trim().is_empty())
+    {
+        request = request.bearer_auth(api_key);
+    }
+    if let Ok(payload) = request.send().and_then(|response| response.json::<Value>()) {
+        if let Some(model_id) = payload
+            .get("data")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find_map(|model| model.get("id").and_then(Value::as_str))
+            .and_then(non_empty_string)
+        {
+            return Some(ProbedEndpointRuntimeModel {
+                model_id,
+                loaded: true,
+            });
+        }
+    }
+    if endpoint.model_kind == ModelKind::Embedder {
+        let info_base_url = normalized.strip_suffix("/v1").unwrap_or(normalized);
+        let mut info_request = client.get(format!("{info_base_url}/info"));
+        if let Some(api_key) = metadata_string_value(&endpoint.metadata, "api_key")
+            .filter(|value| !value.trim().is_empty())
+        {
+            info_request = info_request.bearer_auth(api_key);
+        }
+        if let Some(model_id) = info_request
+            .send()
+            .ok()
+            .and_then(|response| response.error_for_status().ok())
+            .and_then(|response| response.json::<Value>().ok())
+            .filter(|info| info.pointer("/model_type/embedding").is_some())
+            .and_then(|_| {
+                metadata_string_value(&endpoint.metadata, "catalog_model_id")
+                    .or_else(|| metadata_string_value(&endpoint.metadata, "model"))
+                    .or_else(|| non_empty_string(&endpoint.model_name))
+            })
+        {
+            return Some(ProbedEndpointRuntimeModel {
+                model_id,
+                loaded: true,
+            });
+        }
+    }
+
+    let healthz_url = metadata_string_value(&endpoint.metadata, "healthz_url")?;
+    let mut health_request = client.get(healthz_url);
+    if let Some(api_key) = metadata_string_value(&endpoint.metadata, "api_key")
+        .filter(|value| !value.trim().is_empty())
+    {
+        health_request = health_request.bearer_auth(api_key);
+    }
+    let health = health_request
+        .send()
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json::<Value>()
+        .ok()?;
+    if !health
+        .get("ready")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || !health
+            .pointer("/backend/ready")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return None;
+    }
+    let (model_field, loaded_field) = match endpoint.model_kind {
+        ModelKind::Llm => ("chat_model", "/backend/chat_model_loaded"),
+        ModelKind::Embedder => ("embedding_model", "/backend/embedding_model_loaded"),
+        _ => return None,
+    };
+    let model_id = health
+        .get(model_field)
+        .and_then(Value::as_str)
+        .and_then(non_empty_string)?;
+    let loaded = health
+        .pointer(loaded_field)
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            health
+                .pointer("/backend/model_loaded")
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(true);
+    Some(ProbedEndpointRuntimeModel { model_id, loaded })
 }
 
 fn model_capability_installable_model(
@@ -18598,6 +19647,12 @@ fn probe_local_model_runtime(endpoints: &[ModelEndpoint]) -> LocalModelRuntimePr
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string),
+        chat_model_loaded: payload
+            .pointer("/backend/chat_model_loaded")
+            .and_then(Value::as_bool),
+        embedding_model_loaded: payload
+            .pointer("/backend/embedding_model_loaded")
+            .and_then(Value::as_bool),
         note: payload
             .get("note")
             .and_then(Value::as_str)
@@ -18623,7 +19678,9 @@ fn overlay_model_endpoints_with_runtime_truth(
             let mut projection_mismatch = false;
 
             if let Some(default_endpoint) = builtin_defaults.get(&overlayed.model_endpoint_id) {
-                if is_builtin_local_openai_endpoint(default_endpoint) {
+                if is_builtin_local_openai_endpoint(default_endpoint)
+                    && !model_endpoint_uses_external_runtime(&overlayed)
+                {
                     let legacy_base_url = metadata_string_value(&overlayed.metadata, "base_url")
                         .is_some_and(|value| is_legacy_model_api_url(&value));
                     if metadata_missing_or_empty(&overlayed.metadata, "base_url") || legacy_base_url
@@ -19262,6 +20319,35 @@ fn is_builtin_local_openai_endpoint(endpoint: &ModelEndpoint) -> bool {
         )
 }
 
+fn model_endpoint_uses_external_runtime(endpoint: &ModelEndpoint) -> bool {
+    let backend_kind = metadata_string_value(&endpoint.metadata, "runtime_backend_kind")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(
+        backend_kind.as_str(),
+        "vllm" | "sglang" | "openai_proxy" | "llama.cpp" | "llamacpp"
+    ) {
+        return true;
+    }
+    endpoint
+        .metadata
+        .get("runtime_profiles")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(|profile| {
+            matches!(
+                profile.trim().to_ascii_lowercase().as_str(),
+                "vllm-openai-compatible"
+                    | "sglang-openai-compatible"
+                    | "llama.cpp-openai-compatible"
+                    | "openai-compatible-embedding"
+                    | "openai-compatible-vlm"
+            )
+        })
+}
+
 fn infer_healthz_url(base_url: &str) -> String {
     let trimmed = base_url.trim().trim_end_matches('/');
     if let Some(prefix) = trimmed.strip_suffix("/v1") {
@@ -19425,6 +20511,117 @@ fn parse_connected_device(data: &Value) -> Result<CameraDevice, String> {
 fn non_empty_string(value: &str) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn build_knowledge_suggestions(
+    mut entries: Vec<KnowledgeIndexEntry>,
+    limit: usize,
+) -> Vec<KnowledgeSuggestion> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    entries.sort_by(|left, right| {
+        right
+            .file_signature
+            .modified_unix_millis
+            .cmp(&left.file_signature.modified_unix_millis)
+            .then(left.path.cmp(&right.path))
+    });
+
+    let mut suggestions = Vec::new();
+    let mut used_modalities = HashSet::new();
+    let mut used_subjects = HashSet::new();
+    for prefer_new_modality in [true, false] {
+        for entry in &entries {
+            if suggestions.len() >= limit {
+                break;
+            }
+            if prefer_new_modality && used_modalities.contains(&entry.modality) {
+                continue;
+            }
+            let subject = knowledge_suggestion_subject(entry);
+            let normalized_subject = subject.to_lowercase();
+            if subject.is_empty() || used_subjects.contains(&normalized_subject) {
+                continue;
+            }
+            let (kind, filter) = match entry.modality {
+                KnowledgeModality::Document => ("summarize", "text"),
+                KnowledgeModality::Audio => ("summarize", "audio"),
+                KnowledgeModality::Image => ("describe", "images"),
+                KnowledgeModality::Video => ("describe", "videos"),
+            };
+            suggestions.push(KnowledgeSuggestion {
+                subject,
+                kind: kind.to_string(),
+                filter: filter.to_string(),
+            });
+            used_modalities.insert(entry.modality);
+            used_subjects.insert(normalized_subject);
+        }
+    }
+    suggestions
+}
+
+fn knowledge_suggestion_subject(entry: &KnowledgeIndexEntry) -> String {
+    let title = entry.title.trim();
+    let section = entry
+        .chunks
+        .iter()
+        .flat_map(|chunk| chunk.section_path.iter().rev())
+        .map(|value| value.trim())
+        .find(|value| !value.is_empty() && !value.eq_ignore_ascii_case(title));
+    let semantic_subject = entry
+        .text_sources
+        .iter()
+        .map(|source| source.text.as_str())
+        .chain(entry.chunks.iter().map(|chunk| chunk.text.as_str()))
+        .find_map(compact_knowledge_suggestion_text);
+    let subject = match (entry.modality, title.is_empty(), section, semantic_subject) {
+        (_, _, _, Some(subject)) => subject,
+        (KnowledgeModality::Document, false, Some(section), None) => {
+            format!("{title} — {section}")
+        }
+        (_, false, _, None) => title.to_string(),
+        (_, true, Some(section), None) => section.to_string(),
+        (_, true, None, None) => return String::new(),
+    };
+    subject.chars().take(72).collect()
+}
+
+fn compact_knowledge_suggestion_text(text: &str) -> Option<String> {
+    let visible = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("<!--"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut visible = visible.trim();
+    if visible.starts_with('[') {
+        if let Some(end) = visible.find(']') {
+            visible = visible[(end + 1)..].trim();
+        }
+    }
+    if visible.to_ascii_lowercase().starts_with("keyframe ") {
+        if let Some(end) = visible.find(':') {
+            visible = visible[(end + 1)..].trim();
+        }
+    }
+    let visible = visible.trim_matches(|ch| matches!(ch, '"' | '\'' | '“' | '”' | '‘' | '’'));
+    if visible.is_empty() {
+        return None;
+    }
+    let boundary = visible
+        .char_indices()
+        .find(|(index, ch)| {
+            *index >= 12 && matches!(ch, '。' | '！' | '？' | '；' | ',' | '，' | ';' | '!' | '?')
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(visible.len());
+    let compact = visible[..boundary]
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '“' | '”' | '‘' | '’'));
+    let compact = compact.chars().take(56).collect::<String>();
+    (!compact.is_empty()).then_some(compact)
 }
 
 fn looks_redacted_secret(value: &str) -> bool {
@@ -20368,31 +21565,34 @@ fn normalize_live_session_started_at(started_at: Option<String>) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_bridge_provider_binding_projection, authorize_gateway_service_request,
-        build_admin_knowledge_search_request, build_default_notification_target_readiness,
+        apply_bridge_provider_binding_projection, authenticate_gate_principal_headers,
+        authenticate_gate_principal_with_workspace_loader, authorize_gateway_service_request,
+        build_admin_rag_answer_task_request, build_default_notification_target_readiness,
         build_dvr_recording_action_response, build_feature_availability_response,
         build_files_browse_response, build_harboros_im_capability_map,
         build_harboros_status_response, build_hardware_readiness_response,
         build_home_assistant_operator_audit, build_home_assistant_status_response_with_link,
         build_inference_health_alias_response, build_knowledge_index_job,
-        build_knowledge_index_status_response, build_local_model_catalog,
-        build_local_vision_event_notification_blocked_response, build_model_capabilities_response,
-        build_outreach_delivery_notification_request, build_rag_readiness_response,
-        build_redacted_diagnostics_bundle, build_release_readiness_response,
-        build_rtsp_url_from_patch, current_epoch_secs, default_model_download_target_path,
-        default_model_download_target_path_in_root, default_model_endpoints,
-        dvr_timeline_segment_from_harborlink, embedding_warmup_timeout_stats,
-        ensure_local_admin_access, ensure_local_camera_access,
-        harbor_assistant_build_missing_response, hardware_class_for_probe, has_forwarding_headers,
+        build_knowledge_index_status_response, build_knowledge_suggestions,
+        build_local_model_catalog, build_local_vision_event_notification_blocked_response,
+        build_model_capabilities_response, build_outreach_delivery_notification_request,
+        build_rag_readiness_response, build_redacted_diagnostics_bundle,
+        build_release_readiness_response, build_rtsp_url_from_patch, current_epoch_secs,
+        default_model_download_target_path, default_model_download_target_path_in_root,
+        default_model_endpoints, dvr_timeline_segment_from_harborlink, ensure_local_admin_access,
+        ensure_local_camera_access, harbor_assistant_build_missing_response,
+        harbor_assistant_search_session_id, hardware_class_for_probe, has_forwarding_headers,
         huggingface_download_should_fallback_to_plain_http, huggingface_resolve_url,
-        identity_query_suffix, is_admin_surface_path, is_harbor_assistant_client_route,
-        is_harbor_assistant_surface_path, knowledge_preview_mime_supported,
-        latest_model_download_jobs, live_bridge_provider_from_setup_status,
-        local_model_catalog_item, local_model_catalog_specs, mime_type_for_path,
-        model_download_huggingface_endpoint, model_download_huggingface_endpoints,
-        model_download_jobs_status, model_hardware_recommendation, model_snapshot_file_allowed,
-        normalize_detection_job_start, normalize_unified_admin_path,
-        notification_delivery_error_to_harbor_app_error,
+        identity_query_suffix, is_admin_surface_path, is_gate_principal_knowledge_endpoint,
+        is_harbor_assistant_client_route, is_harbor_assistant_surface_path,
+        knowledge_preview_mime_supported, latest_model_download_jobs,
+        live_bridge_provider_from_setup_status, local_model_catalog_item,
+        local_model_catalog_specs, mime_type_for_path, model_download_huggingface_endpoint,
+        model_download_huggingface_endpoints, model_download_jobs_status,
+        model_endpoint_uses_external_runtime, model_hardware_recommendation,
+        model_snapshot_file_allowed, normalize_detection_job_start,
+        normalize_harbor_assistant_conversation_id, normalize_unified_admin_path,
+        normalize_unified_admin_url, notification_delivery_error_to_harbor_app_error,
         overlay_model_endpoints_with_runtime_truth, parse_approval_decision_path,
         parse_camera_analyze_path, parse_camera_hls_live_renew_path,
         parse_camera_hls_live_start_path, parse_camera_hls_live_status_path,
@@ -20403,34 +21603,36 @@ mod tests {
         parse_device_credential_status_path, parse_device_credentials_path,
         parse_device_evidence_path, parse_device_metadata_patch_path, parse_device_rtsp_check_path,
         parse_device_validation_run_path, parse_harbor_app_lifecycle_path, parse_harbor_app_path,
-        parse_json_body_limited, parse_knowledge_index_job_cancel_path,
-        parse_local_vision_event_notify_path, parse_member_default_delivery_surface_update_path,
-        parse_member_role_update_path, parse_model_download_cancel_path,
-        parse_model_download_job_path, parse_model_endpoint_path, parse_model_endpoint_test_path,
-        parse_model_runtime_install_path, parse_notification_target_delete_path,
-        parse_optional_unix_seconds, parse_share_link_revoke_path,
-        parse_shared_camera_live_page_path, parse_shared_camera_live_stream_path,
-        parse_static_byte_range, percent_decode_path_segment, preview_static_file_response,
-        probe_local_model_runtime, prune_detection_job_history, redact_account_management_snapshot,
+        parse_harbor_assistant_conversation_path, parse_json_body_limited,
+        parse_knowledge_index_job_cancel_path, parse_local_vision_event_notify_path,
+        parse_member_default_delivery_surface_update_path, parse_member_role_update_path,
+        parse_model_download_cancel_path, parse_model_download_job_path, parse_model_endpoint_path,
+        parse_model_endpoint_test_path, parse_model_runtime_install_path,
+        parse_notification_target_delete_path, parse_optional_unix_seconds,
+        parse_share_link_revoke_path, parse_shared_camera_live_page_path,
+        parse_shared_camera_live_stream_path, parse_static_byte_range, percent_decode_path_segment,
+        preview_static_file_response, probe_local_model_runtime,
+        probe_local_openai_compatible_serving_model, prune_detection_job_history,
+        reconcile_stale_knowledge_index_jobs, redact_account_management_snapshot,
         redact_admin_string, redact_bridge_provider_config, redact_camera_device_projection,
         redact_model_endpoint_response, redact_state_snapshot, redact_stream_url_credentials,
         redact_value_stream_credentials, redacted_general_message_nsp_route_summary,
         redacted_home_assistant_task_api_event_summary, release_item, request_identity_hints,
-        resolve_harbor_assistant_asset_path, resolve_knowledge_preview_path,
-        run_knowledge_index_jobs, run_model_download_job, run_model_download_transfer,
-        sanitized_outreach_delivery_request_audit, service_overloaded_response,
-        snapshot_artifact_from_task_response, url_encode_path_segment,
+        resolve_admin_search_source_scope, resolve_harbor_assistant_asset_path,
+        resolve_knowledge_preview_path, run_knowledge_index_jobs, run_model_download_job,
+        run_model_download_transfer, sanitized_outreach_delivery_request_audit,
+        service_overloaded_response, snapshot_artifact_from_task_response, url_encode_path_segment,
         validate_home_assistant_service_fields, validate_home_assistant_service_smoke,
         validate_outreach_delivery_request, AdminApi, CameraLiveSessionProjection,
         CameraStreamProfile, DetectionJobProjection, DetectionJobRuntime, DetectionJobStartRequest,
-        HarborLinkHomeAssistantStatus, HarborLinkLiveSession, HarborLinkMediaClient,
-        HarborLinkRecordingArtifact, HarborLinkRecordingStatus, HomeAssistantServiceSmokeRequest,
-        HomeGuardianEvaluationQueue, KnowledgeSearchApiRequest, LocalModelRuntimeProjection,
-        ManualAddRequest, ModelRuntimeActivationRequest, ModelRuntimeActivationResult,
-        OutreachDeliveryRecipientRequest, OutreachDeliveryRequest, VisionIngestLimiter,
-        DEFAULT_HF_ENDPOINT, HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS,
-        HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS, MAX_DETECTION_JOB_HISTORY,
-        MAX_VISION_EVENT_INGEST_INFLIGHT, PRIVACY_GATEWAY_AUDIT_ACTION,
+        GateAuthenticatedPrincipal, HarborLinkHomeAssistantStatus, HarborLinkLiveSession,
+        HarborLinkMediaClient, HarborLinkRecordingArtifact, HarborLinkRecordingStatus,
+        HomeAssistantServiceSmokeRequest, HomeGuardianEvaluationQueue, KnowledgeSearchApiRequest,
+        LocalModelRuntimeProjection, ManualAddRequest, ModelRuntimeActivationRequest,
+        ModelRuntimeActivationResult, OutreachDeliveryRecipientRequest, OutreachDeliveryRequest,
+        VisionIngestLimiter, DEFAULT_HF_ENDPOINT, HARBOR_ASSISTANT_SEARCH_SURFACE,
+        HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS, HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS,
+        MAX_DETECTION_JOB_HISTORY, MAX_VISION_EVENT_INGEST_INFLIGHT, PRIVACY_GATEWAY_AUDIT_ACTION,
     };
     use harborbeacon_local_agent::connectors::notifications::{
         NotificationDeliveryError, NotificationDestinationKind, NotificationRecipientIdType,
@@ -20447,6 +21649,7 @@ mod tests {
     use harborbeacon_local_agent::control_plane::models::{
         ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, PrivacyLevel,
     };
+    use harborbeacon_local_agent::control_plane::tasks::ConversationSession;
     use harborbeacon_local_agent::control_plane::users::{MembershipStatus, RoleKind};
     use harborbeacon_local_agent::orchestrator::executors::harbor_apps::HarborAppLifecycleAction;
     use harborbeacon_local_agent::runtime::access_control::{
@@ -20461,7 +21664,8 @@ mod tests {
     use harborbeacon_local_agent::runtime::dvr::DvrRecordingSettings;
     use harborbeacon_local_agent::runtime::hub::CameraHubService;
     use harborbeacon_local_agent::runtime::knowledge_index::{
-        KnowledgeIndexConfig, KnowledgeIndexService,
+        KnowledgeFileSignature, KnowledgeIndexChunk, KnowledgeIndexConfig, KnowledgeIndexEntry,
+        KnowledgeIndexService, KnowledgeIndexTextSource, KnowledgeModality,
     };
     use harborbeacon_local_agent::runtime::privacy_gateway::PRIVACY_GATEWAY_POLICY_VERSION;
     use harborbeacon_local_agent::runtime::registry::{CameraDevice, DeviceRegistryStore};
@@ -20482,13 +21686,13 @@ mod tests {
     use std::sync::mpsc::sync_channel;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn hf_endpoint_env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
-    use tiny_http::{Header, StatusCode};
+    use tiny_http::{Header, Method, StatusCode};
 
     #[test]
     fn parse_json_body_limited_blocks_oversized_payload() {
@@ -22346,6 +23550,7 @@ mod tests {
         assert!(is_admin_surface_path("/api/account-management"));
         assert!(is_admin_surface_path("/api/gateway/status"));
         assert!(is_admin_surface_path("/api/knowledge/search"));
+        assert!(!is_admin_surface_path("/api/knowledge/answer"));
         assert!(is_admin_surface_path("/api/knowledge/preview"));
         assert!(is_admin_surface_path("/api/share-links"));
         assert!(is_admin_surface_path("/api/models/endpoints"));
@@ -22553,6 +23758,27 @@ mod tests {
             mime_type_for_path(Path::new("C:/tmp/clip.webm")),
             "video/webm"
         );
+        assert_eq!(
+            mime_type_for_path(Path::new("C:/tmp/meeting.mp3")),
+            "audio/mpeg"
+        );
+        assert_eq!(
+            mime_type_for_path(Path::new("C:/tmp/recording.flac")),
+            "audio/flac"
+        );
+        assert_eq!(
+            mime_type_for_path(Path::new("C:/tmp/VOICE.MP3")),
+            "audio/mpeg"
+        );
+        for audio in [
+            "voice.wav",
+            "voice.m4a",
+            "voice.aac",
+            "voice.ogg",
+            "voice.opus",
+        ] {
+            assert!(knowledge_preview_mime_supported(Path::new(audio)));
+        }
         assert!(knowledge_preview_mime_supported(Path::new(
             "C:/tmp/photo.webp"
         )));
@@ -22633,6 +23859,44 @@ mod tests {
         assert_eq!(invalid_content_range.as_deref(), Some("bytes */10"));
 
         fs::remove_file(path).expect("remove preview fixture");
+    }
+
+    #[test]
+    fn audio_preview_supports_full_and_range_responses() {
+        for (extension, mime) in [("mp3", "audio/mpeg"), ("flac", "audio/flac")] {
+            let path = unique_store_path("knowledge-audio-preview").with_extension(extension);
+            fs::write(&path, b"0123456789").expect("write audio fixture");
+
+            let full = preview_static_file_response(&path, None);
+            assert_eq!(full.status_code(), StatusCode(200));
+            assert_eq!(
+                full.headers()
+                    .iter()
+                    .find(|header| header
+                        .field
+                        .as_str()
+                        .to_string()
+                        .eq_ignore_ascii_case("Content-Type"))
+                    .map(|header| header.value.as_str().to_string()),
+                Some(mime.to_string())
+            );
+
+            let ranged = preview_static_file_response(&path, Some("bytes=1-3"));
+            assert_eq!(ranged.status_code(), StatusCode(206));
+            assert_eq!(
+                ranged
+                    .headers()
+                    .iter()
+                    .find(|header| header
+                        .field
+                        .as_str()
+                        .to_string()
+                        .eq_ignore_ascii_case("Content-Range"))
+                    .map(|header| header.value.as_str().to_string()),
+                Some("bytes 1-3/10".to_string())
+            );
+            fs::remove_file(path).expect("remove audio fixture");
+        }
     }
 
     #[test]
@@ -23202,6 +24466,20 @@ mod tests {
             .iter()
             .any(|profile| profile == "harbor-candle"));
 
+        let qwen_embedding = catalog
+            .models
+            .iter()
+            .find(|item| item.model_id == "Qwen/Qwen3-Embedding-0.6B")
+            .expect("qwen embedding catalog model");
+        assert!(qwen_embedding
+            .runtime_profiles
+            .iter()
+            .any(|profile| profile == "llama-cpp-openai-compatible-embedding"));
+        assert_eq!(
+            qwen_embedding.acceptance_note.as_deref(),
+            Some("llama-cpp-retrieval-quality-upgrade")
+        );
+
         let smolvlm = catalog
             .models
             .iter()
@@ -23260,6 +24538,14 @@ mod tests {
         assert_eq!(
             hardware_class_for_probe(8, Some(32_000), true, Some(16_384)),
             "gpu_16gb"
+        );
+        assert_eq!(
+            hardware_class_for_probe(8, Some(32_000), true, Some(16_311)),
+            "gpu_16gb"
+        );
+        assert_eq!(
+            hardware_class_for_probe(8, Some(32_000), true, Some(16_127)),
+            "low_vram_gpu"
         );
 
         let mut hardware = build_hardware_readiness_response();
@@ -23368,6 +24654,140 @@ mod tests {
         assert!(router.runtime_installable);
         assert_eq!(router.next_action, "选择或安装模型");
         assert!(router.current_model.is_none());
+    }
+
+    #[test]
+    fn knowledge_suggestions_use_current_index_subjects_and_diverse_modalities() {
+        let entry = |title: &str, section: &str, modality: KnowledgeModality, modified| {
+            KnowledgeIndexEntry {
+                modality,
+                path: format!("/knowledge/{title}"),
+                title: title.to_string(),
+                searchable_text: section.to_string(),
+                parent_chunks: Vec::new(),
+                chunks: vec![KnowledgeIndexChunk {
+                    section_path: vec![section.to_string()],
+                    ..KnowledgeIndexChunk::default()
+                }],
+                text_sources: vec![KnowledgeIndexTextSource {
+                    source_kind: "test".to_string(),
+                    source_path: None,
+                    provider_key: None,
+                    text: section.to_string(),
+                }],
+                sidecar_path: None,
+                file_signature: KnowledgeFileSignature {
+                    modified_unix_millis: modified,
+                    size_bytes: 100,
+                },
+                sidecar_signature: None,
+                processing_warnings: Vec::new(),
+                parser_key: None,
+                requires_advanced_parser: false,
+            }
+        };
+        let suggestions = build_knowledge_suggestions(
+            vec![
+                entry(
+                    "家庭旅行计划.md",
+                    "行程安排",
+                    KnowledgeModality::Document,
+                    30,
+                ),
+                entry(
+                    "花园春景.jpg",
+                    "花园里的郁金香",
+                    KnowledgeModality::Image,
+                    20,
+                ),
+                entry("会议记录.md", "预算讨论", KnowledgeModality::Document, 10),
+            ],
+            4,
+        );
+
+        assert_eq!(suggestions.len(), 3);
+        assert_eq!(suggestions[0].subject, "行程安排");
+        assert_eq!(suggestions[0].filter, "text");
+        assert_eq!(suggestions[1].subject, "花园里的郁金香");
+        assert_eq!(suggestions[1].filter, "images");
+        assert_eq!(suggestions[2].subject, "预算讨论");
+    }
+
+    #[test]
+    fn model_capabilities_do_not_treat_persisted_assignment_as_runtime_truth() {
+        let runtime = LocalModelRuntimeProjection {
+            error: Some("runtime offline".to_string()),
+            ..Default::default()
+        };
+        let endpoints =
+            overlay_model_endpoints_with_runtime_truth(&default_model_endpoints(), &runtime);
+        let mut model_state = AdminModelCenterState::default();
+        model_state.capability_bindings.push(
+            harborbeacon_local_agent::runtime::admin_console::ModelCapabilityBindingRecord {
+                capability_id: "vlm".to_string(),
+                desired_model_id: "Qwen/Qwen3.5-9B".to_string(),
+                active_model_id: Some("Qwen/Qwen3.5-9B".to_string()),
+                transition_status: "ready".to_string(),
+                last_error: None,
+                updated_at: "1".to_string(),
+            },
+        );
+
+        let response = build_model_capabilities_response(
+            &model_state,
+            &endpoints,
+            &default_model_route_policies(),
+            Vec::new(),
+            &runtime,
+        );
+        let vision = response
+            .capabilities
+            .iter()
+            .find(|capability| capability.capability_id == "vlm")
+            .expect("vision capability");
+
+        assert_eq!(vision.desired_model_id.as_deref(), Some("Qwen/Qwen3.5-9B"));
+        assert!(vision.active_model_id.is_none());
+        assert!(vision.runtime_model_id.is_none());
+        assert!(vision.current_model.is_none());
+        assert_eq!(vision.transition_status, "unknown");
+    }
+
+    #[test]
+    fn model_capabilities_use_external_runtime_evidence_for_ready_status() {
+        let runtime = LocalModelRuntimeProjection::default();
+        let mut endpoints = default_model_endpoints();
+        let llm_endpoint = endpoints
+            .iter_mut()
+            .find(|endpoint| endpoint.model_kind == ModelKind::Llm)
+            .expect("llm endpoint");
+        llm_endpoint.endpoint_kind = ModelEndpointKind::Cloud;
+        llm_endpoint.status = ModelEndpointStatus::Active;
+        llm_endpoint.model_name = "Qwen/Qwen3.5-4B".to_string();
+
+        let response = build_model_capabilities_response(
+            &AdminModelCenterState::default(),
+            &endpoints,
+            &default_model_route_policies(),
+            Vec::new(),
+            &runtime,
+        );
+        for capability_id in ["semantic_router", "retrieval_answer"] {
+            let capability = response
+                .capabilities
+                .iter()
+                .find(|capability| capability.capability_id == capability_id)
+                .expect("llm capability");
+            assert_eq!(capability.status, "ready");
+            assert_eq!(
+                capability.runtime_model_id.as_deref(),
+                Some("Qwen/Qwen3.5-4B")
+            );
+            assert_eq!(
+                capability.active_model_id.as_deref(),
+                Some("Qwen/Qwen3.5-4B")
+            );
+        }
     }
 
     #[test]
@@ -23999,6 +25419,7 @@ mod tests {
                     "size_bytes": 0
                 },
                 "generated_at": "200",
+                "supported_file_count": 5,
                 "directories": [],
                 "entries": [{
                     "modality": "document",
@@ -24040,7 +25461,7 @@ mod tests {
         fs::write(
             index_root.join("root-a.embeddings.json"),
             serde_json::to_string(&json!({
-                "schema_version": 1,
+                "schema_version": 3,
                 "root": "/tmp/root-a",
                 "entries": [{
                     "key": "chunk-1",
@@ -24060,6 +25481,8 @@ mod tests {
 
         assert_eq!(response.manifest_count, 1);
         assert_eq!(response.manifest_entry_count, 3);
+        assert_eq!(response.supported_file_count, Some(5));
+        assert_eq!(response.unindexed_file_count, Some(2));
         assert_eq!(response.document_count, 1);
         assert_eq!(response.image_count, 2);
         assert_eq!(response.content_indexed_image_count, 1);
@@ -24075,13 +25498,115 @@ mod tests {
     }
 
     #[test]
-    fn admin_knowledge_search_request_uses_enabled_roots_and_clamps_limit() {
+    fn rag_answer_request_scopes_each_conversation_to_its_own_session() {
+        let principal = AccessPrincipal {
+            workspace_id: "home-1".to_string(),
+            user_id: "user-1".to_string(),
+            display_name: "User".to_string(),
+            role_kind: RoleKind::Owner,
+        };
+        let request = build_admin_rag_answer_task_request(
+            &principal,
+            KnowledgeSearchApiRequest {
+                query: "继续总结第二篇".to_string(),
+                conversation_id: Some("conv-2".to_string()),
+                limit: None,
+                include_documents: None,
+                include_audio: Some(true),
+                include_images: None,
+                include_videos: None,
+                use_retrieval: None,
+                retrieval_mode: None,
+                source_scope: None,
+                source_root_ids: Vec::new(),
+                camera_id: None,
+                from: None,
+                to: None,
+            },
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(request.source.conversation_id, "conv-2");
+        assert_eq!(
+            request.source.session_id,
+            "harbor-assistant-search:user-1:conv-2"
+        );
+        assert_eq!(request.source.surface, HARBOR_ASSISTANT_SEARCH_SURFACE);
+        assert_eq!(request.intent.domain, "rag");
+        assert_eq!(request.intent.action, "answer");
+        assert_eq!(
+            request.args["modalities"],
+            json!(["document", "audio", "image", "video"])
+        );
+        assert!(normalize_harbor_assistant_conversation_id("../bad").is_none());
+        assert_eq!(
+            parse_harbor_assistant_conversation_path("/api/knowledge/conversations/conv-2")
+                .as_deref(),
+            Some("conv-2")
+        );
+    }
+
+    #[test]
+    fn conversation_read_and_delete_hide_other_users_and_legacy_owner_history() {
+        let (api, paths) = build_test_admin_api("knowledge-conversation-isolation");
+        let store = api.task_service.conversation_store();
+        for user_id in ["harboros:uid:1000", "local-owner"] {
+            store
+                .save_session(&ConversationSession {
+                    session_id: harbor_assistant_search_session_id(user_id, "shared-conversation"),
+                    workspace_id: "home-1".to_string(),
+                    channel: "webui".to_string(),
+                    surface: HARBOR_ASSISTANT_SEARCH_SURFACE.to_string(),
+                    conversation_id: "shared-conversation".to_string(),
+                    user_id: user_id.to_string(),
+                    ..ConversationSession::default()
+                })
+                .expect("save session");
+        }
+        let user_b = GateAuthenticatedPrincipal(AccessPrincipal {
+            workspace_id: "home-1".to_string(),
+            user_id: "harboros:uid:1001".to_string(),
+            display_name: "User B".to_string(),
+            role_kind: RoleKind::Admin,
+        });
+
+        let (read_status, _) = response_json(api.handle_knowledge_conversation(
+            "/api/knowledge/conversations/shared-conversation",
+            &user_b,
+        ));
+        let (delete_status, _) = response_json(api.handle_delete_knowledge_conversation(
+            "/api/knowledge/conversations/shared-conversation",
+            &user_b,
+        ));
+
+        assert_eq!(read_status, StatusCode(404));
+        assert_eq!(delete_status, StatusCode(404));
+        assert!(store
+            .load_session(&harbor_assistant_search_session_id(
+                "harboros:uid:1000",
+                "shared-conversation"
+            ))
+            .expect("load user A")
+            .is_some());
+        assert!(store
+            .load_session(&harbor_assistant_search_session_id(
+                "local-owner",
+                "shared-conversation"
+            ))
+            .expect("load legacy owner")
+            .is_some());
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn admin_search_source_scope_resolves_enabled_configured_root_ids() {
         let settings = KnowledgeSettings {
             source_roots: vec![
                 KnowledgeSourceRoot {
-                    root_id: "enabled".to_string(),
-                    label: "Enabled".to_string(),
-                    path: "/mnt/source-a".to_string(),
+                    root_id: "documents".to_string(),
+                    label: "Documents".to_string(),
+                    path: "/mnt/documents".to_string(),
                     enabled: true,
                     include: Vec::new(),
                     exclude: Vec::new(),
@@ -24090,46 +25615,43 @@ mod tests {
                 KnowledgeSourceRoot {
                     root_id: "disabled".to_string(),
                     label: "Disabled".to_string(),
-                    path: "/mnt/source-b".to_string(),
+                    path: "/mnt/disabled".to_string(),
                     enabled: false,
                     include: Vec::new(),
                     exclude: Vec::new(),
                     last_indexed_at: None,
                 },
             ],
-            index_root: "/mnt/index".to_string(),
             ..Default::default()
         };
+        let payload = KnowledgeSearchApiRequest {
+            query: "春天的文章".to_string(),
+            conversation_id: None,
+            limit: None,
+            include_documents: Some(true),
+            include_audio: None,
+            include_images: Some(false),
+            include_videos: Some(false),
+            use_retrieval: Some(true),
+            retrieval_mode: None,
+            source_scope: Some("all".to_string()),
+            source_root_ids: vec!["documents".to_string(), "documents".to_string()],
+            camera_id: None,
+            from: None,
+            to: None,
+        };
 
-        let request = build_admin_knowledge_search_request(
-            KnowledgeSearchApiRequest {
-                query: " 找到春天照片 ".to_string(),
-                limit: Some(500),
-                include_documents: Some(false),
-                include_images: None,
-                include_videos: Some(true),
-                source_scope: None,
-                camera_id: None,
-                from: None,
-                to: None,
-            },
-            &settings,
-            vec!["/mnt/source-a/camera-main/segment.mp4".to_string()],
-            Vec::new(),
-        )
-        .expect("search request");
-
-        assert_eq!(request.query, "找到春天照片");
-        assert_eq!(request.limit, 50);
-        assert_eq!(request.configured_roots, vec!["/mnt/source-a".to_string()]);
-        assert_eq!(request.roots, vec!["/mnt/source-a".to_string()]);
-        assert!(!request.include_documents);
-        assert!(request.include_images);
-        assert!(request.include_videos);
-        assert_eq!(request.index_root.as_deref(), Some("/mnt/index"));
         assert_eq!(
-            request.focus_paths,
-            vec!["/mnt/source-a/camera-main/segment.mp4"]
+            resolve_admin_search_source_scope(&payload, &settings, None).unwrap(),
+            vec!["/mnt/documents".to_string()]
+        );
+
+        let mut disabled_payload = payload;
+        disabled_payload.source_root_ids = vec!["disabled".to_string()];
+        assert!(
+            resolve_admin_search_source_scope(&disabled_payload, &settings, None)
+                .unwrap_err()
+                .contains("not enabled or configured")
         );
     }
 
@@ -24137,11 +25659,16 @@ mod tests {
     fn admin_search_request_detects_and_validates_dvr_focus_fields() {
         let payload = KnowledgeSearchApiRequest {
             query: "谁在倒饮料".to_string(),
+            conversation_id: None,
             limit: None,
             include_documents: None,
+            include_audio: None,
             include_images: None,
             include_videos: Some(true),
+            use_retrieval: None,
+            retrieval_mode: None,
             source_scope: None,
+            source_root_ids: Vec::new(),
             camera_id: Some(" camera-main ".to_string()),
             from: Some("1714600000".to_string()),
             to: Some("1714600300".to_string()),
@@ -24170,6 +25697,13 @@ mod tests {
         let indexed_path = source_root.join("indexed.md");
         fs::write(&indexed_path, "Harbor Assistant Search indexed preview")
             .expect("write indexed file");
+        let indexed_mp3 = source_root.join("meeting.mp3");
+        let indexed_flac = source_root.join("recording.flac");
+        fs::write(&indexed_mp3, b"fake mp3").expect("write mp3");
+        fs::write(source_root.join("meeting.txt"), "meeting transcript").expect("write sidecar");
+        fs::write(&indexed_flac, b"fake flac").expect("write flac");
+        fs::write(source_root.join("recording.txt"), "recording transcript")
+            .expect("write sidecar");
         let service = KnowledgeIndexService::from_config(
             KnowledgeIndexConfig::new(index_root.clone()).unwrap(),
         )
@@ -24198,6 +25732,8 @@ mod tests {
             resolved,
             indexed_path.canonicalize().expect("canonical path")
         );
+        assert!(resolve_knowledge_preview_path(&indexed_mp3.to_string_lossy(), &settings).is_ok());
+        assert!(resolve_knowledge_preview_path(&indexed_flac.to_string_lossy(), &settings).is_ok());
         let _ = fs::remove_dir_all(source_root);
         let _ = fs::remove_dir_all(index_root);
     }
@@ -24219,11 +25755,11 @@ mod tests {
         service
             .load_or_refresh(&source_root)
             .expect("write index manifest");
-        let unindexed_path = source_root.join("unindexed.md");
+        let unindexed_path = source_root.join("unindexed.mp3");
         fs::write(&unindexed_path, "not indexed").expect("write unindexed file");
         let unsupported_path = source_root.join("payload.bin");
         fs::write(&unsupported_path, "not previewable").expect("write unsupported file");
-        let outside_path = outside_root.join("outside.md");
+        let outside_path = outside_root.join("outside.flac");
         fs::write(&outside_path, "outside").expect("write outside file");
         let settings = KnowledgeSettings {
             source_roots: vec![KnowledgeSourceRoot {
@@ -24278,23 +25814,6 @@ mod tests {
             parse_knowledge_index_job_cancel_path("/api/knowledge/index/jobs/job-123"),
             None
         );
-    }
-
-    #[test]
-    fn embedding_warmup_timeout_stats_complete_job_as_degraded() {
-        let stats = embedding_warmup_timeout_stats(2, Duration::from_millis(25));
-
-        assert_eq!(stats.total, 2);
-        assert_eq!(stats.completed, 0);
-        assert_eq!(stats.skipped, 0);
-        assert_eq!(stats.failed, 2);
-        assert!(stats.degraded);
-        assert!(stats.persist_error.is_none());
-        assert!(stats
-            .last_error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("exceeded 25 ms"));
     }
 
     #[test]
@@ -24743,7 +26262,13 @@ mod tests {
             })
         }));
         api.admin_store
-            .save_model_capability_binding("semantic_router", "qwen2.5-1.5b-instruct")
+            .save_model_capability_assignment(
+                "semantic_router",
+                "qwen2.5-1.5b-instruct",
+                None,
+                "loading",
+                None,
+            )
             .expect("save binding");
 
         api.activate_selected_model_capability("semantic_router", "qwen2.5-1.5b-instruct")
@@ -24789,6 +26314,97 @@ mod tests {
     }
 
     #[test]
+    fn local_openai_probe_reports_the_model_actually_served() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            let body = json!({
+                "object": "list",
+                "data": [{"id": "Qwen/Qwen3.5-4B", "object": "model"}]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+        let endpoint = ModelEndpoint {
+            model_endpoint_id: "vlm-local-openai-compatible".to_string(),
+            workspace_id: None,
+            provider_account_id: None,
+            model_kind: ModelKind::Vlm,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "openai_compatible".to_string(),
+            model_name: "Qwen/Qwen3.5-9B".to_string(),
+            capability_tags: vec!["vlm".to_string()],
+            cost_policy: json!({}),
+            status: ModelEndpointStatus::Active,
+            metadata: json!({"base_url": format!("http://{addr}/v1")}),
+        };
+
+        assert_eq!(
+            probe_local_openai_compatible_serving_model(&endpoint).as_deref(),
+            Some("Qwen/Qwen3.5-4B")
+        );
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn local_embedding_probe_uses_tei_info_when_models_route_is_unavailable() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let addr = listener.local_addr().expect("listener address");
+        let server = std::thread::spawn(move || {
+            for (status, body) in [
+                ("404 Not Found", "{}"),
+                (
+                    "200 OK",
+                    r#"{"model_id":"/data","model_type":{"embedding":{"pooling":"last_token"}}}"#,
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut request = [0_u8; 2048];
+                let _ = stream.read(&mut request).expect("read request");
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+            }
+        });
+        let endpoint = ModelEndpoint {
+            model_endpoint_id: "embed-local-openai-compatible".to_string(),
+            workspace_id: None,
+            provider_account_id: None,
+            model_kind: ModelKind::Embedder,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "openai_compatible".to_string(),
+            model_name: "Qwen/Qwen3-Embedding-0.6B".to_string(),
+            capability_tags: vec!["embedding".to_string()],
+            cost_policy: json!({}),
+            status: ModelEndpointStatus::Active,
+            metadata: json!({
+                "base_url": format!("http://{addr}/v1"),
+                "catalog_model_id": "Qwen/Qwen3-Embedding-0.6B"
+            }),
+        };
+
+        assert_eq!(
+            probe_local_openai_compatible_serving_model(&endpoint).as_deref(),
+            Some("Qwen/Qwen3-Embedding-0.6B")
+        );
+        server.join().expect("server");
+    }
+
+    #[test]
     fn external_openai_compatible_catalog_model_is_not_auto_started() {
         let registry_path = unique_store_path("harborbeacon-model-external-registry");
         let admin_path = unique_store_path("harborbeacon-model-external-state");
@@ -24831,7 +26447,7 @@ mod tests {
             .activate_selected_model_capability("semantic_router", "Qwen/Qwen3.5-4B")
             .expect_err("external runtime model should not be auto-started");
 
-        assert!(error.contains("OpenAI-compatible runtime"));
+        assert!(error.contains("configured and running OpenAI-compatible endpoint"));
         assert!(seen_requests.lock().expect("request lock").is_empty());
 
         let _ = fs::remove_file(admin_path);
@@ -24893,6 +26509,21 @@ mod tests {
             .find(|endpoint| endpoint.model_endpoint_id == "vlm-local-openai-compatible")
             .expect("vlm endpoint");
         assert_eq!(vlm.status, ModelEndpointStatus::Disabled);
+    }
+
+    #[test]
+    fn llama_cpp_profile_is_treated_as_external_openai_runtime() {
+        let mut endpoint = default_model_endpoints()
+            .into_iter()
+            .find(|endpoint| endpoint.model_kind == ModelKind::Llm)
+            .expect("default llm endpoint");
+
+        endpoint.metadata["runtime_backend_kind"] = json!("llama.cpp");
+        assert!(model_endpoint_uses_external_runtime(&endpoint));
+
+        endpoint.metadata["runtime_backend_kind"] = json!("");
+        endpoint.metadata["runtime_profiles"] = json!(["llama.cpp-openai-compatible"]);
+        assert!(model_endpoint_uses_external_runtime(&endpoint));
     }
 
     #[test]
@@ -25276,6 +26907,240 @@ mod tests {
         assert_eq!(hints.open_id.as_deref(), Some("ou_header"));
         assert_eq!(hints.user_id.as_deref(), Some("user-header"));
         assert_eq!(hints.harboros_user_id.as_deref(), Some("harbor"));
+    }
+
+    #[test]
+    fn startup_reconciles_queued_and_running_index_jobs_as_retryable_failures() {
+        let admin_path = unique_store_path("knowledge-index-reconcile-state");
+        let registry_path = unique_store_path("knowledge-index-reconcile-registry");
+        let store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        let root = KnowledgeSourceRoot {
+            root_id: "source".to_string(),
+            label: "Source".to_string(),
+            path: "/mnt/source".to_string(),
+            enabled: true,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            last_indexed_at: None,
+        };
+        let queued = build_knowledge_index_job(&root, "1", RagResourceProfile::CpuOnly);
+        let mut running = build_knowledge_index_job(&root, "2", RagResourceProfile::CpuOnly);
+        running.status = "running".to_string();
+        let mut completed = build_knowledge_index_job(&root, "3", RagResourceProfile::CpuOnly);
+        completed.status = "completed".to_string();
+        completed.progress_percent = Some(100);
+        store.save_knowledge_index_job(queued).expect("save queued");
+        store
+            .save_knowledge_index_job(running)
+            .expect("save running");
+        store
+            .save_knowledge_index_job(completed.clone())
+            .expect("save completed");
+
+        assert_eq!(reconcile_stale_knowledge_index_jobs(&store).unwrap(), 2);
+        let jobs = store.list_knowledge_index_jobs().expect("jobs");
+        let interrupted = jobs
+            .iter()
+            .filter(|job| job.checkpoint["phase"] == "interrupted_by_restart")
+            .collect::<Vec<_>>();
+        assert_eq!(interrupted.len(), 2);
+        assert!(interrupted.iter().all(|job| {
+            job.status == "failed"
+                && job.progress_percent == Some(100)
+                && job.completed_at.is_some()
+                && job.checkpoint["retryable"] == true
+        }));
+        assert_eq!(
+            jobs.iter()
+                .find(|job| job.job_id == completed.job_id)
+                .expect("completed job")
+                .status,
+            "completed"
+        );
+
+        cleanup_test_paths(&[admin_path, registry_path]);
+    }
+
+    fn trusted_gate_headers() -> Vec<Header> {
+        [
+            ("Authorization", "Bearer service-token"),
+            ("X-Harbor-Principal-Source", "harboros"),
+            ("X-Harbor-Principal-Id", "harboros:uid:1000"),
+            ("X-Harbor-Principal-Roles", "FULL_ADMIN"),
+            ("X-Harbor-Workspace-Id", "home-1"),
+        ]
+        .into_iter()
+        .map(|(name, value)| Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("header"))
+        .collect()
+    }
+
+    #[test]
+    fn gate_principal_auth_fails_closed_before_reading_identity() {
+        let missing_config = authenticate_gate_principal_headers(
+            None,
+            "/api/knowledge/search",
+            &trusted_gate_headers(),
+            "home-1",
+        )
+        .expect_err("missing service configuration");
+        assert_eq!(missing_config.status, StatusCode(503));
+
+        let missing_bearer = authenticate_gate_principal_headers(
+            Some("service-token"),
+            "/api/knowledge/search",
+            &[],
+            "home-1",
+        )
+        .expect_err("missing bearer");
+        assert_eq!(missing_bearer.status, StatusCode(401));
+
+        let wrong_bearer = authenticate_gate_principal_headers(
+            Some("different-token"),
+            "/api/knowledge/search",
+            &trusted_gate_headers(),
+            "home-1",
+        )
+        .expect_err("wrong bearer");
+        assert_eq!(wrong_bearer.status, StatusCode(401));
+    }
+
+    #[test]
+    fn gate_principal_service_auth_precedes_workspace_state_loading() {
+        let error = authenticate_gate_principal_with_workspace_loader(
+            Some("service-token"),
+            "/api/knowledge/search",
+            &[],
+            || panic!("workspace state must not be read before bearer validation"),
+        )
+        .expect_err("missing bearer");
+
+        assert_eq!(error.status, StatusCode(401));
+    }
+
+    #[test]
+    fn gate_principal_auth_rejects_legacy_identity_and_enforces_scope() {
+        let mut legacy_header = trusted_gate_headers();
+        legacy_header.push(
+            Header::from_bytes(b"X-Harbor-User-Id".as_slice(), b"local-owner".as_slice())
+                .expect("header"),
+        );
+        let legacy_error = authenticate_gate_principal_headers(
+            Some("service-token"),
+            "/api/knowledge/search",
+            &legacy_header,
+            "home-1",
+        )
+        .expect_err("legacy header");
+        assert_eq!(legacy_error.status, StatusCode(400));
+
+        let legacy_query_error = authenticate_gate_principal_headers(
+            Some("service-token"),
+            "/api/knowledge/search?open_id=forged",
+            &trusted_gate_headers(),
+            "home-1",
+        )
+        .expect_err("legacy query");
+        assert_eq!(legacy_query_error.status, StatusCode(400));
+
+        for query in [
+            "harboros_user_id=forged",
+            "workspace_id=other-home",
+            "principal_id=forged",
+            "account_id=forged",
+            "user%5fid=forged",
+        ] {
+            let error = authenticate_gate_principal_headers(
+                Some("service-token"),
+                &format!("/api/knowledge/search?{query}"),
+                &trusted_gate_headers(),
+                "home-1",
+            )
+            .expect_err("identity query must be rejected");
+            assert_eq!(error.status, StatusCode(400), "query={query}");
+        }
+
+        let mut wrong_role = trusted_gate_headers();
+        wrong_role.retain(|header| {
+            !header
+                .field
+                .as_str()
+                .to_string()
+                .eq_ignore_ascii_case("X-Harbor-Principal-Roles")
+        });
+        wrong_role.push(
+            Header::from_bytes(
+                b"X-Harbor-Principal-Roles".as_slice(),
+                b"READ_ONLY".as_slice(),
+            )
+            .expect("header"),
+        );
+        let role_error = authenticate_gate_principal_headers(
+            Some("service-token"),
+            "/api/knowledge/search",
+            &wrong_role,
+            "home-1",
+        )
+        .expect_err("role mismatch");
+        assert_eq!(role_error.status, StatusCode(403));
+
+        let workspace_error = authenticate_gate_principal_headers(
+            Some("service-token"),
+            "/api/knowledge/search",
+            &trusted_gate_headers(),
+            "other-home",
+        )
+        .expect_err("workspace mismatch");
+        assert_eq!(workspace_error.status, StatusCode(403));
+    }
+
+    #[test]
+    fn gate_principal_auth_maps_full_admin_without_persisted_membership() {
+        let principal = authenticate_gate_principal_headers(
+            Some("service-token"),
+            "/api/knowledge/search",
+            &trusted_gate_headers(),
+            "home-1",
+        )
+        .expect("trusted principal");
+
+        assert_eq!(principal.0.user_id, "harboros:uid:1000");
+        assert_eq!(principal.0.workspace_id, "home-1");
+        assert_eq!(principal.0.role_kind, RoleKind::Admin);
+        assert_ne!(principal.0.user_id, "local-owner");
+        assert_ne!(
+            harbor_assistant_search_session_id("harboros:uid:1000", "shared"),
+            harbor_assistant_search_session_id("harboros:uid:1001", "shared")
+        );
+    }
+
+    #[test]
+    fn every_knowledge_route_alias_uses_the_same_gate_principal_policy() {
+        for raw_path in [
+            "/api/knowledge/search",
+            "/api/beacon/knowledge/search",
+            "/api/harbor-beacon/knowledge/search",
+            "/api/harbor-assistant/knowledge/search",
+        ] {
+            let normalized = normalize_unified_admin_url(raw_path);
+            let path = normalized.split('?').next().expect("path");
+            assert!(is_gate_principal_knowledge_endpoint(&Method::Post, path));
+        }
+
+        assert!(is_gate_principal_knowledge_endpoint(
+            &Method::Get,
+            "/api/knowledge/conversations/conv-1"
+        ));
+        assert!(is_gate_principal_knowledge_endpoint(
+            &Method::Delete,
+            "/api/knowledge/conversations/conv-1"
+        ));
+        assert!(!is_gate_principal_knowledge_endpoint(
+            &Method::Get,
+            "/api/knowledge/conversations/conv-1/nested"
+        ));
     }
 
     #[test]

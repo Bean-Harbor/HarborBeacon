@@ -433,6 +433,8 @@ impl VisionExecutor {
                 image_data_url,
                 detection_summary: detection_summary.to_string(),
                 user_prompt: args.prompt.clone(),
+                system_prompt: None,
+                disable_thinking: false,
             })?;
             return Ok((response.summary, "openai_compatible".to_string()));
         }

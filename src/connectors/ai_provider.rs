@@ -39,6 +39,11 @@ pub struct VisionSummaryRequest {
     pub image_data_url: String,
     pub detection_summary: String,
     pub user_prompt: Option<String>,
+    /// Optional role instruction. When unset, preserve the existing camera-analysis behavior.
+    pub system_prompt: Option<String>,
+    /// Qwen3.5 VLM can spend its limited output budget on hidden reasoning. Enable this only
+    /// for runtimes that explicitly support OpenAI-compatible chat-template options.
+    pub disable_thinking: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -48,6 +53,8 @@ pub struct TextCompletionRequest {
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
     pub timeout: Option<std::time::Duration>,
+    pub disable_thinking: bool,
+    pub json_object_response: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,12 +225,14 @@ impl OpenAiCompatibleVisionClient {
         &self,
         request: &VisionSummaryRequest,
     ) -> Result<VisionSummaryResponse, String> {
-        let system_prompt = "You are a concise Chinese security-camera analyst. Summarize what matters for a HarborBeacon user. Mention detected people count, approximate position, and whether the frame needs attention. Keep it under 80 Chinese characters.";
+        let system_prompt = request.system_prompt.clone().unwrap_or_else(|| {
+            "You are a concise Chinese security-camera analyst. Summarize what matters for a HarborBeacon user. Mention detected people count, approximate position, and whether the frame needs attention. Keep it under 80 Chinese characters.".to_string()
+        });
         let user_prompt = request.user_prompt.clone().unwrap_or_else(|| {
             "请根据检测结果和图片，用中文总结当前画面。优先说明是否有人、人数、位置和是否需要关注。".to_string()
         });
 
-        let payload = json!({
+        let mut payload = json!({
             "model": self.config.model,
             "temperature": 0.2,
             "messages": [
@@ -248,7 +257,9 @@ impl OpenAiCompatibleVisionClient {
                 }
             ]
         });
-
+        if request.disable_thinking {
+            payload["chat_template_kwargs"] = json!({"enable_thinking": false});
+        }
         let response = self
             .client
             .post(format!("{}/chat/completions", self.config.base_url))
@@ -323,6 +334,18 @@ impl OpenAiCompatibleTextClient {
         if let Some(max_tokens) = request.max_tokens {
             payload.insert("max_tokens".to_string(), json!(max_tokens));
         }
+        if request.disable_thinking {
+            payload.insert(
+                "chat_template_kwargs".to_string(),
+                json!({"enable_thinking": false}),
+            );
+        }
+        if request.json_object_response {
+            payload.insert(
+                "response_format".to_string(),
+                json!({"type": "json_object"}),
+            );
+        }
 
         let mut request_builder = self
             .client
@@ -358,8 +381,15 @@ impl OpenAiCompatibleTextClient {
 
 impl OpenAiCompatibleEmbeddingClient {
     pub fn new(config: OpenAiCompatibleConfig) -> Result<Self, String> {
+        Self::new_with_timeout(config, std::time::Duration::from_secs(45))
+    }
+
+    pub fn new_with_timeout(
+        config: OpenAiCompatibleConfig,
+        timeout: std::time::Duration,
+    ) -> Result<Self, String> {
         let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(45))
+            .timeout(timeout.max(std::time::Duration::from_millis(1)))
             .build()
             .map_err(|e| format!("failed to build OpenAI-compatible embedding client: {e}"))?;
         Ok(Self { client, config })
@@ -421,6 +451,7 @@ impl RerankCompatibleClient {
             "model": self.config.model,
             "query": request.query,
             "documents": request.documents,
+            "texts": request.documents,
             "top_n": request.top_n.max(1),
         });
 
@@ -519,7 +550,11 @@ fn rerank_url(base_url: &str, rerank_path: &str) -> String {
 }
 
 fn extract_rerank_scores(value: &Value) -> Vec<RerankScore> {
-    let Some(results) = value.get("results").and_then(Value::as_array) else {
+    let Some(results) = value
+        .get("results")
+        .and_then(Value::as_array)
+        .or_else(|| value.as_array())
+    else {
         return Vec::new();
     };
     let mut scores = results
@@ -623,5 +658,17 @@ mod tests {
         let scores = extract_rerank_scores(&response);
         assert_eq!(scores[0].index, 2);
         assert!((scores[0].score - 0.7).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn extract_rerank_scores_supports_tei_array_shape() {
+        let response = json!([
+            {"index": 0, "score": 0.31},
+            {"index": 1, "score": 0.91}
+        ]);
+
+        let scores = extract_rerank_scores(&response);
+        assert_eq!(scores[0].index, 1);
+        assert!((scores[0].score - 0.91).abs() < f32::EPSILON);
     }
 }

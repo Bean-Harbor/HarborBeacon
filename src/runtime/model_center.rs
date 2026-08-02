@@ -14,6 +14,7 @@ use reqwest::blocking::Client;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokenizers::Tokenizer;
 
 use crate::connectors::ai_provider::{
     EmbeddingRequest, OpenAiCompatibleConfig, OpenAiCompatibleEmbeddingClient,
@@ -45,11 +46,70 @@ const SEMANTIC_ROUTER_TOKEN_ENV: &str = "HARBOR_SEMANTIC_ROUTER_TOKEN";
 const MODEL_API_TOKEN_ENV: &str = "HARBOR_MODEL_API_TOKEN";
 const DEFAULT_SEMANTIC_ROUTER_BASE_URL: &str = "http://127.0.0.1:4176/v1";
 const DEFAULT_SEMANTIC_ROUTER_MODEL: &str = "Qwen/Qwen2.5-0.5B-Instruct";
+const LLM_TOKENIZER_PATH_ENV: &str = "HARBOR_LLM_TOKENIZER_PATH";
 static VLM_EXECUTION_BUSY: AtomicBool = AtomicBool::new(false);
 static VLM_EXECUTION_STARTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static VLM_EXECUTION_BUSY_TOTAL: AtomicU64 = AtomicU64::new(0);
 static VLM_EXECUTION_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static VLM_EXECUTION_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static LLM_TOKENIZER: OnceLock<Option<Tokenizer>> = OnceLock::new();
+
+pub fn llm_text_token_count(text: &str) -> usize {
+    let tokenizer = LLM_TOKENIZER.get_or_init(|| {
+        env_trimmed(LLM_TOKENIZER_PATH_ENV).and_then(|path| Tokenizer::from_file(path).ok())
+    });
+    tokenizer
+        .as_ref()
+        .and_then(|tokenizer| tokenizer.encode(text, false).ok())
+        .map(|encoding| encoding.len())
+        .unwrap_or_else(|| conservative_text_token_count(text))
+}
+
+pub fn truncate_llm_text_to_tokens(text: &str, max_tokens: usize) -> String {
+    if max_tokens == 0 {
+        return String::new();
+    }
+    if llm_text_token_count(text) <= max_tokens {
+        return text.to_string();
+    }
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut low = 0usize;
+    let mut high = chars.len();
+    while low < high {
+        let mid = (low + high + 1) / 2;
+        let candidate = chars[..mid].iter().collect::<String>();
+        if llm_text_token_count(&candidate) <= max_tokens.saturating_sub(1) {
+            low = mid;
+        } else {
+            high = mid.saturating_sub(1);
+        }
+    }
+    let mut truncated = chars[..low].iter().collect::<String>();
+    truncated.push('…');
+    while !truncated.is_empty() && llm_text_token_count(&truncated) > max_tokens {
+        truncated.pop();
+    }
+    truncated
+}
+
+fn conservative_text_token_count(text: &str) -> usize {
+    let mut count = 0usize;
+    let mut ascii_run = 0usize;
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            ascii_run += 1;
+        } else {
+            if ascii_run > 0 {
+                count += ascii_run.div_ceil(3);
+                ascii_run = 0;
+            }
+            if !ch.is_whitespace() {
+                count += 1;
+            }
+        }
+    }
+    count + ascii_run.div_ceil(3)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelEndpointTestResult {
@@ -122,6 +182,7 @@ pub struct LlmTextOptions {
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
     pub timeout: Option<Duration>,
+    pub json_object_response: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -142,6 +203,13 @@ pub struct EmbeddingExecution {
     pub vector: Vec<f32>,
     #[serde(default)]
     pub details: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct EmbeddingEndpointIdentity {
+    pub provider_key: String,
+    pub model_endpoint_id: String,
+    pub model_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -430,10 +498,7 @@ pub fn run_vlm_summary_with_state(
         };
     }
 
-    if !endpoint
-        .provider_key
-        .eq_ignore_ascii_case("openai_compatible")
-    {
+    if !endpoint_uses_openai_compatible_api(&endpoint) {
         return VlmSummaryExecution {
             available: false,
             status: "degraded".to_string(),
@@ -513,9 +578,14 @@ pub fn run_vlm_summary_with_state(
 
     match client.describe_frame(&VisionSummaryRequest {
         image_data_url,
-        detection_summary: "No detector summary is attached for retrieval-side still images."
+        detection_summary: "This is an ordinary image from a knowledge base, not a security-camera alert."
             .to_string(),
         user_prompt: prompt,
+        system_prompt: Some(
+            "You create concise Chinese descriptions for ordinary knowledge-base images. Describe visible subjects, scene, season or weather when evident, colors, actions, and useful searchable details. Do not assess security risk or focus on people unless they are visibly relevant. Never answer only 'none' or 'unknown'; describe what is visible. Keep it under 120 Chinese characters."
+                .to_string(),
+        ),
+        disable_thinking: true,
     }) {
         Ok(response) => VlmSummaryExecution {
             available: true,
@@ -645,10 +715,7 @@ fn vlm_endpoint_local_only_blocker(endpoint: &ModelEndpoint) -> Option<String> {
     let Some(base_url) = metadata_string(&endpoint.metadata, "base_url") else {
         return None;
     };
-    if !endpoint
-        .provider_key
-        .eq_ignore_ascii_case("openai_compatible")
-    {
+    if !endpoint_uses_openai_compatible_api(endpoint) {
         return None;
     }
     if !url_is_loopback(&base_url) {
@@ -1083,9 +1150,7 @@ pub(crate) fn wire_semantic_router_resident_endpoint(state: &mut AdminModelCente
         if endpoint.model_kind != ModelKind::Llm
             || endpoint.endpoint_kind != ModelEndpointKind::Local
             || endpoint.status == ModelEndpointStatus::Disabled
-            || !endpoint
-                .provider_key
-                .eq_ignore_ascii_case("openai_compatible")
+            || !endpoint_uses_openai_compatible_api(endpoint)
         {
             continue;
         }
@@ -1181,10 +1246,7 @@ fn run_llm_text_on_endpoint(
         };
     }
 
-    if !endpoint
-        .provider_key
-        .eq_ignore_ascii_case("openai_compatible")
-    {
+    if !endpoint_uses_openai_compatible_api(endpoint) {
         return LlmTextExecution {
             available: false,
             status: "degraded".to_string(),
@@ -1245,6 +1307,8 @@ fn run_llm_text_on_endpoint(
         temperature: options.temperature.or(Some(0.1)),
         max_tokens: options.max_tokens,
         timeout: options.timeout,
+        disable_thinking: metadata_bool(&endpoint.metadata, "disable_thinking"),
+        json_object_response: options.json_object_response,
     }) {
         Ok(response) => LlmTextExecution {
             available: true,
@@ -1264,6 +1328,7 @@ fn run_llm_text_on_endpoint(
                 "purpose": options.purpose.clone(),
                 "max_tokens": options.max_tokens,
                 "timeout_ms": options.timeout.map(|value| value.as_millis() as u64),
+                "json_object_response": options.json_object_response,
                 "raw_response": response.raw_response,
             }),
         },
@@ -1280,6 +1345,14 @@ fn run_llm_text_on_endpoint(
 }
 
 pub fn run_embedding_with_state(text: &str, state: &AdminModelCenterState) -> EmbeddingExecution {
+    run_embedding_with_state_and_timeout(text, state, Duration::from_secs(45))
+}
+
+pub fn run_embedding_with_state_and_timeout(
+    text: &str,
+    state: &AdminModelCenterState,
+    timeout: Duration,
+) -> EmbeddingExecution {
     let input = text.trim();
     if input.is_empty() {
         return EmbeddingExecution {
@@ -1322,10 +1395,9 @@ pub fn run_embedding_with_state(text: &str, state: &AdminModelCenterState) -> Em
         };
     }
 
-    if !endpoint
-        .provider_key
-        .eq_ignore_ascii_case("openai_compatible")
-    {
+    let resolved_model_name = embedding_model_name_from_endpoint(&endpoint);
+
+    if !endpoint_uses_openai_compatible_api(&endpoint) {
         return EmbeddingExecution {
             available: false,
             status: "degraded".to_string(),
@@ -1335,7 +1407,7 @@ pub fn run_embedding_with_state(text: &str, state: &AdminModelCenterState) -> Em
             ),
             provider_key: endpoint.provider_key.clone(),
             model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
-            model_name: Some(endpoint.model_name.clone()),
+            model_name: resolved_model_name,
             vector: Vec::new(),
             details: json!({
                 "endpoint_kind": endpoint.endpoint_kind.as_str(),
@@ -1351,7 +1423,7 @@ pub fn run_embedding_with_state(text: &str, state: &AdminModelCenterState) -> Em
                 .to_string(),
             provider_key: endpoint.provider_key.clone(),
             model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
-            model_name: Some(endpoint.model_name.clone()),
+            model_name: resolved_model_name,
             vector: Vec::new(),
             details: json!({
                 "endpoint_kind": endpoint.endpoint_kind.as_str(),
@@ -1359,7 +1431,8 @@ pub fn run_embedding_with_state(text: &str, state: &AdminModelCenterState) -> Em
         };
     };
 
-    let client = match OpenAiCompatibleEmbeddingClient::new(config) {
+    let resolved_model_name = Some(config.model.clone());
+    let client = match OpenAiCompatibleEmbeddingClient::new_with_timeout(config, timeout) {
         Ok(client) => client,
         Err(error) => {
             return EmbeddingExecution {
@@ -1368,7 +1441,7 @@ pub fn run_embedding_with_state(text: &str, state: &AdminModelCenterState) -> Em
                 summary: format!("Failed to build embedding client: {error}"),
                 provider_key: endpoint.provider_key.clone(),
                 model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
-                model_name: Some(endpoint.model_name.clone()),
+                model_name: resolved_model_name,
                 vector: Vec::new(),
                 details: json!({}),
             };
@@ -1378,29 +1451,56 @@ pub fn run_embedding_with_state(text: &str, state: &AdminModelCenterState) -> Em
     match client.embed_text(&EmbeddingRequest {
         input: input.to_string(),
     }) {
-        Ok(response) => EmbeddingExecution {
-            available: !response.embedding.is_empty(),
-            status: "active".to_string(),
-            summary: "Embedding request completed.".to_string(),
-            provider_key: endpoint.provider_key.clone(),
-            model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
-            model_name: Some(endpoint.model_name.clone()),
-            vector: response.embedding,
-            details: json!({
-                "raw_response": response.raw_response,
-            }),
-        },
+        Ok(response) => {
+            let actual_model_name = response
+                .raw_response
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .or(resolved_model_name);
+            EmbeddingExecution {
+                available: !response.embedding.is_empty(),
+                status: "active".to_string(),
+                summary: "Embedding request completed.".to_string(),
+                provider_key: endpoint.provider_key.clone(),
+                model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
+                model_name: actual_model_name,
+                vector: response.embedding,
+                details: json!({
+                    "raw_response": response.raw_response,
+                }),
+            }
+        }
         Err(error) => EmbeddingExecution {
             available: false,
             status: "degraded".to_string(),
             summary: format!("Embedding request failed: {error}"),
             provider_key: endpoint.provider_key.clone(),
             model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
-            model_name: Some(endpoint.model_name.clone()),
+            model_name: resolved_model_name,
             vector: Vec::new(),
             details: json!({}),
         },
     }
+}
+
+pub fn run_query_embedding_with_state(
+    text: &str,
+    state: &AdminModelCenterState,
+) -> EmbeddingExecution {
+    let prepared = resolve_endpoint(state, ModelKind::Embedder, EMBED_POLICY_ID)
+        .map(|endpoint| embedding_query_input(&endpoint, text))
+        .unwrap_or_else(|| text.to_string());
+    run_embedding_with_state(&prepared, state)
+}
+
+fn embedding_query_input(endpoint: &ModelEndpoint, text: &str) -> String {
+    let query = text.trim();
+    metadata_string(&endpoint.metadata, "query_instruction")
+        .map(|instruction| format!("Instruct: {instruction}\nQuery:{query}"))
+        .unwrap_or_else(|| query.to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -2008,9 +2108,13 @@ fn openai_compatible_config_from_endpoint(
     if endpoint.endpoint_kind == ModelEndpointKind::Cloud && api_key.trim().is_empty() {
         return None;
     }
-    let model = metadata_string(&endpoint.metadata, "model").or_else(|| {
-        (!endpoint.model_name.trim().is_empty()).then_some(endpoint.model_name.clone())
-    })?;
+    let model = if endpoint.model_kind == ModelKind::Embedder {
+        embedding_model_name_from_endpoint(endpoint)
+    } else {
+        metadata_string(&endpoint.metadata, "model").or_else(|| {
+            (!endpoint.model_name.trim().is_empty()).then_some(endpoint.model_name.clone())
+        })
+    }?;
     Some(OpenAiCompatibleConfig {
         base_url: base_url.trim_end_matches('/').to_string(),
         api_key,
@@ -2076,6 +2180,60 @@ fn metadata_bool(metadata: &Value, key: &str) -> bool {
     metadata.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
+fn metadata_string_list(metadata: &Value, key: &str) -> Vec<String> {
+    metadata
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn endpoint_uses_openai_compatible_api(endpoint: &ModelEndpoint) -> bool {
+    endpoint
+        .provider_key
+        .eq_ignore_ascii_case("openai_compatible")
+        || metadata_string_list(&endpoint.metadata, "runtime_profiles")
+            .iter()
+            .any(|profile| {
+                let normalized = profile.trim().to_ascii_lowercase().replace('_', "-");
+                normalized.contains("openai-compatible")
+                    || matches!(
+                        normalized.as_str(),
+                        "harbor-candle" | "harbor-model-api-candle"
+                    )
+            })
+}
+
+fn embedding_model_name_from_endpoint(endpoint: &ModelEndpoint) -> Option<String> {
+    metadata_string(&endpoint.metadata, "runtime_embedding_model")
+        .or_else(|| metadata_string(&endpoint.metadata, "model"))
+        .or_else(|| (!endpoint.model_name.trim().is_empty()).then_some(endpoint.model_name.clone()))
+}
+
+pub fn embedding_endpoint_identity_with_state(
+    state: &AdminModelCenterState,
+) -> Option<EmbeddingEndpointIdentity> {
+    let runtime = probe_local_runtime(&state.endpoints);
+    let endpoint = resolve_endpoint(state, ModelKind::Embedder, EMBED_POLICY_ID)?;
+    let runtime_model_name = is_builtin_local_openai_endpoint(&endpoint)
+        .then(|| runtime.embedding_model)
+        .flatten()
+        .filter(|value| !value.trim().is_empty());
+    Some(EmbeddingEndpointIdentity {
+        provider_key: endpoint.provider_key.clone(),
+        model_endpoint_id: endpoint.model_endpoint_id.clone(),
+        model_name: runtime_model_name.or_else(|| embedding_model_name_from_endpoint(&endpoint))?,
+    })
+}
+
 fn metadata_missing_or_empty(metadata: &Value, key: &str) -> bool {
     metadata_string(metadata, key).is_none()
 }
@@ -2130,9 +2288,7 @@ fn is_builtin_local_openai_endpoint(endpoint: &ModelEndpoint) -> bool {
         endpoint.model_kind,
         ModelKind::Llm | ModelKind::Embedder | ModelKind::Vlm
     ) && endpoint.endpoint_kind == crate::control_plane::models::ModelEndpointKind::Local
-        && endpoint
-            .provider_key
-            .eq_ignore_ascii_case("openai_compatible")
+        && endpoint_uses_openai_compatible_api(endpoint)
         && metadata_bool(&endpoint.metadata, "builtin")
 }
 
@@ -2298,10 +2454,12 @@ mod tests {
 
     use super::{
         clear_local_runtime_projection_cache, connectivity_url,
-        openai_compatible_config_from_endpoint, redact_model_endpoint, run_embedding_with_state,
-        run_llm_text_with_state, run_llm_text_with_state_and_options, run_rerank_with_state,
-        run_vlm_summary_with_state, semantic_router_local_only_model_state, test_model_endpoint,
-        vlm_endpoint_readiness, LlmTextOptions, RERANK_POLICY_ID,
+        embedding_endpoint_identity_with_state, embedding_query_input,
+        endpoint_uses_openai_compatible_api, openai_compatible_config_from_endpoint,
+        redact_model_endpoint, run_embedding_with_state, run_llm_text_with_state,
+        run_llm_text_with_state_and_options, run_rerank_with_state, run_vlm_summary_with_state,
+        semantic_router_local_only_model_state, test_model_endpoint, vlm_endpoint_readiness,
+        LlmTextOptions, RERANK_POLICY_ID,
     };
     use crate::control_plane::models::{
         ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, ModelRoutePolicy,
@@ -2310,6 +2468,61 @@ mod tests {
     use crate::runtime::admin_console::AdminModelCenterState;
 
     static MODEL_RUNTIME_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn qwen_runtime_profile_uses_openai_compatible_api_and_runtime_embedding_model() {
+        let endpoint = ModelEndpoint {
+            model_endpoint_id: "embed-local-openai-compatible".to_string(),
+            workspace_id: Some("home-1".to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Embedder,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "qwen".to_string(),
+            model_name: "Qwen/Qwen3-Embedding-0.6B".to_string(),
+            capability_tags: vec!["embedding".to_string()],
+            cost_policy: json!({}),
+            status: ModelEndpointStatus::Active,
+            metadata: json!({
+                "base_url": "http://127.0.0.1:8092/v1",
+                "runtime_profiles": ["openai-compatible-embedding"],
+                "runtime_embedding_model": "jina-embeddings-v2-base-zh",
+                "query_instruction": "Given a web search query, retrieve relevant passages that answer the query",
+            }),
+        };
+
+        assert!(endpoint_uses_openai_compatible_api(&endpoint));
+        let config = openai_compatible_config_from_endpoint(&endpoint).expect("embedding config");
+        assert_eq!(config.model, "jina-embeddings-v2-base-zh");
+        assert_eq!(
+            embedding_query_input(&endpoint, "  如何安装 HarborOS？ "),
+            "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:如何安装 HarborOS？"
+        );
+    }
+
+    #[test]
+    fn candle_runtime_profile_uses_openai_compatible_api_even_with_legacy_provider_key() {
+        let endpoint = ModelEndpoint {
+            model_endpoint_id: "embed-local-candle".to_string(),
+            workspace_id: Some("home-1".to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Embedder,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "qwen".to_string(),
+            model_name: "jina-embeddings-v2-base-zh".to_string(),
+            capability_tags: vec!["embedding".to_string()],
+            cost_policy: json!({}),
+            status: ModelEndpointStatus::Active,
+            metadata: json!({
+                "base_url": "http://127.0.0.1:8092/v1",
+                "runtime_profiles": ["harbor-candle", "harbor-model-api-candle"],
+                "runtime_embedding_model": "jina-embeddings-v2-base-zh",
+            }),
+        };
+
+        assert!(endpoint_uses_openai_compatible_api(&endpoint));
+        let config = openai_compatible_config_from_endpoint(&endpoint).expect("embedding config");
+        assert_eq!(config.model, "jina-embeddings-v2-base-zh");
+    }
 
     #[test]
     fn rerank_mock_endpoint_returns_scores() {
@@ -2828,7 +3041,7 @@ mod tests {
                     (&Method::Get, "/healthz") => request
                         .respond(
                             Response::from_string(
-                                r#"{"ready":true,"backend":{"ready":true,"kind":"openai_proxy"},"embedding_model":"Qwen/Qwen3-Embedding-0.6B"}"#,
+                                r#"{"ready":true,"backend":{"ready":true,"kind":"openai_proxy"},"embedding_model":"/models/jina-embeddings-v2-base-zh"}"#,
                             )
                             .with_header(header.clone()),
                         )
@@ -2836,7 +3049,7 @@ mod tests {
                     (&Method::Post, "/v1/embeddings") => request
                         .respond(
                             Response::from_string(
-                                r#"{"data":[{"embedding":[0.1,0.2,0.3]}],"model":"Qwen/Qwen3-Embedding-0.6B"}"#,
+                                r#"{"data":[{"embedding":[0.1,0.2,0.3]}],"model":"/models/jina-embeddings-v2-base-zh"}"#,
                             )
                             .with_header(header.clone()),
                         )
@@ -2886,6 +3099,8 @@ mod tests {
             ..AdminModelCenterState::default()
         };
 
+        let identity =
+            embedding_endpoint_identity_with_state(&state).expect("embedding endpoint identity");
         let result = run_embedding_with_state("谁在倒啤酒", &state);
 
         std::env::remove_var("HARBOR_MODEL_API_BASE_URL");
@@ -2898,11 +3113,16 @@ mod tests {
             result.model_endpoint_id.as_deref(),
             Some("embed-local-openai-compatible")
         );
+        assert_eq!(identity.model_name, "/models/jina-embeddings-v2-base-zh");
+        assert_eq!(
+            result.model_name.as_deref(),
+            Some("/models/jina-embeddings-v2-base-zh")
+        );
         assert_eq!(result.vector, vec![0.1, 0.2, 0.3]);
     }
 
     #[test]
-    fn run_llm_text_with_state_and_options_forwards_max_tokens() {
+    fn run_llm_text_with_state_and_options_forwards_structured_output_options() {
         let _guard = MODEL_RUNTIME_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2923,6 +3143,7 @@ mod tests {
                 .expect("read body");
             let payload: serde_json::Value = serde_json::from_str(&body).expect("payload json");
             assert_eq!(payload["max_tokens"], json!(12), "{body}");
+            assert_eq!(payload["response_format"], json!({"type": "json_object"}));
             request
                 .respond(
                     Response::from_string(
@@ -2974,6 +3195,7 @@ mod tests {
             &LlmTextOptions {
                 purpose: Some("rag.answer".to_string()),
                 max_tokens: Some(12),
+                json_object_response: true,
                 ..Default::default()
             },
         );
@@ -2984,6 +3206,7 @@ mod tests {
         assert!(result.available);
         assert_eq!(result.text, "capability_summary");
         assert_eq!(result.details["max_tokens"], json!(12));
+        assert_eq!(result.details["json_object_response"], json!(true));
     }
 
     #[test]

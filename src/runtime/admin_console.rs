@@ -252,6 +252,8 @@ pub struct KnowledgeSourceRoot {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct KnowledgeRetrievalSettings {
+    #[serde(default = "default_true")]
+    pub query_expansion_enabled: bool,
     #[serde(default = "default_retrieval_fusion_strategy")]
     pub fusion_strategy: String,
     #[serde(default = "default_retrieval_rrf_k")]
@@ -262,6 +264,8 @@ pub struct KnowledgeRetrievalSettings {
     pub vector_weight: f32,
     #[serde(default = "default_retrieval_candidate_limit")]
     pub candidate_limit: usize,
+    #[serde(default = "default_retrieval_lexical_min_score")]
+    pub lexical_min_score: f32,
     #[serde(default = "default_retrieval_vector_min_score")]
     pub vector_min_score: f32,
     #[serde(default = "default_retrieval_semantic_only_min_score")]
@@ -281,11 +285,13 @@ pub struct KnowledgeRetrievalSettings {
 impl Default for KnowledgeRetrievalSettings {
     fn default() -> Self {
         Self {
+            query_expansion_enabled: true,
             fusion_strategy: default_retrieval_fusion_strategy(),
             rrf_k: default_retrieval_rrf_k(),
             lexical_weight: default_retrieval_lexical_weight(),
             vector_weight: default_retrieval_vector_weight(),
             candidate_limit: default_retrieval_candidate_limit(),
+            lexical_min_score: default_retrieval_lexical_min_score(),
             vector_min_score: default_retrieval_vector_min_score(),
             semantic_only_min_score: default_retrieval_semantic_only_min_score(),
             rerank_enabled: true,
@@ -317,6 +323,10 @@ fn default_retrieval_candidate_limit() -> usize {
     80
 }
 
+fn default_retrieval_lexical_min_score() -> f32 {
+    0.0
+}
+
 fn default_retrieval_vector_min_score() -> f32 {
     0.25
 }
@@ -330,11 +340,43 @@ fn default_retrieval_rerank_top_k() -> usize {
 }
 
 fn default_retrieval_rerank_min_score() -> f32 {
-    0.15
+    0.001
 }
 
 fn default_retrieval_mmr_lambda() -> f32 {
     0.70
+}
+
+fn default_conversation_history_limit() -> usize {
+    10
+}
+
+fn default_conversation_context_turn_limit() -> usize {
+    3
+}
+
+fn default_conversation_context_token_limit() -> usize {
+    8_192
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KnowledgeConversationSettings {
+    #[serde(default = "default_conversation_history_limit")]
+    pub history_limit: usize,
+    #[serde(default = "default_conversation_context_turn_limit")]
+    pub context_turn_limit: usize,
+    #[serde(default = "default_conversation_context_token_limit")]
+    pub context_token_limit: usize,
+}
+
+impl Default for KnowledgeConversationSettings {
+    fn default() -> Self {
+        Self {
+            history_limit: default_conversation_history_limit(),
+            context_turn_limit: default_conversation_context_turn_limit(),
+            context_token_limit: default_conversation_context_token_limit(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -349,6 +391,8 @@ pub struct KnowledgeSettings {
     pub default_resource_profile: RagResourceProfile,
     #[serde(default)]
     pub retrieval: KnowledgeRetrievalSettings,
+    #[serde(default)]
+    pub conversation: KnowledgeConversationSettings,
 }
 
 impl Default for KnowledgeSettings {
@@ -359,6 +403,7 @@ impl Default for KnowledgeSettings {
             privacy_level: PrivacyLevel::StrictLocal,
             default_resource_profile: RagResourceProfile::CpuOnly,
             retrieval: KnowledgeRetrievalSettings::default(),
+            conversation: KnowledgeConversationSettings::default(),
         }
     }
 }
@@ -526,8 +571,19 @@ impl Default for AdminModelCenterState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelCapabilityBindingRecord {
     pub capability_id: String,
-    pub model_id: String,
+    #[serde(alias = "model_id")]
+    pub desired_model_id: String,
+    #[serde(default)]
+    pub active_model_id: Option<String>,
+    #[serde(default = "default_model_transition_status")]
+    pub transition_status: String,
+    #[serde(default)]
+    pub last_error: Option<String>,
     pub updated_at: String,
+}
+
+fn default_model_transition_status() -> String {
+    "ready".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1984,18 +2040,26 @@ impl AdminConsoleStore {
         Ok(runtime)
     }
 
-    pub fn save_model_capability_binding(
+    pub fn save_model_capability_assignment(
         &self,
         capability_id: &str,
-        model_id: &str,
+        desired_model_id: &str,
+        active_model_id: Option<&str>,
+        transition_status: &str,
+        last_error: Option<&str>,
     ) -> Result<ModelCapabilityBindingRecord, String> {
         let capability_id =
             non_empty_opt(capability_id).ok_or_else(|| "capability_id 不能为空".to_string())?;
-        let model_id = non_empty_opt(model_id).ok_or_else(|| "model_id 不能为空".to_string())?;
+        let desired_model_id = non_empty_opt(desired_model_id)
+            .ok_or_else(|| "desired_model_id 不能为空".to_string())?;
         let mut state = self.load_or_create_state()?;
         let record = ModelCapabilityBindingRecord {
             capability_id,
-            model_id,
+            desired_model_id,
+            active_model_id: active_model_id.and_then(non_empty_opt),
+            transition_status: non_empty_opt(transition_status)
+                .unwrap_or_else(default_model_transition_status),
+            last_error: last_error.and_then(non_empty_opt),
             updated_at: model_test_timestamp(),
         };
         if let Some(existing) = state
@@ -2346,6 +2410,14 @@ pub fn sanitize_knowledge_settings(settings: KnowledgeSettings) -> KnowledgeSett
         privacy_level: settings.privacy_level,
         default_resource_profile: settings.default_resource_profile,
         retrieval: sanitize_knowledge_retrieval_settings(settings.retrieval),
+        conversation: KnowledgeConversationSettings {
+            history_limit: settings.conversation.history_limit.clamp(1, 100),
+            context_turn_limit: settings.conversation.context_turn_limit.clamp(0, 20),
+            context_token_limit: settings
+                .conversation
+                .context_token_limit
+                .clamp(4_096, 8_192),
+        },
     }
 }
 
@@ -2366,6 +2438,8 @@ fn sanitize_knowledge_retrieval_settings(
         settings.vector_weight = 0.65;
     }
     settings.candidate_limit = settings.candidate_limit.clamp(1, 500);
+    settings.lexical_min_score =
+        sanitize_unit_or_positive_f32(settings.lexical_min_score, 0.0, 1.0, 0.0);
     settings.vector_min_score =
         sanitize_unit_or_positive_f32(settings.vector_min_score, 0.0, 1.0, 0.25);
     settings.semantic_only_min_score =
@@ -3022,7 +3096,7 @@ pub fn sanitize_model_center_state(state: AdminModelCenterState) -> AdminModelCe
         let Some(capability_id) = non_empty_opt(&binding.capability_id) else {
             continue;
         };
-        let Some(model_id) = non_empty_opt(&binding.model_id) else {
+        let Some(desired_model_id) = non_empty_opt(&binding.desired_model_id) else {
             continue;
         };
         if !seen_capabilities.insert(capability_id.clone()) {
@@ -3030,7 +3104,13 @@ pub fn sanitize_model_center_state(state: AdminModelCenterState) -> AdminModelCe
         }
         capability_bindings.push(ModelCapabilityBindingRecord {
             capability_id,
-            model_id,
+            desired_model_id,
+            active_model_id: binding
+                .active_model_id
+                .and_then(|value| non_empty_opt(&value)),
+            transition_status: non_empty_opt(&binding.transition_status)
+                .unwrap_or_else(default_model_transition_status),
+            last_error: binding.last_error.and_then(|value| non_empty_opt(&value)),
             updated_at: non_empty_opt(&binding.updated_at).unwrap_or_else(model_test_timestamp),
         });
     }
@@ -3169,7 +3249,51 @@ pub fn sanitize_model_endpoint(mut endpoint: ModelEndpoint) -> Result<ModelEndpo
     endpoint.cost_policy = normalize_json_object(endpoint.cost_policy);
     endpoint.metadata = normalize_json_object(endpoint.metadata);
     normalize_builtin_local_model_api_endpoint(&mut endpoint);
+    align_embedding_endpoint_identity_with_runtime(&mut endpoint);
     Ok(endpoint)
+}
+
+fn align_embedding_endpoint_identity_with_runtime(endpoint: &mut ModelEndpoint) {
+    if endpoint.model_endpoint_id != "embed-local-openai-compatible"
+        || endpoint.model_kind != ModelKind::Embedder
+        || !model_endpoint_metadata_bool(endpoint, "runtime_ready")
+    {
+        return;
+    }
+
+    let Some(runtime_model_id) = model_endpoint_metadata_string(endpoint, "runtime_model_id")
+    else {
+        return;
+    };
+    let Some(runtime_embedding_model) =
+        model_endpoint_metadata_string(endpoint, "runtime_embedding_model")
+    else {
+        return;
+    };
+    let Some(served_model) = model_endpoint_metadata_string(endpoint, "model") else {
+        return;
+    };
+    if runtime_model_id != runtime_embedding_model || runtime_model_id != served_model {
+        return;
+    }
+
+    let normalized = runtime_model_id.to_ascii_lowercase();
+    let provider_key = if normalized.contains("qwen") {
+        "qwen"
+    } else if normalized.contains("bge") {
+        "bge"
+    } else if normalized.contains("jina") {
+        "jina"
+    } else {
+        return;
+    };
+
+    endpoint.provider_key = provider_key.to_string();
+    endpoint.model_name = runtime_model_id.clone();
+    set_model_endpoint_metadata_string(endpoint, "catalog_model_id", runtime_model_id.clone());
+    set_model_endpoint_metadata_string(endpoint, "model", runtime_model_id.clone());
+    set_model_endpoint_metadata_string(endpoint, "runtime_model_id", runtime_model_id.clone());
+    set_model_endpoint_metadata_string(endpoint, "runtime_embedding_model", runtime_model_id);
 }
 
 fn normalize_builtin_local_model_api_endpoint(endpoint: &mut ModelEndpoint) {
@@ -5721,9 +5845,27 @@ mod tests {
         user_recent_interactive_surface, AdminConsoleState, AdminConsoleStore, AdminDefaults,
         AdminModelCenterState, AutomationRuleReview, BridgeProviderCapabilities,
         BridgeProviderConfig, DeviceCredentialSecret, DeviceEvidenceRecord, IdentityBindingRecord,
-        KnowledgeSettings, KnowledgeSourceRoot, RemoteViewConfig, BRIDGE_PROVIDER_ACCOUNT_ID,
-        LOCAL_RTSP_CREDENTIAL_ID, LOCAL_RTSP_PROVIDER_ACCOUNT_ID,
+        KnowledgeSettings, KnowledgeSourceRoot, ModelCapabilityBindingRecord, RemoteViewConfig,
+        BRIDGE_PROVIDER_ACCOUNT_ID, LOCAL_RTSP_CREDENTIAL_ID, LOCAL_RTSP_PROVIDER_ACCOUNT_ID,
     };
+
+    #[test]
+    fn capability_binding_migrates_legacy_model_id_to_desired_model_id() {
+        let binding: ModelCapabilityBindingRecord = serde_json::from_value(json!({
+            "capability_id": "vlm",
+            "model_id": "Qwen/Qwen3.5-9B",
+            "updated_at": "1"
+        }))
+        .expect("legacy binding");
+
+        assert_eq!(binding.desired_model_id, "Qwen/Qwen3.5-9B");
+        assert_eq!(binding.active_model_id, None);
+        assert_eq!(binding.transition_status, "ready");
+
+        let serialized = serde_json::to_value(binding).expect("serialized binding");
+        assert_eq!(serialized["desired_model_id"], json!("Qwen/Qwen3.5-9B"));
+        assert!(serialized.get("model_id").is_none());
+    }
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
@@ -5794,8 +5936,13 @@ mod tests {
 
         assert_eq!(settings.retrieval.fusion_strategy, "rrf");
         assert_eq!(settings.retrieval.candidate_limit, 80);
+        assert!(settings.retrieval.query_expansion_enabled);
+        assert_eq!(settings.retrieval.lexical_min_score, 0.0);
         assert!(settings.retrieval.rerank_enabled);
         assert!(settings.retrieval.mmr_enabled);
+        assert_eq!(settings.conversation.history_limit, 10);
+        assert_eq!(settings.conversation.context_turn_limit, 3);
+        assert_eq!(settings.conversation.context_token_limit, 8_192);
     }
 
     #[test]
@@ -6952,6 +7099,89 @@ mod tests {
             json!("http://127.0.0.1:4174/api/inference/healthz")
         );
         assert_eq!(endpoint.metadata["legacy_model_api_migrated"], json!(true));
+    }
+
+    #[test]
+    fn sanitize_model_center_aligns_embedding_identity_with_ready_runtime() {
+        let state = AdminModelCenterState {
+            endpoints: vec![ModelEndpoint {
+                model_endpoint_id: "embed-local-openai-compatible".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Embedder,
+                endpoint_kind: ModelEndpointKind::Local,
+                provider_key: "bge".to_string(),
+                model_name: "bge-m3".to_string(),
+                capability_tags: vec!["embeddings".to_string(), "local_first".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({
+                    "catalog_model_id": "bge-m3",
+                    "model": "Qwen/Qwen3-Embedding-0.6B",
+                    "runtime_model_id": "Qwen/Qwen3-Embedding-0.6B",
+                    "runtime_embedding_model": "Qwen/Qwen3-Embedding-0.6B",
+                    "runtime_ready": true,
+                }),
+            }],
+            route_policies: default_model_route_policies(),
+            model_store_root: default_model_store_root(),
+            capability_bindings: Vec::new(),
+            runtimes: Vec::new(),
+        };
+
+        let sanitized = sanitize_model_center_state(state);
+        let endpoint = sanitized
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "embed-local-openai-compatible")
+            .expect("embed endpoint");
+
+        assert_eq!(endpoint.provider_key, "qwen");
+        assert_eq!(endpoint.model_name, "Qwen/Qwen3-Embedding-0.6B");
+        assert_eq!(
+            endpoint.metadata["catalog_model_id"],
+            json!("Qwen/Qwen3-Embedding-0.6B")
+        );
+    }
+
+    #[test]
+    fn sanitize_model_center_does_not_align_inconsistent_embedding_runtime() {
+        let state = AdminModelCenterState {
+            endpoints: vec![ModelEndpoint {
+                model_endpoint_id: "embed-local-openai-compatible".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Embedder,
+                endpoint_kind: ModelEndpointKind::Local,
+                provider_key: "bge".to_string(),
+                model_name: "bge-m3".to_string(),
+                capability_tags: vec!["embeddings".to_string(), "local_first".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({
+                    "catalog_model_id": "bge-m3",
+                    "model": "Qwen/Qwen3-Embedding-0.6B",
+                    "runtime_model_id": "Qwen/Qwen3-Embedding-0.6B",
+                    "runtime_embedding_model": "bge-m3",
+                    "runtime_ready": true,
+                }),
+            }],
+            route_policies: default_model_route_policies(),
+            model_store_root: default_model_store_root(),
+            capability_bindings: Vec::new(),
+            runtimes: Vec::new(),
+        };
+
+        let sanitized = sanitize_model_center_state(state);
+        let endpoint = sanitized
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "embed-local-openai-compatible")
+            .expect("embed endpoint");
+
+        assert_eq!(endpoint.provider_key, "bge");
+        assert_eq!(endpoint.model_name, "bge-m3");
+        assert_eq!(endpoint.metadata["catalog_model_id"], json!("bge-m3"));
     }
 
     #[test]
