@@ -43,7 +43,7 @@ const VECTOR_SEARCH_MODE_ENV: &str = "HARBOR_VECTOR_SEARCH_MODE";
 const DEFAULT_LEXICAL_TOP_K: usize = 256;
 const DOCUMENT_EXTENSIONS: &[&str] = &[
     "txt", "md", "markdown", "json", "csv", "html", "htm", "yaml", "yml", "log", "xml", "rss",
-    "atom", "pdf", "docx", "pptx", "xlsx", "zip",
+    "atom", "pdf", "docx", "pptx", "xlsx",
 ];
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp"];
 const AUDIO_EXTENSIONS: &[&str] = &["mp3", "wav", "m4a", "flac", "aac", "ogg", "opus"];
@@ -512,6 +512,30 @@ impl KnowledgeIndexService {
         snapshot: &KnowledgeIndexSnapshot,
         model_center_state: &AdminModelCenterState,
     ) -> KnowledgeEmbeddingWarmupStats {
+        self.warm_embedding_cache_inner(snapshot, model_center_state, None, None)
+    }
+
+    pub fn warm_embedding_cache_with_deadline(
+        &self,
+        snapshot: &KnowledgeIndexSnapshot,
+        model_center_state: &AdminModelCenterState,
+        deadline: Instant,
+        timeout: Duration,
+    ) -> KnowledgeEmbeddingWarmupStats {
+        self.warm_embedding_cache_inner(snapshot, model_center_state, Some(deadline), Some(timeout))
+    }
+
+    fn warm_embedding_cache_inner(
+        &self,
+        snapshot: &KnowledgeIndexSnapshot,
+        model_center_state: &AdminModelCenterState,
+        deadline: Option<Instant>,
+        timeout: Option<Duration>,
+    ) -> KnowledgeEmbeddingWarmupStats {
+        let candidate_count = self.embedding_warmup_candidate_count(snapshot);
+        if embedding_deadline_expired(deadline) {
+            return embedding_deadline_stats(candidate_count, timeout);
+        }
         let mut stats = KnowledgeEmbeddingWarmupStats::default();
         let embedding_store_path = self.embedding_store_path_for_root(&snapshot.root);
         let mut store = match load_embedding_store(&embedding_store_path) {
@@ -590,7 +614,17 @@ impl KnowledgeIndexService {
                 })
                 .find(|text| !text.is_empty());
             if let Some(probe_text) = probe_text {
-                let execution = run_embedding_with_context_retry(&probe_text, model_center_state);
+                if embedding_deadline_expired(deadline) {
+                    return embedding_deadline_stats(candidate_count, timeout);
+                }
+                let execution = run_embedding_with_context_retry_until(
+                    &probe_text,
+                    model_center_state,
+                    deadline,
+                );
+                if embedding_deadline_expired(deadline) {
+                    return embedding_deadline_stats(candidate_count, timeout);
+                }
                 if execution.available && !execution.vector.is_empty() {
                     let execution_model_name = execution
                         .model_name
@@ -652,7 +686,14 @@ impl KnowledgeIndexService {
                     }
                 }
 
-                let execution = run_embedding_with_context_retry(text, model_center_state);
+                if embedding_deadline_expired(deadline) {
+                    return embedding_deadline_stats(candidate_count, timeout);
+                }
+                let execution =
+                    run_embedding_with_context_retry_until(text, model_center_state, deadline);
+                if embedding_deadline_expired(deadline) {
+                    return embedding_deadline_stats(candidate_count, timeout);
+                }
                 if !execution.available || execution.vector.is_empty() {
                     stats.failed += 1;
                     stats.degraded = true;
@@ -719,6 +760,9 @@ impl KnowledgeIndexService {
             if store.entries.len() != before_retain_len {
                 dirty = true;
             }
+        }
+        if embedding_deadline_expired(deadline) {
+            return embedding_deadline_stats(candidate_count, timeout);
         }
         if dirty {
             let persist_result = if incremental_ready {
@@ -2217,23 +2261,77 @@ fn cosine_similarity_le_bytes(query: &[f32], row: &[u8]) -> f32 {
     }
 }
 
-fn run_embedding_with_context_retry(
+fn embedding_deadline_expired(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| Instant::now() >= deadline)
+}
+
+fn embedding_deadline_stats(
+    total: usize,
+    timeout: Option<Duration>,
+) -> KnowledgeEmbeddingWarmupStats {
+    let timeout_ms = timeout.map(|value| value.as_millis()).unwrap_or_default();
+    KnowledgeEmbeddingWarmupStats {
+        total,
+        completed: 0,
+        skipped: 0,
+        failed: total,
+        degraded: true,
+        persist_error: None,
+        last_error: Some(format!(
+            "Embedding warmup exceeded {timeout_ms} ms; pending results were discarded and the previous embedding store was preserved."
+        )),
+    }
+}
+
+fn run_embedding_with_context_retry_until(
     text: &str,
     model_center_state: &AdminModelCenterState,
+    deadline: Option<Instant>,
 ) -> model_center::EmbeddingExecution {
     let mut input = text.trim().to_string();
-    let mut execution = model_center::run_embedding_with_state(&input, model_center_state);
+    let mut execution = run_embedding_before_deadline(&input, model_center_state, deadline);
     for _ in 0..EMBEDDING_CONTEXT_RETRY_LIMIT {
         if execution.available
             || !embedding_context_limit_error(&execution.summary)
             || input.chars().count() <= EMBEDDING_CONTEXT_RETRY_MIN_CHARS
+            || embedding_deadline_expired(deadline)
         {
             break;
         }
         input = truncate_embedding_retry_input(&input);
-        execution = model_center::run_embedding_with_state(&input, model_center_state);
+        execution = run_embedding_before_deadline(&input, model_center_state, deadline);
     }
     execution
+}
+
+fn run_embedding_before_deadline(
+    text: &str,
+    model_center_state: &AdminModelCenterState,
+    deadline: Option<Instant>,
+) -> model_center::EmbeddingExecution {
+    let Some(deadline) = deadline else {
+        return model_center::run_embedding_with_state(text, model_center_state);
+    };
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        return embedding_deadline_execution();
+    };
+    if remaining.is_zero() {
+        return embedding_deadline_execution();
+    }
+    model_center::run_embedding_with_state_and_timeout(text, model_center_state, remaining)
+}
+
+fn embedding_deadline_execution() -> model_center::EmbeddingExecution {
+    model_center::EmbeddingExecution {
+        available: false,
+        status: "degraded".to_string(),
+        summary: "Embedding warmup deadline exceeded before the next request.".to_string(),
+        provider_key: String::new(),
+        model_endpoint_id: None,
+        model_name: None,
+        vector: Vec::new(),
+        details: serde_json::json!({}),
+    }
 }
 
 fn embedding_context_limit_error(summary: &str) -> bool {
@@ -3677,6 +3775,7 @@ mod tests {
         KnowledgeIndexService, KnowledgeIndexTextSource, KnowledgeModality, VideoFrameQuality,
         EMBEDDING_STORE_SCHEMA_VERSION, INDEX_SCHEMA_VERSION,
     };
+    use crate::runtime::admin_console::AdminModelCenterState;
     use crate::runtime::model_center::EmbeddingEndpointIdentity;
     use std::collections::HashSet;
     use std::fs;
@@ -3710,6 +3809,49 @@ mod tests {
         assert_eq!(truncate_embedding_retry_input(&long).chars().count(), 500);
         let short = "知".repeat(129);
         assert_eq!(truncate_embedding_retry_input(&short).chars().count(), 128);
+    }
+
+    #[test]
+    fn zip_archives_are_not_classified_as_indexable_documents() {
+        assert_eq!(super::classify_path(Path::new("archive.zip")), None);
+        assert_eq!(
+            super::classify_path(Path::new("manual.docx")),
+            Some(KnowledgeModality::Document)
+        );
+    }
+
+    #[test]
+    fn expired_embedding_deadline_preserves_the_previous_store() {
+        let root = unique_dir("harborbeacon-embedding-deadline-root");
+        let index_root = unique_dir("harborbeacon-embedding-deadline-index");
+        fs::create_dir_all(&root).expect("create source root");
+        fs::write(root.join("note.md"), "# Note\n\nDeadline evidence").expect("write source");
+        let service = KnowledgeIndexService::from_config(
+            KnowledgeIndexConfig::new(index_root.clone()).expect("config"),
+        )
+        .expect("service");
+        let snapshot = service.load_or_refresh(&root).expect("snapshot");
+        let store_path = service.embedding_store_path_for_root(&snapshot.root);
+        let previous = KnowledgeEmbeddingStore {
+            schema_version: EMBEDDING_STORE_SCHEMA_VERSION,
+            root: snapshot.root.to_string_lossy().into_owned(),
+            ..KnowledgeEmbeddingStore::default()
+        };
+        save_embedding_store(&store_path, &previous).expect("save previous store");
+        let before = fs::read(&store_path).expect("read previous store");
+
+        let stats = service.warm_embedding_cache_with_deadline(
+            &snapshot,
+            &AdminModelCenterState::default(),
+            Instant::now() - Duration::from_millis(1),
+            Duration::from_millis(1),
+        );
+
+        assert!(stats.degraded);
+        assert_eq!(stats.completed, 0);
+        assert_eq!(fs::read(&store_path).expect("read unchanged store"), before);
+        cleanup_dir(&root);
+        cleanup_dir(&index_root);
     }
 
     #[test]

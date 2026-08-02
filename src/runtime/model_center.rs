@@ -1345,6 +1345,14 @@ fn run_llm_text_on_endpoint(
 }
 
 pub fn run_embedding_with_state(text: &str, state: &AdminModelCenterState) -> EmbeddingExecution {
+    run_embedding_with_state_and_timeout(text, state, Duration::from_secs(45))
+}
+
+pub fn run_embedding_with_state_and_timeout(
+    text: &str,
+    state: &AdminModelCenterState,
+    timeout: Duration,
+) -> EmbeddingExecution {
     let input = text.trim();
     if input.is_empty() {
         return EmbeddingExecution {
@@ -1424,7 +1432,7 @@ pub fn run_embedding_with_state(text: &str, state: &AdminModelCenterState) -> Em
     };
 
     let resolved_model_name = Some(config.model.clone());
-    let client = match OpenAiCompatibleEmbeddingClient::new(config) {
+    let client = match OpenAiCompatibleEmbeddingClient::new_with_timeout(config, timeout) {
         Ok(client) => client,
         Err(error) => {
             return EmbeddingExecution {
