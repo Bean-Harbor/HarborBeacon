@@ -4115,7 +4115,7 @@ impl TaskApiService {
             finalize_rag_answer_citations(&query, &answer, answer_generation_status, &citations);
         answer = citation_finalization.answer;
         if let Some(reason) = citation_finalization.degraded_reason {
-            degraded_reason = Some(reason.to_string());
+            degraded_reason.get_or_insert_with(|| reason.to_string());
         }
         if let Some(warning) = citation_finalization.warning {
             warnings.push(warning);
