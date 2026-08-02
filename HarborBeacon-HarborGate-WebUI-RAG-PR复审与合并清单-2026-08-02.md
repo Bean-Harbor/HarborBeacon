@@ -6,7 +6,7 @@
 
 ## 结论
 
-本轮按 Gate -> WebUI -> Beacon 的顺序收口 Harbor Assistant RAG 用户端点。代码已经完成本地复审和定向验证，远端 PR、CI 与合并结果在本清单后半部分按实际执行结果回填。
+本轮已按 Gate -> WebUI -> Beacon 的顺序完成 Harbor Assistant RAG 用户端点收口。三仓代码、独立复审、PR CI、目标分支 CI 和 squash 合并均已完成，实际 head 与合并提交记录见本清单后半部分。
 
 本轮边界已经锁定：
 
@@ -117,17 +117,18 @@ Camera/HarborLink 工作线后续负责：
 - [x] `cargo clippy --lib --tests` 通过（只保留仓库既有 warning）。
 - [x] `cargo check --bin harboros-beacon --bin agent-hub-admin-api` 通过。
 - [x] release `validate-contract-schemas` 构建和执行通过；本机无 `midclt`/`midcli`，live probe 按工具缺失跳过。
+- [x] HarborBeacon #38、#37 与合并后的 master push 均通过 Linux `rust_quality`（611 项 lib、144 项 API binary）、`harborlink_package_contract` 和 `schema_check`。
 
 Windows 全量 lib 的修复前基线为 610 项中 576 通过、33 失败、1 ignored。首个 knowledge child retrieval 失败会导致后续锁 poisoning；代表性 knowledge/task_api 失败已在未修改的 `b02550d` 基线上原样复现，因此不是本轮回归。本轮新增的第 611 项引用回归测试已单独通过；不再等待整套 Windows lib 重跑，Linux PR CI 作为最终门禁。
 
 ## PR、CI 与合并记录
 
 - HarborGate [#12](https://github.com/Bean-Harbor/HarborGate/pull/12) 已在 head `4648d00490edbe727818310143ca51a776938520` 全绿后 squash 合入 `main`：`ac79547310da9b7179d131fb81ce8498b4a93e72`。合并后的 main push CI 成功。
-- WebUI [#2](https://github.com/Bean-Harbor/webui/pull/2) 已在 head `9c6f3c93168e4779913fea82ee9ab401638453ea` 的构建、变更 lint、Harbor Assistant 测试、HarborNavi 合同、翻译检查和 Docker 全绿后 squash 合入 `develop`：`6c59c207d8fa9c61c565384639d47d2ca3f3ca45`。基线 lint 成功；整仓 baseline tests 明确为 non-blocking，合并时仍在运行。该 fork 未生成 develop push workflow。
-- HarborBeacon 收口 PR：待创建
-- HarborBeacon #37：待最终复审与 squash 合并
+- WebUI [#2](https://github.com/Bean-Harbor/webui/pull/2) 已在 head `9c6f3c93168e4779913fea82ee9ab401638453ea` 的构建、变更 lint、Harbor Assistant 测试、HarborNavi 合同、翻译检查和 Docker 全绿后 squash 合入 `develop`：`6c59c207d8fa9c61c565384639d47d2ca3f3ca45`。基线 lint 成功；整仓 baseline tests 明确为 non-blocking，合并时仍在运行，随后也成功完成。该 fork 未生成 develop push workflow。
+- HarborBeacon 收口 [#38](https://github.com/Bean-Harbor/HarborBeacon/pull/38) 已在最终 head `eff0835d0b768888a936f97d07d76f960c86b0b3` 三项 CI 全绿、独立复核无 P1/P2 后 squash 合入 `feature/RAG`：`9d6a9f4673819f443ebed457dc3ef3ed2d4f57dd`。
+- HarborBeacon [#37](https://github.com/Bean-Harbor/HarborBeacon/pull/37) 已在最终 head `9d6a9f4673819f443ebed457dc3ef3ed2d4f57dd` 三项 CI 全绿后 squash 合入 `master`：`a31cd00751a9e1875db8f8aeafc06193a4c1468a`。合并后的 master push CI 成功。
 
-合并顺序：HarborGate -> WebUI -> HarborBeacon 收口 PR -> HarborBeacon #37。每一步必须等待目标分支 CI 成功；任何失败都停止后续合并并先修复。
+实际合并顺序：HarborGate #12 -> WebUI #2 -> HarborBeacon #38 -> HarborBeacon #37。每一步均在对应阻断 CI 成功后执行；Beacon CI 暴露的问题先完成根因修复和独立复核，再继续后续合并。
 
 ## 不阻塞本轮的后续项
 
