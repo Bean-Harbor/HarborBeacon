@@ -16,7 +16,7 @@ const NATIVE_PARSER_KEY: &str = "harbor_native:v1";
 const MARKITDOWN_PARSER_KEY: &str = "markitdown:0.1.11:v1";
 const NATIVE_EXTENSIONS: &[&str] = &["txt", "md", "markdown", "json", "csv", "yaml", "yml", "log"];
 const MARKITDOWN_EXTENSIONS: &[&str] = &[
-    "html", "htm", "xml", "rss", "atom", "pdf", "docx", "pptx", "xlsx", "zip",
+    "html", "htm", "xml", "rss", "atom", "pdf", "docx", "pptx", "xlsx",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -463,6 +463,7 @@ mod tests {
             parser_key_for_path(std::path::Path::new("manual.docx")).as_deref(),
             Some("markitdown:0.1.11:v1")
         );
+        assert!(parser_key_for_path(std::path::Path::new("archive.zip")).is_none());
         assert!(parser_key_for_path(std::path::Path::new("archive.bin")).is_none());
     }
 

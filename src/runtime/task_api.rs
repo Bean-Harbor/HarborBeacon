@@ -3983,10 +3983,11 @@ impl TaskApiService {
             if !privacy_gateway_evaluation.decision.cloud_allowed {
                 degraded_reason.get_or_insert_with(|| "privacy_gateway_blocked".to_string());
                 warnings.extend(privacy_gateway_evaluation.decision.warnings.clone());
-                answer = format!(
+                warnings.push(format!(
                     "Privacy Gateway 已阻断云端回答：{}",
                     privacy_gateway_evaluation.decision.reason
-                );
+                ));
+                answer = build_limited_rag_answer(&query, &citations);
                 answer_generation_status = "privacy_gateway_blocked";
                 skip_model = true;
             } else if let Some(capsule) = privacy_gateway_evaluation.semantic_capsule.as_ref() {
@@ -3997,9 +3998,7 @@ impl TaskApiService {
                 warnings.push(
                     "Privacy Gateway 未能生成 semantic capsule，已跳过云端模型。".to_string(),
                 );
-                answer =
-                    "Privacy Gateway 未能生成可上云的 semantic capsule，已降级为本地引用摘要。"
-                        .to_string();
+                answer = build_limited_rag_answer(&query, &citations);
                 answer_generation_status = "privacy_gateway_blocked";
                 skip_model = true;
             }
@@ -4104,9 +4103,6 @@ impl TaskApiService {
             }
         }
 
-        let degraded = search_result.degraded || degraded_reason.is_some();
-        let status = if degraded { "degraded" } else { "completed" };
-        let reason = degraded_reason.as_deref().unwrap_or("none");
         let privacy_gateway = privacy_gateway_evaluation.evidence_value(capsule_prompt_used);
         self.record_privacy_gateway_audit(
             request,
@@ -4114,37 +4110,16 @@ impl TaskApiService {
             capsule_prompt_used,
         );
         let citation_count = citations.len();
-        let (cited_indices, answer_review) = match validate_rag_answer_citations(
-            &answer,
-            citation_count,
-        ) {
-            Ok(cited_indices) => (
-                Some(cited_indices.clone()),
-                json!({
-                    "mode": "deterministic_citation_validation",
-                    "status": "passed",
-                    "generation_status": answer_generation_status,
-                    "used_citation_ids": cited_indices,
-                }),
-            ),
-            Err(validation_reason) => {
-                if answer_generation_status == "generated_once" {
-                    warnings.push(format!(
-                            "回答已保留，但引用格式校验未通过：{validation_reason}；请结合参考资料核对。"
-                        ));
-                }
-                (
-                    None,
-                    json!({
-                        "mode": "deterministic_citation_validation",
-                        "status": "warning",
-                        "generation_status": answer_generation_status,
-                        "reason": validation_reason,
-                    }),
-                )
-            }
-        };
-        if let Some(cited_indices) = cited_indices {
+        let citation_finalization =
+            finalize_rag_answer_citations(&query, &answer, answer_generation_status, &citations);
+        answer = citation_finalization.answer;
+        if let Some(reason) = citation_finalization.degraded_reason {
+            degraded_reason.get_or_insert_with(|| reason.to_string());
+        }
+        if let Some(warning) = citation_finalization.warning {
+            warnings.push(warning);
+        }
+        if let Some(cited_indices) = citation_finalization.cited_indices {
             citations = citations
                 .into_iter()
                 .enumerate()
@@ -4153,8 +4128,14 @@ impl TaskApiService {
                 .collect();
         }
         if let Some(model_object) = model.as_object_mut() {
-            model_object.insert("answer_review".to_string(), answer_review);
+            model_object.insert(
+                "answer_review".to_string(),
+                citation_finalization.answer_review,
+            );
         }
+        let degraded = search_result.degraded || degraded_reason.is_some();
+        let status = if degraded { "degraded" } else { "completed" };
+        let reason = degraded_reason.as_deref().unwrap_or("none");
         let answer = strip_rag_citation_markers(&answer, citation_count);
         let data = build_rag_answer_data(
             &query,
@@ -9425,11 +9406,9 @@ fn visible_rag_hits(
         .collect()
 }
 
-fn build_limited_rag_answer(query: &str, citations: &[KnowledgeSearchCitation]) -> String {
-    let mut lines = vec![format!(
-        "基于当前检索到的引用，关于“{}”只能给出有限回答：",
-        query
-    )];
+fn build_limited_rag_answer(_query: &str, citations: &[KnowledgeSearchCitation]) -> String {
+    debug_assert!(!citations.is_empty());
+    let mut lines = vec!["基于当前检索到的引用，只能给出有限回答。[1]".to_string()];
     let mut added = 0usize;
     for (index, citation) in citations.iter().take(3).enumerate() {
         let preview = cleaned_citation_preview(citation);
@@ -9440,7 +9419,7 @@ fn build_limited_rag_answer(query: &str, citations: &[KnowledgeSearchCitation]) 
         added += 1;
     }
     if added == 0 {
-        lines.push("已找到匹配来源，但这些来源缺少可直接引用的文本片段；需要刷新索引或换一个更具体的问题。".to_string());
+        lines.push("已找到匹配来源，但这些来源缺少可直接引用的文本片段；需要刷新索引或换一个更具体的问题。[1]".to_string());
     }
     lines.join("\n")
 }
@@ -9548,7 +9527,10 @@ fn build_document_list_rag_answer(
     if documents.is_empty() {
         return None;
     }
-    let mut lines = vec!["根据检索证据，找到以下相关文档：".to_string()];
+    let mut lines = vec![format!(
+        "根据检索证据，找到以下相关文档：[{}]",
+        documents[0].0 + 1
+    )];
     for (position, (citation_index, citation)) in documents.iter().enumerate() {
         lines.push(format!(
             "{}. 《{}》 [{}]",
@@ -9627,7 +9609,10 @@ fn build_recent_media_list_rag_answer(
     } else {
         "媒体文件"
     };
-    let mut lines = vec![format!("根据修改时间，最新的{media_label}如下：")];
+    let mut lines = vec![format!(
+        "根据修改时间，最新的{media_label}如下：[{}]",
+        media[0].0 + 1
+    )];
     for (position, (citation_index, citation)) in media.iter().enumerate() {
         lines.push(format!(
             "{}. 《{}》 [{}]",
@@ -9867,15 +9852,78 @@ fn validate_rag_answer_citations(
     }
     if answer.lines().any(|line| {
         let line = line.trim();
-        !line.is_empty()
-            && !line.starts_with('#')
-            && !line.ends_with(':')
-            && !line.ends_with('：')
-            && !rag_answer_has_citation_marker(line, citation_count)
+        !line.is_empty() && !rag_answer_has_citation_marker(line, citation_count)
     }) {
         return Err("uncited_content_line");
     }
     Ok(cited_indices)
+}
+
+#[derive(Debug)]
+struct RagCitationFinalization {
+    answer: String,
+    cited_indices: Option<HashSet<usize>>,
+    answer_review: Value,
+    degraded_reason: Option<&'static str>,
+    warning: Option<String>,
+}
+
+fn finalize_rag_answer_citations(
+    query: &str,
+    answer: &str,
+    generation_status: &'static str,
+    citations: &[KnowledgeSearchCitation],
+) -> RagCitationFinalization {
+    match validate_rag_answer_citations(answer, citations.len()) {
+        Ok(cited_indices) => RagCitationFinalization {
+            answer: answer.to_string(),
+            cited_indices: Some(cited_indices.clone()),
+            answer_review: json!({
+                "mode": "deterministic_citation_validation",
+                "status": "passed",
+                "generation_status": generation_status,
+                "used_citation_ids": cited_indices,
+            }),
+            degraded_reason: None,
+            warning: None,
+        },
+        Err(validation_reason) => {
+            debug_assert!(!citations.is_empty());
+            let fallback_candidate = build_limited_rag_answer(query, citations);
+            let (fallback_answer, fallback_indices, fallback_validation_reason) =
+                match validate_rag_answer_citations(&fallback_candidate, citations.len()) {
+                    Ok(indices) => (fallback_candidate, indices, None),
+                    Err(reason) => (
+                        "已找到匹配来源，但暂时无法生成完整的证据摘要。[1]".to_string(),
+                        HashSet::from([1]),
+                        Some(reason),
+                    ),
+                };
+            let warning_subject = if generation_status == "generated_once" {
+                "模型回答"
+            } else {
+                "回答"
+            };
+            RagCitationFinalization {
+                answer: fallback_answer,
+                cited_indices: Some(fallback_indices.clone()),
+                answer_review: json!({
+                    "mode": "deterministic_citation_validation",
+                    "status": "fallback",
+                    "generation_status": "citation_validation_fallback",
+                    "reason": "citation_validation_failed",
+                    "validation_reason": validation_reason,
+                    "fallback_validation_reason": fallback_validation_reason,
+                    "source_generation_status": generation_status,
+                    "used_citation_ids": fallback_indices,
+                }),
+                degraded_reason: Some("citation_validation_failed"),
+                warning: Some(format!(
+                    "{warning_subject}的引用校验未通过（{validation_reason}），已舍弃不合规文本并返回确定性证据摘要。"
+                )),
+            }
+        }
+    }
 }
 
 fn rag_answer_referenced_indices(answer: &str) -> HashSet<usize> {
@@ -13854,6 +13902,7 @@ mod tests {
             &answer,
             citations.len()
         ));
+        assert!(super::validate_rag_answer_citations(&answer, citations.len()).is_ok());
     }
 
     #[test]
@@ -13876,6 +13925,7 @@ mod tests {
             &answer,
             citations.len()
         ));
+        assert!(super::validate_rag_answer_citations(&answer, citations.len()).is_ok());
     }
 
     #[test]
@@ -15359,6 +15409,71 @@ mod tests {
         assert_eq!(
             super::validate_rag_answer_citations("第一项有证据。[1]\n第二项没有引用。", 1,),
             Err("uncited_content_line")
+        );
+        assert_eq!(
+            super::validate_rag_answer_citations("项目已经延期：\n另一项有证据。[1]", 1),
+            Err("uncited_content_line")
+        );
+        assert_eq!(
+            super::validate_rag_answer_citations("## 项目已经延期\n另一项有证据。[1]", 1),
+            Err("uncited_content_line")
+        );
+
+        let invalid_generated = super::finalize_rag_answer_citations(
+            "文章讲了什么？",
+            "这是没有引用的模型幻觉。",
+            "generated_once",
+            &citations,
+        );
+        assert!(!invalid_generated.answer.contains("模型幻觉"));
+        assert_eq!(
+            invalid_generated.degraded_reason,
+            Some("citation_validation_failed")
+        );
+        assert_eq!(
+            invalid_generated.answer_review["generation_status"],
+            "citation_validation_fallback"
+        );
+        assert_eq!(
+            invalid_generated.answer_review["reason"],
+            "citation_validation_failed"
+        );
+        assert_eq!(
+            invalid_generated.cited_indices,
+            Some(std::collections::HashSet::from([1]))
+        );
+
+        let mut citation_without_preview = citations[0].clone();
+        citation_without_preview.preview = Some(" \n ".to_string());
+        let fallback = super::build_limited_rag_answer(
+            "包含\n换行的查询",
+            &[citation_without_preview.clone()],
+        );
+        assert!(fallback
+            .lines()
+            .all(|line| { super::rag_answer_has_citation_marker(line, 1) }));
+        assert_eq!(
+            super::validate_rag_answer_citations(&fallback, 1),
+            Ok(std::collections::HashSet::from([1]))
+        );
+
+        let invalid_deterministic = super::finalize_rag_answer_citations(
+            "文章讲了什么？",
+            "未引用的标题\n有证据的条目。[1]",
+            "deterministic_answer",
+            &[citation_without_preview],
+        );
+        assert_eq!(
+            invalid_deterministic.degraded_reason,
+            Some("citation_validation_failed")
+        );
+        assert_eq!(
+            super::validate_rag_answer_citations(&invalid_deterministic.answer, 1),
+            Ok(std::collections::HashSet::from([1]))
+        );
+        assert_eq!(
+            invalid_deterministic.cited_indices,
+            Some(std::collections::HashSet::from([1]))
         );
     }
 
@@ -19934,7 +20049,17 @@ mod tests {
             false
         );
         assert_eq!(response.result.data["model"], Value::Null);
-        assert!(response.result.message.contains("Privacy Gateway"));
+        assert!(response.result.data["warnings"]
+            .as_array()
+            .is_some_and(|warnings| warnings
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|warning| { warning.contains("Privacy Gateway 已阻断云端回答") })));
+        assert_eq!(
+            response.result.data["citations"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert!(!response.result.message.contains("Privacy Gateway"));
 
         let _ = fs::remove_file(admin_path);
         let _ = fs::remove_file(registry_path);

@@ -381,8 +381,15 @@ impl OpenAiCompatibleTextClient {
 
 impl OpenAiCompatibleEmbeddingClient {
     pub fn new(config: OpenAiCompatibleConfig) -> Result<Self, String> {
+        Self::new_with_timeout(config, std::time::Duration::from_secs(45))
+    }
+
+    pub fn new_with_timeout(
+        config: OpenAiCompatibleConfig,
+        timeout: std::time::Duration,
+    ) -> Result<Self, String> {
         let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(45))
+            .timeout(timeout.max(std::time::Duration::from_millis(1)))
             .build()
             .map_err(|e| format!("failed to build OpenAI-compatible embedding client: {e}"))?;
         Ok(Self { client, config })

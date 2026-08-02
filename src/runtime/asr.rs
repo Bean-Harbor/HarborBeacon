@@ -7,8 +7,9 @@
 use std::env;
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -31,7 +32,13 @@ const ASR_THREADS_ENV: &str = "HARBOR_ASR_THREADS";
 const ASR_LANGUAGE_ENV: &str = "HARBOR_ASR_LANGUAGE";
 const ASR_TIMEOUT_ENV: &str = "HARBOR_ASR_TIMEOUT_SECONDS";
 const ASR_MIN_DURATION_ENV: &str = "HARBOR_ASR_MIN_DURATION_SECONDS";
+const ASR_MAX_DURATION_ENV: &str = "HARBOR_ASR_MAX_DURATION_SECONDS";
+const ASR_MAX_SOURCE_BYTES_ENV: &str = "HARBOR_ASR_MAX_SOURCE_BYTES";
+const ASR_FFPROBE_TIMEOUT_ENV: &str = "HARBOR_ASR_FFPROBE_TIMEOUT_SECONDS";
 const DEFAULT_MIN_DURATION_SECONDS: f64 = 1.0;
+const DEFAULT_MAX_DURATION_SECONDS: f64 = 900.0;
+const DEFAULT_MAX_SOURCE_BYTES: u64 = 256 * 1024 * 1024;
+const DEFAULT_FFPROBE_TIMEOUT_SECONDS: u64 = 15;
 static ASR_EXECUTION_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -76,6 +83,9 @@ struct AsrRuntimeConfig {
     language: String,
     timeout: Duration,
     min_duration_seconds: f64,
+    max_duration_seconds: f64,
+    max_source_bytes: u64,
+    ffprobe_timeout: Duration,
     provider_key: String,
 }
 
@@ -102,8 +112,13 @@ pub fn transcribe_cached(audio_path: &Path, index_root: &Path) -> Result<AsrTran
     })?;
     let config = runtime_config()?;
     let source = source_identity(audio_path)?;
-    let duration_seconds = probe_audio_duration_seconds(audio_path)?;
-    validate_audio_duration(duration_seconds, config.min_duration_seconds)?;
+    validate_source_size(source.size, config.max_source_bytes)?;
+    let duration_seconds = probe_audio_duration_seconds(audio_path, config.ffprobe_timeout)?;
+    validate_audio_duration(
+        duration_seconds,
+        config.min_duration_seconds,
+        config.max_duration_seconds,
+    )?;
     let cache_path = transcript_cache_path(index_root, audio_path);
 
     if let Some(cached) = load_cache(&cache_path) {
@@ -167,6 +182,28 @@ fn runtime_config() -> Result<AsrRuntimeConfig, AsrError> {
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite() && *value >= 0.0)
         .unwrap_or(DEFAULT_MIN_DURATION_SECONDS);
+    let max_duration_seconds = env::var(ASR_MAX_DURATION_ENV)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(DEFAULT_MAX_DURATION_SECONDS);
+    let max_source_bytes = env::var(ASR_MAX_SOURCE_BYTES_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_SOURCE_BYTES);
+    let ffprobe_timeout_seconds = env::var(ASR_FFPROBE_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_FFPROBE_TIMEOUT_SECONDS);
+    let (min_duration_seconds, max_duration_seconds, max_source_bytes, ffprobe_timeout_seconds) =
+        enforce_asr_policy_limits(
+            min_duration_seconds,
+            max_duration_seconds,
+            max_source_bytes,
+            ffprobe_timeout_seconds,
+        );
     let model_metadata = fs::metadata(&model).map_err(|error| {
         AsrError::Unavailable(format!("cannot inspect model {}: {error}", model.display()))
     })?;
@@ -193,55 +230,75 @@ fn runtime_config() -> Result<AsrRuntimeConfig, AsrError> {
         language,
         timeout: Duration::from_secs(timeout_seconds),
         min_duration_seconds,
+        max_duration_seconds,
+        max_source_bytes,
+        ffprobe_timeout: Duration::from_secs(ffprobe_timeout_seconds),
         provider_key,
     })
 }
 
-fn probe_audio_duration_seconds(audio_path: &Path) -> Result<f64, AsrError> {
+fn enforce_asr_policy_limits(
+    min_duration_seconds: f64,
+    max_duration_seconds: f64,
+    max_source_bytes: u64,
+    ffprobe_timeout_seconds: u64,
+) -> (f64, f64, u64, u64) {
+    let max_duration_seconds = max_duration_seconds.min(DEFAULT_MAX_DURATION_SECONDS);
+    (
+        min_duration_seconds.min(max_duration_seconds),
+        max_duration_seconds,
+        max_source_bytes.min(DEFAULT_MAX_SOURCE_BYTES),
+        ffprobe_timeout_seconds.min(DEFAULT_FFPROBE_TIMEOUT_SECONDS),
+    )
+}
+
+fn probe_audio_duration_seconds(audio_path: &Path, timeout: Duration) -> Result<f64, AsrError> {
     let ffprobe = resolve_ffprobe_bin().ok_or_else(|| {
         AsrError::Unavailable(
             "ffprobe is required to enforce the minimum supported audio duration".to_string(),
         )
     })?;
-    let output = Command::new(ffprobe)
+    let mut command = Command::new(ffprobe);
+    command
         .arg("-v")
         .arg("error")
         .arg("-show_entries")
         .arg("format=duration")
         .arg("-of")
         .arg("default=noprint_wrappers=1:nokey=1")
-        .arg(audio_path)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| {
-            AsrError::Failed(format!(
-                "cannot inspect audio duration for {}: {error}",
-                audio_path.display()
-            ))
-        })?;
-    if !output.status.success() {
+        .arg(audio_path);
+    let (status, stdout, stderr) =
+        run_command_capture(&mut command, timeout, "audio duration probe", true)?;
+    if !status.success() {
         return Err(AsrError::Failed(format!(
             "ffprobe could not read audio duration for {}: {}",
             audio_path.display(),
-            compact_log(&String::from_utf8_lossy(&output.stderr))
+            compact_log(&stderr)
         )));
     }
-    let duration_seconds = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<f64>()
-        .map_err(|error| {
-            AsrError::Failed(format!(
-                "ffprobe returned an invalid audio duration for {}: {error}",
-                audio_path.display()
-            ))
-        })?;
-    validate_audio_duration(duration_seconds, 0.0)?;
+    let duration_seconds = stdout.trim().parse::<f64>().map_err(|error| {
+        AsrError::Failed(format!(
+            "ffprobe returned an invalid audio duration for {}: {error}",
+            audio_path.display()
+        ))
+    })?;
+    validate_audio_duration(duration_seconds, 0.0, f64::MAX)?;
     Ok(duration_seconds)
+}
+
+fn validate_source_size(source_size: u64, max_source_bytes: u64) -> Result<(), AsrError> {
+    if source_size > max_source_bytes {
+        return Err(AsrError::Skipped(format!(
+            "audio source is {source_size} bytes, above the supported maximum {max_source_bytes} bytes"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_audio_duration(
     duration_seconds: f64,
     min_duration_seconds: f64,
+    max_duration_seconds: f64,
 ) -> Result<(), AsrError> {
     if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
         return Err(AsrError::Failed(format!(
@@ -252,6 +309,12 @@ fn validate_audio_duration(
         return Err(AsrError::Skipped(format!(
             "audio duration {duration_seconds:.2}s is below the supported minimum \
              {min_duration_seconds:.2}s; provide a longer recording"
+        )));
+    }
+    if duration_seconds > max_duration_seconds {
+        return Err(AsrError::Skipped(format!(
+            "audio duration {duration_seconds:.2}s exceeds the supported maximum \
+             {max_duration_seconds:.2}s"
         )));
     }
     Ok(())
@@ -360,27 +423,68 @@ fn run_command(
         .stderr(Stdio::from(stderr))
         .spawn()
         .map_err(|error| AsrError::Failed(format!("cannot start {label}: {error}")))?;
+    let status = wait_for_child(&mut child, timeout, label, false)?;
+    if status.success() {
+        Ok(status)
+    } else {
+        let detail = fs::read_to_string(log_path).unwrap_or_default();
+        Err(AsrError::Failed(format!(
+            "{label} exited with {status}: {}",
+            compact_log(&detail)
+        )))
+    }
+}
+
+fn run_command_capture(
+    command: &mut Command,
+    timeout: Duration,
+    label: &str,
+    timeout_is_skipped: bool,
+) -> Result<(ExitStatus, String, String), AsrError> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| AsrError::Failed(format!("cannot start {label}: {error}")))?;
+    let status = wait_for_child(&mut child, timeout, label, timeout_is_skipped)?;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_end(&mut stdout);
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_end(&mut stderr);
+    }
+    Ok((
+        status,
+        String::from_utf8_lossy(&stdout).into_owned(),
+        String::from_utf8_lossy(&stderr).into_owned(),
+    ))
+}
+
+fn wait_for_child(
+    child: &mut Child,
+    timeout: Duration,
+    label: &str,
+    timeout_is_skipped: bool,
+) -> Result<ExitStatus, AsrError> {
     let started = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(status),
-            Ok(Some(status)) => {
-                let detail = fs::read_to_string(log_path).unwrap_or_default();
-                return Err(AsrError::Failed(format!(
-                    "{label} exited with {status}: {}",
-                    compact_log(&detail)
-                )));
-            }
+            Ok(Some(status)) => return Ok(status),
             Ok(None) if started.elapsed() < timeout => {
                 thread::sleep(Duration::from_millis(100));
             }
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(AsrError::Failed(format!(
-                    "{label} exceeded {} seconds",
-                    timeout.as_secs()
-                )));
+                let message = format!("{label} exceeded {} seconds", timeout.as_secs());
+                return Err(if timeout_is_skipped {
+                    AsrError::Skipped(message)
+                } else {
+                    AsrError::Failed(message)
+                });
             }
             Err(error) => {
                 let _ = child.kill();
@@ -592,29 +696,40 @@ fn source_identity(path: &Path) -> Result<SourceIdentity, AsrError> {
 
 fn compact_log(value: &str) -> String {
     let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.len() <= 400 {
+    if compact.chars().count() <= 400 {
         compact
     } else {
-        format!("{}...", &compact[..400])
+        format!("{}...", compact.chars().take(400).collect::<String>())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::env;
+    #[cfg(unix)]
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
     use std::sync::Mutex;
+    #[cfg(unix)]
+    use std::time::Duration;
 
     use serde_json::json;
 
     use super::{
-        parse_timestamp_ms, parse_whisper_json, transcribe_cached, validate_audio_duration,
-        AsrError, AsrSegment, ASR_BIN_ENV, ASR_LANGUAGE_ENV, ASR_MIN_DURATION_ENV, ASR_MODEL_ENV,
-        ASR_THREADS_ENV,
+        compact_log, enforce_asr_policy_limits, parse_timestamp_ms, parse_whisper_json,
+        validate_audio_duration, validate_source_size, AsrError, AsrSegment,
+    };
+    #[cfg(unix)]
+    use super::{
+        probe_audio_duration_seconds, transcribe_cached, ASR_BIN_ENV, ASR_FFPROBE_TIMEOUT_ENV,
+        ASR_LANGUAGE_ENV, ASR_MAX_DURATION_ENV, ASR_MAX_SOURCE_BYTES_ENV, ASR_MIN_DURATION_ENV,
+        ASR_MODEL_ENV, ASR_THREADS_ENV,
     };
 
+    #[cfg(unix)]
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
@@ -681,14 +796,78 @@ mod tests {
 
     #[test]
     fn short_audio_is_skipped_with_an_explicit_policy_reason() {
-        let error = validate_audio_duration(0.3, 1.0).expect_err("short audio must be skipped");
+        let error =
+            validate_audio_duration(0.3, 1.0, 900.0).expect_err("short audio must be skipped");
         assert!(matches!(error, AsrError::Skipped(_)));
         assert_eq!(
             error.to_string(),
             "ASR skipped by policy: audio duration 0.30s is below the supported minimum 1.00s; \
              provide a longer recording"
         );
-        assert!(validate_audio_duration(1.0, 1.0).is_ok());
+        assert!(validate_audio_duration(1.0, 1.0, 900.0).is_ok());
+    }
+
+    #[test]
+    fn oversized_or_overlong_audio_is_skipped_before_transcription() {
+        assert!(matches!(
+            validate_source_size(268_435_457, 268_435_456),
+            Err(AsrError::Skipped(_))
+        ));
+        assert!(matches!(
+            validate_audio_duration(900.1, 1.0, 900.0),
+            Err(AsrError::Skipped(_))
+        ));
+    }
+
+    #[test]
+    fn asr_environment_limits_can_only_tighten_hard_policy_caps() {
+        let (minimum, maximum, bytes, probe_seconds) =
+            enforce_asr_policy_limits(1_000.0, 10_000.0, u64::MAX, u64::MAX);
+
+        assert_eq!(minimum, 900.0);
+        assert_eq!(maximum, 900.0);
+        assert_eq!(bytes, 256 * 1024 * 1024);
+        assert_eq!(probe_seconds, 15);
+
+        let (minimum, maximum, bytes, probe_seconds) =
+            enforce_asr_policy_limits(1.0, 120.0, 1024, 2);
+        assert_eq!(
+            (minimum, maximum, bytes, probe_seconds),
+            (1.0, 120.0, 1024, 2)
+        );
+    }
+
+    #[test]
+    fn compact_log_truncates_utf8_on_character_boundaries() {
+        let compact = compact_log(&"界".repeat(500));
+        assert_eq!(compact.chars().count(), 403);
+        assert!(compact.ends_with("..."));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ffprobe_timeout_is_a_skipped_policy_result() {
+        let _guard = ENV_LOCK.lock().expect("environment lock");
+        let root = env::temp_dir().join(format!(
+            "harborbeacon-asr-ffprobe-timeout-{}",
+            uuid::Uuid::new_v4().as_simple()
+        ));
+        fs::create_dir_all(&root).expect("create root");
+        let audio = root.join("meeting.mp3");
+        let ffprobe = root.join("fake-ffprobe");
+        fs::write(&audio, b"audio").expect("write audio");
+        fs::write(&ffprobe, "#!/bin/sh\nsleep 2\nprintf '2.5\\n'\n").expect("write ffprobe");
+        let mut permissions = fs::metadata(&ffprobe).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&ffprobe, permissions).expect("make executable");
+        env::set_var("HARBOR_FFPROBE_BIN", &ffprobe);
+
+        let error = probe_audio_duration_seconds(&audio, Duration::from_millis(100))
+            .expect_err("probe must time out");
+
+        assert!(matches!(error, AsrError::Skipped(_)));
+        env::remove_var("HARBOR_FFPROBE_BIN");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
@@ -736,6 +915,9 @@ mod tests {
         env::set_var(ASR_THREADS_ENV, "2");
         env::set_var(ASR_LANGUAGE_ENV, "auto");
         env::set_var(ASR_MIN_DURATION_ENV, "1.0");
+        env::set_var(ASR_MAX_DURATION_ENV, "900");
+        env::set_var(ASR_MAX_SOURCE_BYTES_ENV, "268435456");
+        env::set_var(ASR_FFPROBE_TIMEOUT_ENV, "15");
 
         let first = transcribe_cached(&audio, &index_root).expect("first transcript");
         let second = transcribe_cached(&audio, &index_root).expect("cached transcript");
@@ -759,6 +941,9 @@ mod tests {
             ASR_THREADS_ENV,
             ASR_LANGUAGE_ENV,
             ASR_MIN_DURATION_ENV,
+            ASR_MAX_DURATION_ENV,
+            ASR_MAX_SOURCE_BYTES_ENV,
+            ASR_FFPROBE_TIMEOUT_ENV,
         ] {
             env::remove_var(key);
         }
