@@ -1397,6 +1397,7 @@ dependencies = [
  "hf-hub",
  "hmac",
  "if-addrs",
+ "libc",
  "markitdown",
  "memmap2",
  "qrcodegen",

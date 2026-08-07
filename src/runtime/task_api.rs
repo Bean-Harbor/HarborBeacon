@@ -8,7 +8,7 @@ mod home_assistant_actions;
 mod system_readiness_actions;
 mod vision_event_actions;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -21,9 +21,11 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use self::general_message_plan::{
-    GeneralMessageCandidate, GeneralMessageControllerTrace, GeneralMessageConversationAct,
-    GeneralMessagePlan, GeneralMessagePlanKind, GeneralMessagePlanPayload, GeneralMessageSignals,
-    GeneralMessageWorkflowCompilerShadowTrace,
+    CatActivityQueryOptions, CatActivitySelection, CatActivityTimeScope, GeneralMessageCandidate,
+    GeneralMessageControllerTrace, GeneralMessageConversationAct, GeneralMessagePlan,
+    GeneralMessagePlanKind, GeneralMessagePlanPayload, GeneralMessageSignals,
+    GeneralMessageWorkflowCompilerShadowTrace, CAT_ACTIVITY_DEFAULT_BATCH_LIMIT,
+    CAT_ACTIVITY_MAX_BATCH_LIMIT,
 };
 #[cfg(test)]
 use self::general_message_router::general_message_requests_capability_summary;
@@ -36,10 +38,10 @@ use self::general_message_router::{
     general_message_default_clarification_prompt, general_message_nsp_schema_valid,
     general_message_nsp_validation_failure, general_message_plan_decision_label,
     general_message_support_summary_for_request, general_message_supported_examples,
-    general_message_unsupported_summary, infer_general_message_conversation_act,
-    parse_general_message_plan, parse_general_message_router_decision,
-    record_general_message_nsp_plan_trace, resolve_deterministic_general_message_plan,
-    should_try_general_message_router_llm,
+    general_message_unsupported_summary, infer_cat_activity_query_options,
+    infer_general_message_conversation_act, parse_general_message_plan,
+    parse_general_message_router_decision, record_general_message_nsp_plan_trace,
+    resolve_deterministic_general_message_plan, should_try_general_message_router_llm,
 };
 #[cfg(test)]
 use self::system_readiness_actions::build_general_message_readiness_summary;
@@ -98,6 +100,10 @@ use crate::runtime::admin_console::{
     AdminConsoleState, AdminConsoleStore, AdminModelCenterState, NotificationTargetRecord,
     RagResourceProfile,
 };
+use crate::runtime::cat_recording_validation::{
+    validation_mode_from_env, CatRecordingValidationMode, CatRecordingValidationRecord,
+    CatRecordingValidationStore,
+};
 use crate::runtime::hub::{
     looks_like_auth_error, CameraConnectRequest, CameraHubService, HubScanRequest,
     HubScanResultItem,
@@ -109,8 +115,8 @@ use crate::runtime::knowledge::{
 };
 use crate::runtime::media::ClipCaptureResult;
 use crate::runtime::model_center::{
-    llm_text_token_count, run_llm_text_with_state_and_options, run_ocr_with_state,
-    run_vlm_summary_with_state, truncate_llm_text_to_tokens, LlmTextExecution, LlmTextOptions,
+    llm_text_token_count, run_llm_text_with_state_and_options, truncate_llm_text_to_tokens,
+    LlmTextExecution, LlmTextOptions,
 };
 use crate::runtime::privacy_gateway::{PrivacyGateway, PrivacyGatewayEvaluation};
 use crate::runtime::registry::ResolvedCameraTarget;
@@ -118,8 +124,8 @@ use crate::runtime::remote_view;
 use crate::runtime::task_session::{
     session_state_value_from_conversation, PendingTaskCandidate, PendingTaskClipConfirmation,
     PendingTaskConnect, PendingTaskGeneralMessageLoop, PendingTaskHomeAssistantCandidate,
-    PendingTaskHomeAssistantClarification, RecentClipPlaybackState, RecentFamilyMemoryEventState,
-    TaskConversationState, TaskConversationStore,
+    PendingTaskHomeAssistantClarification, RecentCatActivityQueryState, RecentClipPlaybackState,
+    RecentFamilyMemoryEventState, TaskConversationState, TaskConversationStore,
 };
 use crate::runtime::vision_event::StoredLocalVisionEvent;
 const GENERAL_MESSAGE_RECAP_LIMIT: usize = 3;
@@ -129,6 +135,7 @@ const GENERAL_MESSAGE_ROUTER_MAX_TOKENS: u32 = 220;
 const GENERAL_MESSAGE_NSP_MIN_CONFIDENCE: u8 = 60;
 const GENERAL_MESSAGE_RENDERER_BUDGET_MS: u64 = 1_800;
 const GENERAL_MESSAGE_RENDERER_MAX_TOKENS: u32 = 48;
+const CAT_ACTIVITY_CURSOR_MAX_ARTIFACTS: usize = 256;
 const RAG_DOMAIN: &str = "rag";
 const RAG_OP_ANSWER: &str = "answer";
 const RAG_DEFAULT_RESULT_LIMIT: usize = 5;
@@ -2266,6 +2273,20 @@ impl TaskApiService {
                 };
                 self.complete_recent_clip_playback(request, &recent_clip)
             }
+            GeneralMessagePlanKind::CameraLiveView => {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
+                let mut routed = request.clone();
+                routed.intent.domain = "camera".to_string();
+                routed.intent.action = "live_view".to_string();
+                if let Some(camera_hint) = plan.camera_hint {
+                    upsert_json_string(&mut routed.args, "/device_hint", &camera_hint);
+                }
+                self.handle_camera_share_link(&routed)
+            }
             GeneralMessagePlanKind::CameraSnapshot => {
                 if let Err(response) =
                     self.clear_general_message_loop_if_matches(request, prior_pending)
@@ -2280,6 +2301,18 @@ impl TaskApiService {
                 }
                 self.handle_camera_snapshot(&routed)
             }
+            GeneralMessagePlanKind::CameraSnapshotAndRecordClip => {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
+                let mut routed = request.clone();
+                if let Some(camera_hint) = plan.camera_hint {
+                    upsert_json_string(&mut routed.args, "/device_hint", &camera_hint);
+                }
+                self.handle_camera_snapshot_and_record_clip(&routed)
+            }
             GeneralMessagePlanKind::CameraRecordClip => {
                 if let Err(response) =
                     self.clear_general_message_loop_if_matches(request, prior_pending)
@@ -2293,6 +2326,14 @@ impl TaskApiService {
                     upsert_json_string(&mut routed.args, "/device_hint", &camera_hint);
                 }
                 self.handle_camera_record_clip(&routed)
+            }
+            GeneralMessagePlanKind::CatActivityQuery => {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
+                self.handle_cat_activity_query(request, &plan)
             }
             GeneralMessagePlanKind::KnowledgeSearch => {
                 if let Err(response) =
@@ -2504,6 +2545,7 @@ impl TaskApiService {
                     "capabilities": [
                         "camera_snapshot",
                         "camera_record_clip",
+                        "cat_activity_query",
                         "vision_event_summary",
                         "vision_event_notify_latest",
                         "vlm_describe_latest_event",
@@ -2525,6 +2567,7 @@ impl TaskApiService {
             }),
             Vec::new(),
             vec![
+                "今天猫干了什么".to_string(),
                 "拍一张门口".to_string(),
                 "最近事件".to_string(),
                 "通知最新事件".to_string(),
@@ -2560,6 +2603,7 @@ impl TaskApiService {
                     "capabilities": [
                         "camera_snapshot",
                         "camera_record_clip",
+                        "cat_activity_query",
                         "vision_event_summary",
                         "vision_event_notify_latest",
                         "vlm_describe_latest_event",
@@ -2581,6 +2625,7 @@ impl TaskApiService {
             }),
             Vec::new(),
             vec![
+                "今天猫干了什么".to_string(),
                 "拍一张门口".to_string(),
                 "最近事件".to_string(),
                 "通知最新事件".to_string(),
@@ -2873,6 +2918,7 @@ impl TaskApiService {
             query: pending_loop
                 .and_then(|pending| pending.query.clone())
                 .or_else(|| infer_query_from_raw_text(request.intent.raw_text.as_str())),
+            cat_activity: CatActivityQueryOptions::default(),
             home_assistant_action: None,
             guardian_rule: None,
             event_id: None,
@@ -3011,6 +3057,25 @@ impl TaskApiService {
         ) {
             insert_string_value_if_object(&mut entry, "query", query);
         }
+        let data_kind = string_at_paths(&step_output, &["/data/kind", "/data/query_kind"]);
+        if data_kind
+            .as_deref()
+            .is_some_and(|kind| matches!(kind, "cat_activity_today" | "cat_activity_query"))
+        {
+            let cat_activity = json!({
+                "time_scope": string_at_paths(&step_output, &["/data/time_scope"]),
+                "selection": string_at_paths(&step_output, &["/data/selection"]),
+                "recording_count": usize_at_paths(&step_output, &["/data/recording_count"])
+                    .unwrap_or_default(),
+                "may_have_more": step_output
+                    .pointer("/data/may_have_more")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            });
+            if let Some(object) = entry.as_object_mut() {
+                object.insert("cat_activity".to_string(), cat_activity);
+            }
+        }
         let video_count =
             array_len_at_paths(&step_output, &["/data/videos", "/data/search/videos"]).unwrap_or(0);
         let image_count =
@@ -3087,6 +3152,242 @@ impl TaskApiService {
         routed
     }
 
+    fn handle_cat_activity_query(
+        &self,
+        request: &TaskRequest,
+        plan: &GeneralMessagePlan,
+    ) -> TaskResponse {
+        let now_epoch_ms = cat_activity_epoch_ms();
+        let previous_query = self
+            .load_conversation(request)
+            .and_then(|conversation| conversation.recent_cat_activity_query())
+            .filter(|previous| recent_cat_activity_query_is_fresh(previous, now_epoch_ms));
+        let query = resolve_cat_activity_query_options(
+            request.intent.raw_text.as_str(),
+            &plan.cat_activity,
+            previous_query.as_ref(),
+        );
+        let camera_hint = plan.camera_hint.as_deref().or_else(|| {
+            matches!(
+                query.selection,
+                CatActivitySelection::Remaining | CatActivitySelection::ResendLast
+            )
+            .then(|| {
+                previous_query
+                    .as_ref()
+                    .and_then(|previous| previous.camera_hint.as_deref())
+            })
+            .flatten()
+        });
+        let targets = if let Some(camera_hint) = camera_hint {
+            let mut routed = request.clone();
+            upsert_json_string(&mut routed.args, "/device_hint", camera_hint);
+            match self.resolve_camera_target(&routed) {
+                Ok(target) => vec![target],
+                Err(error) => {
+                    return self.failed(request, "cat_activity_timeline", RiskLevel::Low, error);
+                }
+            }
+        } else {
+            match self.admin_store.registry_store().load_camera_targets() {
+                Ok(targets) if !targets.is_empty() => targets,
+                Ok(_) => {
+                    return self.failed(
+                        request,
+                        "cat_activity_timeline",
+                        RiskLevel::Low,
+                        "当前还没有已注册的摄像头，请先完成接入。".to_string(),
+                    );
+                }
+                Err(error) => {
+                    return self.failed(request, "cat_activity_timeline", RiskLevel::Low, error);
+                }
+            }
+        };
+        let harborlink = match HarborLinkMediaClient::from_env() {
+            Ok(client) => client,
+            Err(error) => {
+                return self.failed(request, "cat_activity_timeline", RiskLevel::Low, error);
+            }
+        };
+        let mut recordings = Vec::new();
+        for target in &targets {
+            let timeline = match harborlink.recording_timeline(&target.device_id) {
+                Ok(timeline) => timeline,
+                Err(error) => {
+                    return self.failed(request, "cat_activity_timeline", RiskLevel::Low, error);
+                }
+            };
+            recordings.extend(timeline.into_iter().filter(|artifact| {
+                artifact.kind == "recording"
+                    && artifact.event_id.is_some()
+                    && artifact
+                        .source
+                        .as_deref()
+                        .is_some_and(|source| source == "yolo_cat_activity")
+                    && artifact.labels.iter().any(|label| label == "cat")
+                    && cat_activity_recording_is_in_scope(artifact, query.time_scope, now_epoch_ms)
+            }));
+        }
+        let validation_mode = match validation_mode_from_env() {
+            Ok(mode) => mode,
+            Err(error) => {
+                return self.failed(request, "cat_activity_timeline", RiskLevel::Low, error);
+            }
+        };
+        let artifact_ids = recordings
+            .iter()
+            .map(|artifact| artifact.artifact_id.clone())
+            .collect::<HashSet<_>>();
+        let validation_records =
+            match CatRecordingValidationStore::default().records_for_artifacts(&artifact_ids) {
+                Ok(records) => records,
+                Err(error) => {
+                    return self.failed(
+                        request,
+                        "cat_activity_timeline",
+                        RiskLevel::Low,
+                        format!("猫活动复核索引暂不可用，已停止发送视频：{error}"),
+                    );
+                }
+            };
+        recordings = filter_publishable_cat_recordings(
+            recordings,
+            CatRecordingValidationMode::Enforce,
+            &validation_records,
+        );
+        let previous_for_selection = previous_query.as_ref().filter(|previous| {
+            previous.time_scope == query.time_scope.as_str()
+                && previous.camera_hint.as_deref() == camera_hint
+        });
+        recordings = select_cat_activity_recordings(
+            recordings,
+            &query,
+            now_epoch_ms,
+            previous_for_selection,
+        );
+        let artifacts = recordings
+            .iter()
+            .enumerate()
+            .map(|(index, artifact)| {
+                let validation = validation_records.get(&artifact.artifact_id);
+                TaskArtifact {
+                    kind: "video".to_string(),
+                    label: format!(
+                        "{}猫活动视频 {}",
+                        cat_activity_time_scope_label(query.time_scope),
+                        index + 1
+                    ),
+                    mime_type: artifact.mime_type.clone(),
+                    media_asset_id: None,
+                    path: None,
+                    url: Some(harborlink_artifact_proxy_url(&artifact.artifact_id)),
+                    metadata: json!({
+                        "artifact_role": "cat_activity_video",
+                        "harborlink_artifact_id": artifact.artifact_id,
+                        "event_id": artifact.event_id,
+                        "camera_id": artifact.camera_id,
+                        "started_at_epoch_ms": artifact.started_at_epoch_ms,
+                        "ended_at_epoch_ms": artifact.ended_at_epoch_ms,
+                        "duration_seconds": artifact.duration_seconds,
+                        "labels": artifact.labels,
+                        "validation_mode": validation_mode.as_str(),
+                        "validation_status": validation.map(|record| record.validation_status),
+                        "validation_id": validation.map(|record| record.validation_id.as_str()),
+                        "validation_summary": validation
+                            .and_then(|record| record.decision.as_ref())
+                            .map(|decision| decision.summary.as_str()),
+                        "behavior_tags": validation
+                            .and_then(|record| record.decision.as_ref())
+                            .map(|decision| decision.behavior_tags.as_slice()),
+                        "preferred_transport": "native_video",
+                        "fallback_delivery": "file",
+                    }),
+                }
+            })
+            .collect::<Vec<_>>();
+        let scope_label = cat_activity_time_scope_label(query.time_scope);
+        let message = if artifacts.is_empty() && query.selection == CatActivitySelection::Remaining
+        {
+            format!("{scope_label}没有更多已通过复核的猫活动视频了。")
+        } else if artifacts.is_empty() && query.selection == CatActivitySelection::ResendLast {
+            "当前会话里没有可重发的上一批猫活动视频。".to_string()
+        } else if artifacts.is_empty() {
+            format!("{scope_label}还没有通过复核的猫活动视频。")
+        } else {
+            format!(
+                "{scope_label}找到 {} 段已通过复核的猫活动视频，正在发送。",
+                artifacts.len()
+            )
+        };
+        let same_context_previous = previous_query.as_ref().filter(|previous| {
+            previous.time_scope == query.time_scope.as_str()
+                && previous.camera_hint.as_deref() == camera_hint
+        });
+        let mut delivered_artifact_ids = same_context_previous
+            .map(|previous| previous.delivered_artifact_ids.clone())
+            .unwrap_or_default();
+        delivered_artifact_ids.extend(
+            recordings
+                .iter()
+                .map(|recording| recording.artifact_id.clone()),
+        );
+        delivered_artifact_ids.sort();
+        delivered_artifact_ids.dedup();
+        if delivered_artifact_ids.len() > CAT_ACTIVITY_CURSOR_MAX_ARTIFACTS {
+            delivered_artifact_ids
+                .drain(..delivered_artifact_ids.len() - CAT_ACTIVITY_CURSOR_MAX_ARTIFACTS);
+        }
+        let last_batch_artifact_ids = if recordings.is_empty() {
+            same_context_previous
+                .map(|previous| previous.last_batch_artifact_ids.clone())
+                .unwrap_or_default()
+        } else {
+            recordings
+                .iter()
+                .map(|recording| recording.artifact_id.clone())
+                .collect()
+        };
+        let mut conversation = self.load_or_create_conversation(request);
+        conversation.set_recent_cat_activity_query(Some(RecentCatActivityQueryState {
+            camera_hint: camera_hint.map(str::to_string),
+            time_scope: query.time_scope.as_str().to_string(),
+            delivered_artifact_ids,
+            last_batch_artifact_ids,
+            updated_at_epoch_ms: now_epoch_ms,
+        }));
+        if let Err(error) = self.save_conversation(request, &conversation) {
+            return self.failed(
+                request,
+                "cat_activity_timeline",
+                RiskLevel::Low,
+                format!("无法保存猫活动查询上下文，已停止发送视频：{error}"),
+            );
+        }
+        self.completed(
+            request,
+            "cat_activity_timeline",
+            RiskLevel::Low,
+            message,
+            json!({
+                "kind": "cat_activity_today",
+                "query_kind": "cat_activity_query",
+                "recording_count": artifacts.len(),
+                "timezone": "Asia/Shanghai",
+                "time_scope": query.time_scope.as_str(),
+                "selection": query.selection.as_str(),
+                "batch_limit": query.limit,
+                "publication_gate": "accepted_and_published",
+                "may_have_more": artifacts.len() == query.limit
+                    && query.selection != CatActivitySelection::ResendLast,
+                "camera_count": targets.len(),
+                "validation_mode": validation_mode.as_str(),
+            }),
+            artifacts,
+            Vec::new(),
+        )
+    }
+
     fn handle_camera_record_clip(&self, request: &TaskRequest) -> TaskResponse {
         let target = match self.resolve_camera_target(request) {
             Ok(target) => target,
@@ -3146,10 +3447,36 @@ impl TaskApiService {
                 return self.failed(request, "camera_hub_service", RiskLevel::Low, error);
             }
         };
-        if link_clip.camera_id != target.device_id
-            || link_clip.clip_path.trim().is_empty()
-            || link_clip.keyframe_paths.is_empty()
-        {
+        let clip_artifact = match link_clip.clip_artifact.clone() {
+            Some(artifact)
+                if artifact.media_contract_version == "1.0"
+                    && artifact.camera_id == target.device_id
+                    && artifact.kind == "clip"
+                    && !artifact.artifact_id.trim().is_empty() =>
+            {
+                artifact
+            }
+            _ => {
+                return self.failed(
+                    request,
+                    "camera_hub_service",
+                    RiskLevel::Low,
+                    "HarborLink 返回的短视频媒体契约无效，请先升级 HarborLink。".to_string(),
+                );
+            }
+        };
+        let keyframe_artifacts = link_clip
+            .keyframe_artifacts
+            .iter()
+            .filter(|artifact| {
+                artifact.media_contract_version == "1.0"
+                    && artifact.camera_id == target.device_id
+                    && artifact.kind == "keyframe"
+                    && !artifact.artifact_id.trim().is_empty()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if link_clip.camera_id != target.device_id || keyframe_artifacts.is_empty() {
             return self.failed(
                 request,
                 "camera_hub_service",
@@ -3168,29 +3495,13 @@ impl TaskApiService {
             Some(link_clip.keyframe_interval_seconds),
         );
         clip.mime_type = link_clip.mime_type;
-        clip.storage.relative_path = link_clip.clip_path;
+        clip.storage.relative_path = harborlink_artifact_storage_uri(&clip_artifact.artifact_id);
         clip.captured_at_epoch_ms = link_clip.captured_at_epoch_ms;
         clip.started_at_epoch_ms = link_clip.started_at_epoch_ms;
         clip.ended_at_epoch_ms = link_clip.ended_at_epoch_ms;
-        clip.index_sidecar_relative_path = PathBuf::from(&clip.storage.relative_path)
-            .with_extension("json")
-            .to_string_lossy()
-            .into_owned();
-        let keyframes = link_clip
-            .keyframe_paths
-            .into_iter()
-            .map(PathBuf::from)
-            .collect::<Vec<_>>();
-        if let Err(error) = self.persist_clip_ingest(&admin_state, &target, &clip, &keyframes) {
-            return self.failed(
-                request,
-                "camera_hub_service",
-                RiskLevel::Low,
-                format!("短视频已保存，但写入索引副产物失败: {error}"),
-            );
-        }
+        clip.index_sidecar_relative_path.clear();
 
-        let media_asset = build_clip_media_asset(request, &target, &clip);
+        let media_asset = build_clip_media_asset(request, &target, &clip, &clip_artifact);
         if let Err(error) = self.conversation_store.save_media_asset(&media_asset) {
             return self.failed(
                 request,
@@ -3201,7 +3512,7 @@ impl TaskApiService {
         }
 
         let Some(cover_artifact) =
-            build_clip_confirmation_cover_artifact(&clip, &keyframes, &media_asset)
+            build_clip_confirmation_cover_artifact(&clip, &keyframe_artifacts, &media_asset)
         else {
             return self.failed(
                 request,
@@ -3216,14 +3527,15 @@ impl TaskApiService {
             &media_asset,
             &cover_artifact,
             &target.display_name,
+            &harborlink_artifact_proxy_url(&clip_artifact.artifact_id),
         );
         let mut conversation = self.load_or_create_conversation(request);
         conversation.set_clip_pending_confirmation(Some(PendingTaskClipConfirmation {
             resume_token: resume_token.clone(),
             clip_media_asset_id: media_asset.asset_id.clone(),
-            clip_path: clip.storage.relative_path.clone(),
+            clip_path: harborlink_artifact_proxy_url(&clip_artifact.artifact_id),
             clip_mime_type: clip.mime_type.clone(),
-            cover_path: cover_artifact.path.clone().unwrap_or_default(),
+            cover_path: artifact_delivery_location(&cover_artifact),
             display_name: target.display_name.clone(),
         }));
         conversation.set_recent_clip_playback(Some(recent_clip));
@@ -3249,6 +3561,94 @@ impl TaskApiService {
             Vec::new(),
             vec!["要".to_string(), "不要".to_string()],
         )
+    }
+
+    fn handle_camera_snapshot_and_record_clip(&self, request: &TaskRequest) -> TaskResponse {
+        let mut snapshot_request = request.clone();
+        snapshot_request.intent.domain = "camera".to_string();
+        snapshot_request.intent.action = "snapshot".to_string();
+        let snapshot = self.handle_camera_snapshot(&snapshot_request);
+
+        let mut clip_request = request.clone();
+        clip_request.intent.domain = "camera".to_string();
+        clip_request.intent.action = "record_clip".to_string();
+        let clip = self.handle_camera_record_clip(&clip_request);
+        let clip = self.complete_explicit_clip_delivery(&clip_request, clip);
+
+        self.merge_snapshot_and_clip_responses(request, snapshot, clip)
+    }
+
+    fn complete_explicit_clip_delivery(
+        &self,
+        request: &TaskRequest,
+        response: TaskResponse,
+    ) -> TaskResponse {
+        if response.status != TaskStatus::NeedsInput {
+            return response;
+        }
+        let mut conversation = self.load_or_create_conversation(request);
+        let Some(recent_clip) = conversation.recent_clip_playback() else {
+            return response;
+        };
+        conversation.set_clip_pending_confirmation(None);
+        if let Err(error) = self.save_conversation(request, &conversation) {
+            return self.failed(
+                request,
+                "camera_hub_service",
+                RiskLevel::Low,
+                format!("短视频已保存，但无法更新回放状态: {error}"),
+            );
+        }
+        self.complete_recent_clip_playback(request, &recent_clip)
+    }
+
+    fn merge_snapshot_and_clip_responses(
+        &self,
+        request: &TaskRequest,
+        mut snapshot: TaskResponse,
+        mut clip: TaskResponse,
+    ) -> TaskResponse {
+        let snapshot_failed = snapshot.status == TaskStatus::Failed;
+        let clip_failed = clip.status == TaskStatus::Failed;
+        match (snapshot_failed, clip_failed) {
+            (false, false) => {
+                let snapshot_data = snapshot.result.data;
+                let snapshot_message = snapshot.result.message;
+                let mut artifacts = snapshot.result.artifacts;
+                artifacts.append(&mut clip.result.artifacts);
+                if let Some(data) = clip.result.data.as_object_mut() {
+                    data.insert("snapshot_capture".to_string(), snapshot_data);
+                    data.insert("capture_mode".to_string(), json!("snapshot_and_clip"));
+                }
+                clip.result.message =
+                    format!("{snapshot_message} 短视频也已录制，照片和完整回放如下。");
+                clip.result.artifacts = artifacts;
+                clip
+            }
+            (false, true) => {
+                let clip_error = clip.result.message;
+                snapshot.result.message =
+                    format!("{} 但短视频录制失败：{clip_error}", snapshot.result.message);
+                insert_partial_capture_failure(&mut snapshot.result.data, "clip", &clip_error);
+                snapshot
+            }
+            (true, false) => {
+                let snapshot_error = snapshot.result.message;
+                clip.result.message =
+                    format!("照片抓拍失败：{snapshot_error} 但短视频已录制，完整回放如下。");
+                insert_partial_capture_failure(&mut clip.result.data, "snapshot", &snapshot_error);
+                clip
+            }
+            (true, true) => self.failed(
+                request,
+                "camera_hub_service",
+                RiskLevel::Low,
+                format!(
+                    "照片抓拍失败：{}；短视频录制失败：{}",
+                    snapshot.result.message, clip.result.message
+                ),
+            ),
+        }
     }
 
     fn complete_clip_confirmation_delivery(
@@ -3380,6 +3780,19 @@ impl TaskApiService {
         };
         match harborlink.archive_snapshot(&target.device_id) {
             Ok(snapshot) => {
+                if snapshot.media_contract_version != "1.0"
+                    || snapshot.camera_id != target.device_id
+                    || snapshot.kind != "snapshot"
+                    || snapshot.mime_type != "image/jpeg"
+                    || snapshot.artifact_id.trim().is_empty()
+                {
+                    return self.failed(
+                        request,
+                        "camera_hub_service",
+                        RiskLevel::Low,
+                        "HarborLink 返回的抓拍媒体契约无效，请先升级 HarborLink。".to_string(),
+                    );
+                }
                 let media_asset =
                     build_harborlink_snapshot_media_asset(request, &target, &snapshot);
                 if let Err(error) = self.conversation_store.save_media_asset(&media_asset) {
@@ -4391,47 +4804,6 @@ impl TaskApiService {
             .first()
             .cloned()
             .ok_or_else(|| "未找到可分析的摄像头设备。".to_string())
-    }
-
-    fn persist_clip_ingest(
-        &self,
-        state: &AdminConsoleState,
-        target: &ResolvedCameraTarget,
-        clip: &ClipCaptureResult,
-        keyframes: &[PathBuf],
-    ) -> Result<(), String> {
-        let clip_path = PathBuf::from(&clip.storage.relative_path);
-        let clip_tags = vec!["video".to_string(), "clip".to_string()];
-        write_media_index_sidecar(
-            &clip_path.with_extension("json"),
-            &clip.storage.relative_path,
-            None,
-            target,
-            "",
-            &format!(
-                "短视频片段，时长 {} 秒，共提取 {} 张关键帧。",
-                clip.clip_length_seconds,
-                keyframes.len()
-            ),
-            &clip_tags,
-        )?;
-
-        for keyframe in keyframes {
-            let ocr = run_ocr_with_state(keyframe, &state.models);
-            let vlm = run_vlm_summary_with_state(keyframe, &state.models);
-            let keyframe_tags = vec!["video".to_string(), "keyframe".to_string()];
-            write_media_index_sidecar(
-                &keyframe.with_extension("json"),
-                keyframe.to_string_lossy().as_ref(),
-                Some(&clip.storage.relative_path),
-                target,
-                &ocr.text,
-                &vlm.text,
-                &keyframe_tags,
-            )?;
-        }
-
-        Ok(())
     }
 
     fn completed(
@@ -5725,18 +6097,15 @@ fn build_harborlink_snapshot_artifact(
     snapshot: &HarborLinkRecordingArtifact,
     media_asset: &MediaAsset,
 ) -> TaskArtifact {
-    let proxy_url = format!(
-        "/api/cameras/recordings/artifacts/{}",
-        url_encode_path_segment(&snapshot.artifact_id)
-    );
     TaskArtifact {
         kind: "image".to_string(),
         label: "抓拍图片".to_string(),
         mime_type: snapshot.mime_type.clone(),
         media_asset_id: Some(media_asset.asset_id.clone()),
-        path: Some(harborlink_snapshot_storage_uri(snapshot)),
-        url: Some(proxy_url),
+        path: None,
+        url: Some(harborlink_artifact_proxy_url(&snapshot.artifact_id)),
         metadata: json!({
+            "media_contract_version": snapshot.media_contract_version,
             "media_asset_id": media_asset.asset_id.clone(),
             "storage_target": StorageTargetKind::HarborOsPool,
             "captured_at_epoch_ms": harborlink_snapshot_captured_at(snapshot),
@@ -5782,7 +6151,18 @@ fn build_harborlink_snapshot_media_asset(
 }
 
 fn harborlink_snapshot_storage_uri(snapshot: &HarborLinkRecordingArtifact) -> String {
-    format!("harborlink://dvr/{}", snapshot.artifact_id)
+    harborlink_artifact_storage_uri(&snapshot.artifact_id)
+}
+
+fn harborlink_artifact_storage_uri(artifact_id: &str) -> String {
+    format!("harborlink://dvr/{artifact_id}")
+}
+
+fn harborlink_artifact_proxy_url(artifact_id: &str) -> String {
+    format!(
+        "/api/cameras/recordings/artifacts/{}",
+        url_encode_path_segment(artifact_id)
+    )
 }
 
 fn harborlink_snapshot_captured_at(snapshot: &HarborLinkRecordingArtifact) -> u128 {
@@ -5793,10 +6173,191 @@ fn harborlink_snapshot_captured_at(snapshot: &HarborLinkRecordingArtifact) -> u1
     }
 }
 
+fn cat_activity_epoch_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
+fn china_day_number(epoch_ms: u128) -> u128 {
+    const CHINA_UTC_OFFSET_MS: u128 = 8 * 60 * 60 * 1_000;
+    const DAY_MS: u128 = 24 * 60 * 60 * 1_000;
+    epoch_ms.saturating_add(CHINA_UTC_OFFSET_MS) / DAY_MS
+}
+
+fn recent_cat_activity_query_is_fresh(
+    previous: &RecentCatActivityQueryState,
+    now_epoch_ms: u128,
+) -> bool {
+    const MAX_AGE_MS: u128 = 24 * 60 * 60 * 1_000;
+    previous.updated_at_epoch_ms <= now_epoch_ms
+        && now_epoch_ms.saturating_sub(previous.updated_at_epoch_ms) <= MAX_AGE_MS
+        && china_day_number(previous.updated_at_epoch_ms) == china_day_number(now_epoch_ms)
+}
+
+fn resolve_cat_activity_query_options(
+    raw_text: &str,
+    planned: &CatActivityQueryOptions,
+    previous: Option<&RecentCatActivityQueryState>,
+) -> CatActivityQueryOptions {
+    use self::general_message_plan::CAT_ACTIVITY_MAX_BATCH_LIMIT;
+
+    let inferred = infer_cat_activity_query_options(raw_text);
+    let selection = if planned.selection == CatActivitySelection::Batch {
+        inferred.selection
+    } else {
+        planned.selection
+    };
+    let time_scope = if planned.time_scope != CatActivityTimeScope::Inherit {
+        planned.time_scope
+    } else if inferred.time_scope != CatActivityTimeScope::Inherit {
+        inferred.time_scope
+    } else {
+        previous
+            .and_then(|previous| CatActivityTimeScope::parse(&previous.time_scope))
+            .filter(|scope| *scope != CatActivityTimeScope::Inherit)
+            .unwrap_or(CatActivityTimeScope::Today)
+    };
+    let limit = if selection == CatActivitySelection::Latest {
+        1
+    } else {
+        planned.limit.clamp(1, CAT_ACTIVITY_MAX_BATCH_LIMIT)
+    };
+    CatActivityQueryOptions {
+        time_scope,
+        selection,
+        limit,
+    }
+}
+
+fn cat_activity_recording_is_in_scope(
+    artifact: &HarborLinkRecordingArtifact,
+    time_scope: CatActivityTimeScope,
+    now_epoch_ms: u128,
+) -> bool {
+    const HOUR_MS: u128 = 60 * 60 * 1_000;
+    const DAY_MS: u128 = 24 * HOUR_MS;
+    const CHINA_UTC_OFFSET_MS: u128 = 8 * HOUR_MS;
+    let day_start = china_day_number(now_epoch_ms)
+        .saturating_mul(DAY_MS)
+        .saturating_sub(CHINA_UTC_OFFSET_MS);
+    let (start, end) = match time_scope {
+        CatActivityTimeScope::Morning => (day_start, day_start.saturating_add(12 * HOUR_MS)),
+        CatActivityTimeScope::Afternoon => (
+            day_start.saturating_add(12 * HOUR_MS),
+            day_start.saturating_add(18 * HOUR_MS),
+        ),
+        CatActivityTimeScope::Evening => (
+            day_start.saturating_add(18 * HOUR_MS),
+            day_start.saturating_add(DAY_MS),
+        ),
+        CatActivityTimeScope::Recent => (now_epoch_ms.saturating_sub(2 * HOUR_MS), now_epoch_ms),
+        CatActivityTimeScope::Inherit | CatActivityTimeScope::Today => {
+            (day_start, day_start.saturating_add(DAY_MS))
+        }
+    };
+    artifact.started_at_epoch_ms >= start
+        && artifact.started_at_epoch_ms < end
+        && artifact.started_at_epoch_ms <= now_epoch_ms
+}
+
+fn select_cat_activity_recordings(
+    recordings: Vec<HarborLinkRecordingArtifact>,
+    query: &CatActivityQueryOptions,
+    now_epoch_ms: u128,
+    previous: Option<&RecentCatActivityQueryState>,
+) -> Vec<HarborLinkRecordingArtifact> {
+    let mut seen = HashSet::new();
+    let mut recordings = recordings
+        .into_iter()
+        .filter(|artifact| {
+            cat_activity_recording_is_in_scope(artifact, query.time_scope, now_epoch_ms)
+                && seen.insert(artifact.artifact_id.clone())
+        })
+        .collect::<Vec<_>>();
+    recordings.sort_by(|left, right| {
+        right
+            .started_at_epoch_ms
+            .cmp(&left.started_at_epoch_ms)
+            .then_with(|| right.artifact_id.cmp(&left.artifact_id))
+    });
+
+    match query.selection {
+        CatActivitySelection::Remaining => {
+            let delivered = previous
+                .map(|previous| {
+                    previous
+                        .delivered_artifact_ids
+                        .iter()
+                        .cloned()
+                        .collect::<HashSet<_>>()
+                })
+                .unwrap_or_default();
+            recordings.retain(|artifact| !delivered.contains(&artifact.artifact_id));
+        }
+        CatActivitySelection::ResendLast => {
+            let order = previous
+                .map(|previous| {
+                    previous
+                        .last_batch_artifact_ids
+                        .iter()
+                        .enumerate()
+                        .map(|(index, artifact_id)| (artifact_id.clone(), index))
+                        .collect::<HashMap<_, _>>()
+                })
+                .unwrap_or_default();
+            recordings.retain(|artifact| order.contains_key(&artifact.artifact_id));
+            recordings.sort_by_key(|artifact| {
+                order
+                    .get(&artifact.artifact_id)
+                    .copied()
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        CatActivitySelection::Batch | CatActivitySelection::Latest => {}
+    }
+    let limit = if query.selection == CatActivitySelection::Latest {
+        1
+    } else {
+        query.limit
+    };
+    recordings.truncate(limit);
+    recordings
+}
+
+fn cat_activity_time_scope_label(time_scope: CatActivityTimeScope) -> &'static str {
+    match time_scope {
+        CatActivityTimeScope::Morning => "今天上午",
+        CatActivityTimeScope::Afternoon => "今天下午",
+        CatActivityTimeScope::Evening => "今天晚上",
+        CatActivityTimeScope::Recent => "最近两小时",
+        CatActivityTimeScope::Inherit | CatActivityTimeScope::Today => "今天",
+    }
+}
+
+fn filter_publishable_cat_recordings(
+    mut recordings: Vec<HarborLinkRecordingArtifact>,
+    validation_mode: CatRecordingValidationMode,
+    validation_records: &HashMap<String, CatRecordingValidationRecord>,
+) -> Vec<HarborLinkRecordingArtifact> {
+    recordings.sort_by_key(|artifact| artifact.started_at_epoch_ms);
+    recordings.dedup_by(|left, right| left.artifact_id == right.artifact_id);
+    if validation_mode.enforces_publication() {
+        recordings.retain(|artifact| {
+            validation_records
+                .get(&artifact.artifact_id)
+                .is_some_and(CatRecordingValidationRecord::is_published)
+        });
+    }
+    recordings
+}
+
 fn build_clip_media_asset(
     request: &TaskRequest,
     target: &ResolvedCameraTarget,
     clip: &ClipCaptureResult,
+    harborlink_artifact: &HarborLinkRecordingArtifact,
 ) -> MediaAsset {
     MediaAsset {
         asset_id: new_media_asset_id(),
@@ -5807,7 +6368,7 @@ fn build_clip_media_asset(
         storage_uri: clip.storage.relative_path.clone(),
         mime_type: clip.mime_type.clone(),
         byte_size: clip.byte_size as u64,
-        checksum: file_checksum(&clip.storage.relative_path),
+        checksum: None,
         captured_at: Some(clip.captured_at_epoch_ms.to_string()),
         started_at: Some(clip.started_at_epoch_ms.to_string()),
         ended_at: Some(clip.ended_at_epoch_ms.to_string()),
@@ -5822,6 +6383,9 @@ fn build_clip_media_asset(
             "camera_display_name": target.display_name.clone(),
             "room_name": target.room_name.clone(),
             "storage_relative_path": clip.storage.relative_path.clone(),
+            "media_contract_version": harborlink_artifact.media_contract_version,
+            "harborlink_artifact_id": harborlink_artifact.artifact_id,
+            "harborlink_preview_url": harborlink_artifact.preview_url,
             "clip_length_seconds": clip.clip_length_seconds,
             "keyframe_count": clip.keyframe_count,
             "keyframe_interval_seconds": clip.keyframe_interval_seconds,
@@ -5859,7 +6423,7 @@ fn build_clip_confirmation_payload(
 
 fn build_clip_confirmation_cover_artifact(
     clip: &ClipCaptureResult,
-    keyframes: &[PathBuf],
+    keyframes: &[HarborLinkRecordingArtifact],
     media_asset: &MediaAsset,
 ) -> Option<TaskArtifact> {
     let cover = keyframes.first()?;
@@ -5868,9 +6432,11 @@ fn build_clip_confirmation_cover_artifact(
         label: "视频首帧".to_string(),
         mime_type: "image/jpeg".to_string(),
         media_asset_id: None,
-        path: Some(cover.to_string_lossy().to_string()),
-        url: None,
+        path: None,
+        url: Some(harborlink_artifact_proxy_url(&cover.artifact_id)),
         metadata: json!({
+            "media_contract_version": cover.media_contract_version,
+            "harborlink_artifact_id": cover.artifact_id,
             "artifact_role": "video_cover_frame",
             "clip_media_asset_id": media_asset.asset_id.clone(),
             "source_video_path": clip.storage.relative_path.clone(),
@@ -5884,12 +6450,13 @@ fn recent_clip_playback_from_capture(
     media_asset: &MediaAsset,
     cover_artifact: &TaskArtifact,
     display_name: &str,
+    clip_delivery_url: &str,
 ) -> RecentClipPlaybackState {
     RecentClipPlaybackState {
         clip_media_asset_id: media_asset.asset_id.clone(),
-        clip_path: clip.storage.relative_path.clone(),
+        clip_path: clip_delivery_url.to_string(),
         clip_mime_type: clip.mime_type.clone(),
-        cover_path: cover_artifact.path.clone().unwrap_or_default(),
+        cover_path: artifact_delivery_location(cover_artifact),
         display_name: display_name.to_string(),
         captured_at_epoch_ms: clip.captured_at_epoch_ms,
     }
@@ -5914,7 +6481,7 @@ fn build_clip_delivery_payload(recent_clip: &RecentClipPlaybackState) -> Value {
         "clip": {
             "media_asset_id": recent_clip.clip_media_asset_id.clone(),
             "mime_type": recent_clip.clip_mime_type.clone(),
-            "path": recent_clip.clip_path.clone(),
+            "url": recent_clip.clip_path.clone(),
         },
         "clip_delivery": {
             "kind": "clip_delivery",
@@ -5927,19 +6494,58 @@ fn build_clip_delivery_payload(recent_clip: &RecentClipPlaybackState) -> Value {
 }
 
 fn build_clip_delivery_artifact(recent_clip: &RecentClipPlaybackState) -> TaskArtifact {
+    let (path, url) = delivery_path_and_url(&recent_clip.clip_path);
     TaskArtifact {
         kind: "video".to_string(),
         label: format!("{} 完整回放", recent_clip.display_name),
         mime_type: recent_clip.clip_mime_type.clone(),
         media_asset_id: Some(recent_clip.clip_media_asset_id.clone()),
-        path: Some(recent_clip.clip_path.clone()),
-        url: None,
+        path,
+        url,
         metadata: json!({
             "artifact_role": "video_full_clip",
             "clip_media_asset_id": recent_clip.clip_media_asset_id.clone(),
             "delivery_target": "weixin",
             "fallback_delivery": "file",
         }),
+    }
+}
+
+fn artifact_delivery_location(artifact: &TaskArtifact) -> String {
+    artifact
+        .url
+        .clone()
+        .or_else(|| artifact.path.clone())
+        .unwrap_or_default()
+}
+
+fn delivery_path_and_url(location: &str) -> (Option<String>, Option<String>) {
+    let location = location.trim();
+    if location.starts_with('/')
+        || location.starts_with("http://")
+        || location.starts_with("https://")
+    {
+        (None, Some(location.to_string()))
+    } else if location.is_empty() || location.starts_with("harborlink://") {
+        (None, None)
+    } else {
+        (Some(location.to_string()), None)
+    }
+}
+
+fn insert_partial_capture_failure(data: &mut Value, operation: &str, message: &str) {
+    if !data.is_object() {
+        *data = json!({});
+    }
+    if let Some(object) = data.as_object_mut() {
+        object.insert(
+            "partial_failure".to_string(),
+            json!({
+                "operation": operation,
+                "message": message,
+            }),
+        );
+        object.insert("capture_mode".to_string(), json!("snapshot_and_clip"));
     }
 }
 
@@ -6075,7 +6681,9 @@ fn join_short_reply(intro: &str, reanchor: &str) -> String {
 fn clip_confirmation_active_frame_decision(plan: &GeneralMessagePlan) -> ActiveFrameDecision {
     match plan.kind {
         GeneralMessagePlanKind::CameraReplayRecentClip => ActiveFrameDecision::Deliver,
-        GeneralMessagePlanKind::CameraSnapshot
+        GeneralMessagePlanKind::CameraLiveView
+        | GeneralMessagePlanKind::CameraSnapshot
+        | GeneralMessagePlanKind::CameraSnapshotAndRecordClip
         | GeneralMessagePlanKind::CameraRecordClip
         | GeneralMessagePlanKind::KnowledgeSearch
         | GeneralMessagePlanKind::RagAnswer
@@ -6241,54 +6849,6 @@ fn current_epoch_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default()
-}
-
-fn write_media_index_sidecar(
-    sidecar_path: &Path,
-    media_path: &str,
-    source_video_path: Option<&str>,
-    target: &ResolvedCameraTarget,
-    ocr_text: &str,
-    vlm_summary: &str,
-    tags: &[String],
-) -> Result<(), String> {
-    if let Some(parent) = sidecar_path.parent() {
-        fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "failed to create sidecar directory {}: {error}",
-                parent.display()
-            )
-        })?;
-    }
-
-    let searchable = [ocr_text.trim(), vlm_summary.trim()]
-        .iter()
-        .filter(|value| !value.is_empty())
-        .copied()
-        .collect::<Vec<_>>()
-        .join("\n");
-    let content = serde_json::to_string_pretty(&json!({
-        "caption": vlm_summary.trim(),
-        "derived_text": searchable,
-        "ocr_text": ocr_text.trim(),
-        "source_video_path": source_video_path,
-        "camera": {
-            "device_id": target.device_id,
-            "display_name": target.display_name,
-            "room_name": target.room_name,
-            "vendor": target.vendor,
-            "model": target.model,
-        },
-        "source_path": media_path,
-        "labels": tags,
-    }))
-    .map_err(|error| format!("failed to serialize media sidecar: {error}"))?;
-    fs::write(sidecar_path, content).map_err(|error| {
-        format!(
-            "failed to write media sidecar {}: {error}",
-            sidecar_path.display()
-        )
-    })
 }
 
 fn build_vision_image_media_asset(
@@ -10532,8 +11092,8 @@ fn delivery_hints_from_task_response(response: &TaskResponse) -> Vec<TaskDeliver
                     && artifact
                         .path
                         .as_deref()
-                        .map(|path| !path.trim().is_empty())
-                        .unwrap_or(false)
+                        .or(artifact.url.as_deref())
+                        .is_some_and(|location| !location.trim().is_empty())
             })
             .take(3)
             .collect::<Vec<_>>();
@@ -10541,6 +11101,14 @@ fn delivery_hints_from_task_response(response: &TaskResponse) -> Vec<TaskDeliver
             let paths = image_artifacts
                 .iter()
                 .filter_map(|artifact| artifact.path.clone())
+                .collect::<Vec<_>>();
+            let urls = image_artifacts
+                .iter()
+                .filter_map(|artifact| artifact.url.clone())
+                .collect::<Vec<_>>();
+            let locations = image_artifacts
+                .iter()
+                .filter_map(|artifact| artifact.url.clone().or_else(|| artifact.path.clone()))
                 .collect::<Vec<_>>();
             hints.push(TaskDeliveryHint {
                 kind: "native_image".to_string(),
@@ -10551,6 +11119,8 @@ fn delivery_hints_from_task_response(response: &TaskResponse) -> Vec<TaskDeliver
                     "artifact_count": image_artifacts.len(),
                     "preferred_transport": "native_image",
                     "paths": paths,
+                    "urls": urls,
+                    "locations": locations,
                 }),
             });
         }
@@ -13574,11 +14144,12 @@ fn stable_prefixed_id(prefix: &str, payload: &str, length: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
     use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use serde_json::{json, Value};
     use tiny_http::{Header, Method, Response, Server};
@@ -13588,17 +14159,20 @@ mod tests {
         build_knowledge_search_artifacts, build_redacted_vision_event_summary, conversation_key,
         delivery_hints_from_task_response, effective_autonomy_level,
         effective_autonomy_level_for_task_run, effective_requires_approval,
-        fallback_general_message_plan, format_pending_candidates,
-        general_message_requests_capability_summary, infer_home_assistant_natural_action,
-        infer_query_from_raw_text, knowledge_modalities, normalize_command_text,
-        notification_delivery_outcome, parse_general_message_plan, parse_rag_query_understanding,
-        pending_candidates_from_results, protocol_string, rag_knowledge_result_limit,
-        requested_result_limit_from_query, resolve_home_assistant_action_entity,
-        resolve_notification_recipient, room_aliases, should_route_general_message_to_knowledge,
-        GeneralMessageConversationAct, GeneralMessagePlanKind, HomeAssistantEntityResolution,
-        HomeAssistantNaturalAction, HomeAssistantNaturalActionRequest, PendingTaskCandidate,
-        TaskApiService, TaskArtifact, TaskIntent, TaskMessage, TaskRequest, TaskRequestAcceptance,
-        TaskResponse, TaskResultEnvelope, TaskSource, TaskStatus, TaskTurnActor, TaskTurnBlock,
+        fallback_general_message_plan, filter_publishable_cat_recordings,
+        format_pending_candidates, general_message_requests_capability_summary,
+        infer_home_assistant_natural_action, infer_query_from_raw_text, knowledge_modalities,
+        normalize_command_text, notification_delivery_outcome, parse_general_message_plan,
+        parse_rag_query_understanding, pending_candidates_from_results, protocol_string,
+        rag_knowledge_result_limit, requested_result_limit_from_query,
+        resolve_cat_activity_query_options, resolve_home_assistant_action_entity,
+        resolve_notification_recipient, room_aliases, select_cat_activity_recordings,
+        should_route_general_message_to_knowledge, CatActivityQueryOptions, CatActivitySelection,
+        CatActivityTimeScope, GeneralMessageConversationAct, GeneralMessagePlanKind,
+        HomeAssistantEntityResolution, HomeAssistantNaturalAction,
+        HomeAssistantNaturalActionRequest, PendingTaskCandidate, TaskApiService, TaskArtifact,
+        TaskIntent, TaskMessage, TaskRequest, TaskRequestAcceptance, TaskResponse,
+        TaskResultEnvelope, TaskSource, TaskStatus, TaskTurnActor, TaskTurnBlock,
         TaskTurnContinuation, TaskTurnConversation, TaskTurnEnvelope, TaskTurnInput,
         TaskTurnTransport, KNOWLEDGE_DOMAIN, KNOWLEDGE_OP_SEARCH,
     };
@@ -13624,6 +14198,10 @@ mod tests {
         AdminConsoleState, AdminConsoleStore, IdentityBindingRecord, KnowledgeSettings,
         KnowledgeSourceRoot, NotificationTargetRecord, RagResourceProfile, RemoteViewConfig,
     };
+    use crate::runtime::cat_recording_validation::{
+        CatRecordingPublicationStatus, CatRecordingValidationMode, CatRecordingValidationRecord,
+        CatRecordingValidationStatus,
+    };
     use crate::runtime::hub::HubScanResultItem;
     use crate::runtime::knowledge::{
         KnowledgeSearchCitation, KnowledgeSearchHit, KnowledgeSearchReplyPack,
@@ -13635,8 +14213,8 @@ mod tests {
         ResolvedCameraTarget, StreamTransport,
     };
     use crate::runtime::task_session::{
-        PendingTaskClipConfirmation, PendingTaskConnect, RecentClipPlaybackState,
-        TaskConversationState, TaskConversationStore,
+        PendingTaskClipConfirmation, PendingTaskConnect, RecentCatActivityQueryState,
+        RecentClipPlaybackState, TaskConversationState, TaskConversationStore,
     };
     use crate::runtime::vision_event::{
         LocalVisionEvent, LocalVisionEventArtifact, LocalVisionEventVlmSummary, SnapshotArtifact,
@@ -13645,6 +14223,186 @@ mod tests {
 
     static RETRIEVAL_GATE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static HARBOROS_TASK_API_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn cat_recording_artifact(id: &str, started_at_epoch_ms: u128) -> HarborLinkRecordingArtifact {
+        HarborLinkRecordingArtifact {
+            media_contract_version: "1.0".to_string(),
+            artifact_id: id.to_string(),
+            camera_id: "camera-252".to_string(),
+            kind: "recording".to_string(),
+            mime_type: "video/mp4".to_string(),
+            byte_size: 1024,
+            started_at_epoch_ms,
+            ended_at_epoch_ms: started_at_epoch_ms + 5_000,
+            duration_seconds: 5,
+            stream_kind: "mainstream".to_string(),
+            modified_at_epoch_ms: started_at_epoch_ms + 5_000,
+            preview_url: "/v1/dvr/artifacts/test".to_string(),
+            event_id: Some(format!("event-{id}")),
+            labels: vec!["cat".to_string()],
+            source: Some("yolo_cat_activity".to_string()),
+        }
+    }
+
+    fn cat_validation_record(
+        artifact_id: &str,
+        validation_status: CatRecordingValidationStatus,
+        publication_status: CatRecordingPublicationStatus,
+    ) -> CatRecordingValidationRecord {
+        CatRecordingValidationRecord {
+            schema_version: "1.0".to_string(),
+            validation_id: format!("validation-{artifact_id}"),
+            policy_version: "test".to_string(),
+            artifact_id: artifact_id.to_string(),
+            event_id: format!("event-{artifact_id}"),
+            artifact_source: Some("yolo_cat_activity".to_string()),
+            camera_id: "camera-252".to_string(),
+            mime_type: "video/mp4".to_string(),
+            byte_size: 1024,
+            started_at_epoch_ms: 1_000,
+            ended_at_epoch_ms: 6_000,
+            duration_seconds: 5,
+            validation_status,
+            publication_status,
+            attempt_count: 1,
+            detection_evidence: Vec::new(),
+            next_retry_at_epoch_ms: None,
+            created_at_epoch_ms: 1_000,
+            updated_at_epoch_ms: 2_000,
+            decision: None,
+            last_error: None,
+            artifact_disposition: Default::default(),
+            discard_attempt_count: 0,
+            discarded_at_epoch_ms: None,
+            discard_error: None,
+        }
+    }
+
+    #[test]
+    fn enforce_cat_recording_filter_only_returns_accepted_and_published_artifacts() {
+        let artifacts = vec![
+            cat_recording_artifact("rejected", 4_000),
+            cat_recording_artifact("accepted-unpublished", 2_000),
+            cat_recording_artifact("accepted-published", 3_000),
+            cat_recording_artifact("pending", 1_000),
+            cat_recording_artifact("missing-validation", 5_000),
+            cat_recording_artifact("accepted-published", 3_000),
+        ];
+        let records = HashMap::from([
+            (
+                "rejected".to_string(),
+                cat_validation_record(
+                    "rejected",
+                    CatRecordingValidationStatus::Rejected,
+                    CatRecordingPublicationStatus::Unpublished,
+                ),
+            ),
+            (
+                "accepted-unpublished".to_string(),
+                cat_validation_record(
+                    "accepted-unpublished",
+                    CatRecordingValidationStatus::Accepted,
+                    CatRecordingPublicationStatus::Unpublished,
+                ),
+            ),
+            (
+                "accepted-published".to_string(),
+                cat_validation_record(
+                    "accepted-published",
+                    CatRecordingValidationStatus::Accepted,
+                    CatRecordingPublicationStatus::Published,
+                ),
+            ),
+            (
+                "pending".to_string(),
+                cat_validation_record(
+                    "pending",
+                    CatRecordingValidationStatus::PendingValidation,
+                    CatRecordingPublicationStatus::Unpublished,
+                ),
+            ),
+        ]);
+
+        let filtered = filter_publishable_cat_recordings(
+            artifacts,
+            CatRecordingValidationMode::Enforce,
+            &records,
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].artifact_id, "accepted-published");
+    }
+
+    #[test]
+    fn cat_activity_selection_honors_time_window_batch_cursor_and_resend() {
+        const HOUR_MS: u128 = 60 * 60 * 1_000;
+        const DAY_MS: u128 = 24 * HOUR_MS;
+        const CHINA_OFFSET_MS: u128 = 8 * HOUR_MS;
+        let china_day = 42_u128;
+        let day_start = china_day * DAY_MS - CHINA_OFFSET_MS;
+        let now = day_start + 20 * HOUR_MS;
+        let recordings = vec![
+            cat_recording_artifact("morning", day_start + 9 * HOUR_MS),
+            cat_recording_artifact("afternoon-old", day_start + 13 * HOUR_MS),
+            cat_recording_artifact("afternoon-new", day_start + 16 * HOUR_MS),
+            cat_recording_artifact("evening", day_start + 19 * HOUR_MS),
+            cat_recording_artifact("yesterday", day_start.saturating_sub(HOUR_MS)),
+        ];
+
+        let afternoon = CatActivityQueryOptions {
+            time_scope: CatActivityTimeScope::Afternoon,
+            selection: CatActivitySelection::Batch,
+            limit: 3,
+        };
+        let selected = select_cat_activity_recordings(recordings.clone(), &afternoon, now, None);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|artifact| artifact.artifact_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["afternoon-new", "afternoon-old"]
+        );
+
+        let prior = RecentCatActivityQueryState {
+            time_scope: "afternoon".to_string(),
+            delivered_artifact_ids: vec!["afternoon-new".to_string()],
+            last_batch_artifact_ids: vec!["afternoon-new".to_string()],
+            updated_at_epoch_ms: now,
+            ..Default::default()
+        };
+        let remaining = CatActivityQueryOptions {
+            time_scope: CatActivityTimeScope::Afternoon,
+            selection: CatActivitySelection::Remaining,
+            limit: 3,
+        };
+        let inherited = resolve_cat_activity_query_options(
+            "还有吗",
+            &CatActivityQueryOptions::default(),
+            Some(&prior),
+        );
+        assert_eq!(inherited.time_scope, CatActivityTimeScope::Afternoon);
+        assert_eq!(inherited.selection, CatActivitySelection::Remaining);
+        let resend_inherited = resolve_cat_activity_query_options(
+            "刚才那段再发一次",
+            &CatActivityQueryOptions::default(),
+            Some(&prior),
+        );
+        assert_eq!(resend_inherited.time_scope, CatActivityTimeScope::Afternoon);
+        assert_eq!(resend_inherited.selection, CatActivitySelection::ResendLast);
+        let selected =
+            select_cat_activity_recordings(recordings.clone(), &remaining, now, Some(&prior));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].artifact_id, "afternoon-old");
+
+        let resend = CatActivityQueryOptions {
+            time_scope: CatActivityTimeScope::Afternoon,
+            selection: CatActivitySelection::ResendLast,
+            limit: 3,
+        };
+        let selected = select_cat_activity_recordings(recordings, &resend, now, Some(&prior));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].artifact_id, "afternoon-new");
+    }
 
     #[test]
     fn rag_result_limit_defaults_to_five_and_supports_explicit_requests() {
@@ -16040,6 +16798,106 @@ mod tests {
         (posts, server_thread, environment)
     }
 
+    fn start_mock_harborlink_camera_capture_server() -> (
+        Arc<Mutex<Vec<String>>>,
+        thread::JoinHandle<()>,
+        MockHarborLinkEnvironment,
+    ) {
+        let server = Server::http("127.0.0.1:0").expect("HarborLink camera mock server");
+        let base_url = format!("http://{}", server.server_addr());
+        let environment = MockHarborLinkEnvironment {
+            previous_url: std::env::var_os("HARBORLINK_MEDIA_API_URL"),
+            previous_mode: std::env::var_os("HARBORBEACON_SOUTHBOUND_MODE"),
+        };
+        std::env::set_var("HARBORLINK_MEDIA_API_URL", &base_url);
+        std::env::set_var("HARBORBEACON_SOUTHBOUND_MODE", "harborlink");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_records = requests.clone();
+        let json_header =
+            Header::from_bytes(b"Content-Type", b"application/json").expect("json header");
+        let server_thread = thread::spawn(move || {
+            for _ in 0..2 {
+                let request = server
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("camera mock receive")
+                    .expect("camera capture request");
+                let method = request.method().clone();
+                let path = request.url().to_string();
+                request_records
+                    .lock()
+                    .expect("camera request records")
+                    .push(format!("{method:?} {path}"));
+                let response = match (method, path.as_str()) {
+                    (Method::Post, "/v1/cameras/cam-252/snapshot.jpg") => json!({
+                        "mediaContractVersion": "1.0",
+                        "artifactId": "snapshots~cam-252~1785289217000.jpg",
+                        "cameraId": "cam-252",
+                        "kind": "snapshot",
+                        "mimeType": "image/jpeg",
+                        "byteSize": 4096,
+                        "startedAtEpochMs": 1785289217000_u128,
+                        "endedAtEpochMs": 1785289217000_u128,
+                        "durationSeconds": 0,
+                        "streamKind": "snapshot",
+                        "modifiedAtEpochMs": 1785289217000_u128,
+                        "previewUrl": "/v1/dvr/artifacts/snapshots~cam-252~1785289217000.jpg"
+                    }),
+                    (Method::Post, "/v1/cameras/cam-252/clips") => json!({
+                        "cameraId": "cam-252",
+                        "clipPath": "/mnt/software/harborlink/camera-dvr/library/clips/cam-252/1785289217123.mp4",
+                        "keyframePaths": [
+                            "/mnt/software/harborlink/camera-dvr/library/clips/cam-252/1785289217123/frame-001.jpg"
+                        ],
+                        "clipArtifact": {
+                            "mediaContractVersion": "1.0",
+                            "artifactId": "clips~cam-252~1785289217123.mp4",
+                            "cameraId": "cam-252",
+                            "kind": "clip",
+                            "mimeType": "video/mp4",
+                            "byteSize": 724631,
+                            "startedAtEpochMs": 1785289217123_u128,
+                            "endedAtEpochMs": 1785289220123_u128,
+                            "durationSeconds": 3,
+                            "streamKind": "clip",
+                            "modifiedAtEpochMs": 1785289220123_u128,
+                            "previewUrl": "/v1/dvr/artifacts/clips~cam-252~1785289217123.mp4"
+                        },
+                        "keyframeArtifacts": [{
+                            "mediaContractVersion": "1.0",
+                            "artifactId": "clips~cam-252~1785289217123~frame-001.jpg",
+                            "cameraId": "cam-252",
+                            "kind": "keyframe",
+                            "mimeType": "image/jpeg",
+                            "byteSize": 8192,
+                            "startedAtEpochMs": 1785289217123_u128,
+                            "endedAtEpochMs": 1785289217123_u128,
+                            "durationSeconds": 0,
+                            "streamKind": "keyframe",
+                            "modifiedAtEpochMs": 1785289217123_u128,
+                            "previewUrl": "/v1/dvr/artifacts/clips~cam-252~1785289217123~frame-001.jpg"
+                        }],
+                        "mimeType": "video/mp4",
+                        "byteSize": 724631,
+                        "capturedAtEpochMs": 1785289217123_u128,
+                        "startedAtEpochMs": 1785289217123_u128,
+                        "endedAtEpochMs": 1785289220123_u128,
+                        "clipLengthSeconds": 3,
+                        "keyframeCount": 1,
+                        "keyframeIntervalSeconds": 1
+                    }),
+                    _ => json!({"error": "unexpected camera capture request"}),
+                };
+                request
+                    .respond(
+                        Response::from_string(response.to_string())
+                            .with_header(json_header.clone()),
+                    )
+                    .expect("camera mock response");
+            }
+        });
+        (requests, server_thread, environment)
+    }
+
     fn home_assistant_light_entities() -> Value {
         json!([
             home_assistant_entity_state(
@@ -16805,6 +17663,7 @@ mod tests {
             last_seen_at: None,
         };
         let snapshot = HarborLinkRecordingArtifact {
+            media_contract_version: "1.0".to_string(),
             artifact_id: "snapshots~cam-1~2026~07~24~030401.jpg".to_string(),
             camera_id: "cam-1".to_string(),
             kind: "snapshot".to_string(),
@@ -16816,6 +17675,9 @@ mod tests {
             stream_kind: "snapshot".to_string(),
             modified_at_epoch_ms: 1_721_790_241_000,
             preview_url: "/v1/dvr/artifacts/snapshot".to_string(),
+            event_id: None,
+            labels: Vec::new(),
+            source: None,
         };
         let expected_captured_at = snapshot.started_at_epoch_ms.to_string();
 
@@ -16874,10 +17736,7 @@ mod tests {
             artifact.media_asset_id.as_deref(),
             Some(media_asset.asset_id.as_str())
         );
-        assert_eq!(
-            artifact.path.as_deref(),
-            Some("harborlink://dvr/snapshots~cam-1~2026~07~24~030401.jpg")
-        );
+        assert!(artifact.path.is_none());
         assert_eq!(
             artifact.url.as_deref(),
             Some("/api/cameras/recordings/artifacts/snapshots~cam-1~2026~07~24~030401.jpg")
@@ -18077,6 +18936,155 @@ mod tests {
         let _ = fs::remove_file(admin_path);
         let _ = fs::remove_file(registry_path);
         let _ = fs::remove_file(conversation_path);
+    }
+
+    #[test]
+    fn general_message_snapshot_and_clip_returns_both_delivery_artifacts() {
+        let _guard = HARBOROS_TASK_API_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (requests, server_thread, _environment) = start_mock_harborlink_camera_capture_server();
+        let admin_path = unique_path("harborbeacon-composite-capture-admin");
+        let registry_path = unique_path("harborbeacon-composite-capture-registry");
+        let conversation_path = unique_path("harborbeacon-composite-capture-conversation");
+        let registry_store = DeviceRegistryStore::new(registry_path.clone());
+        let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store.clone());
+        let conversation_store = TaskConversationStore::new(conversation_path.clone());
+        let service = TaskApiService::new(admin_store, conversation_store.clone());
+        let mut device = CameraDevice::new("cam-252", "K3 camera 252", "rtsp://192.0.2.252/live");
+        device.status = DeviceStatus::Online;
+        device.discovery_source = "manual_entry".to_string();
+        device.capabilities.snapshot = true;
+        device.capabilities.stream = true;
+        registry_store
+            .save_devices(&[device])
+            .expect("save camera 252");
+        let request = general_message_test_request(
+            "camera-snapshot-and-clip",
+            "用 K3 camera 252 帮我拍一张照片和一段视频",
+            json!({"device_hint": "K3 camera 252"}),
+        );
+        let session_id = request.source.session_id.clone();
+        let conversation_id = request.source.conversation_id.clone();
+
+        let response = service.handle_task(request);
+
+        server_thread.join().expect("camera mock thread");
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.executor_used, "camera_hub_service");
+        assert_eq!(response.result.data["capture_mode"], "snapshot_and_clip");
+        assert_eq!(response.result.artifacts.len(), 2);
+        assert!(response
+            .result
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.kind == "image"
+                && artifact.path.is_none()
+                && artifact
+                    .url
+                    .as_deref()
+                    .is_some_and(|url| url.starts_with("/api/cameras/recordings/artifacts/"))));
+        assert!(response
+            .result
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.kind == "video"
+                && artifact.path.is_none()
+                && artifact
+                    .url
+                    .as_deref()
+                    .is_some_and(|url| url.starts_with("/api/cameras/recordings/artifacts/"))));
+        assert_eq!(
+            requests.lock().expect("camera requests").as_slice(),
+            [
+                "Post /v1/cameras/cam-252/snapshot.jpg",
+                "Post /v1/cameras/cam-252/clips",
+            ]
+        );
+        let conversation = conversation_store
+            .load_for_session(&session_id, Some(&conversation_id))
+            .expect("load composite capture conversation")
+            .expect("composite capture conversation");
+        assert!(conversation.clip_pending_confirmation().is_none());
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+    }
+
+    #[test]
+    fn snapshot_and_clip_partial_failures_keep_successful_artifact_and_error() {
+        let (service, _conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("camera-snapshot-and-clip-partial");
+        let request = general_message_test_request(
+            "camera-snapshot-and-clip-partial",
+            "拍一张照片和一段视频",
+            json!({}),
+        );
+        let completed = |kind: &str, message: &str| TaskResponse {
+            task_id: request.task_id.clone(),
+            trace_id: request.trace_id.clone(),
+            status: TaskStatus::Completed,
+            executor_used: "camera_hub_service".to_string(),
+            risk_level: RiskLevel::Low,
+            result: TaskResultEnvelope {
+                message: message.to_string(),
+                data: json!({"kind": kind}),
+                artifacts: vec![TaskArtifact {
+                    kind: kind.to_string(),
+                    url: Some(format!("/api/cameras/recordings/artifacts/{kind}-252")),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            audit_ref: "audit-partial-success".to_string(),
+            missing_fields: Vec::new(),
+            prompt: None,
+            resume_token: None,
+        };
+        let failed = |message: &str| TaskResponse {
+            task_id: request.task_id.clone(),
+            trace_id: request.trace_id.clone(),
+            status: TaskStatus::Failed,
+            executor_used: "camera_hub_service".to_string(),
+            risk_level: RiskLevel::Low,
+            result: TaskResultEnvelope {
+                message: message.to_string(),
+                ..Default::default()
+            },
+            audit_ref: "audit-partial-failure".to_string(),
+            missing_fields: Vec::new(),
+            prompt: None,
+            resume_token: None,
+        };
+
+        let snapshot_only = service.merge_snapshot_and_clip_responses(
+            &request,
+            completed("image", "照片已抓拍"),
+            failed("视频采集失败"),
+        );
+        assert_eq!(snapshot_only.status, TaskStatus::Completed);
+        assert_eq!(snapshot_only.result.artifacts[0].kind, "image");
+        assert_eq!(
+            snapshot_only.result.data["partial_failure"]["operation"],
+            "clip"
+        );
+        assert!(snapshot_only.result.message.contains("视频采集失败"));
+
+        let clip_only = service.merge_snapshot_and_clip_responses(
+            &request,
+            failed("照片采集失败"),
+            completed("video", "视频已录制"),
+        );
+        assert_eq!(clip_only.status, TaskStatus::Completed);
+        assert_eq!(clip_only.result.artifacts[0].kind, "video");
+        assert_eq!(
+            clip_only.result.data["partial_failure"]["operation"],
+            "snapshot"
+        );
+        assert!(clip_only.result.message.contains("照片采集失败"));
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
     }
 
     #[test]
@@ -19353,6 +20361,47 @@ mod tests {
     }
 
     #[test]
+    fn delivery_hints_include_url_backed_image_artifacts() {
+        let response = TaskResponse {
+            task_id: "task-image-url-hint".to_string(),
+            trace_id: "trace-image-url-hint".to_string(),
+            status: TaskStatus::Completed,
+            executor_used: "camera_hub_service".to_string(),
+            risk_level: RiskLevel::Low,
+            result: TaskResultEnvelope {
+                message: "snapshot captured".to_string(),
+                data: json!({}),
+                artifacts: vec![TaskArtifact {
+                    kind: "image".to_string(),
+                    label: "camera snapshot".to_string(),
+                    mime_type: "image/jpeg".to_string(),
+                    media_asset_id: Some("artifact-snapshot-252".to_string()),
+                    path: None,
+                    url: Some("/api/cameras/recordings/artifacts/snapshot-252".to_string()),
+                    metadata: json!({}),
+                }],
+                ..Default::default()
+            },
+            audit_ref: "audit-image-url-hint".to_string(),
+            missing_fields: Vec::new(),
+            prompt: None,
+            resume_token: None,
+        };
+
+        let hints = delivery_hints_from_task_response(&response);
+
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].kind, "native_image");
+        assert_eq!(
+            hints[0].metadata["urls"][0],
+            "/api/cameras/recordings/artifacts/snapshot-252"
+        );
+        assert!(hints[0].metadata["paths"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
+    }
+
+    #[test]
     fn handle_knowledge_search_returns_document_and_image_hits() {
         let admin_path = unique_path("harborbeacon-admin-state");
         let registry_path = unique_path("harborbeacon-device-registry");
@@ -20520,6 +21569,18 @@ mod tests {
             GeneralMessagePlanKind::CameraRecordClip
         );
         assert_eq!(
+            fallback_general_message_plan("打开 K3 camera 252 实时直播", None)
+                .expect("live view plan")
+                .kind,
+            GeneralMessagePlanKind::CameraLiveView
+        );
+        assert_eq!(
+            fallback_general_message_plan("用 K3 camera 252 帮我拍一张照片和一段视频", None)
+                .expect("snapshot and clip plan")
+                .kind,
+            GeneralMessagePlanKind::CameraSnapshotAndRecordClip
+        );
+        assert_eq!(
             fallback_general_message_plan("最近事件", None)
                 .expect("event summary plan")
                 .kind,
@@ -20566,6 +21627,69 @@ mod tests {
             .expect("rag answer plan");
         assert_eq!(rag_plan.kind, GeneralMessagePlanKind::RagAnswer);
         assert_eq!(rag_plan.query.as_deref(), Some("樱花计划"));
+    }
+
+    #[test]
+    fn explicit_live_view_bypasses_conflicting_nsp_snapshot_decision() {
+        let (service, _conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("explicit-live-view-priority");
+        configure_mock_general_message_llm(
+            &service,
+            r#"{
+                "decision": "camera_snapshot",
+                "confidence": 0.93,
+                "canonical_phrase": "camera_snapshot",
+                "reason": "conflicting NSP decision"
+            }"#,
+        );
+        let request = general_message_test_request(
+            "explicit-live-view-priority",
+            "打开 K3 camera 252 实时直播",
+            Value::Null,
+        );
+
+        let (plan, trace) = service
+            .general_message_plan(&request, None)
+            .expect("resolve explicit live view plan");
+
+        assert_eq!(plan.kind, GeneralMessagePlanKind::CameraLiveView);
+        assert_eq!(trace.controller_stage, "deterministic_single_candidate");
+        assert!(!trace.router_llm);
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+    }
+
+    #[test]
+    fn explicit_snapshot_and_clip_bypasses_conflicting_nsp_clip_decision() {
+        let (service, _conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("explicit-snapshot-clip-priority");
+        configure_mock_general_message_llm(
+            &service,
+            r#"{
+                "decision": "camera_record_clip",
+                "confidence": 0.94,
+                "canonical_phrase": "camera_record_clip",
+                "reason": "conflicting NSP decision"
+            }"#,
+        );
+        let request = general_message_test_request(
+            "explicit-snapshot-clip-priority",
+            "用 K3 camera 252 帮我拍一张照片和一段视频",
+            Value::Null,
+        );
+
+        let (plan, trace) = service
+            .general_message_plan(&request, None)
+            .expect("resolve explicit snapshot and clip plan");
+
+        assert_eq!(
+            plan.kind,
+            GeneralMessagePlanKind::CameraSnapshotAndRecordClip
+        );
+        assert_eq!(trace.controller_stage, "deterministic_single_candidate");
+        assert!(!trace.router_llm);
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
     }
 
     #[test]
@@ -21217,6 +22341,11 @@ mod tests {
     fn parse_general_message_plan_accepts_closed_nsp_tool_decisions() {
         let cases = [
             ("camera_snapshot", GeneralMessagePlanKind::CameraSnapshot),
+            ("camera_live_view", GeneralMessagePlanKind::CameraLiveView),
+            (
+                "camera_snapshot_and_record_clip",
+                GeneralMessagePlanKind::CameraSnapshotAndRecordClip,
+            ),
             (
                 "camera_record_clip",
                 GeneralMessagePlanKind::CameraRecordClip,
@@ -21267,6 +22396,10 @@ mod tests {
         assert!(prompt.contains("do not copy 0.0"));
         assert!(prompt.contains("asking status/diagnostics/health"));
         assert!(prompt.contains("evt_readiness, evt_preflight, evt_evidence_bundle"));
+        assert!(prompt.contains("cat_activity_today"));
+        assert!(prompt.contains("cat_activity_query"));
+        assert!(prompt.contains("remaining|resend_last"));
+        assert!(prompt.contains("For conversation_* decisions, always fill reply_text"));
         assert!(prompt.contains("4h or 72h stress test"));
         assert!(prompt.contains("default notification"));
         assert!(prompt.contains("\"domain\":\"scene\",\"service\":\"turn_on\""));
@@ -21274,6 +22407,77 @@ mod tests {
         assert!(prompt.contains("\"decision\":\"evt_preflight\""));
         assert!(prompt.contains("生成压测证据"));
         assert!(prompt.contains("\"decision\":\"evt_evidence_bundle\""));
+    }
+
+    #[test]
+    fn general_message_nsp_routes_named_cat_without_keyword_to_bounded_query() {
+        let (service, _conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-named-cat-query");
+        configure_mock_general_message_llm(
+            &service,
+            r#"{
+                "decision":"cat_activity_query",
+                "confidence":0.95,
+                "cat_activity":{
+                    "time_scope":"today",
+                    "selection":"batch",
+                    "limit":3
+                },
+                "reason":"named pet activity query"
+            }"#,
+        );
+        let request =
+            general_message_test_request("named_cat_query", "小咪今天有什么新鲜事", Value::Null);
+
+        let (plan, trace) = service
+            .general_message_plan(&request, None)
+            .expect("named cat activity plan");
+
+        assert_eq!(plan.kind, GeneralMessagePlanKind::CatActivityQuery);
+        assert_eq!(plan.cat_activity.time_scope, CatActivityTimeScope::Today);
+        assert_eq!(plan.cat_activity.selection, CatActivitySelection::Batch);
+        assert_eq!(plan.cat_activity.limit, 3);
+        assert!(trace.router_llm);
+        assert_eq!(trace.controller_stage, "nsp_router");
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+    }
+
+    #[test]
+    fn general_message_conversation_uses_llm_reply_instead_of_canned_ack() {
+        let (service, _conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-conversational-reply");
+        configure_mock_general_message_llm(
+            &service,
+            r#"{
+                "decision":"conversation_continue",
+                "conversation_act":"continue",
+                "confidence":0.93,
+                "reply_text":"你好，我在。你想聊聊，还是让我帮你看看家里的情况？"
+            }"#,
+        );
+
+        let response = service.handle_task(general_message_test_request(
+            "conversational_reply",
+            "你好",
+            Value::Null,
+        ));
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(
+            response.result.message,
+            "你好，我在。你想聊聊，还是让我帮你看看家里的情况？"
+        );
+        assert_eq!(
+            response.result.data["reply_pack"]["kind"],
+            "conversation_continue"
+        );
+        assert_eq!(
+            response.result.data["general_message_controller"]["router_llm"],
+            true
+        );
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
     }
 
     #[test]
@@ -21551,12 +22755,13 @@ mod tests {
             response.result.data["reply_pack"]["kind"],
             "capability_summary"
         );
-        assert_eq!(
-            response.result.data["reply_pack"]["examples"]
-                .as_array()
-                .map(Vec::len),
-            Some(19)
-        );
+        let examples = response.result.data["reply_pack"]["examples"]
+            .as_array()
+            .expect("capability examples");
+        assert!(examples.len() >= 19);
+        assert!(examples
+            .iter()
+            .any(|example| example.as_str() == Some("今天猫干了什么")));
         assert!(response.result.data["reply_pack"]["capabilities"]
             .as_array()
             .expect("capabilities")
@@ -21567,6 +22772,11 @@ mod tests {
             .expect("capabilities")
             .iter()
             .any(|capability| capability.as_str() == Some("vision_event_notify_latest")));
+        assert!(response.result.data["reply_pack"]["capabilities"]
+            .as_array()
+            .expect("capabilities")
+            .iter()
+            .any(|capability| capability.as_str() == Some("cat_activity_query")));
         assert!(response.result.data["reply_pack"]["capabilities"]
             .as_array()
             .expect("capabilities")

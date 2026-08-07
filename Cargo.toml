@@ -103,6 +103,7 @@ qrcodegen = "1.8"
 if-addrs = "0.13"
 quick-xml = "0.38"
 markitdown = "0.1.11"
+libc = "0.2"
 memmap2 = "0.9"
 fast-hnsw = "1.0.1"
 candle = { package = "candle-core", version = "0.10.2" }

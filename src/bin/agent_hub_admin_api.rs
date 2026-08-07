@@ -1,14 +1,17 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -26,9 +29,9 @@ use tiny_http::{Header, Method, Request, Response, ResponseBox, Server, StatusCo
 use uuid::Uuid;
 
 use harborbeacon_local_agent::connectors::harborlink_media::{
-    harborlink_request_scope, HarborLinkCredentialStatus, HarborLinkHomeAssistantStatus,
-    HarborLinkLiveSession, HarborLinkMediaClient, HarborLinkRecordingArtifact,
-    HarborLinkRecordingStatus,
+    harborlink_request_scope, HarborLinkCredentialStatus, HarborLinkEventRecordingLease,
+    HarborLinkHomeAssistantStatus, HarborLinkLiveSession, HarborLinkMediaClient,
+    HarborLinkRecordingArtifact, HarborLinkRecordingStatus,
 };
 #[cfg(test)]
 use harborbeacon_local_agent::connectors::home_assistant::validate_home_assistant_service_fields as validate_home_assistant_service_fields_shared;
@@ -88,6 +91,21 @@ use harborbeacon_local_agent::runtime::admin_console::{
     KnowledgeRetrievalSettings, KnowledgeSettings, KnowledgeSourceRoot, ModelDownloadJobRecord,
     ModelRuntimeRecord, NotificationTargetRecord, RagResourceProfile,
 };
+use harborbeacon_local_agent::runtime::ai_resource_scheduler::{
+    acquire_ai_resource_lease, ai_resource_scheduler_snapshot, AiLeaseErrorKind, AiResourceLease,
+    AiWorkload, AI_RESOURCE_QUEUE_MODE,
+};
+use harborbeacon_local_agent::runtime::cat_recording_classifier::{
+    aggregate_cat_recording_predictions, build_classifier_command, classifier_config_from_env,
+    parse_classifier_output, validator_backend_from_env, CatRecordingClassifierConfig,
+    CatRecordingClassifierOutput, CatRecordingValidatorBackend,
+    CAT_RECORDING_CLASSIFIER_MIN_POSITIVE_FRAMES,
+};
+use harborbeacon_local_agent::runtime::cat_recording_validation::{
+    cat_recording_hard_gate_reason, sanitize_decision, validation_mode_from_env,
+    CatDetectionEvidence, CatRecordingValidationDecision, CatRecordingValidationMode,
+    CatRecordingValidationRecord, CatRecordingValidationStatus, CatRecordingValidationStore,
+};
 use harborbeacon_local_agent::runtime::dvr::{
     build_status_response, sanitize_dvr_recording_settings, DvrRecordingSettings,
     DvrRecordingStatus, DvrRecordingStatusResponse, DvrTimelineResponse, DvrTimelineSegment,
@@ -128,9 +146,10 @@ use harborbeacon_local_agent::runtime::knowledge_index::{
     KnowledgeIndexManifest, KnowledgeIndexService, KnowledgeIndexSnapshot, KnowledgeModality,
 };
 use harborbeacon_local_agent::runtime::model_center::{
-    load_model_center_state, redact_model_endpoint, run_vlm_summary_with_state,
-    test_model_endpoint, vlm_endpoint_readiness, vlm_execution_runtime_snapshot,
-    ModelEndpointTestResult, ADMIN_STATE_PATH_ENV,
+    load_model_center_state, redact_model_endpoint, run_cat_recording_validation,
+    run_vlm_summary_with_state, test_model_endpoint, vlm_endpoint_readiness,
+    vlm_execution_runtime_snapshot, CatRecordingVlmExecution, ModelEndpointTestResult,
+    ADMIN_STATE_PATH_ENV,
 };
 use harborbeacon_local_agent::runtime::privacy_gateway::PRIVACY_GATEWAY_POLICY_VERSION;
 use harborbeacon_local_agent::runtime::registry::{
@@ -164,20 +183,142 @@ const HOME_GUARDIAN_IDEMPOTENCY_MEMORY_SECONDS: u64 = 7 * 24 * 60 * 60;
 const ADMIN_HTTP_WORKER_COUNT: usize = 32;
 const ADMIN_HTTP_REQUEST_QUEUE_CAPACITY: usize = 256;
 const MAX_VISION_EVENT_INGEST_INFLIGHT: usize = 8;
+const DETECTION_JOB_MONITOR_INTERVAL: Duration = Duration::from_secs(1);
+const CAT_RECORDING_VALIDATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const CAT_RECORDING_VALIDATION_RUNTIME_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+const CAT_RECORDING_VALIDATION_MAX_BYTES: u64 = 256 * 1024 * 1024;
+const CAT_RECORDING_VALIDATION_MAX_DURATION_SECONDS: f64 = 10.0 * 60.0;
+const CAT_RECORDING_VALIDATION_MEDIA_TIMEOUT: Duration = Duration::from_secs(45);
+const CAT_RECORDING_CLASSIFIER_TIMEOUT: Duration = Duration::from_secs(15);
+const CAT_RECORDING_CLASSIFIER_STOP_GRACE_PERIOD: Duration = Duration::from_secs(5);
+const CAT_RECORDING_VALIDATION_FAST_SEEK_TIMEOUT: Duration = Duration::from_secs(8);
+const CAT_RECORDING_VALIDATION_ACCURATE_SEEK_TIMEOUT: Duration = Duration::from_secs(15);
+const CAT_RECORDING_VALIDATION_STDERR_MAX_CHARS: usize = 120;
+const CAT_RECORDING_VALIDATION_ERROR_MAX_CHARS: usize = 480;
+const CAT_RECORDING_VALIDATION_MEDIA_CAPTURE_MAX_BYTES: usize = 64 * 1024;
+const CAT_RECORDING_VALIDATION_TEMP_ROOT_ENV: &str = "HARBOR_K3_CAT_RECORDING_VALIDATION_TEMP_ROOT";
+const CAT_RECORDING_VALIDATION_MAX_ATTEMPTS: u32 = 4;
+const CAT_RECORDING_VALIDATION_RETRY_DELAYS_SECONDS: [u64; 3] = [10, 30, 120];
+const CAT_RECORDING_AI_RESOURCE_RETRY_DELAY: Duration = Duration::from_secs(5);
+const CAT_RECORDING_VALIDATION_FRAMES_PER_ROUND: usize = 5;
+const CAT_RECORDING_VALIDATION_MAX_FRAMES: usize = 10;
+const CAT_RECORDING_VALIDATION_FRAME_MARGIN_MS: u64 = 100;
+const CAT_RECORDING_VALIDATION_FOLLOWUP_OFFSETS_MS: [u64; 3] = [250, 500, 1_000];
 const HOME_GUARDIAN_ACTIVITY_LIMIT: usize = 500;
 const MAX_FAMILY_MEMORY_FEEDBACK_JSON_BYTES: usize = 32 * 1024;
 const DEFAULT_DETECTION_JOB_TTL_SECONDS: u64 = 60;
 const MIN_DETECTION_JOB_TTL_SECONDS: u64 = 60;
 const MAX_DETECTION_JOB_TTL_SECONDS: u64 = 900;
 const MAX_DETECTION_JOB_HISTORY: usize = 64;
-const DEFAULT_DETECTION_MAX_FPS: f64 = 5.0;
-const MAX_DETECTION_MAX_FPS: f64 = 10.0;
+const DETECTION_CHILD_STOP_GRACE_PERIOD: Duration = Duration::from_secs(5);
+#[cfg(unix)]
+const DETECTION_CHILD_STOP_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const DEFAULT_DETECTION_MAX_FPS: f64 = 25.0;
+const MAX_DETECTION_MAX_FPS: f64 = 25.0;
 const DEFAULT_DETECTION_CONFIDENCE: f64 = 0.35;
 const DEFAULT_DETECTION_WORKER: &str =
     "/usr/lib/harboros-beacon/harbornavi_k3_yolo_stream_worker.py";
 const DEFAULT_DETECTION_MODEL: &str = "/var/lib/harboros-beacon/models/yolov8n_192x320.q.onnx";
 const DEFAULT_DETECTION_LABELS: &str = "/var/lib/harboros-beacon/models/label.txt";
 const DEFAULT_DETECTION_OUTPUT_ROOT: &str = "/run/harboros-beacon/detection-jobs";
+const CAT_AUTO_RECORD_ENABLED_ENV: &str = "HARBOR_K3_CAT_AUTO_RECORD_ENABLED";
+const CAT_AUTO_RECORD_START_FRAMES_ENV: &str = "HARBOR_K3_CAT_AUTO_RECORD_START_CONSECUTIVE_FRAMES";
+const CAT_AUTO_RECORD_START_DURATION_MS_ENV: &str = "HARBOR_K3_CAT_AUTO_RECORD_START_DURATION_MS";
+const CAT_AUTO_RECORD_STOP_FRAMES_ENV: &str = "HARBOR_K3_CAT_AUTO_RECORD_STOP_CONSECUTIVE_FRAMES";
+const CAT_AUTO_RECORD_STOP_DURATION_MS_ENV: &str = "HARBOR_K3_CAT_AUTO_RECORD_STOP_DURATION_MS";
+const CAT_AUTO_RECORD_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const CAT_AUTO_RECORD_LEASE_TTL_SECONDS: u64 = 30;
+const CAT_AUTO_RECORD_PRE_ROLL_SECONDS: u32 = 3;
+const CAT_AUTO_RECORD_RENEW_INTERVAL_SECONDS: u128 = 10;
+const CAT_AUTO_RECORD_MAX_RESULT_AGE_MS: u128 = 5_000;
+const CAT_AUTO_RECORD_MAX_DETECTION_EVIDENCE: usize = 256;
+const DEFAULT_CAT_AUTO_RECORD_START_CONSECUTIVE_FRAMES: u64 = 5;
+const DEFAULT_CAT_AUTO_RECORD_START_DURATION_MS: u64 = 500;
+const DEFAULT_CAT_AUTO_RECORD_STOP_CONSECUTIVE_FRAMES: u64 = 15;
+const DEFAULT_CAT_AUTO_RECORD_STOP_DURATION_MS: u64 = 3_000;
+const LIVE_MANAGED_DETECTION_TTL_SECONDS: u64 = 300;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatRecordingFrameSeekStrategy {
+    Fast,
+    Accurate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatRecordingFrameProfile {
+    Classifier,
+    Vlm,
+}
+
+impl CatRecordingFrameProfile {
+    fn max_frames(self) -> usize {
+        match self {
+            Self::Classifier => 9,
+            Self::Vlm => CAT_RECORDING_VALIDATION_FRAMES_PER_ROUND,
+        }
+    }
+}
+
+impl CatRecordingFrameSeekStrategy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Accurate => "accurate",
+        }
+    }
+
+    fn timeout_cap(self) -> Duration {
+        match self {
+            Self::Fast => CAT_RECORDING_VALIDATION_FAST_SEEK_TIMEOUT,
+            Self::Accurate => CAT_RECORDING_VALIDATION_ACCURATE_SEEK_TIMEOUT,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BoundedMediaCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    timed_out: bool,
+    forced_stop: bool,
+}
+
+#[derive(Debug)]
+struct BoundedMediaCommandError {
+    message: String,
+    exit_confirmed: bool,
+}
+
+impl BoundedMediaCommandError {
+    fn confirmed(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            exit_confirmed: true,
+        }
+    }
+
+    fn unconfirmed(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            exit_confirmed: false,
+        }
+    }
+}
+
+impl std::fmt::Display for BoundedMediaCommandError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for BoundedMediaCommandError {}
+
+impl From<String> for BoundedMediaCommandError {
+    fn from(message: String) -> Self {
+        Self::confirmed(message)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GateAuthenticatedPrincipal(AccessPrincipal);
@@ -338,8 +479,54 @@ pub struct AdminApi {
     guardian_rule_cache: Arc<Mutex<HomeGuardianRuleCache>>,
     guardian_activity_log_lock: Arc<Mutex<()>>,
     detection_jobs: Arc<Mutex<HashMap<String, DetectionJobRuntime>>>,
+    cat_auto_recording: Arc<Mutex<HashMap<String, CatAutoRecordingState>>>,
+    cat_recording_validation_mode: CatRecordingValidationMode,
+    cat_recording_validation_store: CatRecordingValidationStore,
     http_runtime: HttpRuntimeCounters,
     vision_ingest_limiter: VisionIngestLimiter,
+}
+
+#[derive(Debug, Default)]
+struct CatAutoRecordingState {
+    last_sequence: Option<u64>,
+    event_id: Option<String>,
+    lease_id: Option<String>,
+    stream_profile: Option<String>,
+    last_renewed_epoch_ms: u128,
+    detection_evidence: Vec<CatDetectionEvidence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CatAutoRecordingConfig {
+    start_consecutive_frames: u64,
+    start_duration_ms: u64,
+    stop_consecutive_frames: u64,
+    stop_duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CatDetectionStreakSample {
+    sequence: u64,
+    frame_epoch_ms: u64,
+    detection_count: u64,
+    consecutive_present_frames: u64,
+    consecutive_absent_frames: u64,
+    present_since_epoch_ms: u64,
+    absent_since_epoch_ms: u64,
+    max_confidence_ppm: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CatRecordingSampleTarget {
+    frame_index: u8,
+    offset_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatAutoRecordingTransition {
+    Hold,
+    Start,
+    Stop,
 }
 
 #[derive(Clone, Default)]
@@ -1876,6 +2063,7 @@ struct DetectionJobProjection {
     started_at: String,
     updated_at: String,
     expires_at: String,
+    managed_by_live: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     latest_result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1884,10 +2072,32 @@ struct DetectionJobProjection {
     message: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct DetectionJobStartResponse {
+    #[serde(flatten)]
+    projection: DetectionJobProjection,
+    reused: bool,
+}
+
 struct DetectionJobRuntime {
     projection: DetectionJobProjection,
     output_dir: PathBuf,
     child: Option<Child>,
+    ai_lease: Option<AiResourceLease>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+enum DetectionChildStopOutcome {
+    AlreadyExited,
+    Graceful,
+    Forced,
+}
+
+#[derive(Debug)]
+struct DetectionChildStopReport {
+    outcome: DetectionChildStopOutcome,
+    warning: Option<String>,
 }
 
 type StateResponse = HubStateSnapshot;
@@ -1904,6 +2114,8 @@ impl AdminApi {
     ) -> Self {
         let (guardian_sender, guardian_receiver) =
             sync_channel(HOME_GUARDIAN_EVALUATION_QUEUE_CAPACITY);
+        let cat_recording_validation_mode =
+            validation_mode_from_env().unwrap_or_else(|error| fail(&error));
         let api = Self {
             admin_store,
             task_service,
@@ -1927,11 +2139,17 @@ impl AdminApi {
             guardian_rule_cache: Arc::new(Mutex::new(HomeGuardianRuleCache::default())),
             guardian_activity_log_lock: Arc::new(Mutex::new(())),
             detection_jobs: Arc::new(Mutex::new(HashMap::new())),
+            cat_auto_recording: Arc::new(Mutex::new(HashMap::new())),
+            cat_recording_validation_mode,
+            cat_recording_validation_store: CatRecordingValidationStore::default(),
             http_runtime: HttpRuntimeCounters::new(),
             vision_ingest_limiter: VisionIngestLimiter::new(),
         };
         api.refresh_home_guardian_rule_cache_best_effort();
         api.start_home_guardian_worker(guardian_receiver);
+        api.start_detection_job_monitor();
+        api.start_cat_auto_recording_worker();
+        api.start_cat_recording_validation_worker();
         api
     }
 
@@ -1958,6 +2176,602 @@ impl AdminApi {
         let _ = thread::Builder::new()
             .name("home-guardian-eval".to_string())
             .spawn(move || worker.run_home_guardian_worker(receiver));
+    }
+
+    fn start_detection_job_monitor(&self) {
+        let worker = self.clone();
+        let _ = thread::Builder::new()
+            .name("detection-job-monitor".to_string())
+            .spawn(move || loop {
+                if let Ok(mut jobs) = worker.detection_jobs.lock() {
+                    for runtime in jobs.values_mut() {
+                        worker.refresh_detection_job(runtime);
+                    }
+                }
+                thread::sleep(DETECTION_JOB_MONITOR_INTERVAL);
+            });
+    }
+
+    fn start_cat_auto_recording_worker(&self) {
+        if !cat_auto_recording_enabled() {
+            return;
+        }
+        let config = match cat_auto_recording_config_from_env() {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("HarborBeacon cat auto-recording is disabled: {error}");
+                return;
+            }
+        };
+        let worker = self.clone();
+        let _ = thread::Builder::new()
+            .name("cat-auto-recording".to_string())
+            .spawn(move || loop {
+                if let Err(error) = worker.cat_auto_recording_tick(config) {
+                    eprintln!("HarborBeacon cat auto-recording tick failed: {error}");
+                }
+                thread::sleep(CAT_AUTO_RECORD_POLL_INTERVAL);
+            });
+    }
+
+    fn start_cat_recording_validation_worker(&self) {
+        if !self.cat_recording_validation_mode.validates_candidates() {
+            return;
+        }
+        let worker = self.clone();
+        let _ = thread::Builder::new()
+            .name("cat-recording-validation".to_string())
+            .spawn(move || worker.run_cat_recording_validation_worker());
+    }
+
+    fn run_cat_recording_validation_worker(self) {
+        if let Err(error) = self.cat_recording_validation_store.recover_interrupted() {
+            eprintln!("HarborBeacon cat recording validation recovery failed: {error}");
+        }
+        self.retry_pending_cat_recording_discards();
+        loop {
+            self.retry_pending_cat_recording_discards();
+            match cat_recording_validation_runtime_ready() {
+                Ok(true) => {}
+                Ok(false) => {
+                    thread::sleep(CAT_RECORDING_VALIDATION_RUNTIME_RETRY_INTERVAL);
+                    continue;
+                }
+                Err(error) => {
+                    eprintln!("HarborBeacon cat recording validation readiness failed: {error}");
+                    thread::sleep(CAT_RECORDING_VALIDATION_RUNTIME_RETRY_INTERVAL);
+                    continue;
+                }
+            }
+            match self.cat_recording_validation_store.next_pending() {
+                Ok(Some(record)) => self.process_cat_recording_validation(record),
+                Ok(None) => thread::sleep(CAT_RECORDING_VALIDATION_POLL_INTERVAL),
+                Err(error) => {
+                    eprintln!("HarborBeacon cat recording validation queue failed: {error}");
+                    thread::sleep(CAT_RECORDING_VALIDATION_POLL_INTERVAL);
+                }
+            }
+        }
+    }
+
+    fn process_cat_recording_validation(&self, record: CatRecordingValidationRecord) {
+        let claimed = match self
+            .cat_recording_validation_store
+            .mark_processing(&record.artifact_id)
+        {
+            Ok(record) => record,
+            Err(error) => {
+                eprintln!("HarborBeacon cat recording validation claim failed: {error}");
+                return;
+            }
+        };
+
+        let started = Instant::now();
+        let result = self.evaluate_cat_recording_candidate(&claimed, started);
+        let completion = match result {
+            Ok((status, decision, error)) => self.cat_recording_validation_store.complete(
+                &claimed.artifact_id,
+                status,
+                decision,
+                error.as_deref(),
+            ),
+            Err(error) => {
+                let diagnostic = sanitize_cat_recording_validation_error(&error);
+                if is_cat_recording_ai_resource_contention(&error) {
+                    let retry_at = cat_auto_recording_epoch_ms()
+                        .saturating_add(CAT_RECORDING_AI_RESOURCE_RETRY_DELAY.as_millis());
+                    eprintln!(
+                        "HarborBeacon cat recording validation deferred for AI resource contention: validation_id={} camera_id={} retry_in_seconds={} error={}",
+                        claimed.validation_id,
+                        claimed.camera_id,
+                        CAT_RECORDING_AI_RESOURCE_RETRY_DELAY.as_secs(),
+                        diagnostic
+                    );
+                    self.cat_recording_validation_store
+                        .defer_resource_contention(&claimed.artifact_id, retry_at, &diagnostic)
+                } else {
+                    match cat_recording_validation_retry_delay(claimed.attempt_count) {
+                        Some(delay) => {
+                            let retry_at =
+                                cat_auto_recording_epoch_ms().saturating_add(delay.as_millis());
+                            eprintln!(
+                            "HarborBeacon cat recording validation scheduled retry: validation_id={} camera_id={} attempt={} retry_in_seconds={} error={}",
+                            claimed.validation_id,
+                            claimed.camera_id,
+                            claimed.attempt_count,
+                            delay.as_secs(),
+                            diagnostic
+                        );
+                            self.cat_recording_validation_store.schedule_retry(
+                                &claimed.artifact_id,
+                                retry_at,
+                                &diagnostic,
+                            )
+                        }
+                        None => {
+                            eprintln!(
+                            "HarborBeacon cat recording validation exhausted retries: validation_id={} camera_id={} attempts={} error={}",
+                            claimed.validation_id,
+                            claimed.camera_id,
+                            claimed.attempt_count,
+                            diagnostic
+                        );
+                            self.cat_recording_validation_store.complete(
+                                &claimed.artifact_id,
+                                CatRecordingValidationStatus::ReviewRequired,
+                                None,
+                                Some(&diagnostic),
+                            )
+                        }
+                    }
+                }
+            }
+        };
+        match completion {
+            Ok(record) if record.is_physical_discard_eligible() => {
+                self.discard_cat_recording_artifact(&record);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("HarborBeacon cat recording validation completion failed: {error}");
+            }
+        }
+    }
+
+    fn retry_pending_cat_recording_discards(&self) {
+        match self.cat_recording_validation_store.pending_discards() {
+            Ok(records) => {
+                for record in records {
+                    self.discard_cat_recording_artifact(&record);
+                }
+            }
+            Err(error) => {
+                eprintln!("HarborBeacon cat recording discard recovery failed: {error}");
+            }
+        }
+    }
+
+    fn discard_cat_recording_artifact(&self, record: &CatRecordingValidationRecord) {
+        if !record.is_physical_discard_eligible() {
+            return;
+        }
+        let pending = if record.artifact_disposition
+            == harborbeacon_local_agent::runtime::cat_recording_validation::CatRecordingArtifactDisposition::DiscardPending
+        {
+            Ok(record.clone())
+        } else {
+            self.cat_recording_validation_store
+                .mark_artifact_discard_pending(&record.artifact_id)
+        };
+        let pending = match pending {
+            Ok(record) => record,
+            Err(error) => {
+                eprintln!("HarborBeacon could not persist cat recording discard intent: {error}");
+                return;
+            }
+        };
+        match self
+            .harborlink_media
+            .delete_dvr_artifact(&pending.artifact_id)
+        {
+            Ok(_) => {
+                if let Err(error) = self
+                    .cat_recording_validation_store
+                    .mark_artifact_discarded(&pending.artifact_id)
+                {
+                    eprintln!(
+                        "HarborBeacon could not persist cat recording discard tombstone: {error}"
+                    );
+                }
+            }
+            Err(error) => {
+                let diagnostic = sanitize_cat_recording_validation_error(&error);
+                if let Err(store_error) = self
+                    .cat_recording_validation_store
+                    .mark_artifact_discard_failed(&pending.artifact_id, &diagnostic)
+                {
+                    eprintln!("HarborBeacon could not persist cat recording discard failure: {store_error}");
+                }
+                eprintln!(
+                    "HarborBeacon cat recording physical discard failed: validation_id={} artifact_id={} error={}",
+                    pending.validation_id, pending.artifact_id, diagnostic
+                );
+            }
+        }
+    }
+
+    fn evaluate_cat_recording_candidate(
+        &self,
+        record: &CatRecordingValidationRecord,
+        started: Instant,
+    ) -> Result<
+        (
+            CatRecordingValidationStatus,
+            Option<CatRecordingValidationDecision>,
+            Option<String>,
+        ),
+        String,
+    > {
+        if record.byte_size > CAT_RECORDING_VALIDATION_MAX_BYTES {
+            return Ok((
+                CatRecordingValidationStatus::ReviewRequired,
+                None,
+                Some("recording_exceeds_validation_size_limit".to_string()),
+            ));
+        }
+        let work_dir = cat_recording_validation_temp_root().join(&record.validation_id);
+        fs::create_dir_all(&work_dir).map_err(|error| {
+            format!("failed to create cat recording validation work directory: {error}")
+        })?;
+        let video_path = work_dir.join("recording.mp4");
+        let evaluation = (|| {
+            self.harborlink_media.download_dvr_artifact_to(
+                &record.artifact_id,
+                &video_path,
+                CAT_RECORDING_VALIDATION_MAX_BYTES,
+            )?;
+            let duration_seconds = probe_media_duration_seconds(&video_path)?;
+            if !duration_seconds.is_finite()
+                || duration_seconds <= 0.0
+                || duration_seconds > CAT_RECORDING_VALIDATION_MAX_DURATION_SECONDS
+            {
+                return Ok((
+                    CatRecordingValidationStatus::ReviewRequired,
+                    None,
+                    Some("recording_duration_is_outside_validation_limits".to_string()),
+                ));
+            }
+            let measured_duration_ms = (duration_seconds * 1_000.0)
+                .round()
+                .clamp(0.0, u64::MAX as f64) as u64;
+            if let Some((status, reason)) =
+                cat_recording_hard_gate_reason(record, measured_duration_ms)
+            {
+                return Ok((status, None, Some(reason.to_string())));
+            }
+            let backend = validator_backend_from_env()?;
+            let decision = match backend {
+                CatRecordingValidatorBackend::MobileNetV2Int8 => {
+                    let (sampling_strategy, sample_targets) =
+                        select_cat_recording_classifier_sample_targets(record, duration_seconds);
+                    let frames = build_cat_recording_sample_frames(
+                        &video_path,
+                        &work_dir,
+                        &sample_targets,
+                        Instant::now() + CAT_RECORDING_VALIDATION_MEDIA_TIMEOUT,
+                        CatRecordingFrameProfile::Classifier,
+                    )?;
+                    let config = classifier_config_from_env()?;
+                    let execution = run_cat_recording_classifier(&frames, &config)?;
+                    let aggregation = aggregate_cat_recording_predictions(
+                        &execution.predictions,
+                        config.threshold_ppm,
+                        CAT_RECORDING_CLASSIFIER_MIN_POSITIVE_FRAMES,
+                    )?;
+                    sanitize_decision(CatRecordingValidationDecision {
+                        cat_present: aggregation.cat_present,
+                        cat_frame_indices: aggregation.cat_frame_indices,
+                        behavior_tags: Vec::new(),
+                        summary: String::new(),
+                        reason_code: aggregation.reason_code,
+                        sampled_frame_count: execution.sampled_frame_count,
+                        sampling_strategy,
+                        validation_rounds: 1,
+                        sampled_offsets_ms: sample_targets
+                            .iter()
+                            .map(|target| target.offset_ms)
+                            .collect(),
+                        frame_predictions: aggregation.frame_predictions,
+                        model_endpoint_id: execution.provider,
+                        model_name: execution.model_name,
+                        elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                    })
+                }
+                CatRecordingValidatorBackend::Vlm => {
+                    let media_deadline = Instant::now() + CAT_RECORDING_VALIDATION_MEDIA_TIMEOUT;
+                    let (sampling_strategy, mut sample_targets) =
+                        select_initial_cat_recording_vlm_sample_targets(record, duration_seconds);
+                    let initial_frames = build_cat_recording_sample_frames(
+                        &video_path,
+                        &work_dir,
+                        &sample_targets,
+                        media_deadline,
+                        CatRecordingFrameProfile::Vlm,
+                    )?;
+                    let initial_execution = run_cat_recording_validation(&initial_frames);
+                    if !initial_execution.available {
+                        return Err(format!("vlm_{}", initial_execution.status));
+                    }
+                    let mut executions = vec![initial_execution];
+                    if should_run_cat_recording_followup(&executions[0], record) {
+                        let positive_offsets = cat_recording_positive_offsets(
+                            &sample_targets,
+                            &executions[0].cat_frame_indices,
+                        );
+                        let followup_targets = select_followup_cat_recording_sample_targets(
+                            record,
+                            duration_seconds,
+                            &sample_targets,
+                            &positive_offsets,
+                        );
+                        if !followup_targets.is_empty() {
+                            let followup_frames = build_cat_recording_sample_frames(
+                                &video_path,
+                                &work_dir,
+                                &followup_targets,
+                                media_deadline,
+                                CatRecordingFrameProfile::Vlm,
+                            )?;
+                            let followup_execution = run_cat_recording_validation(&followup_frames);
+                            if !followup_execution.available {
+                                return Err(format!("vlm_{}", followup_execution.status));
+                            }
+                            sample_targets.extend(followup_targets);
+                            executions.push(followup_execution);
+                        }
+                    }
+                    let execution = merge_cat_recording_vlm_executions(&executions);
+                    sanitize_decision(CatRecordingValidationDecision {
+                        cat_present: execution.cat_present,
+                        cat_frame_indices: execution.cat_frame_indices,
+                        behavior_tags: execution.behavior_tags,
+                        summary: execution.summary,
+                        reason_code: execution.reason_code,
+                        sampled_frame_count: execution.sampled_frame_count,
+                        sampling_strategy,
+                        validation_rounds: u8::try_from(executions.len()).unwrap_or(u8::MAX),
+                        sampled_offsets_ms: sample_targets
+                            .iter()
+                            .map(|target| target.offset_ms)
+                            .collect(),
+                        frame_predictions: Vec::new(),
+                        model_endpoint_id: execution.model_endpoint_id.unwrap_or_default(),
+                        model_name: execution.model_name,
+                        elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                    })
+                }
+            };
+            let status = cat_recording_validation_status_for_decision(&decision);
+            Ok((status, Some(decision), None))
+        })();
+        if let Err(error) = fs::remove_dir_all(&work_dir) {
+            eprintln!("HarborBeacon cat recording validation cleanup failed: {error}");
+        }
+        evaluation
+    }
+
+    fn register_cat_recording_validation_artifacts(
+        &self,
+        artifacts: &[HarborLinkRecordingArtifact],
+        detection_evidence: &[CatDetectionEvidence],
+    ) {
+        if !self.cat_recording_validation_mode.validates_candidates() {
+            return;
+        }
+        for artifact in artifacts.iter().filter(|artifact| {
+            artifact.kind == "recording"
+                && artifact
+                    .source
+                    .as_deref()
+                    .is_some_and(|source| source == "yolo_cat_activity")
+                && artifact.labels.iter().any(|label| label == "cat")
+        }) {
+            if let Err(error) = self
+                .cat_recording_validation_store
+                .register_candidate_with_evidence(artifact, detection_evidence)
+            {
+                eprintln!("HarborBeacon cat recording validation registration failed: {error}");
+            }
+        }
+    }
+
+    fn cat_auto_recording_tick(&self, config: CatAutoRecordingConfig) -> Result<(), String> {
+        let samples = {
+            let mut jobs = self
+                .detection_jobs
+                .lock()
+                .map_err(|_| "detection job state is unavailable".to_string())?;
+            jobs.values_mut()
+                .filter_map(|runtime| {
+                    self.refresh_detection_job(runtime);
+                    (runtime.projection.status == "running").then(|| {
+                        (
+                            runtime.projection.camera_id.clone(),
+                            runtime.projection.stream_profile.clone(),
+                            runtime.projection.latest_result.clone(),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let active_cameras = samples
+            .iter()
+            .map(|(camera_id, _, _)| camera_id.clone())
+            .collect::<HashSet<_>>();
+        for (camera_id, stream_profile, latest_result) in samples {
+            self.process_cat_detection_result(
+                &camera_id,
+                &stream_profile,
+                latest_result.as_ref(),
+                config,
+            )?;
+        }
+        self.stop_orphaned_cat_recordings(&active_cameras)
+    }
+
+    fn process_cat_detection_result(
+        &self,
+        camera_id: &str,
+        stream_profile: &str,
+        latest_result: Option<&Value>,
+        config: CatAutoRecordingConfig,
+    ) -> Result<(), String> {
+        let now = cat_auto_recording_epoch_ms();
+        let sample =
+            latest_result.and_then(|result| parse_cat_detection_streak_sample(result, now));
+
+        let mut states = self
+            .cat_auto_recording
+            .lock()
+            .map_err(|_| "cat auto-recording state is unavailable".to_string())?;
+        let state = states.entry(camera_id.to_string()).or_default();
+        if state
+            .stream_profile
+            .as_deref()
+            .is_some_and(|active_profile| active_profile != stream_profile)
+        {
+            if let Some(lease_id) = state.lease_id.take() {
+                let stopped = self
+                    .harborlink_media
+                    .stop_event_recording(camera_id, &lease_id)?;
+                let detection_evidence = std::mem::take(&mut state.detection_evidence);
+                self.register_cat_recording_validation_artifacts(
+                    &stopped.artifacts,
+                    &detection_evidence,
+                );
+            }
+            *state = CatAutoRecordingState::default();
+        }
+        state.stream_profile = Some(stream_profile.to_string());
+        let new_sample =
+            sample.filter(|sample| is_new_cat_detection_sequence(state.last_sequence, sample));
+        if let Some(sample) = new_sample {
+            state.last_sequence = Some(sample.sequence);
+        }
+        let transition = new_sample
+            .map(|sample| cat_auto_recording_transition(state.lease_id.is_some(), &sample, config))
+            .unwrap_or(CatAutoRecordingTransition::Hold);
+
+        if transition == CatAutoRecordingTransition::Start {
+            let trigger_epoch_ms =
+                new_sample
+                    .map(|sample| sample.frame_epoch_ms)
+                    .ok_or_else(|| {
+                        "cat auto-recording start is missing trigger evidence".to_string()
+                    })?;
+            let current_lease = self
+                .harborlink_media
+                .event_recording_status(camera_id)
+                .ok()
+                .filter(is_harborbeacon_cat_event_recording);
+            let start_event_recording = || {
+                let event_id = format!("cat-activity-{}", Uuid::new_v4().simple());
+                self.harborlink_media.start_event_recording(
+                    camera_id,
+                    &event_id,
+                    stream_profile,
+                    CAT_AUTO_RECORD_LEASE_TTL_SECONDS,
+                    CAT_AUTO_RECORD_PRE_ROLL_SECONDS,
+                    trigger_epoch_ms,
+                )
+            };
+            let lease = match current_lease {
+                Some(lease) if reusable_cat_event_recording(&lease, stream_profile) => lease,
+                Some(lease) => {
+                    let stopped = self
+                        .harborlink_media
+                        .stop_event_recording(camera_id, &lease.lease_id)?;
+                    self.register_cat_recording_validation_artifacts(&stopped.artifacts, &[]);
+                    start_event_recording()?
+                }
+                None => start_event_recording()?,
+            };
+            state.stream_profile = Some(lease.stream_profile.clone());
+            state.event_id = Some(lease.event_id);
+            state.lease_id = Some(lease.lease_id);
+            state.last_renewed_epoch_ms = now;
+            state.detection_evidence.clear();
+        }
+
+        if state.lease_id.is_some() {
+            if let Some(sample) = new_sample.filter(|sample| sample.detection_count > 0) {
+                record_cat_detection_evidence(&mut state.detection_evidence, &sample);
+            }
+        }
+
+        if let Some(lease_id) = state.lease_id.clone() {
+            if transition == CatAutoRecordingTransition::Stop {
+                let stop_result = self
+                    .harborlink_media
+                    .stop_event_recording(camera_id, &lease_id);
+                state.event_id = None;
+                state.lease_id = None;
+                let stopped = stop_result?;
+                let detection_evidence = std::mem::take(&mut state.detection_evidence);
+                self.register_cat_recording_validation_artifacts(
+                    &stopped.artifacts,
+                    &detection_evidence,
+                );
+            } else if sample.is_some()
+                && now.saturating_sub(state.last_renewed_epoch_ms)
+                    >= CAT_AUTO_RECORD_RENEW_INTERVAL_SECONDS * 1_000
+            {
+                let renew_result = self.harborlink_media.renew_event_recording(
+                    camera_id,
+                    &lease_id,
+                    CAT_AUTO_RECORD_LEASE_TTL_SECONDS,
+                );
+                match renew_result {
+                    Ok(_) => state.last_renewed_epoch_ms = now,
+                    Err(error) => {
+                        state.event_id = None;
+                        state.lease_id = None;
+                        state.detection_evidence.clear();
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn stop_orphaned_cat_recordings(&self, active_cameras: &HashSet<String>) -> Result<(), String> {
+        let mut states = self
+            .cat_auto_recording
+            .lock()
+            .map_err(|_| "cat auto-recording state is unavailable".to_string())?;
+        for (camera_id, state) in states.iter_mut() {
+            if active_cameras.contains(camera_id) {
+                continue;
+            }
+            if let Some(lease_id) = state.lease_id.take() {
+                let detection_evidence = std::mem::take(&mut state.detection_evidence);
+                match self
+                    .harborlink_media
+                    .stop_event_recording(camera_id, &lease_id)
+                {
+                    Ok(stopped) => self.register_cat_recording_validation_artifacts(
+                        &stopped.artifacts,
+                        &detection_evidence,
+                    ),
+                    Err(error) => {
+                        eprintln!("HarborBeacon orphaned cat recording stop failed: {error}")
+                    }
+                }
+            }
+            *state = CatAutoRecordingState::default();
+        }
+        Ok(())
     }
 
     fn run_home_guardian_worker(self, receiver: Receiver<StoredLocalVisionEvent>) {
@@ -2103,6 +2917,7 @@ impl AdminApi {
             "http": self.http_runtime.snapshot(),
             "vision_ingest": self.vision_ingest_limiter.snapshot(),
             "vlm": vlm_execution_runtime_snapshot(),
+            "ai_resources": ai_resource_scheduler_snapshot(),
             "home_guardian": self.home_guardian_queue_snapshot(),
             "home_guardian_rule_cache": self.guardian_rule_cache_snapshot(),
             "metadata_only": true,
@@ -2743,6 +3558,9 @@ impl AdminApi {
                 .boxed(),
             Method::Get if path == "/api/vision/events" => self
                 .handle_list_local_vision_events(&raw_url, &identity_hints)
+                .boxed(),
+            Method::Get if path == "/api/vision/cat-recording-validations" => self
+                .handle_cat_recording_validations(&identity_hints)
                 .boxed(),
             Method::Get if path == "/api/vision/vlm/status" => {
                 self.handle_vision_vlm_status(&identity_hints).boxed()
@@ -5710,24 +6528,87 @@ impl AdminApi {
             return error_json(StatusCode(422), &error);
         }
 
-        let mut jobs = match self.detection_jobs.lock() {
-            Ok(jobs) => jobs,
-            Err(_) => return error_json(StatusCode(503), "detection job state is unavailable"),
-        };
+        match self.start_detection_job(config, false) {
+            Ok(projection) => ok_json(&projection),
+            Err((status, error)) => error_json(status, &error),
+        }
+    }
+
+    fn start_detection_job(
+        &self,
+        config: DetectionJobConfig,
+        managed_by_live: bool,
+    ) -> Result<DetectionJobStartResponse, (StatusCode, String)> {
+        let provider =
+            match normalize_detection_provider(env::var("HARBOR_K3_YOLO_PROVIDER").ok().as_deref())
+            {
+                Ok(provider) => provider,
+                Err(error) => return Err((StatusCode(500), error)),
+            };
+
+        {
+            let mut jobs = self.detection_jobs.lock().map_err(|_| {
+                (
+                    StatusCode(503),
+                    "detection job state is unavailable".to_string(),
+                )
+            })?;
+            for runtime in jobs
+                .values_mut()
+                .filter(|runtime| runtime.projection.camera_id == config.camera_id)
+            {
+                self.refresh_detection_job(runtime);
+            }
+            match reusable_detection_job_projection(
+                &jobs,
+                config.camera_id.as_str(),
+                config.stream_profile.as_str(),
+            ) {
+                Ok(Some(projection)) => {
+                    return Ok(DetectionJobStartResponse {
+                        projection,
+                        reused: true,
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => return Err((StatusCode(409), error)),
+            }
+            prune_detection_job_history(&mut jobs);
+        }
+
+        let ai_lease = acquire_ai_resource_lease(AiWorkload::Yolo).map_err(|error| {
+            let status = match error.kind() {
+                AiLeaseErrorKind::QueueFull => StatusCode(429),
+                AiLeaseErrorKind::WaitTimeout => StatusCode(503),
+            };
+            (status, format!("YOLO A100 resource is busy: {error}"))
+        })?;
+
+        let mut jobs = self.detection_jobs.lock().map_err(|_| {
+            (
+                StatusCode(503),
+                "detection job state is unavailable".to_string(),
+            )
+        })?;
         for runtime in jobs
             .values_mut()
             .filter(|runtime| runtime.projection.camera_id == config.camera_id)
         {
             self.refresh_detection_job(runtime);
         }
-        if jobs.values().any(|runtime| {
-            runtime.projection.camera_id == config.camera_id
-                && runtime.projection.status == "running"
-        }) {
-            return error_json(
-                StatusCode(409),
-                "an active detection job already exists for this camera",
-            );
+        match reusable_detection_job_projection(
+            &jobs,
+            config.camera_id.as_str(),
+            config.stream_profile.as_str(),
+        ) {
+            Ok(Some(projection)) => {
+                return Ok(DetectionJobStartResponse {
+                    projection,
+                    reused: true,
+                });
+            }
+            Ok(None) => {}
+            Err(error) => return Err((StatusCode(409), error)),
         }
         prune_detection_job_history(&mut jobs);
 
@@ -5735,9 +6616,10 @@ impl AdminApi {
             &config.camera_id,
             &config.stream_profile,
             config.ttl_seconds,
+            CAT_AUTO_RECORD_PRE_ROLL_SECONDS,
         ) {
             Ok(lease) => lease,
-            Err(error) => return error_json(StatusCode(502), &error),
+            Err(error) => return Err((StatusCode(502), error)),
         };
         let source = match lease.local_rtsp_url.as_deref() {
             Some(source) if source.starts_with("rtsp://127.0.0.1:") => source,
@@ -5745,10 +6627,10 @@ impl AdminApi {
                 let _ = self
                     .harborlink_media
                     .stop_detection_lease(&config.camera_id, &lease.lease_id);
-                return error_json(
+                return Err((
                     StatusCode(502),
-                    "HarborLink did not return a loopback detection source",
-                );
+                    "HarborLink did not return a loopback detection source".to_string(),
+                ));
             }
         };
 
@@ -5761,10 +6643,10 @@ impl AdminApi {
             let _ = self
                 .harborlink_media
                 .stop_detection_lease(&config.camera_id, &lease.lease_id);
-            return error_json(
+            return Err((
                 StatusCode(500),
-                &format!("failed to create detection output directory: {error}"),
-            );
+                format!("failed to create detection output directory: {error}"),
+            ));
         }
         let stderr_path = output_dir.join("worker.stderr.log");
         let stderr = match fs::File::create(&stderr_path) {
@@ -5774,10 +6656,10 @@ impl AdminApi {
                     .harborlink_media
                     .stop_detection_lease(&config.camera_id, &lease.lease_id);
                 cleanup_detection_job_output_dir(&output_dir);
-                return error_json(
+                return Err((
                     StatusCode(500),
-                    &format!("failed to create detection worker log: {error}"),
-                );
+                    format!("failed to create detection worker log: {error}"),
+                ));
             }
         };
         let python = env::var("HARBOR_K3_YOLO_PYTHON").unwrap_or_else(|_| "python3".to_string());
@@ -5800,7 +6682,7 @@ impl AdminApi {
             .arg("--target-label")
             .arg(&config.target_label)
             .arg("--provider")
-            .arg("cpu")
+            .arg(provider)
             .arg("--max-fps")
             .arg(config.max_fps.to_string())
             .arg("--conf-threshold")
@@ -5816,10 +6698,10 @@ impl AdminApi {
                     .harborlink_media
                     .stop_detection_lease(&config.camera_id, &lease.lease_id);
                 cleanup_detection_job_output_dir(&output_dir);
-                return error_json(
+                return Err((
                     StatusCode(500),
-                    &format!("failed to start detection worker: {error}"),
-                );
+                    format!("failed to start detection worker: {error}"),
+                ));
             }
         };
 
@@ -5835,6 +6717,7 @@ impl AdminApi {
             started_at: lease.started_at,
             updated_at: lease.updated_at,
             expires_at: lease.expires_at,
+            managed_by_live,
             latest_result: None,
             metrics: None,
             message: None,
@@ -5845,9 +6728,121 @@ impl AdminApi {
                 projection: projection.clone(),
                 output_dir,
                 child: Some(child),
+                ai_lease: Some(ai_lease),
             },
         );
-        ok_json(&projection)
+        Ok(DetectionJobStartResponse {
+            projection,
+            reused: false,
+        })
+    }
+
+    fn ensure_live_managed_detection_job(
+        &self,
+        camera_id: &str,
+        stream_profile: &str,
+    ) -> Result<(), String> {
+        if !cat_auto_recording_enabled() {
+            return Ok(());
+        }
+
+        {
+            let mut jobs = self
+                .detection_jobs
+                .lock()
+                .map_err(|_| "detection job state is unavailable".to_string())?;
+            for runtime in jobs
+                .values_mut()
+                .filter(|runtime| runtime.projection.camera_id == camera_id)
+            {
+                self.refresh_detection_job(runtime);
+            }
+            if let Some(runtime) = jobs.values_mut().find(|runtime| {
+                runtime.projection.camera_id == camera_id && runtime.projection.status == "running"
+            }) {
+                if detection_job_matches_stream_profile(&runtime.projection, stream_profile) {
+                    if !runtime.projection.managed_by_live {
+                        return Ok(());
+                    }
+                    let lease = self.harborlink_media.renew_detection_lease(
+                        camera_id,
+                        &runtime.projection.lease_id,
+                        LIVE_MANAGED_DETECTION_TTL_SECONDS,
+                    )?;
+                    runtime.projection.expires_at = lease.expires_at;
+                    runtime.projection.updated_at = lease.updated_at;
+                    return Ok(());
+                }
+                if !runtime.projection.managed_by_live {
+                    return Err(format!(
+                        "a detection job is already running with stream profile {}; stop it before switching to {stream_profile}",
+                        runtime.projection.stream_profile
+                    ));
+                }
+                let stop_result = stop_detection_child(runtime);
+                let worker_stop_note =
+                    complete_detection_job_stop(runtime, "stopped", stop_result)?;
+                let lease_stop_result = self
+                    .harborlink_media
+                    .stop_detection_lease(camera_id, &runtime.projection.lease_id);
+                runtime.projection.message = worker_stop_note;
+                refresh_detection_job_outputs(runtime);
+                lease_stop_result.map_err(|error| {
+                    format!(
+                        "could not switch the detection stream profile: {}",
+                        redact_admin_string(&error)
+                    )
+                })?;
+            }
+        }
+
+        let config = DetectionJobConfig {
+            camera_id: camera_id.to_string(),
+            target_label: "cat".to_string(),
+            ttl_seconds: LIVE_MANAGED_DETECTION_TTL_SECONDS,
+            max_fps: DEFAULT_DETECTION_MAX_FPS,
+            confidence: DEFAULT_DETECTION_CONFIDENCE,
+            stream_profile: stream_profile.to_string(),
+        };
+        match self.start_detection_job(config, true) {
+            Ok(_) | Err((StatusCode(409), _)) => Ok(()),
+            Err((_, error)) => Err(error),
+        }
+    }
+
+    fn stop_live_managed_detection_job(&self, camera_id: &str) -> Result<(), String> {
+        let mut jobs = self
+            .detection_jobs
+            .lock()
+            .map_err(|_| "detection job state is unavailable".to_string())?;
+        for runtime in jobs.values_mut().filter(|runtime| {
+            runtime.projection.camera_id == camera_id && runtime.projection.managed_by_live
+        }) {
+            self.refresh_detection_job(runtime);
+            if runtime.projection.status != "running" {
+                continue;
+            }
+            let stop_result = stop_detection_child(runtime);
+            let worker_stop_note = complete_detection_job_stop(runtime, "stopped", stop_result)?;
+            let lease_stop_note = self
+                .harborlink_media
+                .stop_detection_lease(camera_id, &runtime.projection.lease_id)
+                .err()
+                .map(|error| {
+                    format!(
+                        "detection lease cleanup was incomplete: {}",
+                        redact_admin_string(&error)
+                    )
+                });
+            runtime.projection.message = match (worker_stop_note, lease_stop_note) {
+                (Some(worker), Some(lease)) => Some(format!("{worker}; {lease}")),
+                (Some(worker), None) => Some(worker),
+                (None, Some(lease)) => Some(lease),
+                (None, None) => None,
+            };
+            refresh_detection_job_outputs(runtime);
+        }
+        Ok(())
     }
 
     fn handle_get_detection_job(
@@ -5963,18 +6958,30 @@ impl AdminApi {
         };
         self.refresh_detection_job(runtime);
         if runtime.projection.status == "running" {
-            stop_detection_child(runtime);
+            let stop_result = stop_detection_child(runtime);
+            let worker_stop_note =
+                match complete_detection_job_stop(runtime, "stopped", stop_result) {
+                    Ok(note) => note,
+                    Err(error) => {
+                        refresh_detection_job_outputs(runtime);
+                        return error_json(StatusCode(503), &error);
+                    }
+                };
             let lease_result = self
                 .harborlink_media
                 .stop_detection_lease(&runtime.projection.camera_id, &runtime.projection.lease_id);
-            runtime.projection.status = "stopped".to_string();
-            runtime.projection.updated_at = current_rfc3339_timestamp();
-            runtime.projection.message = lease_result.err().map(|error| {
+            let lease_stop_note = lease_result.err().map(|error| {
                 format!(
-                    "worker stopped; detection lease cleanup was incomplete: {}",
+                    "detection lease cleanup was incomplete: {}",
                     redact_admin_string(&error)
                 )
             });
+            runtime.projection.message = match (worker_stop_note, lease_stop_note) {
+                (Some(worker), Some(lease)) => Some(format!("{worker}; {lease}")),
+                (Some(worker), None) => Some(worker),
+                (None, Some(lease)) => Some(lease),
+                (None, None) => None,
+            };
         }
         refresh_detection_job_outputs(runtime);
         ok_json(&runtime.projection)
@@ -5996,18 +7003,28 @@ impl AdminApi {
         if runtime.projection.status == "running"
             && detection_job_has_expired(&runtime.projection.expires_at)
         {
-            stop_detection_child(runtime);
-            let _ = self
-                .harborlink_media
-                .stop_detection_lease(&runtime.projection.camera_id, &runtime.projection.lease_id);
-            runtime.projection.status = "expired".to_string();
-            runtime.projection.updated_at = current_rfc3339_timestamp();
-            runtime.projection.message = Some("detection lease expired".to_string());
+            let stop_result = stop_detection_child(runtime);
+            match complete_detection_job_stop(runtime, "expired", stop_result) {
+                Ok(worker_stop_note) => {
+                    let _ = self.harborlink_media.stop_detection_lease(
+                        &runtime.projection.camera_id,
+                        &runtime.projection.lease_id,
+                    );
+                    runtime.projection.message = Some(match worker_stop_note {
+                        Some(note) => format!("detection lease expired; {note}"),
+                        None => "detection lease expired".to_string(),
+                    });
+                }
+                Err(error) => {
+                    runtime.projection.message = Some(format!("detection lease expired; {error}"));
+                }
+            }
         } else if runtime.projection.status == "running" {
             let process_status = runtime.child.as_mut().map(Child::try_wait);
             match process_status {
                 Some(Ok(Some(status))) => {
                     runtime.child = None;
+                    runtime.ai_lease.take();
                     let _ = self.harborlink_media.stop_detection_lease(
                         &runtime.projection.camera_id,
                         &runtime.projection.lease_id,
@@ -6018,23 +7035,31 @@ impl AdminApi {
                         "failed".to_string()
                     };
                     runtime.projection.updated_at = current_rfc3339_timestamp();
-                    runtime.projection.message = Some(match status.code() {
-                        Some(code) => format!("detection worker exited with code {code}"),
-                        None => "detection worker exited without a status code".to_string(),
-                    });
+                    runtime.projection.message = Some(detection_child_exit_message(&status));
                 }
                 Some(Err(error)) => {
-                    stop_detection_child(runtime);
-                    let _ = self.harborlink_media.stop_detection_lease(
-                        &runtime.projection.camera_id,
-                        &runtime.projection.lease_id,
-                    );
-                    runtime.projection.status = "failed".to_string();
-                    runtime.projection.updated_at = current_rfc3339_timestamp();
-                    runtime.projection.message = Some(format!(
-                        "failed to inspect detection worker: {}",
-                        redact_admin_string(&error.to_string())
-                    ));
+                    let inspect_error = redact_admin_string(&error.to_string());
+                    let stop_result = stop_detection_child(runtime);
+                    match complete_detection_job_stop(runtime, "failed", stop_result) {
+                        Ok(worker_stop_note) => {
+                            let _ = self.harborlink_media.stop_detection_lease(
+                                &runtime.projection.camera_id,
+                                &runtime.projection.lease_id,
+                            );
+                            runtime.projection.message = Some(format!(
+                                "failed to inspect detection worker: {}{}",
+                                inspect_error,
+                                worker_stop_note
+                                    .map(|note| format!("; {note}"))
+                                    .unwrap_or_default()
+                            ));
+                        }
+                        Err(stop_error) => {
+                            runtime.projection.message = Some(format!(
+                                "failed to inspect detection worker: {inspect_error}; {stop_error}"
+                            ));
+                        }
+                    }
                 }
                 Some(Ok(None)) | None => {}
             }
@@ -6085,6 +7110,37 @@ impl AdminApi {
                 "metadata_only": true,
                 "secret_scan": "clean",
             })),
+            Err(error) => error_json(StatusCode(500), &redact_admin_string(&error)),
+        }
+    }
+
+    fn handle_cat_recording_validations(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        match self.cat_recording_validation_store.list_latest() {
+            Ok(mut records) => {
+                let mut counts = BTreeMap::<String, usize>::new();
+                for record in &records {
+                    *counts
+                        .entry(record.validation_status.as_str().to_string())
+                        .or_default() += 1;
+                }
+                records.truncate(100);
+                ok_json(&json!({
+                    "generated_at": now_unix_string(),
+                    "kind": "cat_recording_validations_v1",
+                    "mode": self.cat_recording_validation_mode.as_str(),
+                    "counts": counts,
+                    "records": records,
+                    "store_path_redacted": true,
+                    "metadata_only": true,
+                    "secret_scan": "clean",
+                }))
+            }
             Err(error) => error_json(StatusCode(500), &redact_admin_string(&error)),
         }
     }
@@ -6203,7 +7259,7 @@ impl AdminApi {
                 json!({
                     "trigger": trigger,
                     "frame_source": "fresh_camera_snapshot",
-                    "queue_mode": "global_serial_try_lock",
+                    "queue_mode": AI_RESOURCE_QUEUE_MODE,
                     "local_only": true,
                     "fallback_allowed": false,
                     "model_endpoint_id": execution.model_endpoint_id,
@@ -8908,7 +9964,18 @@ impl AdminApi {
             .harborlink_media
             .start_live_session(&device_id, stream_profile.as_str(), 300)
         {
-            Ok(session) => ok_json(&CameraLiveSessionProjection::from_harborlink(session)),
+            Ok(session) => {
+                if let Err(error) = self
+                    .ensure_live_managed_detection_job(&device_id, session.stream_profile.as_str())
+                {
+                    eprintln!(
+                        "HarborBeacon could not ensure live cat detection for {}: {}",
+                        redact_admin_string(&device_id),
+                        redact_admin_string(&error)
+                    );
+                }
+                ok_json(&CameraLiveSessionProjection::from_harborlink(session))
+            }
             Err(error) => error_json(StatusCode(502), &error),
         }
     }
@@ -8974,7 +10041,16 @@ impl AdminApi {
             .harborlink_media
             .stop_live_session(&device_id, payload.session_id.as_deref())
         {
-            Ok(session) => ok_json(&CameraLiveSessionProjection::from_harborlink(session)),
+            Ok(session) => {
+                if let Err(error) = self.stop_live_managed_detection_job(&device_id) {
+                    eprintln!(
+                        "HarborBeacon could not stop live cat detection for {}: {}",
+                        redact_admin_string(&device_id),
+                        redact_admin_string(&error)
+                    );
+                }
+                ok_json(&CameraLiveSessionProjection::from_harborlink(session))
+            }
             Err(error) => error_json(StatusCode(502), &error),
         }
     }
@@ -9009,7 +10085,18 @@ impl AdminApi {
             payload.session_id.trim(),
             ttl_seconds,
         ) {
-            Ok(session) => ok_json(&CameraLiveSessionProjection::from_harborlink(session)),
+            Ok(session) => {
+                if let Err(error) = self
+                    .ensure_live_managed_detection_job(&device_id, session.stream_profile.as_str())
+                {
+                    eprintln!(
+                        "HarborBeacon could not renew live cat detection for {}: {}",
+                        redact_admin_string(&device_id),
+                        redact_admin_string(&error)
+                    );
+                }
+                ok_json(&CameraLiveSessionProjection::from_harborlink(session))
+            }
             Err(error) => error_json(StatusCode(502), &error),
         }
     }
@@ -10443,7 +11530,7 @@ fn normalize_detection_job_start(
     }
     let max_fps = request.max_fps.unwrap_or(DEFAULT_DETECTION_MAX_FPS);
     if !max_fps.is_finite() || !(0.0..=MAX_DETECTION_MAX_FPS).contains(&max_fps) || max_fps == 0.0 {
-        return Err("max_fps must be greater than 0 and at most 10".to_string());
+        return Err("max_fps must be greater than 0 and at most 25".to_string());
     }
     let confidence = request.confidence.unwrap_or(DEFAULT_DETECTION_CONFIDENCE);
     if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) || confidence == 0.0 {
@@ -10465,6 +11552,1226 @@ fn normalize_detection_job_start(
         confidence,
         stream_profile,
     })
+}
+
+fn normalize_detection_provider(value: Option<&str>) -> Result<String, String> {
+    let provider = value.unwrap_or("cpu").trim().to_ascii_lowercase();
+    if matches!(provider.as_str(), "cpu" | "spacemit") {
+        return Ok(provider);
+    }
+    Err("HARBOR_K3_YOLO_PROVIDER must be cpu or spacemit".to_string())
+}
+
+fn cat_auto_recording_enabled() -> bool {
+    env::var(CAT_AUTO_RECORD_ENABLED_ENV)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn cat_auto_recording_config_from_env() -> Result<CatAutoRecordingConfig, String> {
+    Ok(CatAutoRecordingConfig {
+        start_consecutive_frames: bounded_u64_env(
+            CAT_AUTO_RECORD_START_FRAMES_ENV,
+            DEFAULT_CAT_AUTO_RECORD_START_CONSECUTIVE_FRAMES,
+            2,
+            100,
+        )?,
+        start_duration_ms: bounded_u64_env(
+            CAT_AUTO_RECORD_START_DURATION_MS_ENV,
+            DEFAULT_CAT_AUTO_RECORD_START_DURATION_MS,
+            100,
+            10_000,
+        )?,
+        stop_consecutive_frames: bounded_u64_env(
+            CAT_AUTO_RECORD_STOP_FRAMES_ENV,
+            DEFAULT_CAT_AUTO_RECORD_STOP_CONSECUTIVE_FRAMES,
+            2,
+            1_000,
+        )?,
+        stop_duration_ms: bounded_u64_env(
+            CAT_AUTO_RECORD_STOP_DURATION_MS_ENV,
+            DEFAULT_CAT_AUTO_RECORD_STOP_DURATION_MS,
+            500,
+            60_000,
+        )?,
+    })
+}
+
+fn bounded_u64_env(name: &str, default: u64, min: u64, max: u64) -> Result<u64, String> {
+    match env::var(name) {
+        Ok(value) => bounded_u64_value(name, Some(&value), default, min, max),
+        Err(env::VarError::NotPresent) => bounded_u64_value(name, None, default, min, max),
+        Err(env::VarError::NotUnicode(_)) => Err(format!("{name} must be valid Unicode")),
+    }
+}
+
+fn bounded_u64_value(
+    name: &str,
+    raw: Option<&str>,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<u64, String> {
+    let value = match raw {
+        Some(raw) => raw
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("{name} must be an integer between {min} and {max}"))?,
+        None => default,
+    };
+    if !(min..=max).contains(&value) {
+        return Err(format!("{name} must be between {min} and {max}"));
+    }
+    Ok(value)
+}
+
+fn cat_auto_recording_epoch_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
+fn cat_recording_validation_temp_root() -> PathBuf {
+    env::var_os(CAT_RECORDING_VALIDATION_TEMP_ROOT_ENV)
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::env::temp_dir().join("harborbeacon-cat-recording-validation"))
+}
+
+fn cat_recording_validation_runtime_ready() -> Result<bool, String> {
+    let backend = validator_backend_from_env()?;
+    Ok(cat_recording_validation_runtime_ready_for(backend, || {
+        vlm_endpoint_readiness(&load_model_center_state())
+            .get("endpoint_ready")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }))
+}
+
+fn cat_recording_validation_runtime_ready_for(
+    backend: CatRecordingValidatorBackend,
+    vlm_ready: impl FnOnce() -> bool,
+) -> bool {
+    match backend {
+        CatRecordingValidatorBackend::MobileNetV2Int8 => true,
+        CatRecordingValidatorBackend::Vlm => vlm_ready(),
+    }
+}
+
+fn cat_recording_validation_status_for_decision(
+    decision: &CatRecordingValidationDecision,
+) -> CatRecordingValidationStatus {
+    if decision.cat_present && decision.cat_frame_indices.len() >= 2 {
+        CatRecordingValidationStatus::Accepted
+    } else if !decision.cat_present
+        && decision.cat_frame_indices.is_empty()
+        && decision.reason_code == "no_cat_visible"
+    {
+        CatRecordingValidationStatus::Rejected
+    } else {
+        CatRecordingValidationStatus::ReviewRequired
+    }
+}
+
+fn cat_recording_validation_retry_delay(attempt_count: u32) -> Option<Duration> {
+    if attempt_count >= CAT_RECORDING_VALIDATION_MAX_ATTEMPTS {
+        return None;
+    }
+    let index = usize::try_from(attempt_count.saturating_sub(1)).ok()?;
+    CAT_RECORDING_VALIDATION_RETRY_DELAYS_SECONDS
+        .get(index)
+        .copied()
+        .map(Duration::from_secs)
+}
+
+fn is_cat_recording_ai_resource_contention(error: &str) -> bool {
+    matches!(
+        error,
+        "cat_classifier_ai_resource_queue_full" | "cat_classifier_ai_resource_wait_timeout"
+    )
+}
+
+fn media_error_requires_ai_lease_quarantine(error: &BoundedMediaCommandError) -> bool {
+    !error.exit_confirmed
+}
+
+fn quarantine_ai_resource_lease(lease: AiResourceLease) {
+    static QUARANTINED_LEASES: OnceLock<Mutex<Vec<AiResourceLease>>> = OnceLock::new();
+    let leases = QUARANTINED_LEASES.get_or_init(|| Mutex::new(Vec::new()));
+    leases
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(lease);
+}
+
+fn run_cat_recording_classifier(
+    sample_frames: &[(u8, PathBuf)],
+    config: &CatRecordingClassifierConfig,
+) -> Result<CatRecordingClassifierOutput, String> {
+    let command = build_classifier_command(config, sample_frames)?;
+    let lease = acquire_ai_resource_lease(AiWorkload::CatRecordingVerifier)
+        .map_err(|error| format!("cat_classifier_{}", error.code()))?;
+    let output = match run_bounded_media_command_with_graceful_stop(
+        command,
+        CAT_RECORDING_CLASSIFIER_TIMEOUT,
+        CAT_RECORDING_CLASSIFIER_STOP_GRACE_PERIOD,
+    ) {
+        Ok(output) => output,
+        Err(error) if media_error_requires_ai_lease_quarantine(&error) => {
+            quarantine_ai_resource_lease(lease);
+            return Err(format!(
+                "cat_classifier_runner_error={error}; exit_unconfirmed=true; ai_resource_lease_quarantined=true; board_reboot_required=true"
+            ));
+        }
+        Err(error) => return Err(format!("cat_classifier_runner_error={error}")),
+    };
+    if output.timed_out {
+        return Err(if output.forced_stop {
+            "cat_classifier_timeout_forced".to_string()
+        } else {
+            "cat_classifier_timeout".to_string()
+        });
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "cat_classifier_failed {}",
+            summarize_media_tool_stderr(&output.stderr, &[])
+        ));
+    }
+    let mut expected_frame_indices = sample_frames
+        .iter()
+        .map(|(frame_index, _)| *frame_index)
+        .collect::<Vec<_>>();
+    expected_frame_indices.sort_unstable();
+    parse_classifier_output(&output.stdout, config, &expected_frame_indices)
+}
+
+fn select_cat_recording_classifier_sample_targets(
+    record: &CatRecordingValidationRecord,
+    duration_seconds: f64,
+) -> (String, Vec<CatRecordingSampleTarget>) {
+    let duration_ms = cat_recording_duration_ms(duration_seconds);
+    let evidence = cat_recording_evidence_offsets(record, duration_ms);
+    let mut offsets = select_diverse_cat_recording_offsets(&evidence, 5);
+    let strategy = if evidence.is_empty() {
+        "uniform_9"
+    } else {
+        "yolo_guided_hybrid_9"
+    };
+    for candidate in uniform_cat_recording_classifier_offsets(duration_ms) {
+        if offsets.len() >= 9 {
+            break;
+        }
+        if offsets
+            .iter()
+            .all(|offset| offset.abs_diff(candidate) >= CAT_RECORDING_VALIDATION_FRAME_MARGIN_MS)
+        {
+            offsets.push(candidate);
+        }
+    }
+    offsets.truncate(9);
+    (
+        strategy.to_string(),
+        cat_recording_targets_from_offsets(&offsets, 1),
+    )
+}
+
+fn select_initial_cat_recording_vlm_sample_targets(
+    record: &CatRecordingValidationRecord,
+    duration_seconds: f64,
+) -> (String, Vec<CatRecordingSampleTarget>) {
+    let duration_ms = cat_recording_duration_ms(duration_seconds);
+    let evidence = cat_recording_evidence_offsets(record, duration_ms);
+    let (strategy, offsets) = if evidence.is_empty() {
+        (
+            "uniform_fallback".to_string(),
+            uniform_cat_recording_sample_offsets(duration_ms),
+        )
+    } else {
+        (
+            "yolo_guided_adaptive".to_string(),
+            select_diverse_cat_recording_offsets(
+                &evidence,
+                CAT_RECORDING_VALIDATION_FRAMES_PER_ROUND,
+            ),
+        )
+    };
+    (strategy, cat_recording_targets_from_offsets(&offsets, 1))
+}
+
+fn select_followup_cat_recording_sample_targets(
+    record: &CatRecordingValidationRecord,
+    duration_seconds: f64,
+    initial_targets: &[CatRecordingSampleTarget],
+    positive_offsets: &[u64],
+) -> Vec<CatRecordingSampleTarget> {
+    let duration_ms = cat_recording_duration_ms(duration_seconds);
+    let evidence = cat_recording_evidence_offsets(record, duration_ms);
+    let seed_offsets = if positive_offsets.is_empty() {
+        if evidence.is_empty() {
+            initial_targets
+                .iter()
+                .map(|target| target.offset_ms)
+                .collect::<Vec<_>>()
+        } else {
+            evidence.iter().map(|(offset, _)| *offset).collect()
+        }
+    } else {
+        positive_offsets.to_vec()
+    };
+    let has_positive_seed = !positive_offsets.is_empty();
+
+    let mut candidates = BTreeMap::<u64, u32>::new();
+    for (offset, confidence_ppm) in &evidence {
+        insert_cat_recording_followup_candidate(
+            &mut candidates,
+            initial_targets,
+            duration_ms,
+            *offset,
+            confidence_ppm.saturating_add(if has_positive_seed { 0 } else { 1_000_000 }),
+        );
+    }
+    let neighbor_priority = if has_positive_seed {
+        2_000_000_u32
+    } else {
+        1_000_000_u32
+    };
+    for seed in seed_offsets {
+        for delta in CAT_RECORDING_VALIDATION_FOLLOWUP_OFFSETS_MS {
+            insert_cat_recording_followup_candidate(
+                &mut candidates,
+                initial_targets,
+                duration_ms,
+                seed.saturating_sub(delta),
+                neighbor_priority.saturating_sub(u32::try_from(delta).unwrap_or(u32::MAX)),
+            );
+            insert_cat_recording_followup_candidate(
+                &mut candidates,
+                initial_targets,
+                duration_ms,
+                seed.saturating_add(delta),
+                neighbor_priority.saturating_sub(u32::try_from(delta).unwrap_or(u32::MAX)),
+            );
+        }
+    }
+
+    let available_slots = CAT_RECORDING_VALIDATION_MAX_FRAMES.saturating_sub(initial_targets.len());
+    let offsets = select_diverse_cat_recording_offsets(
+        &candidates.into_iter().collect::<Vec<_>>(),
+        available_slots.min(CAT_RECORDING_VALIDATION_FRAMES_PER_ROUND),
+    );
+    let start_index = u8::try_from(initial_targets.len() + 1).unwrap_or(u8::MAX);
+    cat_recording_targets_from_offsets(&offsets, start_index)
+}
+
+fn should_run_cat_recording_followup(
+    execution: &CatRecordingVlmExecution,
+    record: &CatRecordingValidationRecord,
+) -> bool {
+    execution.cat_frame_indices.len() == 1
+        || execution.reason_code == "uncertain"
+        || (execution.cat_frame_indices.is_empty() && !record.detection_evidence.is_empty())
+}
+
+fn cat_recording_positive_offsets(
+    targets: &[CatRecordingSampleTarget],
+    positive_frame_indices: &[u8],
+) -> Vec<u64> {
+    targets
+        .iter()
+        .filter(|target| positive_frame_indices.contains(&target.frame_index))
+        .map(|target| target.offset_ms)
+        .collect()
+}
+
+fn merge_cat_recording_vlm_executions(
+    executions: &[CatRecordingVlmExecution],
+) -> CatRecordingVlmExecution {
+    let mut merged = executions.first().cloned().unwrap_or_default();
+    merged.available = executions.iter().all(|execution| execution.available);
+    merged.cat_frame_indices = executions
+        .iter()
+        .flat_map(|execution| execution.cat_frame_indices.iter().copied())
+        .collect();
+    merged.cat_frame_indices.sort_unstable();
+    merged.cat_frame_indices.dedup();
+    merged.behavior_tags.clear();
+    for tag in executions
+        .iter()
+        .flat_map(|execution| execution.behavior_tags.iter())
+    {
+        if !merged.behavior_tags.contains(tag) {
+            merged.behavior_tags.push(tag.clone());
+        }
+    }
+    merged.sampled_frame_count = executions.iter().fold(0_u8, |count, execution| {
+        count.saturating_add(execution.sampled_frame_count)
+    });
+    merged.cat_present = !merged.cat_frame_indices.is_empty();
+    let has_uncertain = executions
+        .iter()
+        .any(|execution| execution.reason_code == "uncertain");
+    merged.reason_code = if merged.cat_frame_indices.len() >= 2 {
+        "cat_visible".to_string()
+    } else if merged.cat_frame_indices.len() == 1 || has_uncertain {
+        "uncertain".to_string()
+    } else {
+        "no_cat_visible".to_string()
+    };
+    merged.summary = match merged.cat_frame_indices.len() {
+        count if count >= 2 => format!(
+            "共抽样 {} 帧，其中 {count} 个不同时间点确认出现猫。",
+            merged.sampled_frame_count
+        ),
+        1 => format!(
+            "共抽样 {} 帧，仅一个时间点确认出现猫，需要复核。",
+            merged.sampled_frame_count
+        ),
+        _ if has_uncertain => format!(
+            "共抽样 {} 帧仍未形成明确结论，需要复核。",
+            merged.sampled_frame_count
+        ),
+        _ => format!("共抽样 {} 帧均未看见猫。", merged.sampled_frame_count),
+    };
+    merged
+}
+
+fn cat_recording_duration_ms(duration_seconds: f64) -> u64 {
+    (duration_seconds.max(0.0) * 1_000.0)
+        .round()
+        .min(u64::MAX as f64) as u64
+}
+
+fn cat_recording_evidence_offsets(
+    record: &CatRecordingValidationRecord,
+    duration_ms: u64,
+) -> Vec<(u64, u32)> {
+    if record.started_at_epoch_ms == 0 || duration_ms == 0 {
+        return Vec::new();
+    }
+    let lower_bound = record.started_at_epoch_ms.saturating_sub(2_000);
+    let upper_bound = record
+        .ended_at_epoch_ms
+        .max(
+            record
+                .started_at_epoch_ms
+                .saturating_add(u128::from(duration_ms)),
+        )
+        .saturating_add(1_000);
+    let mut offsets = BTreeMap::<u64, u32>::new();
+    for evidence in &record.detection_evidence {
+        let frame_epoch_ms = u128::from(evidence.frame_epoch_ms);
+        if frame_epoch_ms < lower_bound || frame_epoch_ms > upper_bound {
+            continue;
+        }
+        let raw_offset = frame_epoch_ms.saturating_sub(record.started_at_epoch_ms);
+        let offset = bounded_cat_recording_sample_offset(
+            u64::try_from(raw_offset).unwrap_or(u64::MAX),
+            duration_ms,
+        );
+        offsets
+            .entry(offset)
+            .and_modify(|confidence| *confidence = (*confidence).max(evidence.confidence_ppm))
+            .or_insert(evidence.confidence_ppm);
+    }
+    offsets.into_iter().collect()
+}
+
+fn uniform_cat_recording_sample_offsets(duration_ms: u64) -> Vec<u64> {
+    [50_u64, 30, 70, 10, 90]
+        .into_iter()
+        .map(|percent| {
+            bounded_cat_recording_sample_offset(
+                duration_ms.saturating_mul(percent) / 100,
+                duration_ms,
+            )
+        })
+        .fold(Vec::new(), |mut offsets, offset| {
+            if !offsets.contains(&offset) {
+                offsets.push(offset);
+            }
+            offsets
+        })
+}
+
+fn uniform_cat_recording_classifier_offsets(duration_ms: u64) -> Vec<u64> {
+    [50_u64, 10, 90, 30, 70, 20, 80, 40, 60]
+        .into_iter()
+        .map(|percent| {
+            bounded_cat_recording_sample_offset(
+                duration_ms.saturating_mul(percent) / 100,
+                duration_ms,
+            )
+        })
+        .fold(Vec::new(), |mut offsets, offset| {
+            if !offsets.contains(&offset) {
+                offsets.push(offset);
+            }
+            offsets
+        })
+}
+
+fn bounded_cat_recording_sample_offset(offset_ms: u64, duration_ms: u64) -> u64 {
+    if duration_ms <= CAT_RECORDING_VALIDATION_FRAME_MARGIN_MS.saturating_mul(2) {
+        return duration_ms / 2;
+    }
+    offset_ms.clamp(
+        CAT_RECORDING_VALIDATION_FRAME_MARGIN_MS,
+        duration_ms - CAT_RECORDING_VALIDATION_FRAME_MARGIN_MS,
+    )
+}
+
+fn select_diverse_cat_recording_offsets(candidates: &[(u64, u32)], limit: usize) -> Vec<u64> {
+    if candidates.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let mut selected = Vec::<usize>::new();
+    let peak_index = candidates
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, (_, confidence))| *confidence)
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    selected.push(peak_index);
+    for index in [0, candidates.len() - 1] {
+        if selected.len() >= limit {
+            break;
+        }
+        if !selected.contains(&index) {
+            selected.push(index);
+        }
+    }
+    while selected.len() < limit && selected.len() < candidates.len() {
+        let next = candidates
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !selected.contains(index))
+            .map(|(index, (offset, confidence))| {
+                let minimum_distance = selected
+                    .iter()
+                    .map(|selected_index| offset.abs_diff(candidates[*selected_index].0))
+                    .min()
+                    .unwrap_or_default();
+                (index, minimum_distance, *confidence)
+            })
+            .max_by_key(|(_, distance, confidence)| (*distance, *confidence))
+            .map(|(index, _, _)| index);
+        let Some(next) = next else {
+            break;
+        };
+        selected.push(next);
+    }
+    selected
+        .into_iter()
+        .map(|index| candidates[index].0)
+        .collect()
+}
+
+fn insert_cat_recording_followup_candidate(
+    candidates: &mut BTreeMap<u64, u32>,
+    initial_targets: &[CatRecordingSampleTarget],
+    duration_ms: u64,
+    raw_offset_ms: u64,
+    priority: u32,
+) {
+    let offset = bounded_cat_recording_sample_offset(raw_offset_ms, duration_ms);
+    if initial_targets
+        .iter()
+        .any(|target| target.offset_ms.abs_diff(offset) < CAT_RECORDING_VALIDATION_FRAME_MARGIN_MS)
+    {
+        return;
+    }
+    candidates
+        .entry(offset)
+        .and_modify(|existing| *existing = (*existing).max(priority))
+        .or_insert(priority);
+}
+
+fn cat_recording_targets_from_offsets(
+    offsets: &[u64],
+    start_index: u8,
+) -> Vec<CatRecordingSampleTarget> {
+    offsets
+        .iter()
+        .enumerate()
+        .filter_map(|(offset_index, offset_ms)| {
+            let frame_index = start_index.checked_add(u8::try_from(offset_index).ok()?)?;
+            (usize::from(frame_index) <= CAT_RECORDING_VALIDATION_MAX_FRAMES).then_some(
+                CatRecordingSampleTarget {
+                    frame_index,
+                    offset_ms: *offset_ms,
+                },
+            )
+        })
+        .collect()
+}
+
+fn probe_media_duration_seconds(video_path: &Path) -> Result<f64, String> {
+    let ffprobe = env::var_os("HARBOR_FFPROBE_BIN")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "ffprobe".into());
+    let mut failures = Vec::new();
+    for video_stream_only in [true, false] {
+        let command =
+            build_cat_recording_duration_probe_command(&ffprobe, video_path, video_stream_only);
+        match run_bounded_media_command(command, CAT_RECORDING_VALIDATION_MEDIA_TIMEOUT) {
+            Ok(output) if !output.timed_out && output.status.success() => {
+                let duration = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .find_map(|line| line.trim().parse::<f64>().ok())
+                    .filter(|duration| duration.is_finite() && *duration > 0.0);
+                if let Some(duration) = duration {
+                    return Ok(duration);
+                }
+                failures.push(format!(
+                    "profile={} invalid_duration",
+                    if video_stream_only {
+                        "video"
+                    } else {
+                        "container"
+                    }
+                ));
+            }
+            Ok(output) => failures.push(format!(
+                "profile={} {}",
+                if video_stream_only {
+                    "video"
+                } else {
+                    "container"
+                },
+                media_tool_output_summary(&output, None, &[video_path])
+            )),
+            Err(error) => failures.push(format!(
+                "profile={} runner_error={}",
+                if video_stream_only {
+                    "video"
+                } else {
+                    "container"
+                },
+                sanitize_cat_recording_validation_error(&error.to_string())
+            )),
+        }
+    }
+    Err(sanitize_cat_recording_validation_error(&format!(
+        "ffprobe_failed_for_cat_recording_validation attempts=[{}]",
+        failures.join("; ")
+    )))
+}
+
+fn build_cat_recording_duration_probe_command(
+    ffprobe: &OsStr,
+    video_path: &Path,
+    video_stream_only: bool,
+) -> Command {
+    let mut command = Command::new(ffprobe);
+    command.arg("-v").arg("error");
+    if video_stream_only {
+        command
+            .arg("-select_streams")
+            .arg("v:0")
+            .arg("-show_entries")
+            .arg("stream=duration");
+    } else {
+        command.arg("-show_entries").arg("format=duration");
+    }
+    command
+        .arg("-of")
+        .arg("default=noprint_wrappers=1:nokey=1")
+        .arg(video_path);
+    command
+}
+
+fn build_cat_recording_sample_frames(
+    video_path: &Path,
+    output_dir: &Path,
+    targets: &[CatRecordingSampleTarget],
+    deadline: Instant,
+    profile: CatRecordingFrameProfile,
+) -> Result<Vec<(u8, PathBuf)>, String> {
+    if targets.is_empty() || targets.len() > profile.max_frames() {
+        return Err("cat_recording_sample_target_count_is_invalid".to_string());
+    }
+    let ffmpeg = env::var_os("HARBOR_FFMPEG_BIN")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "ffmpeg".into());
+    let mut output_paths = Vec::with_capacity(targets.len());
+    for target in targets {
+        let timestamp_seconds = target.offset_ms as f64 / 1_000.0;
+        let frame_index = target.frame_index;
+        let output_path = output_dir.join(format!("frame-{frame_index}.jpg"));
+        extract_cat_recording_sample_frame(
+            &ffmpeg,
+            video_path,
+            &output_path,
+            frame_index,
+            timestamp_seconds,
+            deadline,
+            profile,
+        )?;
+        output_paths.push((frame_index, output_path));
+    }
+    Ok(output_paths)
+}
+
+fn extract_cat_recording_sample_frame(
+    ffmpeg: &OsStr,
+    video_path: &Path,
+    output_path: &Path,
+    frame_index: u8,
+    timestamp_seconds: f64,
+    deadline: Instant,
+    profile: CatRecordingFrameProfile,
+) -> Result<(), String> {
+    let extraction = attempt_cat_recording_seek_fallback(|strategy| {
+        match fs::remove_file(output_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "strategy={} output_reset_error={}",
+                    strategy.as_str(),
+                    sanitize_cat_recording_validation_error(&error.to_string())
+                ));
+            }
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!("strategy={} deadline_exhausted", strategy.as_str()));
+        }
+        let timeout = std::cmp::min(remaining, strategy.timeout_cap());
+        let command = build_cat_recording_sample_frame_command(
+            ffmpeg,
+            video_path,
+            output_path,
+            timestamp_seconds,
+            strategy,
+            profile,
+        );
+        let output = run_bounded_media_command(command, timeout).map_err(|error| {
+            format!(
+                "strategy={} runner_error={}",
+                strategy.as_str(),
+                sanitize_cat_recording_validation_error(&error.to_string())
+            )
+        })?;
+        if !output.timed_out
+            && output.status.success()
+            && media_output_state(output_path) == "present"
+        {
+            return Ok(());
+        }
+
+        Err(format!(
+            "strategy={} {}",
+            strategy.as_str(),
+            media_tool_output_summary(&output, Some(output_path), &[video_path, output_path])
+        ))
+    });
+
+    extraction.map_err(|attempts| {
+        sanitize_cat_recording_validation_error(&format!(
+            "ffmpeg_sample_frame_failed frame={frame_index} timestamp_ms={:.0} {attempts}",
+            timestamp_seconds * 1_000.0
+        ))
+    })
+}
+
+fn attempt_cat_recording_seek_fallback<T>(
+    mut attempt: impl FnMut(CatRecordingFrameSeekStrategy) -> Result<T, String>,
+) -> Result<T, String> {
+    match attempt(CatRecordingFrameSeekStrategy::Fast) {
+        Ok(result) => Ok(result),
+        Err(fast_error) => match attempt(CatRecordingFrameSeekStrategy::Accurate) {
+            Ok(result) => Ok(result),
+            Err(accurate_error) => Err(format!("attempts=[{fast_error}; {accurate_error}]")),
+        },
+    }
+}
+
+fn build_cat_recording_sample_frame_command(
+    ffmpeg: &OsStr,
+    video_path: &Path,
+    output_path: &Path,
+    timestamp_seconds: f64,
+    strategy: CatRecordingFrameSeekStrategy,
+    profile: CatRecordingFrameProfile,
+) -> Command {
+    let timestamp = format!("{timestamp_seconds:.3}");
+    let mut command = Command::new(ffmpeg);
+    command.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"]);
+    if strategy == CatRecordingFrameSeekStrategy::Fast {
+        command.args(["-ss", timestamp.as_str()]);
+    }
+    command.arg("-i").arg(video_path);
+    if strategy == CatRecordingFrameSeekStrategy::Accurate {
+        command.args(["-ss", timestamp.as_str()]);
+    }
+    command.args(["-map", "0:v:0", "-frames:v", "1", "-an", "-sn", "-dn"]);
+    if profile == CatRecordingFrameProfile::Vlm {
+        command.arg("-vf").arg(
+            "scale=384:384:force_original_aspect_ratio=decrease,\
+             pad=384:384:(ow-iw)/2:(oh-ih)/2:black",
+        );
+    }
+    command.args(["-q:v", "3"]).arg(output_path);
+    command
+}
+
+fn media_output_state(output_path: &Path) -> &'static str {
+    match fs::metadata(output_path) {
+        Ok(metadata) if metadata.is_file() && metadata.len() > 0 => "present",
+        Ok(metadata) if metadata.is_file() => "empty",
+        Ok(_) => "not_file",
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "missing",
+        Err(_) => "unreadable",
+    }
+}
+
+fn media_tool_output_summary(
+    output: &BoundedMediaCommandOutput,
+    expected_output: Option<&Path>,
+    redacted_paths: &[&Path],
+) -> String {
+    let exit = if output.timed_out {
+        "timeout".to_string()
+    } else {
+        output
+            .status
+            .code()
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "signal".to_string())
+    };
+    let output_state = expected_output
+        .map(media_output_state)
+        .unwrap_or("not_applicable");
+    let stderr = summarize_media_tool_stderr(&output.stderr, redacted_paths);
+    format!("exit={exit} output={output_state} stderr={stderr}")
+}
+
+fn summarize_media_tool_stderr(stderr: &[u8], redacted_paths: &[&Path]) -> String {
+    let mut text = String::from_utf8_lossy(stderr).into_owned();
+    for path in redacted_paths {
+        let rendered = path.to_string_lossy();
+        if !rendered.is_empty() {
+            text = text.replace(rendered.as_ref(), "<redacted-path>");
+        }
+    }
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        "none".to_string()
+    } else {
+        tail_bounded_text(&normalized, CAT_RECORDING_VALIDATION_STDERR_MAX_CHARS)
+    }
+}
+
+fn sanitize_cat_recording_validation_error(error: &str) -> String {
+    let normalized = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    head_and_tail_bounded_text(&normalized, CAT_RECORDING_VALIDATION_ERROR_MAX_CHARS)
+}
+
+fn tail_bounded_text(value: &str, max_chars: usize) -> String {
+    let char_count = value.chars().count();
+    if char_count <= max_chars {
+        return value.to_string();
+    }
+    let tail = value
+        .chars()
+        .rev()
+        .take(max_chars.saturating_sub(3))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("...{tail}")
+}
+
+fn head_and_tail_bounded_text(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let separator = " ... ";
+    let available = max_chars.saturating_sub(separator.chars().count());
+    let head_chars = available / 2;
+    let tail_chars = available.saturating_sub(head_chars);
+    let head = value.chars().take(head_chars).collect::<String>();
+    let tail = value
+        .chars()
+        .rev()
+        .take(tail_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{head}{separator}{tail}")
+}
+
+fn run_bounded_media_command(
+    command: Command,
+    timeout: Duration,
+) -> Result<BoundedMediaCommandOutput, BoundedMediaCommandError> {
+    run_bounded_media_command_inner(command, timeout, None)
+}
+
+fn run_bounded_media_command_with_graceful_stop(
+    command: Command,
+    timeout: Duration,
+    stop_grace_period: Duration,
+) -> Result<BoundedMediaCommandOutput, BoundedMediaCommandError> {
+    run_bounded_media_command_inner(command, timeout, Some(stop_grace_period))
+}
+
+fn run_bounded_media_command_inner(
+    mut command: Command,
+    timeout: Duration,
+    stop_grace_period: Option<Duration>,
+) -> Result<BoundedMediaCommandOutput, BoundedMediaCommandError> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|error| {
+        BoundedMediaCommandError::confirmed(format!("failed_to_start_media_tool:{error}"))
+    })?;
+    let stdout_reader = child.stdout.take().map(|handle| {
+        thread::spawn(move || {
+            read_media_pipe_tail(handle, CAT_RECORDING_VALIDATION_MEDIA_CAPTURE_MAX_BYTES)
+        })
+    });
+    let stderr_reader = child.stderr.take().map(|handle| {
+        thread::spawn(move || {
+            read_media_pipe_tail(handle, CAT_RECORDING_VALIDATION_MEDIA_CAPTURE_MAX_BYTES)
+        })
+    });
+    let deadline = Instant::now() + timeout;
+    let (status, timed_out, forced_stop) = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break (status, false, false),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                let stop_result = match stop_grace_period {
+                    Some(grace_period) => stop_media_process_with_grace(&mut child, grace_period),
+                    None => force_media_process(&mut child)
+                        .map(|status| (status, true))
+                        .map_err(|error| {
+                            BoundedMediaCommandError::unconfirmed(format!(
+                                "failed_to_stop_timed_out_media_tool:{error}"
+                            ))
+                        }),
+                };
+                match stop_result {
+                    Ok((status, was_forced)) => break (status, true, was_forced),
+                    Err(error) => {
+                        if error.exit_confirmed {
+                            let _ = join_media_pipe_reader(stdout_reader, "stdout");
+                            let _ = join_media_pipe_reader(stderr_reader, "stderr");
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            Err(error) => {
+                return match force_media_process(&mut child) {
+                    Ok(_) => {
+                        let _ = join_media_pipe_reader(stdout_reader, "stdout");
+                        let _ = join_media_pipe_reader(stderr_reader, "stderr");
+                        Err(BoundedMediaCommandError::confirmed(format!(
+                            "failed_to_poll_media_tool:{error}"
+                        )))
+                    }
+                    Err(force_error) => Err(BoundedMediaCommandError::unconfirmed(format!(
+                        "failed_to_poll_media_tool:{error}; {force_error}"
+                    ))),
+                };
+            }
+        }
+    };
+    let stdout = join_media_pipe_reader(stdout_reader, "stdout")?;
+    let stderr = join_media_pipe_reader(stderr_reader, "stderr")?;
+    Ok(BoundedMediaCommandOutput {
+        status,
+        stdout,
+        stderr,
+        timed_out,
+        forced_stop,
+    })
+}
+
+#[cfg(unix)]
+fn stop_media_process_with_grace(
+    child: &mut Child,
+    grace_period: Duration,
+) -> Result<(ExitStatus, bool), BoundedMediaCommandError> {
+    match child.try_wait() {
+        Ok(Some(status)) => return Ok((status, false)),
+        Ok(None) => {}
+        Err(error) => {
+            return Err(media_stop_error_after_force(
+                child,
+                format!("failed_to_inspect_media_tool_before_sigterm:{error}"),
+            ));
+        }
+    }
+
+    let signal_result = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    if signal_result != 0 {
+        let signal_error = std::io::Error::last_os_error();
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok((status, false)),
+            Ok(None) => {}
+            Err(error) => {
+                return Err(media_stop_error_after_force(
+                    child,
+                    format!(
+                        "failed_to_send_sigterm_to_media_tool:{signal_error}; failed_to_inspect_media_tool_after_sigterm:{error}"
+                    ),
+                ));
+            }
+        }
+        return Err(media_stop_error_after_force(
+            child,
+            format!("failed_to_send_sigterm_to_media_tool:{signal_error}"),
+        ));
+    }
+
+    let deadline = Instant::now() + grace_period;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok((status, false)),
+            Ok(None) => {}
+            Err(error) => {
+                return Err(media_stop_error_after_force(
+                    child,
+                    format!("failed_to_inspect_media_tool_during_graceful_stop:{error}"),
+                ));
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25).min(deadline - now));
+    }
+
+    force_media_process(child)
+        .map(|status| (status, true))
+        .map_err(|error| {
+            BoundedMediaCommandError::unconfirmed(format!(
+                "failed_to_stop_media_tool_after_grace_period:{error}"
+            ))
+        })
+}
+
+#[cfg(not(unix))]
+fn stop_media_process_with_grace(
+    child: &mut Child,
+    _grace_period: Duration,
+) -> Result<(ExitStatus, bool), BoundedMediaCommandError> {
+    force_media_process(child)
+        .map(|status| (status, true))
+        .map_err(|error| {
+            BoundedMediaCommandError::unconfirmed(format!(
+                "failed_to_stop_media_tool_after_grace_period:{error}"
+            ))
+        })
+}
+
+#[cfg(unix)]
+fn media_stop_error_after_force(child: &mut Child, message: String) -> BoundedMediaCommandError {
+    match force_media_process(child) {
+        Ok(status) => {
+            BoundedMediaCommandError::confirmed(format!("{message}; force-stopped with {status}"))
+        }
+        Err(force_error) => {
+            BoundedMediaCommandError::unconfirmed(format!("{message}; {force_error}"))
+        }
+    }
+}
+
+fn force_media_process(child: &mut Child) -> Result<ExitStatus, String> {
+    let kill_error = child.kill().err();
+    match child.wait() {
+        Ok(status) => Ok(status),
+        Err(wait_error) => Err(match kill_error {
+            Some(kill_error) => format!(
+                "failed_to_force_stop_media_tool:{kill_error}; failed_to_reap_media_tool:{wait_error}"
+            ),
+            None => format!("failed_to_reap_media_tool:{wait_error}"),
+        }),
+    }
+}
+
+fn read_media_pipe_tail(mut reader: impl Read, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+    let mut retained = Vec::with_capacity(max_bytes);
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            return Ok(retained);
+        }
+        if read >= max_bytes {
+            retained.clear();
+            retained.extend_from_slice(&chunk[read - max_bytes..read]);
+            continue;
+        }
+        let overflow = retained
+            .len()
+            .saturating_add(read)
+            .saturating_sub(max_bytes);
+        if overflow > 0 {
+            retained.drain(..overflow);
+        }
+        retained.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn join_media_pipe_reader(
+    reader: Option<thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+    stream_name: &str,
+) -> Result<Vec<u8>, String> {
+    let Some(reader) = reader else {
+        return Ok(Vec::new());
+    };
+    reader
+        .join()
+        .map_err(|_| format!("media_tool_{stream_name}_reader_panicked"))?
+        .map_err(|error| format!("failed_to_read_media_tool_{stream_name}:{error}"))
+}
+
+fn parse_cat_detection_streak_sample(
+    result: &Value,
+    now_epoch_ms: u128,
+) -> Option<CatDetectionStreakSample> {
+    if result.get("target_label")?.as_str()? != "cat" {
+        return None;
+    }
+    let detection_count = result.get("detection_count")?.as_u64()?;
+    let sample = CatDetectionStreakSample {
+        sequence: result.get("sequence")?.as_u64()?,
+        frame_epoch_ms: result.get("frame_epoch_ms")?.as_u64()?,
+        detection_count,
+        consecutive_present_frames: result.get("consecutive_present_frames")?.as_u64()?,
+        consecutive_absent_frames: result.get("consecutive_absent_frames")?.as_u64()?,
+        present_since_epoch_ms: result.get("present_since_epoch_ms")?.as_u64()?,
+        absent_since_epoch_ms: result.get("absent_since_epoch_ms")?.as_u64()?,
+        max_confidence_ppm: cat_detection_max_confidence_ppm(result, detection_count)?,
+    };
+    if sample.frame_epoch_ms == 0
+        || now_epoch_ms.saturating_sub(u128::from(sample.frame_epoch_ms))
+            > CAT_AUTO_RECORD_MAX_RESULT_AGE_MS
+    {
+        return None;
+    }
+    let consistent = if sample.detection_count > 0 {
+        sample.consecutive_present_frames > 0
+            && sample.consecutive_absent_frames == 0
+            && sample.present_since_epoch_ms > 0
+            && sample.present_since_epoch_ms <= sample.frame_epoch_ms
+            && sample.absent_since_epoch_ms == 0
+    } else {
+        sample.consecutive_present_frames == 0
+            && sample.consecutive_absent_frames > 0
+            && sample.present_since_epoch_ms == 0
+            && sample.absent_since_epoch_ms > 0
+            && sample.absent_since_epoch_ms <= sample.frame_epoch_ms
+    };
+    consistent.then_some(sample)
+}
+
+fn cat_detection_max_confidence_ppm(result: &Value, detection_count: u64) -> Option<u32> {
+    let detections = result.get("detections")?.as_array()?;
+    if detections.len() != usize::try_from(detection_count).ok()? {
+        return None;
+    }
+    if detections.is_empty() {
+        return Some(0);
+    }
+    detections.iter().try_fold(0_u32, |maximum, detection| {
+        if detection.get("label")?.as_str()? != "cat" {
+            return None;
+        }
+        let confidence = detection.get("confidence")?.as_f64()?;
+        if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
+            return None;
+        }
+        Some(maximum.max((confidence * 1_000_000.0).round() as u32))
+    })
+}
+
+fn record_cat_detection_evidence(
+    evidence: &mut Vec<CatDetectionEvidence>,
+    sample: &CatDetectionStreakSample,
+) {
+    let item = CatDetectionEvidence {
+        sequence: sample.sequence,
+        frame_epoch_ms: sample.frame_epoch_ms,
+        confidence_ppm: sample.max_confidence_ppm,
+    };
+    if evidence.len() < CAT_AUTO_RECORD_MAX_DETECTION_EVIDENCE {
+        evidence.push(item);
+        return;
+    }
+
+    let latest_index = evidence.len() - 1;
+    if latest_index > 1 {
+        let weakest_index = (1..latest_index)
+            .min_by_key(|index| evidence[*index].confidence_ppm)
+            .unwrap_or(1);
+        if evidence[latest_index].confidence_ppm > evidence[weakest_index].confidence_ppm {
+            evidence[weakest_index] = evidence[latest_index].clone();
+        }
+    }
+    evidence[latest_index] = item;
+}
+
+fn cat_auto_recording_transition(
+    recording_active: bool,
+    sample: &CatDetectionStreakSample,
+    config: CatAutoRecordingConfig,
+) -> CatAutoRecordingTransition {
+    if !recording_active
+        && sample.detection_count > 0
+        && sample.consecutive_present_frames >= config.start_consecutive_frames
+        && sample
+            .frame_epoch_ms
+            .saturating_sub(sample.present_since_epoch_ms)
+            >= config.start_duration_ms
+    {
+        CatAutoRecordingTransition::Start
+    } else if recording_active
+        && sample.detection_count == 0
+        && sample.consecutive_absent_frames >= config.stop_consecutive_frames
+        && sample
+            .frame_epoch_ms
+            .saturating_sub(sample.absent_since_epoch_ms)
+            >= config.stop_duration_ms
+    {
+        CatAutoRecordingTransition::Stop
+    } else {
+        CatAutoRecordingTransition::Hold
+    }
+}
+
+fn is_new_cat_detection_sequence(
+    last_sequence: Option<u64>,
+    sample: &CatDetectionStreakSample,
+) -> bool {
+    last_sequence.is_none_or(|last_sequence| sample.sequence > last_sequence)
+}
+
+fn is_harborbeacon_cat_event_recording(lease: &HarborLinkEventRecordingLease) -> bool {
+    lease.owner == "harborbeacon" && lease.labels.iter().any(|label| label == "cat")
+}
+
+fn reusable_cat_event_recording(
+    lease: &HarborLinkEventRecordingLease,
+    stream_profile: &str,
+) -> bool {
+    is_harborbeacon_cat_event_recording(lease) && lease.stream_profile == stream_profile
 }
 
 fn parse_detection_job_path(path: &str, suffix: Option<&str>) -> Option<String> {
@@ -10492,16 +12799,207 @@ fn detection_job_has_expired(expires_at: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn stop_detection_child(runtime: &mut DetectionJobRuntime) {
+fn stop_detection_child(
+    runtime: &mut DetectionJobRuntime,
+) -> Result<DetectionChildStopReport, String> {
+    stop_detection_child_with(runtime, |child| {
+        stop_detection_process(child, DETECTION_CHILD_STOP_GRACE_PERIOD)
+    })
+}
+
+fn stop_detection_child_with(
+    runtime: &mut DetectionJobRuntime,
+    stop_process: impl FnOnce(&mut Child) -> Result<DetectionChildStopOutcome, String>,
+) -> Result<DetectionChildStopReport, String> {
     let Some(mut child) = runtime.child.take() else {
-        return;
+        runtime.ai_lease.take();
+        return Ok(DetectionChildStopReport {
+            outcome: DetectionChildStopOutcome::AlreadyExited,
+            warning: None,
+        });
     };
+
+    let stop_result = stop_process(&mut child);
     match child.try_wait() {
-        Ok(Some(_)) => {}
-        Ok(None) | Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
+        Ok(Some(_)) => {
+            runtime.ai_lease.take();
+            Ok(match stop_result {
+                Ok(outcome) => DetectionChildStopReport {
+                    outcome,
+                    warning: None,
+                },
+                Err(error) => DetectionChildStopReport {
+                    outcome: DetectionChildStopOutcome::AlreadyExited,
+                    warning: Some(format!(
+                        "detection worker exit was confirmed after stop warning: {error}"
+                    )),
+                },
+            })
         }
+        Ok(None) => {
+            runtime.child = Some(child);
+            match stop_result {
+                Ok(outcome) => Err(format!(
+                    "detection worker reported {outcome:?} stop but remained running"
+                )),
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => {
+            runtime.child = Some(child);
+            Err(match stop_result {
+                Ok(outcome) => format!(
+                    "detection worker reported {outcome:?} stop but exit could not be confirmed: {error}"
+                ),
+                Err(stop_error) => format!(
+                    "{stop_error}; detection worker exit could not be confirmed: {error}"
+                ),
+            })
+        }
+    }
+}
+
+fn complete_detection_job_stop(
+    runtime: &mut DetectionJobRuntime,
+    terminal_status: &str,
+    stop_result: Result<DetectionChildStopReport, String>,
+) -> Result<Option<String>, String> {
+    match stop_result {
+        Ok(report) => {
+            runtime.projection.status = terminal_status.to_string();
+            runtime.projection.updated_at = current_rfc3339_timestamp();
+            Ok(detection_child_stop_note(report))
+        }
+        Err(error) => {
+            let message = format!("worker cleanup failed: {error}");
+            runtime.projection.updated_at = current_rfc3339_timestamp();
+            runtime.projection.message = Some(message.clone());
+            Err(message)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn stop_detection_process(
+    child: &mut Child,
+    grace_period: Duration,
+) -> Result<DetectionChildStopOutcome, String> {
+    match child.try_wait() {
+        Ok(Some(_)) => return Ok(DetectionChildStopOutcome::AlreadyExited),
+        Ok(None) => {}
+        Err(error) => {
+            force_detection_process(child)?;
+            return Err(format!(
+                "failed to inspect detection worker before stopping: {error}; \
+                 worker was forcefully reaped"
+            ));
+        }
+    }
+
+    let signal_result = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    if signal_result != 0 {
+        let error = std::io::Error::last_os_error();
+        if child
+            .try_wait()
+            .map_err(|wait_error| {
+                format!(
+                    "failed to send SIGTERM to detection worker: {error}; \
+                     failed to inspect worker afterward: {wait_error}"
+                )
+            })?
+            .is_some()
+        {
+            return Ok(DetectionChildStopOutcome::AlreadyExited);
+        }
+        force_detection_process(child)?;
+        return Err(format!(
+            "failed to send SIGTERM to detection worker: {error}; worker was forcefully reaped"
+        ));
+    }
+
+    let deadline = Instant::now() + grace_period;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(DetectionChildStopOutcome::Graceful),
+            Ok(None) => {}
+            Err(error) => {
+                force_detection_process(child)?;
+                return Err(format!(
+                    "failed to inspect detection worker during graceful stop: {error}; \
+                     worker was forcefully reaped"
+                ));
+            }
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        thread::sleep(DETECTION_CHILD_STOP_POLL_INTERVAL.min(deadline - now));
+    }
+
+    force_detection_process(child)?;
+    Ok(DetectionChildStopOutcome::Forced)
+}
+
+#[cfg(not(unix))]
+fn stop_detection_process(
+    child: &mut Child,
+    _grace_period: Duration,
+) -> Result<DetectionChildStopOutcome, String> {
+    if child
+        .try_wait()
+        .map_err(|error| format!("failed to inspect detection worker before stopping: {error}"))?
+        .is_some()
+    {
+        return Ok(DetectionChildStopOutcome::AlreadyExited);
+    }
+    force_detection_process(child)?;
+    Ok(DetectionChildStopOutcome::Forced)
+}
+
+fn force_detection_process(child: &mut Child) -> Result<(), String> {
+    let kill_error = child.kill().err();
+    let wait_result = child.wait();
+    match (kill_error, wait_result) {
+        (_, Ok(_)) => Ok(()),
+        (Some(kill_error), Err(wait_error)) => Err(format!(
+            "failed to force-stop detection worker: {kill_error}; \
+             failed to reap detection worker: {wait_error}"
+        )),
+        (None, Err(wait_error)) => Err(format!("failed to reap detection worker: {wait_error}")),
+    }
+}
+
+fn detection_child_stop_note(report: DetectionChildStopReport) -> Option<String> {
+    if let Some(warning) = report.warning {
+        return Some(warning);
+    }
+    match report.outcome {
+        DetectionChildStopOutcome::AlreadyExited | DetectionChildStopOutcome::Graceful => None,
+        DetectionChildStopOutcome::Forced => Some(format!(
+            "worker required SIGKILL after the {}-second graceful stop timeout",
+            DETECTION_CHILD_STOP_GRACE_PERIOD.as_secs()
+        )),
+    }
+}
+
+fn detection_child_exit_message(status: &ExitStatus) -> String {
+    #[cfg(unix)]
+    if let Some(signal) = status.signal() {
+        let signal_name = match signal {
+            libc::SIGABRT => "SIGABRT",
+            libc::SIGINT => "SIGINT",
+            libc::SIGKILL => "SIGKILL",
+            libc::SIGTERM => "SIGTERM",
+            _ => "unknown signal",
+        };
+        return format!("detection worker exited after signal {signal} ({signal_name})");
+    }
+
+    match status.code() {
+        Some(code) => format!("detection worker exited with code {code}"),
+        None => "detection worker exited without a status code".to_string(),
     }
 }
 
@@ -10509,6 +13007,36 @@ fn refresh_detection_job_outputs(runtime: &mut DetectionJobRuntime) {
     runtime.projection.latest_result =
         read_detection_job_json(&runtime.output_dir.join("latest.json"));
     runtime.projection.metrics = read_detection_job_json(&runtime.output_dir.join("metrics.json"));
+}
+
+fn reusable_detection_job_projection(
+    jobs: &HashMap<String, DetectionJobRuntime>,
+    camera_id: &str,
+    stream_profile: &str,
+) -> Result<Option<DetectionJobProjection>, String> {
+    let projection = jobs
+        .values()
+        .find(|runtime| {
+            runtime.projection.camera_id == camera_id && runtime.projection.status == "running"
+        })
+        .map(|runtime| runtime.projection.clone());
+    let Some(projection) = projection else {
+        return Ok(None);
+    };
+    if detection_job_matches_stream_profile(&projection, stream_profile) {
+        return Ok(Some(projection));
+    }
+    Err(format!(
+        "a detection job is already running with stream profile {}; stop it before switching to {stream_profile}",
+        projection.stream_profile
+    ))
+}
+
+fn detection_job_matches_stream_profile(
+    projection: &DetectionJobProjection,
+    stream_profile: &str,
+) -> bool {
+    projection.stream_profile == stream_profile
 }
 
 fn prune_detection_job_history(jobs: &mut HashMap<String, DetectionJobRuntime>) {
@@ -11746,6 +14274,7 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/vision/detection-jobs"
         || path.starts_with("/api/vision/detection-jobs/")
         || path == "/api/vision/events"
+        || path == "/api/vision/cat-recording-validations"
         || path == "/api/vision/vlm/status"
         || path == "/api/vision/events/latest/vlm-enrich"
         || (path.starts_with("/api/vision/events/") && path.ends_with("/notify"))
@@ -21565,32 +24094,38 @@ fn normalize_live_session_started_at(started_at: Option<String>) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_bridge_provider_binding_projection, authenticate_gate_principal_headers,
-        authenticate_gate_principal_with_workspace_loader, authorize_gateway_service_request,
-        build_admin_rag_answer_task_request, build_default_notification_target_readiness,
-        build_dvr_recording_action_response, build_feature_availability_response,
-        build_files_browse_response, build_harboros_im_capability_map,
-        build_harboros_status_response, build_hardware_readiness_response,
-        build_home_assistant_operator_audit, build_home_assistant_status_response_with_link,
-        build_inference_health_alias_response, build_knowledge_index_job,
-        build_knowledge_index_status_response, build_knowledge_suggestions,
-        build_local_model_catalog, build_local_vision_event_notification_blocked_response,
-        build_model_capabilities_response, build_outreach_delivery_notification_request,
-        build_rag_readiness_response, build_redacted_diagnostics_bundle,
-        build_release_readiness_response, build_rtsp_url_from_patch, current_epoch_secs,
-        default_model_download_target_path, default_model_download_target_path_in_root,
-        default_model_endpoints, dvr_timeline_segment_from_harborlink, ensure_local_admin_access,
-        ensure_local_camera_access, harbor_assistant_build_missing_response,
-        harbor_assistant_search_session_id, hardware_class_for_probe, has_forwarding_headers,
+        apply_bridge_provider_binding_projection, attempt_cat_recording_seek_fallback,
+        authenticate_gate_principal_headers, authenticate_gate_principal_with_workspace_loader,
+        authorize_gateway_service_request, bounded_u64_value, build_admin_rag_answer_task_request,
+        build_cat_recording_duration_probe_command, build_cat_recording_sample_frame_command,
+        build_default_notification_target_readiness, build_dvr_recording_action_response,
+        build_feature_availability_response, build_files_browse_response,
+        build_harboros_im_capability_map, build_harboros_status_response,
+        build_hardware_readiness_response, build_home_assistant_operator_audit,
+        build_home_assistant_status_response_with_link, build_inference_health_alias_response,
+        build_knowledge_index_job, build_knowledge_index_status_response,
+        build_knowledge_suggestions, build_local_model_catalog,
+        build_local_vision_event_notification_blocked_response, build_model_capabilities_response,
+        build_outreach_delivery_notification_request, build_rag_readiness_response,
+        build_redacted_diagnostics_bundle, build_release_readiness_response,
+        build_rtsp_url_from_patch, cat_auto_recording_transition,
+        cat_recording_validation_retry_delay, cat_recording_validation_status_for_decision,
+        current_epoch_secs, default_model_download_target_path,
+        default_model_download_target_path_in_root, default_model_endpoints,
+        detection_job_matches_stream_profile, dvr_timeline_segment_from_harborlink,
+        ensure_local_admin_access, ensure_local_camera_access,
+        harbor_assistant_build_missing_response, harbor_assistant_search_session_id,
+        hardware_class_for_probe, has_forwarding_headers,
         huggingface_download_should_fallback_to_plain_http, huggingface_resolve_url,
         identity_query_suffix, is_admin_surface_path, is_gate_principal_knowledge_endpoint,
         is_harbor_assistant_client_route, is_harbor_assistant_surface_path,
-        knowledge_preview_mime_supported, latest_model_download_jobs,
-        live_bridge_provider_from_setup_status, local_model_catalog_item,
-        local_model_catalog_specs, mime_type_for_path, model_download_huggingface_endpoint,
+        is_new_cat_detection_sequence, knowledge_preview_mime_supported,
+        latest_model_download_jobs, live_bridge_provider_from_setup_status,
+        local_model_catalog_item, local_model_catalog_specs, merge_cat_recording_vlm_executions,
+        mime_type_for_path, model_download_huggingface_endpoint,
         model_download_huggingface_endpoints, model_download_jobs_status,
         model_endpoint_uses_external_runtime, model_hardware_recommendation,
-        model_snapshot_file_allowed, normalize_detection_job_start,
+        model_snapshot_file_allowed, normalize_detection_job_start, normalize_detection_provider,
         normalize_harbor_assistant_conversation_id, normalize_unified_admin_path,
         normalize_unified_admin_url, notification_delivery_error_to_harbor_app_error,
         overlay_model_endpoints_with_runtime_truth, parse_approval_decision_path,
@@ -21599,9 +24134,10 @@ mod tests {
         parse_camera_hls_live_stop_path, parse_camera_live_page_path,
         parse_camera_live_stream_path, parse_camera_recording_start_path,
         parse_camera_recording_stop_path, parse_camera_share_link_path, parse_camera_snapshot_path,
-        parse_camera_task_snapshot_path, parse_detection_job_path,
-        parse_device_credential_status_path, parse_device_credentials_path,
-        parse_device_evidence_path, parse_device_metadata_patch_path, parse_device_rtsp_check_path,
+        parse_camera_task_snapshot_path, parse_cat_detection_streak_sample,
+        parse_detection_job_path, parse_device_credential_status_path,
+        parse_device_credentials_path, parse_device_evidence_path,
+        parse_device_metadata_patch_path, parse_device_rtsp_check_path,
         parse_device_validation_run_path, parse_harbor_app_lifecycle_path, parse_harbor_app_path,
         parse_harbor_assistant_conversation_path, parse_json_body_limited,
         parse_knowledge_index_job_cancel_path, parse_local_vision_event_notify_path,
@@ -21613,24 +24149,31 @@ mod tests {
         parse_shared_camera_live_stream_path, parse_static_byte_range, percent_decode_path_segment,
         preview_static_file_response, probe_local_model_runtime,
         probe_local_openai_compatible_serving_model, prune_detection_job_history,
-        reconcile_stale_knowledge_index_jobs, redact_account_management_snapshot,
-        redact_admin_string, redact_bridge_provider_config, redact_camera_device_projection,
-        redact_model_endpoint_response, redact_state_snapshot, redact_stream_url_credentials,
-        redact_value_stream_credentials, redacted_general_message_nsp_route_summary,
-        redacted_home_assistant_task_api_event_summary, release_item, request_identity_hints,
-        resolve_admin_search_source_scope, resolve_harbor_assistant_asset_path,
-        resolve_knowledge_preview_path, run_knowledge_index_jobs, run_model_download_job,
-        run_model_download_transfer, sanitized_outreach_delivery_request_audit,
-        service_overloaded_response, snapshot_artifact_from_task_response, url_encode_path_segment,
+        read_media_pipe_tail, reconcile_stale_knowledge_index_jobs,
+        redact_account_management_snapshot, redact_admin_string, redact_bridge_provider_config,
+        redact_camera_device_projection, redact_model_endpoint_response, redact_state_snapshot,
+        redact_stream_url_credentials, redact_value_stream_credentials,
+        redacted_general_message_nsp_route_summary, redacted_home_assistant_task_api_event_summary,
+        release_item, request_identity_hints, resolve_admin_search_source_scope,
+        resolve_harbor_assistant_asset_path, resolve_knowledge_preview_path,
+        reusable_cat_event_recording, reusable_detection_job_projection, run_knowledge_index_jobs,
+        run_model_download_job, run_model_download_transfer,
+        sanitize_cat_recording_validation_error, sanitized_outreach_delivery_request_audit,
+        select_cat_recording_classifier_sample_targets,
+        select_followup_cat_recording_sample_targets, service_overloaded_response,
+        snapshot_artifact_from_task_response, summarize_media_tool_stderr, url_encode_path_segment,
         validate_home_assistant_service_fields, validate_home_assistant_service_smoke,
         validate_outreach_delivery_request, AdminApi, CameraLiveSessionProjection,
-        CameraStreamProfile, DetectionJobProjection, DetectionJobRuntime, DetectionJobStartRequest,
-        GateAuthenticatedPrincipal, HarborLinkHomeAssistantStatus, HarborLinkLiveSession,
-        HarborLinkMediaClient, HarborLinkRecordingArtifact, HarborLinkRecordingStatus,
-        HomeAssistantServiceSmokeRequest, HomeGuardianEvaluationQueue, KnowledgeSearchApiRequest,
-        LocalModelRuntimeProjection, ManualAddRequest, ModelRuntimeActivationRequest,
-        ModelRuntimeActivationResult, OutreachDeliveryRecipientRequest, OutreachDeliveryRequest,
-        VisionIngestLimiter, DEFAULT_HF_ENDPOINT, HARBOR_ASSISTANT_SEARCH_SURFACE,
+        CameraStreamProfile, CatAutoRecordingConfig, CatAutoRecordingTransition,
+        CatDetectionStreakSample, CatRecordingFrameProfile, CatRecordingFrameSeekStrategy,
+        CatRecordingSampleTarget, DetectionJobProjection, DetectionJobRuntime,
+        DetectionJobStartRequest, GateAuthenticatedPrincipal, HarborLinkEventRecordingLease,
+        HarborLinkHomeAssistantStatus, HarborLinkLiveSession, HarborLinkMediaClient,
+        HarborLinkRecordingArtifact, HarborLinkRecordingStatus, HomeAssistantServiceSmokeRequest,
+        HomeGuardianEvaluationQueue, KnowledgeSearchApiRequest, LocalModelRuntimeProjection,
+        ManualAddRequest, ModelRuntimeActivationRequest, ModelRuntimeActivationResult,
+        OutreachDeliveryRecipientRequest, OutreachDeliveryRequest, VisionIngestLimiter,
+        DEFAULT_HF_ENDPOINT, HARBOR_ASSISTANT_SEARCH_SURFACE,
         HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS, HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS,
         MAX_DETECTION_JOB_HISTORY, MAX_VISION_EVENT_INGEST_INFLIGHT, PRIVACY_GATEWAY_AUDIT_ACTION,
     };
@@ -21661,12 +24204,17 @@ mod tests {
         KnowledgeSettings, KnowledgeSourceRoot, ModelDownloadJobRecord, NotificationTargetRecord,
         RagResourceProfile, RemoteViewConfig,
     };
+    use harborbeacon_local_agent::runtime::cat_recording_validation::{
+        CatDetectionEvidence, CatRecordingPublicationStatus, CatRecordingValidationDecision,
+        CatRecordingValidationRecord, CatRecordingValidationStatus,
+    };
     use harborbeacon_local_agent::runtime::dvr::DvrRecordingSettings;
     use harborbeacon_local_agent::runtime::hub::CameraHubService;
     use harborbeacon_local_agent::runtime::knowledge_index::{
         KnowledgeFileSignature, KnowledgeIndexChunk, KnowledgeIndexConfig, KnowledgeIndexEntry,
         KnowledgeIndexService, KnowledgeIndexTextSource, KnowledgeModality,
     };
+    use harborbeacon_local_agent::runtime::model_center::CatRecordingVlmExecution;
     use harborbeacon_local_agent::runtime::privacy_gateway::PRIVACY_GATEWAY_POLICY_VERSION;
     use harborbeacon_local_agent::runtime::registry::{CameraDevice, DeviceRegistryStore};
     use harborbeacon_local_agent::runtime::remote_view;
@@ -21678,6 +24226,7 @@ mod tests {
     };
     use serde_json::{json, Value};
     use std::collections::{BTreeMap, HashMap};
+    use std::ffi::OsStr;
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -21686,7 +24235,7 @@ mod tests {
     use std::sync::mpsc::sync_channel;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn hf_endpoint_env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -22284,8 +24833,30 @@ mod tests {
         .expect("default request");
         assert_eq!(config.target_label, "cat");
         assert_eq!(config.ttl_seconds, 60);
-        assert_eq!(config.max_fps, 5.0);
+        assert_eq!(config.max_fps, 25.0);
         assert_eq!(config.stream_profile, "sub");
+
+        let config = normalize_detection_job_start(DetectionJobStartRequest {
+            camera_id: "camera.252".to_string(),
+            target_labels: vec!["cat".to_string()],
+            duration_seconds: Some(60),
+            max_fps: Some(25.0),
+            confidence: Some(0.35),
+            stream_profile: Some("sub".to_string()),
+        })
+        .expect("25 FPS request");
+        assert_eq!(config.max_fps, 25.0);
+
+        let error = normalize_detection_job_start(DetectionJobStartRequest {
+            camera_id: "camera.252".to_string(),
+            target_labels: vec!["cat".to_string()],
+            duration_seconds: Some(60),
+            max_fps: Some(25.1),
+            confidence: Some(0.35),
+            stream_profile: Some("sub".to_string()),
+        })
+        .expect_err("frame rate above the camera limit must be rejected");
+        assert!(error.contains("25"));
 
         let error = normalize_detection_job_start(DetectionJobStartRequest {
             camera_id: "camera.252".to_string(),
@@ -22308,6 +24879,908 @@ mod tests {
         })
         .expect_err("unbounded duration must be rejected");
         assert!(error.contains("900"));
+    }
+
+    #[test]
+    fn detection_job_projection_exposes_live_management_ownership() {
+        let runtime = DetectionJobRuntime {
+            projection: DetectionJobProjection {
+                job_id: "yolo-live-managed".to_string(),
+                camera_id: "camera.252".to_string(),
+                status: "running".to_string(),
+                target_labels: vec!["cat".to_string()],
+                stream_profile: "sub".to_string(),
+                max_fps: 25.0,
+                confidence: 0.35,
+                lease_id: "detect-live-managed".to_string(),
+                started_at: "2026-07-30T00:00:00Z".to_string(),
+                updated_at: "2026-07-30T00:00:00Z".to_string(),
+                expires_at: "2026-07-30T00:05:00Z".to_string(),
+                managed_by_live: true,
+                latest_result: None,
+                metrics: None,
+                message: None,
+            },
+            output_dir: std::env::temp_dir().join("harborbeacon-live-managed-projection"),
+            child: None,
+            ai_lease: None,
+        };
+
+        let projection = serde_json::to_value(&runtime.projection).expect("serialize projection");
+        let jobs = HashMap::from([(runtime.projection.job_id.clone(), runtime)]);
+        let reused = reusable_detection_job_projection(&jobs, "camera.252", "sub")
+            .expect("matching stream profile")
+            .expect("reuse running live-managed job");
+        let mismatch = reusable_detection_job_projection(&jobs, "camera.252", "main")
+            .expect_err("a running sub-stream job must not be reused for main stream");
+
+        assert_eq!(projection["managed_by_live"], true);
+        assert_eq!(reused.job_id, "yolo-live-managed");
+        assert!(mismatch.contains("sub"));
+        assert!(mismatch.contains("main"));
+        assert!(reused.managed_by_live);
+        assert!(detection_job_matches_stream_profile(&reused, "sub"));
+        assert!(!detection_job_matches_stream_profile(&reused, "main"));
+
+        let start_response = serde_json::to_value(super::DetectionJobStartResponse {
+            projection: reused,
+            reused: true,
+        })
+        .expect("serialize reused start response");
+        assert_eq!(start_response["job_id"], "yolo-live-managed");
+        assert_eq!(start_response["managed_by_live"], true);
+        assert_eq!(start_response["reused"], true);
+        assert!(start_response.get("projection").is_none());
+    }
+
+    #[test]
+    fn cat_auto_recording_requires_consecutive_present_frames_and_duration() {
+        let config = CatAutoRecordingConfig {
+            start_consecutive_frames: 5,
+            start_duration_ms: 500,
+            stop_consecutive_frames: 15,
+            stop_duration_ms: 3_000,
+        };
+        let mut sample = CatDetectionStreakSample {
+            sequence: 5,
+            frame_epoch_ms: 1_500,
+            detection_count: 1,
+            consecutive_present_frames: 4,
+            consecutive_absent_frames: 0,
+            present_since_epoch_ms: 1_000,
+            absent_since_epoch_ms: 0,
+            max_confidence_ppm: 800_000,
+        };
+
+        assert_eq!(
+            cat_auto_recording_transition(false, &sample, config),
+            CatAutoRecordingTransition::Hold
+        );
+        sample.consecutive_present_frames = 5;
+        sample.frame_epoch_ms = 1_499;
+        assert_eq!(
+            cat_auto_recording_transition(false, &sample, config),
+            CatAutoRecordingTransition::Hold
+        );
+        sample.frame_epoch_ms = 1_500;
+        assert_eq!(
+            cat_auto_recording_transition(false, &sample, config),
+            CatAutoRecordingTransition::Start
+        );
+    }
+
+    #[test]
+    fn cat_auto_recording_requires_consecutive_absent_frames_and_duration() {
+        let config = CatAutoRecordingConfig {
+            start_consecutive_frames: 5,
+            start_duration_ms: 500,
+            stop_consecutive_frames: 15,
+            stop_duration_ms: 3_000,
+        };
+        let mut sample = CatDetectionStreakSample {
+            sequence: 20,
+            frame_epoch_ms: 13_000,
+            detection_count: 0,
+            consecutive_present_frames: 0,
+            consecutive_absent_frames: 14,
+            present_since_epoch_ms: 0,
+            absent_since_epoch_ms: 10_000,
+            max_confidence_ppm: 0,
+        };
+
+        assert_eq!(
+            cat_auto_recording_transition(true, &sample, config),
+            CatAutoRecordingTransition::Hold
+        );
+        sample.consecutive_absent_frames = 15;
+        sample.frame_epoch_ms = 12_999;
+        assert_eq!(
+            cat_auto_recording_transition(true, &sample, config),
+            CatAutoRecordingTransition::Hold
+        );
+        sample.frame_epoch_ms = 13_000;
+        assert_eq!(
+            cat_auto_recording_transition(true, &sample, config),
+            CatAutoRecordingTransition::Stop
+        );
+    }
+
+    #[test]
+    fn cat_recording_validation_requires_two_confirmed_frames() {
+        let mut decision = CatRecordingValidationDecision {
+            cat_present: true,
+            cat_frame_indices: vec![2],
+            behavior_tags: vec!["walking".to_string()],
+            summary: "猫在走动".to_string(),
+            reason_code: "cat_visible".to_string(),
+            sampled_frame_count: 5,
+            sampling_strategy: "yolo_guided_adaptive".to_string(),
+            validation_rounds: 1,
+            sampled_offsets_ms: vec![500, 1_500, 2_500, 3_500, 4_500],
+            frame_predictions: Vec::new(),
+            model_endpoint_id: "vlm-local".to_string(),
+            model_name: "local-vlm".to_string(),
+            elapsed_ms: 10,
+        };
+        assert_eq!(
+            cat_recording_validation_status_for_decision(&decision),
+            CatRecordingValidationStatus::ReviewRequired
+        );
+        decision.cat_frame_indices.push(4);
+        assert_eq!(
+            cat_recording_validation_status_for_decision(&decision),
+            CatRecordingValidationStatus::Accepted
+        );
+        decision.cat_present = false;
+        decision.cat_frame_indices.clear();
+        decision.reason_code = "no_cat_visible".to_string();
+        assert_eq!(
+            cat_recording_validation_status_for_decision(&decision),
+            CatRecordingValidationStatus::Rejected
+        );
+        decision.reason_code = "uncertain".to_string();
+        assert_eq!(
+            cat_recording_validation_status_for_decision(&decision),
+            CatRecordingValidationStatus::ReviewRequired
+        );
+    }
+
+    #[test]
+    fn mobilenet_recording_validation_does_not_depend_on_vlm_readiness() {
+        let mut vlm_probed = false;
+        let mobilenet_ready = super::cat_recording_validation_runtime_ready_for(
+            super::CatRecordingValidatorBackend::MobileNetV2Int8,
+            || {
+                vlm_probed = true;
+                false
+            },
+        );
+
+        assert!(mobilenet_ready);
+        assert!(!vlm_probed);
+        assert!(!super::cat_recording_validation_runtime_ready_for(
+            super::CatRecordingValidatorBackend::Vlm,
+            || false,
+        ));
+    }
+
+    fn cat_validation_record_with_evidence(
+        evidence: Vec<CatDetectionEvidence>,
+    ) -> CatRecordingValidationRecord {
+        CatRecordingValidationRecord {
+            schema_version: "1.1".to_string(),
+            validation_id: "catval-test".to_string(),
+            policy_version: "cat-recording-validation-v4".to_string(),
+            artifact_id: "artifact-test".to_string(),
+            event_id: "event-test".to_string(),
+            artifact_source: Some("yolo_cat_activity".to_string()),
+            camera_id: "camera.252".to_string(),
+            mime_type: "video/mp4".to_string(),
+            byte_size: 1024,
+            started_at_epoch_ms: 100_000,
+            ended_at_epoch_ms: 110_000,
+            duration_seconds: 10,
+            validation_status: CatRecordingValidationStatus::PendingValidation,
+            publication_status: CatRecordingPublicationStatus::Unpublished,
+            attempt_count: 0,
+            detection_evidence: evidence,
+            next_retry_at_epoch_ms: None,
+            created_at_epoch_ms: 110_000,
+            updated_at_epoch_ms: 110_000,
+            decision: None,
+            last_error: None,
+            artifact_disposition: Default::default(),
+            discard_attempt_count: 0,
+            discarded_at_epoch_ms: None,
+            discard_error: None,
+        }
+    }
+
+    #[test]
+    fn cat_recording_initial_sampling_prefers_diverse_yolo_evidence() {
+        let record = cat_validation_record_with_evidence(vec![
+            CatDetectionEvidence {
+                sequence: 1,
+                frame_epoch_ms: 99_500,
+                confidence_ppm: 700_000,
+            },
+            CatDetectionEvidence {
+                sequence: 2,
+                frame_epoch_ms: 101_000,
+                confidence_ppm: 600_000,
+            },
+            CatDetectionEvidence {
+                sequence: 3,
+                frame_epoch_ms: 105_000,
+                confidence_ppm: 950_000,
+            },
+            CatDetectionEvidence {
+                sequence: 4,
+                frame_epoch_ms: 109_000,
+                confidence_ppm: 800_000,
+            },
+        ]);
+
+        let (strategy, targets) = select_cat_recording_classifier_sample_targets(&record, 10.0);
+
+        assert_eq!(strategy, "yolo_guided_hybrid_9");
+        assert_eq!(targets[0].offset_ms, 5_000);
+        assert!(targets.iter().any(|target| target.offset_ms == 100));
+        assert!(targets.iter().any(|target| target.offset_ms == 9_000));
+        assert_eq!(targets.len(), 9);
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.offset_ms)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            9
+        );
+    }
+
+    #[test]
+    fn cat_recording_followup_samples_near_a_positive_frame() {
+        let record = cat_validation_record_with_evidence(vec![CatDetectionEvidence {
+            sequence: 1,
+            frame_epoch_ms: 105_000,
+            confidence_ppm: 950_000,
+        }]);
+        let initial = vec![CatRecordingSampleTarget {
+            frame_index: 1,
+            offset_ms: 5_000,
+        }];
+
+        let targets =
+            select_followup_cat_recording_sample_targets(&record, 10.0, &initial, &[5_000]);
+
+        assert!(!targets.is_empty());
+        assert!(targets.len() <= 5);
+        assert_eq!(targets[0].frame_index, 2);
+        assert!(targets
+            .iter()
+            .any(|target| target.offset_ms.abs_diff(5_000) <= 1_000));
+        assert!(targets
+            .iter()
+            .all(|target| target.offset_ms.abs_diff(5_000) >= 100));
+    }
+
+    #[test]
+    fn cat_recording_vlm_rounds_accept_two_distinct_positive_frames() {
+        let first = CatRecordingVlmExecution {
+            available: true,
+            status: "active".to_string(),
+            cat_present: true,
+            cat_frame_indices: vec![2],
+            reason_code: "uncertain".to_string(),
+            sampled_frame_count: 5,
+            ..Default::default()
+        };
+        let second = CatRecordingVlmExecution {
+            available: true,
+            status: "active".to_string(),
+            cat_present: true,
+            cat_frame_indices: vec![6],
+            reason_code: "uncertain".to_string(),
+            sampled_frame_count: 3,
+            ..Default::default()
+        };
+
+        let merged = merge_cat_recording_vlm_executions(&[first, second]);
+
+        assert!(merged.cat_present);
+        assert_eq!(merged.cat_frame_indices, vec![2, 6]);
+        assert_eq!(merged.reason_code, "cat_visible");
+        assert_eq!(merged.sampled_frame_count, 8);
+    }
+
+    #[test]
+    fn cat_recording_validation_retry_is_bounded() {
+        assert_eq!(
+            cat_recording_validation_retry_delay(1),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            cat_recording_validation_retry_delay(2),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            cat_recording_validation_retry_delay(3),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(cat_recording_validation_retry_delay(4), None);
+    }
+
+    #[test]
+    fn cat_recording_ai_resource_contention_uses_non_consuming_deferral() {
+        assert!(super::is_cat_recording_ai_resource_contention(
+            "cat_classifier_ai_resource_queue_full"
+        ));
+        assert!(super::is_cat_recording_ai_resource_contention(
+            "cat_classifier_ai_resource_wait_timeout"
+        ));
+        assert!(!super::is_cat_recording_ai_resource_contention(
+            "cat_classifier_timeout"
+        ));
+        assert!(!super::is_cat_recording_ai_resource_contention(
+            "vlm_ai_resource_wait_timeout"
+        ));
+        assert_eq!(
+            super::CAT_RECORDING_AI_RESOURCE_RETRY_DELAY,
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn cat_recording_frame_extraction_uses_fast_seek_without_unneeded_retry() {
+        let mut attempts = Vec::new();
+
+        let result = attempt_cat_recording_seek_fallback(|strategy| {
+            attempts.push(strategy);
+            Ok::<_, String>("frame")
+        })
+        .expect("fast extraction should succeed");
+
+        assert_eq!(result, "frame");
+        assert_eq!(attempts, vec![CatRecordingFrameSeekStrategy::Fast]);
+    }
+
+    #[test]
+    fn cat_recording_frame_extraction_falls_back_to_accurate_seek() {
+        let mut attempts = Vec::new();
+
+        let result = attempt_cat_recording_seek_fallback(|strategy| {
+            attempts.push(strategy);
+            match strategy {
+                CatRecordingFrameSeekStrategy::Fast => Err("fast failed".to_string()),
+                CatRecordingFrameSeekStrategy::Accurate => Ok("frame"),
+            }
+        })
+        .expect("accurate extraction should recover the frame");
+
+        assert_eq!(result, "frame");
+        assert_eq!(
+            attempts,
+            vec![
+                CatRecordingFrameSeekStrategy::Fast,
+                CatRecordingFrameSeekStrategy::Accurate,
+            ]
+        );
+    }
+
+    #[test]
+    fn cat_recording_frame_extraction_preserves_both_attempt_errors() {
+        let error = attempt_cat_recording_seek_fallback::<()>(|strategy| {
+            Err(format!("{} failed", strategy.as_str()))
+        })
+        .expect_err("both failed seeks must be reported");
+
+        assert!(error.contains("fast failed"));
+        assert!(error.contains("accurate failed"));
+    }
+
+    #[test]
+    fn cat_recording_frame_commands_place_seek_for_fast_and_accurate_modes() {
+        let video_path = Path::new("recording.mp4");
+        let output_path = Path::new("frame-3.jpg");
+        let fast = build_cat_recording_sample_frame_command(
+            OsStr::new("ffmpeg"),
+            video_path,
+            output_path,
+            12.3456,
+            CatRecordingFrameSeekStrategy::Fast,
+            CatRecordingFrameProfile::Vlm,
+        );
+        let accurate = build_cat_recording_sample_frame_command(
+            OsStr::new("ffmpeg"),
+            video_path,
+            output_path,
+            12.3456,
+            CatRecordingFrameSeekStrategy::Accurate,
+            CatRecordingFrameProfile::Vlm,
+        );
+        let fast_args = fast
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let accurate_args = accurate
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let fast_seek = fast_args
+            .iter()
+            .position(|argument| argument == "-ss")
+            .expect("fast seek argument");
+        let fast_input = fast_args
+            .iter()
+            .position(|argument| argument == "-i")
+            .expect("fast input argument");
+        let accurate_seek = accurate_args
+            .iter()
+            .position(|argument| argument == "-ss")
+            .expect("accurate seek argument");
+        let accurate_input = accurate_args
+            .iter()
+            .position(|argument| argument == "-i")
+            .expect("accurate input argument");
+
+        assert!(fast_seek < fast_input);
+        assert!(accurate_seek > accurate_input);
+        assert!(fast_args.windows(2).any(|args| args == ["-map", "0:v:0"]));
+        assert!(fast_args.iter().any(|argument| argument == "-nostdin"));
+        assert!(fast_args.iter().any(|argument| argument == "-an"));
+        assert!(fast_args.iter().any(|argument| argument == "-sn"));
+        assert!(fast_args.iter().any(|argument| argument == "-dn"));
+
+        let classifier = build_cat_recording_sample_frame_command(
+            OsStr::new("ffmpeg"),
+            video_path,
+            output_path,
+            12.3456,
+            CatRecordingFrameSeekStrategy::Fast,
+            CatRecordingFrameProfile::Classifier,
+        );
+        let classifier_args = classifier
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(!classifier_args.iter().any(|argument| argument == "-vf"));
+    }
+
+    #[test]
+    fn cat_recording_duration_probe_prefers_video_stream_and_keeps_container_fallback() {
+        let video_path = Path::new("recording.mp4");
+        let video_probe =
+            build_cat_recording_duration_probe_command(OsStr::new("ffprobe"), video_path, true);
+        let video_args = video_probe
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(video_args
+            .windows(2)
+            .any(|pair| pair == ["-select_streams", "v:0"]));
+        assert!(video_args
+            .windows(2)
+            .any(|pair| pair == ["-show_entries", "stream=duration"]));
+
+        let container_probe =
+            build_cat_recording_duration_probe_command(OsStr::new("ffprobe"), video_path, false);
+        let container_args = container_probe
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(!container_args
+            .iter()
+            .any(|argument| argument == "-select_streams"));
+        assert!(container_args
+            .windows(2)
+            .any(|pair| pair == ["-show_entries", "format=duration"]));
+    }
+
+    #[test]
+    fn cat_recording_media_errors_are_redacted_normalized_and_bounded() {
+        let video_path = Path::new("/run/private/cat-recording.mp4");
+        let redacted = summarize_media_tool_stderr(
+            format!("decoder error at {}", video_path.display()).as_bytes(),
+            &[video_path],
+        );
+        let summary = summarize_media_tool_stderr(
+            format!("{} tail-marker", "x".repeat(240)).as_bytes(),
+            &[video_path],
+        );
+        let diagnostic = sanitize_cat_recording_validation_error(&format!(
+            "prefix\n{} {} suffix-marker",
+            "y".repeat(600),
+            summary
+        ));
+
+        assert!(!redacted.contains(video_path.to_string_lossy().as_ref()));
+        assert!(redacted.contains("<redacted-path>"));
+        assert!(summary.ends_with("tail-marker"));
+        assert!(summary.chars().count() <= super::CAT_RECORDING_VALIDATION_STDERR_MAX_CHARS);
+        assert!(!diagnostic.contains('\n'));
+        assert!(diagnostic.starts_with("prefix"));
+        assert!(diagnostic.ends_with("suffix-marker"));
+        assert!(diagnostic.chars().count() <= super::CAT_RECORDING_VALIDATION_ERROR_MAX_CHARS);
+    }
+
+    #[test]
+    fn media_pipe_capture_drains_input_and_keeps_only_the_bounded_tail() {
+        let input = (0_u16..512)
+            .map(|value| (value % 256) as u8)
+            .collect::<Vec<_>>();
+
+        let retained = read_media_pipe_tail(std::io::Cursor::new(&input), 64)
+            .expect("bounded media pipe capture");
+
+        assert_eq!(retained, input[input.len() - 64..]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_media_command_drains_large_stderr_without_deadlock() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "i=0; while [ \"$i\" -lt 4096 ]; do printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' >&2; i=$((i + 1)); done",
+        ]);
+
+        let output = super::run_bounded_media_command(command, Duration::from_secs(5))
+            .expect("large stderr command should complete");
+
+        assert!(output.status.success());
+        assert!(!output.timed_out);
+        assert!(!output.forced_stop);
+        assert_eq!(
+            output.stderr.len(),
+            super::CAT_RECORDING_VALIDATION_MEDIA_CAPTURE_MAX_BYTES
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_media_command_kills_and_reaps_after_timeout() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "while :; do :; done"]);
+        let started = std::time::Instant::now();
+
+        let output = super::run_bounded_media_command(command, Duration::from_millis(50))
+            .expect("timed out command should be reaped");
+
+        assert!(output.timed_out);
+        assert!(output.forced_stop);
+        assert!(!output.status.success());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn cat_recording_classifier_timeout_allows_five_second_cleanup() {
+        assert_eq!(
+            super::CAT_RECORDING_CLASSIFIER_STOP_GRACE_PERIOD,
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn unconfirmed_media_exit_requires_ai_lease_quarantine() {
+        let confirmed = super::BoundedMediaCommandError::confirmed("pipe read failed");
+        let unconfirmed = super::BoundedMediaCommandError::unconfirmed("kill and wait failed");
+
+        assert!(!super::media_error_requires_ai_lease_quarantine(&confirmed));
+        assert!(super::media_error_requires_ai_lease_quarantine(
+            &unconfirmed
+        ));
+        assert!(unconfirmed.to_string().contains("kill and wait failed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_media_command_can_timeout_with_graceful_sigterm_cleanup() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "trap 'sleep 0.1; exit 0' TERM; while :; do sleep 0.05; done",
+        ]);
+
+        let output = super::run_bounded_media_command_with_graceful_stop(
+            command,
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+        )
+        .expect("signal-aware command should be reaped");
+
+        assert!(output.timed_out);
+        assert!(!output.forced_stop);
+        assert!(output.status.success());
+    }
+
+    #[test]
+    fn cat_detection_streak_sample_rejects_stale_or_inconsistent_results() {
+        let result = json!({
+            "sequence": 10,
+            "target_label": "cat",
+            "frame_epoch_ms": 20_000,
+            "detection_count": 1,
+            "detections": [{"label": "cat", "confidence": 0.82}],
+            "consecutive_present_frames": 5,
+            "consecutive_absent_frames": 0,
+            "present_since_epoch_ms": 19_000,
+            "absent_since_epoch_ms": 0
+        });
+        let sample = parse_cat_detection_streak_sample(&result, 20_100).unwrap();
+        assert_eq!(sample.max_confidence_ppm, 820_000);
+        assert!(parse_cat_detection_streak_sample(&result, 26_000).is_none());
+
+        let inconsistent = json!({
+            "sequence": 11,
+            "target_label": "cat",
+            "frame_epoch_ms": 21_000,
+            "detection_count": 0,
+            "detections": [],
+            "consecutive_present_frames": 5,
+            "consecutive_absent_frames": 0,
+            "present_since_epoch_ms": 20_000,
+            "absent_since_epoch_ms": 0
+        });
+        assert!(parse_cat_detection_streak_sample(&inconsistent, 21_100).is_none());
+    }
+
+    #[test]
+    fn cat_detection_sequence_rejects_duplicates_and_out_of_order_results() {
+        let sample = CatDetectionStreakSample {
+            sequence: 10,
+            frame_epoch_ms: 20_000,
+            detection_count: 1,
+            consecutive_present_frames: 5,
+            consecutive_absent_frames: 0,
+            present_since_epoch_ms: 19_000,
+            absent_since_epoch_ms: 0,
+            max_confidence_ppm: 820_000,
+        };
+
+        assert!(is_new_cat_detection_sequence(None, &sample));
+        assert!(is_new_cat_detection_sequence(Some(9), &sample));
+        assert!(!is_new_cat_detection_sequence(Some(10), &sample));
+        assert!(!is_new_cat_detection_sequence(Some(11), &sample));
+    }
+
+    #[test]
+    fn cat_auto_recording_settings_enforce_bounds() {
+        assert_eq!(
+            bounded_u64_value("SETTING", None, 5, 2, 100).expect("default value"),
+            5
+        );
+        assert_eq!(
+            bounded_u64_value("SETTING", Some(" 15 "), 5, 2, 100).expect("configured value"),
+            15
+        );
+        assert!(bounded_u64_value("SETTING", Some("1"), 5, 2, 100).is_err());
+        assert!(bounded_u64_value("SETTING", Some("101"), 5, 2, 100).is_err());
+        assert!(bounded_u64_value("SETTING", Some("invalid"), 5, 2, 100).is_err());
+    }
+
+    #[test]
+    fn cat_event_recording_is_reused_only_for_the_selected_stream_profile() {
+        let lease = HarborLinkEventRecordingLease {
+            camera_id: "camera.252".to_string(),
+            lease_id: "event-recording-1".to_string(),
+            event_id: "cat-activity-1".to_string(),
+            owner: "harborbeacon".to_string(),
+            status: "recording".to_string(),
+            stream_profile: "main".to_string(),
+            labels: vec!["cat".to_string()],
+            started_at: "2026-07-30T00:00:00Z".to_string(),
+            updated_at: "2026-07-30T00:00:00Z".to_string(),
+            expires_at: "2026-07-30T00:00:30Z".to_string(),
+            pre_roll_seconds: 3,
+            trigger_epoch_ms: 1_786_060_800_123,
+            artifacts: Vec::new(),
+        };
+
+        assert!(reusable_cat_event_recording(&lease, "main"));
+        assert!(!reusable_cat_event_recording(&lease, "sub"));
+    }
+
+    #[test]
+    fn detection_provider_defaults_to_cpu_and_allows_explicit_spacemit() {
+        assert_eq!(
+            normalize_detection_provider(None).expect("default provider"),
+            "cpu"
+        );
+        assert_eq!(
+            normalize_detection_provider(Some(" spacemit ")).expect("explicit NPU provider"),
+            "spacemit"
+        );
+        assert!(normalize_detection_provider(Some("cuda")).is_err());
+    }
+
+    #[test]
+    fn detection_worker_stop_grace_period_is_five_seconds() {
+        assert_eq!(
+            super::DETECTION_CHILD_STOP_GRACE_PERIOD,
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn detection_worker_stop_keeps_child_and_ai_lease_when_exit_is_unconfirmed() {
+        #[cfg(windows)]
+        let child = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+            .spawn()
+            .expect("spawn long-running worker");
+        #[cfg(unix)]
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "while :; do sleep 1; done"])
+            .spawn()
+            .expect("spawn long-running worker");
+
+        let mut runtime = DetectionJobRuntime {
+            projection: DetectionJobProjection {
+                job_id: "yolo-unconfirmed-stop".to_string(),
+                camera_id: "camera-252".to_string(),
+                status: "running".to_string(),
+                target_labels: vec!["cat".to_string()],
+                stream_profile: "sub".to_string(),
+                max_fps: 25.0,
+                confidence: 0.35,
+                lease_id: "detect-unconfirmed-stop".to_string(),
+                started_at: "2026-08-06T00:00:00Z".to_string(),
+                updated_at: "2026-08-06T00:00:00Z".to_string(),
+                expires_at: "2026-08-06T00:05:00Z".to_string(),
+                managed_by_live: false,
+                latest_result: None,
+                metrics: None,
+                message: None,
+            },
+            output_dir: std::env::temp_dir().join("harborbeacon-unconfirmed-worker-stop"),
+            child: Some(child),
+            ai_lease: Some(
+                super::acquire_ai_resource_lease(super::AiWorkload::Yolo)
+                    .expect("acquire YOLO resources"),
+            ),
+        };
+
+        let stop_result = super::stop_detection_child_with(&mut runtime, |_| {
+            Err("injected stop failure".to_string())
+        });
+        let error = super::complete_detection_job_stop(&mut runtime, "stopped", stop_result)
+            .expect_err("unconfirmed worker exit must fail");
+
+        assert!(error.contains("injected stop failure"));
+        assert_eq!(runtime.projection.status, "running");
+        assert!(runtime
+            .projection
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("worker cleanup failed")));
+        assert!(runtime.child.is_some());
+        assert!(runtime.ai_lease.is_some());
+
+        let mut child = runtime.child.take().expect("retained worker");
+        let _ = child.kill();
+        let _ = child.wait();
+        runtime.ai_lease.take();
+    }
+
+    #[test]
+    fn detection_worker_stop_completes_terminal_state_after_confirmed_reap_warning() {
+        #[cfg(windows)]
+        let child = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+            .spawn()
+            .expect("spawn long-running worker");
+        #[cfg(unix)]
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "while :; do sleep 1; done"])
+            .spawn()
+            .expect("spawn long-running worker");
+
+        let mut runtime = DetectionJobRuntime {
+            projection: DetectionJobProjection {
+                job_id: "yolo-confirmed-reap-warning".to_string(),
+                camera_id: "camera-252".to_string(),
+                status: "running".to_string(),
+                target_labels: vec!["cat".to_string()],
+                stream_profile: "sub".to_string(),
+                max_fps: 25.0,
+                confidence: 0.35,
+                lease_id: "detect-confirmed-reap-warning".to_string(),
+                started_at: "2026-08-06T00:00:00Z".to_string(),
+                updated_at: "2026-08-06T00:00:00Z".to_string(),
+                expires_at: "2026-08-06T00:05:00Z".to_string(),
+                managed_by_live: false,
+                latest_result: None,
+                metrics: None,
+                message: None,
+            },
+            output_dir: std::env::temp_dir().join("harborbeacon-confirmed-reap-warning"),
+            child: Some(child),
+            ai_lease: Some(
+                super::acquire_ai_resource_lease(super::AiWorkload::Yolo)
+                    .expect("acquire YOLO resources"),
+            ),
+        };
+
+        let stop_result = super::stop_detection_child_with(&mut runtime, |child| {
+            let _ = child.kill();
+            child.wait().expect("reap injected worker");
+            Err("injected cleanup warning after confirmed reap".to_string())
+        });
+        let note = super::complete_detection_job_stop(&mut runtime, "stopped", stop_result)
+            .expect("confirmed reap must complete the terminal state")
+            .expect("confirmed reap warning must be retained");
+
+        assert_eq!(runtime.projection.status, "stopped");
+        assert!(runtime.child.is_none());
+        assert!(runtime.ai_lease.is_none());
+        assert!(note.contains("injected cleanup warning after confirmed reap"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detection_worker_stop_reaps_process_after_graceful_sigterm() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("python3")
+            .args([
+                "-c",
+                "import signal, sys\n\
+                 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n\
+                 print('ready', flush=True)\n\
+                 signal.pause()",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn signal-aware worker");
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().expect("worker stdout"))
+            .read_line(&mut ready)
+            .expect("read worker readiness");
+        assert_eq!(ready.trim(), "ready");
+
+        let outcome =
+            super::stop_detection_process(&mut child, Duration::from_secs(1)).expect("stop worker");
+
+        assert_eq!(outcome, super::DetectionChildStopOutcome::Graceful);
+        assert!(child.try_wait().expect("inspect reaped worker").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detection_worker_stop_forces_and_reaps_process_after_timeout() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "trap '' TERM; echo ready; while :; do :; done"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn signal-ignoring worker");
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().expect("worker stdout"))
+            .read_line(&mut ready)
+            .expect("read worker readiness");
+        assert_eq!(ready.trim(), "ready");
+
+        let outcome = super::stop_detection_process(&mut child, Duration::from_millis(100))
+            .expect("force worker stop");
+
+        assert_eq!(outcome, super::DetectionChildStopOutcome::Forced);
+        assert!(child.try_wait().expect("inspect reaped worker").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detection_worker_exit_message_reports_unix_signal() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let status = std::process::ExitStatus::from_raw(libc::SIGABRT);
+
+        assert_eq!(
+            super::detection_child_exit_message(&status),
+            "detection worker exited after signal 6 (SIGABRT)"
+        );
     }
 
     #[test]
@@ -22335,6 +25808,7 @@ mod tests {
                         started_at: format!("2026-07-23T00:{:02}:00Z", index % 60),
                         updated_at: format!("2026-07-23T00:{:02}:00Z", index % 60),
                         expires_at: "2026-07-23T00:15:00Z".to_string(),
+                        managed_by_live: false,
                         latest_result: None,
                         metrics: None,
                         message: None,
@@ -22344,6 +25818,7 @@ mod tests {
                         std::process::id()
                     )),
                     child: None,
+                    ai_lease: None,
                 },
             );
         }
@@ -23095,6 +26570,7 @@ mod tests {
         );
 
         let snapshot_artifact = HarborLinkRecordingArtifact {
+            media_contract_version: "1.0".to_string(),
             artifact_id: "snapshots~cam-1~2026~07~23~021258.jpg".to_string(),
             camera_id: "cam-1".to_string(),
             kind: "snapshot".to_string(),
@@ -23106,6 +26582,9 @@ mod tests {
             stream_kind: "snapshot".to_string(),
             modified_at_epoch_ms: 1_784_772_778_731,
             preview_url: "/v1/dvr/artifacts/snapshot".to_string(),
+            event_id: None,
+            labels: Vec::new(),
+            source: None,
         };
         let task_response = TaskResponse {
             task_id: "task-snapshot".to_string(),

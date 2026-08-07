@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import os
@@ -21,6 +22,7 @@ import onnxruntime as ort
 
 from harbornavi_k3_yolov8_analyzer import (
     input_hw,
+    letterbox_pad_value,
     load_labels,
     postprocess,
     preprocess,
@@ -31,7 +33,12 @@ from harbornavi_k3_yolov8_analyzer import (
 DEFAULT_MODEL = "/var/lib/harboros-beacon/models/yolov8n_192x320.q.onnx"
 DEFAULT_LABELS = "/var/lib/harboros-beacon/models/label.txt"
 DEFAULT_TARGET_LABEL = "cat"
+CONFIDENCE_OVERRIDE_ENV = "HARBOR_K3_YOLO_CONFIDENCE_OVERRIDE"
 STOP_REQUESTED = threading.Event()
+
+
+class WorkerStopRequested(Exception):
+    """Stop the worker through its normal resource cleanup path."""
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--target-label", default=DEFAULT_TARGET_LABEL)
     parser.add_argument("--provider", choices=["cpu", "spacemit"], default="cpu")
-    parser.add_argument("--max-fps", type=float, default=5.0)
+    parser.add_argument("--max-fps", type=float, default=25.0)
     parser.add_argument("--conf-threshold", type=float, default=0.35)
     parser.add_argument("--iou-threshold", type=float, default=0.45)
     parser.add_argument("--max-detections", type=int, default=20)
@@ -55,6 +62,21 @@ def file_sha256(path: str) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def confidence_threshold_from_env(command_line_value: float) -> float:
+    raw_value = os.environ.get(CONFIDENCE_OVERRIDE_ENV)
+    if raw_value is None:
+        return command_line_value
+    try:
+        value = float(raw_value.strip())
+    except ValueError as error:
+        raise ValueError(f"{CONFIDENCE_OVERRIDE_ENV} must be a number") from error
+    if not 0 < value <= 1:
+        raise ValueError(
+            f"{CONFIDENCE_OVERRIDE_ENV} must be greater than 0 and at most 1"
+        )
+    return value
 
 
 def filter_target_detections(
@@ -79,6 +101,34 @@ def should_write_snapshot(
     detections: list[dict[str, Any]], now: float, last_write: float
 ) -> bool:
     return bool(detections) and now - last_write >= 1.0
+
+
+class ConsecutiveDetectionState:
+    def __init__(self) -> None:
+        self._present_frames = 0
+        self._absent_frames = 0
+        self._present_since_epoch_ms = 0
+        self._absent_since_epoch_ms = 0
+
+    def observe(self, present: bool, frame_epoch_ms: int) -> dict[str, int]:
+        if present:
+            if self._present_frames == 0:
+                self._present_since_epoch_ms = frame_epoch_ms
+            self._present_frames += 1
+            self._absent_frames = 0
+            self._absent_since_epoch_ms = 0
+        else:
+            if self._absent_frames == 0:
+                self._absent_since_epoch_ms = frame_epoch_ms
+            self._absent_frames += 1
+            self._present_frames = 0
+            self._present_since_epoch_ms = 0
+        return {
+            "consecutive_present_frames": self._present_frames,
+            "consecutive_absent_frames": self._absent_frames,
+            "present_since_epoch_ms": self._present_since_epoch_ms,
+            "absent_since_epoch_ms": self._absent_since_epoch_ms,
+        }
 
 
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -145,17 +195,24 @@ class LatestFrameReader:
         self._thread.join(timeout=3)
 
     def wait_next(
-        self, previous_sequence: int, timeout_seconds: float = 10.0
+        self,
+        previous_sequence: int,
+        timeout_seconds: float = 10.0,
+        stop_event: threading.Event | None = None,
     ) -> tuple[int, int, np.ndarray]:
         deadline = time.monotonic() + timeout_seconds
         with self._lock:
-            while self._sequence <= previous_sequence and not self._stopped:
+            while self._sequence <= previous_sequence:
+                if stop_event is not None and stop_event.is_set():
+                    raise WorkerStopRequested
                 if self._error is not None:
                     raise RuntimeError(self._error)
+                if self._stopped:
+                    raise RuntimeError("video source stopped before a fresh frame was available")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("stream did not produce a fresh frame")
-                self._lock.wait(timeout=remaining)
+                self._lock.wait(timeout=min(remaining, 0.1))
             if self._frame is None:
                 raise RuntimeError(self._error or "stream ended before a frame was available")
             return self._sequence, self._frame_epoch_ms, self._frame.copy()
@@ -207,7 +264,37 @@ def build_session(args: argparse.Namespace) -> tuple[ort.InferenceSession, int, 
         raise ValueError("target label is not present in the label file")
     providers = provider_list(args.provider)
     options = ort.SessionOptions()
-    options.intra_op_num_threads = 1
+    if args.provider == "spacemit":
+        ai_threads = int(os.environ.get("HARBOR_K3_YOLO_AI_THREADS", "4"))
+        if ai_threads <= 0:
+            raise ValueError("HARBOR_K3_YOLO_AI_THREADS must be positive")
+        affinity = os.environ.get(
+            "HARBOR_K3_YOLO_AI_AFFINITY", "8;9;10;11"
+        )
+        core_ids = [core_id.strip() for core_id in affinity.split(";")]
+        if len(core_ids) != ai_threads or any(
+            not core_id.isdigit() for core_id in core_ids
+        ):
+            raise ValueError(
+                "HARBOR_K3_YOLO_AI_AFFINITY "
+                f"must contain {ai_threads} core IDs"
+            )
+        options.intra_op_num_threads = 1
+        providers = [
+            (
+                providers[0],
+                {
+                    "SPACEMIT_EP_INTRA_THREAD_NUM": str(ai_threads),
+                    "SPACEMIT_EP_INTRA_THREAD_AFFINITY": affinity,
+                    "SPACEMIT_EP_INTER_THREAD_NUM": "1",
+                },
+            )
+        ]
+    else:
+        cpu_threads = int(os.environ.get("HARBOR_K3_YOLO_CPU_THREADS", "1"))
+        if cpu_threads <= 0:
+            raise ValueError("HARBOR_K3_YOLO_CPU_THREADS must be positive")
+        options.intra_op_num_threads = cpu_threads
     session = ort.InferenceSession(args.model, sess_options=options, providers=providers)
     input_height, input_width = input_hw(session.get_inputs()[0].shape)
     provider = session.get_providers()[0] if session.get_providers() else providers[0]
@@ -217,7 +304,8 @@ def build_session(args: argparse.Namespace) -> tuple[ort.InferenceSession, int, 
 def run_worker(args: argparse.Namespace) -> int:
     if not 0 < args.max_fps <= 30:
         raise ValueError("max-fps must be greater than 0 and at most 30")
-    if not 0 < args.conf_threshold <= 1:
+    confidence_threshold = confidence_threshold_from_env(args.conf_threshold)
+    if not 0 < confidence_threshold <= 1:
         raise ValueError("conf-threshold must be greater than 0 and at most 1")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -233,18 +321,32 @@ def run_worker(args: argparse.Namespace) -> int:
     cat_frames = 0
     reader = LatestFrameReader(args.source)
     reader.start()
-    last_processed = 0.0
+    last_processed_started = 0.0
     last_snapshot_write = 0.0
+    detection_state = ConsecutiveDetectionState()
+    tensor: Any | None = None
+    outputs: Any | None = None
     try:
         while not STOP_REQUESTED.is_set():
-            sequence, frame_epoch_ms, image = reader.wait_next(sequence)
-            now = time.monotonic()
-            wait_seconds = frame_interval - (now - last_processed)
+            wait_seconds = frame_interval - (
+                time.monotonic() - last_processed_started
+            )
             if wait_seconds > 0:
                 STOP_REQUESTED.wait(wait_seconds)
                 if STOP_REQUESTED.is_set():
                     break
-            tensor, letterbox = preprocess(image, input_height, input_width)
+            sequence, frame_epoch_ms, image = reader.wait_next(
+                sequence,
+                stop_event=STOP_REQUESTED,
+            )
+            now = time.monotonic()
+            last_processed_started = now
+            tensor, letterbox = preprocess(
+                image,
+                input_height,
+                input_width,
+                letterbox_pad_value(len(output_names)),
+            )
             inference_started = time.perf_counter()
             outputs = session.run(output_names, {input_info.name: tensor})
             inference_ms = int((time.perf_counter() - inference_started) * 1000)
@@ -253,7 +355,7 @@ def run_worker(args: argparse.Namespace) -> int:
                 labels,
                 letterbox,
                 image.shape[:2],
-                args.conf_threshold,
+                confidence_threshold,
                 args.iou_threshold,
                 args.max_detections,
             )
@@ -270,6 +372,7 @@ def run_worker(args: argparse.Namespace) -> int:
                 "target_label": args.target_label.strip().lower(),
                 "provider": provider,
                 "model_sha256": model_sha256,
+                "confidence_threshold": confidence_threshold,
                 "frame_epoch_ms": frame_epoch_ms,
                 "processed_epoch_ms": processed_epoch_ms,
                 "result_age_ms": max(0, processed_epoch_ms - frame_epoch_ms),
@@ -277,6 +380,9 @@ def run_worker(args: argparse.Namespace) -> int:
                 "detection_count": len(target_detections),
                 "detections": target_detections,
             }
+            result.update(
+                detection_state.observe(bool(target_detections), frame_epoch_ms)
+            )
             atomic_write_json(output_dir / "latest.json", result)
             if should_write_snapshot(target_detections, now, last_snapshot_write):
                 atomic_write_jpeg(
@@ -291,6 +397,7 @@ def run_worker(args: argparse.Namespace) -> int:
                 "source_kind": source_kind(args.source),
                 "target_label": args.target_label.strip().lower(),
                 "provider": provider,
+                "confidence_threshold": confidence_threshold,
                 "frames_processed": processed,
                 "cat_frames": cat_frames,
                 "average_inference_ms": int(sum(ordered) / len(ordered)),
@@ -299,12 +406,19 @@ def run_worker(args: argparse.Namespace) -> int:
                 "updated_at_epoch_ms": processed_epoch_ms,
             }
             atomic_write_json(output_dir / "metrics.json", metrics)
-            last_processed = time.monotonic()
+    except WorkerStopRequested:
+        return 0
     except (RuntimeError, TimeoutError) as error:
         if source_kind(args.source) == "file" and processed > 0:
             return 0
         raise error
     finally:
+        outputs = None
+        tensor = None
+        input_info = None
+        output_names = []
+        session = None
+        gc.collect()
         reader.close()
     return 0
 

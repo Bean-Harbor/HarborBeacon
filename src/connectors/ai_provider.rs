@@ -5,6 +5,8 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+const VISION_SUMMARY_MAX_TOKENS: u32 = 160;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderType {
     LocalSidecar,
@@ -66,6 +68,34 @@ pub struct EmbeddingRequest {
 pub struct VisionSummaryResponse {
     pub summary: String,
     pub raw_response: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatFrameVerificationResponse {
+    pub cat_present: bool,
+    pub behavior_tags: Vec<String>,
+    pub summary: String,
+    pub reason_code: String,
+    pub raw_response: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatSceneDescriptionResponse {
+    pub summary: String,
+    pub raw_response: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct CatFrameVerificationPayload {
+    #[serde(default)]
+    behavior_tags: Vec<String>,
+    summary: String,
+    reason_code: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CatSceneDescriptionPayload {
+    summary: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -232,9 +262,94 @@ impl OpenAiCompatibleVisionClient {
             "请根据检测结果和图片，用中文总结当前画面。优先说明是否有人、人数、位置和是否需要关注。".to_string()
         });
 
+        let (summary, raw_response) = self.complete_vision(
+            &system_prompt,
+            &format!("{user_prompt}\n\n检测结果:\n{}", request.detection_summary),
+            &request.image_data_url,
+            0.2,
+            Some(VISION_SUMMARY_MAX_TOKENS),
+            None,
+            request.disable_thinking,
+        )?;
+
+        Ok(VisionSummaryResponse {
+            summary,
+            raw_response,
+        })
+    }
+
+    pub fn verify_cat_frame(
+        &self,
+        image_data_url: &str,
+    ) -> Result<CatFrameVerificationResponse, String> {
+        let system_prompt = "You are a visual cat-presence classifier. Judge image pixels only and select exactly one reason_code. Use cat_visible when any domestic cat is visibly present, including a partial cat. Use no_cat_visible when no cat is visible. Use uncertain only when the image cannot be interpreted. Write summary in concise Chinese.";
+        let user_prompt = "请只看图像选择 reason_code：画面里看见任何完整或局部的猫就选 cat_visible。只有能明确判断的行为才加入 behavior_tags，否则使用 unknown。";
+        let (text, raw_response) = self.complete_vision(
+            system_prompt,
+            user_prompt,
+            image_data_url,
+            0.0,
+            Some(160),
+            Some(cat_frame_response_format()),
+            true,
+        )?;
+        let json_text = extract_json_object(&text)
+            .ok_or_else(|| "cat verification response did not contain a JSON object".to_string())?;
+        let mut payload = serde_json::from_str::<CatFrameVerificationPayload>(json_text)
+            .map_err(|error| format!("failed to parse cat verification JSON: {error}"))?;
+        normalize_cat_frame_payload(&mut payload);
+        validate_cat_frame_payload(&payload)?;
+        Ok(CatFrameVerificationResponse {
+            cat_present: payload.reason_code == "cat_visible",
+            behavior_tags: payload.behavior_tags,
+            summary: payload.summary,
+            reason_code: payload.reason_code,
+            raw_response,
+        })
+    }
+
+    pub fn describe_scene_for_cat_gate(
+        &self,
+        image_data_url: &str,
+    ) -> Result<CatSceneDescriptionResponse, String> {
+        let system_prompt = "Describe only the scene and objects clearly visible in the image pixels. Explicitly name visible animals, people, vehicles, furniture, plants, bags, and screens when present. Do not speculate about hidden objects. Write one concise Chinese sentence.";
+        let user_prompt = "请客观描述这张摄像头抽样帧里清晰可见的场景和物体。";
+        let (text, raw_response) = self.complete_vision(
+            system_prompt,
+            user_prompt,
+            image_data_url,
+            0.0,
+            Some(120),
+            Some(cat_scene_description_response_format()),
+            true,
+        )?;
+        let json_text = extract_json_object(&text).ok_or_else(|| {
+            "scene description response did not contain a JSON object".to_string()
+        })?;
+        let payload = serde_json::from_str::<CatSceneDescriptionPayload>(json_text)
+            .map_err(|error| format!("failed to parse scene description JSON: {error}"))?;
+        if payload.summary.trim().is_empty() {
+            return Err("scene description response omitted summary".to_string());
+        }
+        Ok(CatSceneDescriptionResponse {
+            summary: payload.summary.trim().to_string(),
+            raw_response,
+        })
+    }
+
+    fn complete_vision(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+        image_data_url: &str,
+        temperature: f32,
+        max_tokens: Option<u32>,
+        response_format: Option<Value>,
+        disable_thinking: bool,
+    ) -> Result<(String, Value), String> {
         let mut payload = json!({
             "model": self.config.model,
-            "temperature": 0.2,
+            "temperature": temperature,
             "messages": [
                 {
                     "role": "system",
@@ -245,19 +360,25 @@ impl OpenAiCompatibleVisionClient {
                     "content": [
                         {
                             "type": "text",
-                            "text": format!("{user_prompt}\n\n检测结果:\n{}", request.detection_summary)
+                            "text": user_prompt
                         },
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": request.image_data_url
+                                "url": image_data_url
                             }
                         }
                     ]
                 }
             ]
         });
-        if request.disable_thinking {
+        if let Some(max_tokens) = max_tokens {
+            payload["max_tokens"] = json!(max_tokens);
+        }
+        if let Some(response_format) = response_format {
+            payload["response_format"] = response_format;
+        }
+        if disable_thinking {
             payload["chat_template_kwargs"] = json!({"enable_thinking": false});
         }
         let response = self
@@ -266,8 +387,7 @@ impl OpenAiCompatibleVisionClient {
             .headers(self.headers()?)
             .json(&payload)
             .send()
-            .map_err(|e| format!("OpenAI-compatible request failed: {e}"))?;
-
+            .map_err(|error| format!("OpenAI-compatible request failed: {error}"))?;
         if !response.status().is_success() {
             let status = response.status();
             let body = response
@@ -275,23 +395,134 @@ impl OpenAiCompatibleVisionClient {
                 .unwrap_or_else(|_| "<body unavailable>".to_string());
             return Err(format!("OpenAI-compatible API error {status}: {body}"));
         }
-
-        let raw_response: serde_json::Value = response
-            .json()
-            .map_err(|e| format!("failed to parse OpenAI-compatible response: {e}"))?;
-        let summary = extract_message_text(&raw_response).ok_or_else(|| {
+        let raw_response = response
+            .json::<Value>()
+            .map_err(|error| format!("failed to parse OpenAI-compatible response: {error}"))?;
+        let text = extract_message_text(&raw_response).ok_or_else(|| {
             "OpenAI-compatible response did not contain assistant text".to_string()
         })?;
-
-        Ok(VisionSummaryResponse {
-            summary,
-            raw_response,
-        })
+        Ok((text, raw_response))
     }
 
     fn headers(&self) -> Result<HeaderMap, String> {
         openai_compatible_headers(&self.config.api_key)
     }
+}
+
+fn cat_frame_response_format() -> Value {
+    json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "cat_frame_verification",
+            "strict": true,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "behavior_tags": {
+                        "type": "array",
+                        "minItems": 0,
+                        "maxItems": 4,
+                        "uniqueItems": true,
+                        "items": {
+                            "type": "string",
+                            "enum": [
+                                "walking", "running", "jumping", "eating", "drinking",
+                                "playing", "resting", "grooming", "unknown"
+                            ]
+                        }
+                    },
+                    "summary": {"type": "string", "minLength": 1, "maxLength": 120},
+                    "reason_code": {
+                        "type": "string",
+                        "enum": ["cat_visible", "no_cat_visible", "uncertain", "invalid_frame"]
+                    }
+                },
+                "required": [
+                    "behavior_tags", "summary", "reason_code"
+                ],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+fn cat_scene_description_response_format() -> Value {
+    json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "scene_description",
+            "strict": true,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string", "minLength": 1, "maxLength": 180}
+                },
+                "required": ["summary"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+fn normalize_cat_frame_payload(payload: &mut CatFrameVerificationPayload) {
+    let mut unique_tags = Vec::with_capacity(payload.behavior_tags.len());
+    for tag in payload.behavior_tags.drain(..) {
+        if !unique_tags.contains(&tag) {
+            unique_tags.push(tag);
+        }
+    }
+    payload.behavior_tags = unique_tags;
+}
+
+fn validate_cat_frame_payload(payload: &CatFrameVerificationPayload) -> Result<(), String> {
+    if payload.summary.trim().is_empty() || payload.reason_code.trim().is_empty() {
+        return Err("cat verification response omitted summary or reason_code".to_string());
+    }
+    let valid_reason_code = matches!(
+        payload.reason_code.as_str(),
+        "cat_visible" | "no_cat_visible" | "uncertain" | "invalid_frame"
+    );
+    if !valid_reason_code {
+        return Err("cat verification response contained an invalid reason_code".to_string());
+    }
+    if payload.reason_code != "cat_visible" && !payload.behavior_tags.is_empty() {
+        return Err("cat verification response attached behavior to a negative result".to_string());
+    }
+    if payload.behavior_tags.len() > 4
+        || payload.behavior_tags.iter().any(|tag| {
+            !matches!(
+                tag.as_str(),
+                "walking"
+                    | "running"
+                    | "jumping"
+                    | "eating"
+                    | "drinking"
+                    | "playing"
+                    | "resting"
+                    | "grooming"
+                    | "unknown"
+            )
+        })
+    {
+        return Err("cat verification response contained invalid behavior tags".to_string());
+    }
+    let mut unique_tags = payload.behavior_tags.clone();
+    unique_tags.sort_unstable();
+    unique_tags.dedup();
+    if unique_tags.len() != payload.behavior_tags.len() {
+        return Err("cat verification response contained duplicate behavior tags".to_string());
+    }
+    Ok(())
+}
+
+fn extract_json_object(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        return Some(trimmed);
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    (start < end).then_some(&trimmed[start..=end])
 }
 
 impl OpenAiCompatibleTextClient {
@@ -579,7 +810,12 @@ fn extract_rerank_scores(value: &Value) -> Vec<RerankScore> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_embedding_vector, extract_message_text, extract_rerank_scores};
+    use super::{
+        cat_frame_response_format, cat_scene_description_response_format, extract_embedding_vector,
+        extract_json_object, extract_message_text, extract_rerank_scores,
+        normalize_cat_frame_payload, validate_cat_frame_payload, CatFrameVerificationPayload,
+        VISION_SUMMARY_MAX_TOKENS,
+    };
     use serde_json::json;
 
     #[test]
@@ -615,6 +851,11 @@ mod tests {
             extract_message_text(&response).as_deref(),
             Some("画面中有 2 人\n其中一人位于左侧")
         );
+    }
+
+    #[test]
+    fn vision_summary_generation_is_bounded() {
+        assert_eq!(VISION_SUMMARY_MAX_TOKENS, 160);
     }
 
     #[test]
@@ -670,5 +911,87 @@ mod tests {
         let scores = extract_rerank_scores(&response);
         assert_eq!(scores[0].index, 1);
         assert!((scores[0].score - 0.91).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn cat_verification_json_is_extracted_and_parsed_strictly() {
+        let text = "```json\n{\"behavior_tags\":[\"walking\"],\"summary\":\"猫在房间内走动\",\"reason_code\":\"cat_visible\"}\n```";
+        let payload = serde_json::from_str::<CatFrameVerificationPayload>(
+            extract_json_object(text).expect("json object"),
+        )
+        .expect("valid verification payload");
+
+        assert_eq!(payload.reason_code, "cat_visible");
+    }
+
+    #[test]
+    fn cat_verification_schema_bounds_model_generated_arrays() {
+        let response_format = cat_frame_response_format();
+        let schema = &response_format["json_schema"]["schema"];
+
+        assert_eq!(response_format["type"], json!("json_schema"));
+        assert_eq!(schema["additionalProperties"], json!(false));
+        assert_eq!(schema["properties"]["behavior_tags"]["maxItems"], json!(4));
+        assert_eq!(
+            cat_scene_description_response_format()["json_schema"]["schema"]["required"],
+            json!(["summary"])
+        );
+    }
+
+    #[test]
+    fn cat_verification_payload_rejects_invalid_reason_code() {
+        let valid = CatFrameVerificationPayload {
+            behavior_tags: Vec::new(),
+            summary: "未看到猫".to_string(),
+            reason_code: "no_cat_visible".to_string(),
+        };
+        validate_cat_frame_payload(&valid).expect("consistent negative result");
+
+        let invalid = CatFrameVerificationPayload {
+            reason_code: "unsupported".to_string(),
+            ..valid
+        };
+        assert!(validate_cat_frame_payload(&invalid)
+            .expect_err("invalid reason code")
+            .contains("invalid reason_code"));
+    }
+
+    #[test]
+    fn cat_verification_payload_rejects_negative_behavior_and_reason_mismatch() {
+        let negative_with_behavior = CatFrameVerificationPayload {
+            behavior_tags: vec!["walking".to_string()],
+            summary: "未看到猫".to_string(),
+            reason_code: "no_cat_visible".to_string(),
+        };
+        assert!(validate_cat_frame_payload(&negative_with_behavior)
+            .expect_err("negative result must not contain behavior")
+            .contains("behavior"));
+
+        let invalid_behavior = CatFrameVerificationPayload {
+            behavior_tags: vec!["sleeping".to_string()],
+            summary: "看到猫".to_string(),
+            reason_code: "cat_visible".to_string(),
+        };
+        assert!(validate_cat_frame_payload(&invalid_behavior)
+            .expect_err("behavior tag must be supported")
+            .contains("behavior tags"));
+    }
+
+    #[test]
+    fn cat_verification_payload_normalizes_duplicate_model_output() {
+        let mut payload = CatFrameVerificationPayload {
+            behavior_tags: vec![
+                "eating".to_string(),
+                "eating".to_string(),
+                "unknown".to_string(),
+            ],
+            summary: "看到猫".to_string(),
+            reason_code: "cat_visible".to_string(),
+        };
+
+        normalize_cat_frame_payload(&mut payload);
+
+        assert_eq!(payload.behavior_tags, vec!["eating", "unknown"]);
+        validate_cat_frame_payload(&payload).expect("normalized payload is valid");
     }
 }

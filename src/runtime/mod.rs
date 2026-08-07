@@ -2,8 +2,11 @@
 
 pub mod access_control;
 pub mod admin_console;
+pub mod ai_resource_scheduler;
 pub mod asr;
 pub mod automation;
+pub mod cat_recording_classifier;
+pub mod cat_recording_validation;
 pub mod discovery;
 pub mod document_parser;
 pub mod dvr;

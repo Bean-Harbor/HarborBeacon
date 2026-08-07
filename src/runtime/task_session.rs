@@ -104,6 +104,20 @@ pub struct RecentFamilyMemoryEventState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RecentCatActivityQueryState {
+    #[serde(default)]
+    pub camera_hint: Option<String>,
+    #[serde(default)]
+    pub time_scope: String,
+    #[serde(default)]
+    pub delivered_artifact_ids: Vec<String>,
+    #[serde(default)]
+    pub last_batch_artifact_ids: Vec<String>,
+    #[serde(default)]
+    pub updated_at_epoch_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct PendingTaskGeneralMessageLoop {
     #[serde(default)]
     pub resume_token: String,
@@ -193,6 +207,8 @@ pub struct TaskConversationState {
     pub recent_clip_playback: Option<RecentClipPlaybackState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recent_family_memory_event: Option<RecentFamilyMemoryEventState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_cat_activity_query: Option<RecentCatActivityQueryState>,
     #[serde(default)]
     pub last_scan_cidr: String,
 }
@@ -280,6 +296,17 @@ impl TaskConversationState {
         recent_event: Option<RecentFamilyMemoryEventState>,
     ) {
         self.recent_family_memory_event = recent_event;
+    }
+
+    pub fn recent_cat_activity_query(&self) -> Option<RecentCatActivityQueryState> {
+        self.recent_cat_activity_query.clone()
+    }
+
+    pub fn set_recent_cat_activity_query(
+        &mut self,
+        recent_query: Option<RecentCatActivityQueryState>,
+    ) {
+        self.recent_cat_activity_query = recent_query;
     }
 }
 
@@ -1229,9 +1256,30 @@ mod tests {
 
     use super::{
         PendingTaskCandidate, PendingTaskClipConfirmation, PendingTaskConnect,
-        PendingTaskGeneralMessageLoop, RecentClipPlaybackState, TaskConversationState,
-        TaskConversationStore, TaskSessionStateEnvelope,
+        PendingTaskGeneralMessageLoop, RecentCatActivityQueryState, RecentClipPlaybackState,
+        TaskConversationState, TaskConversationStore, TaskSessionStateEnvelope,
     };
+
+    #[test]
+    fn recent_cat_activity_query_state_round_trips_with_conversation() {
+        let state = TaskConversationState {
+            key: "weixin:cat-query".to_string(),
+            recent_cat_activity_query: Some(RecentCatActivityQueryState {
+                camera_hint: Some("camera-252".to_string()),
+                time_scope: "afternoon".to_string(),
+                delivered_artifact_ids: vec!["artifact-1".to_string()],
+                last_batch_artifact_ids: vec!["artifact-1".to_string()],
+                updated_at_epoch_ms: 123_456,
+            }),
+            ..Default::default()
+        };
+
+        let encoded = serde_json::to_value(&state).expect("serialize conversation state");
+        let decoded = serde_json::from_value::<TaskConversationState>(encoded)
+            .expect("deserialize conversation state");
+
+        assert_eq!(decoded, state);
+    }
     use crate::control_plane::approvals::{ApprovalStatus, ApprovalTicket};
     use crate::control_plane::events::{EventRecord, EventSeverity, EventSourceKind};
     use crate::control_plane::media::{
