@@ -680,6 +680,23 @@ impl HarborLinkMediaClient {
         decode_json_response(response, "event recording")
     }
 
+    pub fn event_recording_lease_status(
+        &self,
+        camera_id: &str,
+        lease_id: &str,
+    ) -> Result<HarborLinkEventRecordingLease, String> {
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                self.event_recording_endpoint(camera_id, lease_id),
+                false,
+            )
+            .timeout(Duration::from_secs(4))
+            .send_harborlink()
+            .map_err(unavailable_error)?;
+        decode_json_response(response, "event recording")
+    }
+
     pub fn renew_event_recording(
         &self,
         camera_id: &str,

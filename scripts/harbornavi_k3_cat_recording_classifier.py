@@ -20,6 +20,7 @@ from typing import Any, Callable
 
 MODEL_NAME = "mobilenetv2-cat-binary-v2-int8"
 MAX_FRAMES = 9
+MINIMUM_POSITIVE_FRAMES = 3
 MAX_FRAME_BYTES = 32 * 1024 * 1024
 STOP_REQUESTED = threading.Event()
 
@@ -129,7 +130,7 @@ def parse_frame_specs(specs: list[str], max_frames: int = MAX_FRAMES) -> list[tu
 def aggregate_predictions(
     predictions: list[dict[str, Any]],
     threshold: float,
-    minimum_positive_frames: int,
+    minimum_positive_frames: int = MINIMUM_POSITIVE_FRAMES,
 ) -> dict[str, Any]:
     if not 0.0 <= threshold <= 1.0 or minimum_positive_frames < 1:
         raise ValueError("invalid classifier aggregation policy")
@@ -256,6 +257,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "inference_ms": inference_ms,
                 }
             )
+        aggregate_predictions(
+            predictions,
+            threshold=args.threshold,
+            minimum_positive_frames=MINIMUM_POSITIVE_FRAMES,
+        )
         return {
             "schema_version": "1.0",
             "status": "ok",

@@ -76,6 +76,8 @@ pub struct NotificationRecipient {
 pub struct NotificationAttachment {
     pub kind: NotificationAttachmentKind,
     pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
     #[serde(default)]
     pub mime_type: String,
     #[serde(default)]
@@ -116,6 +118,8 @@ pub struct NotificationContent {
     pub structured_payload: Value,
     #[serde(default)]
     pub attachments: Vec<NotificationAttachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delivery_hints: Vec<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -460,11 +464,13 @@ mod tests {
                 attachments: vec![NotificationAttachment {
                     kind: NotificationAttachmentKind::Image,
                     label: "snapshot".to_string(),
+                    artifact_id: None,
                     mime_type: "image/jpeg".to_string(),
                     path: Some(".harborbeacon/vision/snapshot.jpg".to_string()),
                     url: None,
                     metadata: Value::Null,
                 }],
+                delivery_hints: Vec::new(),
             },
             delivery: NotificationDelivery {
                 mode: NotificationDeliveryMode::Send,
@@ -476,6 +482,26 @@ mod tests {
                 correlation_id: "trace_01JABC".to_string(),
             },
         }
+    }
+
+    #[test]
+    fn legacy_notification_content_and_attachment_default_stable_artifact_fields() {
+        let attachment = serde_json::from_value::<NotificationAttachment>(json!({
+            "kind": "video",
+            "label": "legacy video",
+            "mime_type": "video/mp4",
+            "url": "/legacy.mp4"
+        }))
+        .expect("legacy notification attachment");
+        let content = serde_json::from_value::<NotificationContent>(json!({
+            "title": "legacy",
+            "body": "legacy body",
+            "attachments": []
+        }))
+        .expect("legacy notification content");
+
+        assert!(attachment.artifact_id.is_none());
+        assert!(content.delivery_hints.is_empty());
     }
 
     #[test]

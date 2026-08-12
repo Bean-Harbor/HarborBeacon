@@ -109,8 +109,8 @@ pub struct RecentCatActivityQueryState {
     pub camera_hint: Option<String>,
     #[serde(default)]
     pub time_scope: String,
-    #[serde(default)]
-    pub delivered_artifact_ids: Vec<String>,
+    #[serde(default, alias = "delivered_artifact_ids")]
+    pub issued_artifact_ids: Vec<String>,
     #[serde(default)]
     pub last_batch_artifact_ids: Vec<String>,
     #[serde(default)]
@@ -1267,7 +1267,7 @@ mod tests {
             recent_cat_activity_query: Some(RecentCatActivityQueryState {
                 camera_hint: Some("camera-252".to_string()),
                 time_scope: "afternoon".to_string(),
-                delivered_artifact_ids: vec!["artifact-1".to_string()],
+                issued_artifact_ids: vec!["artifact-1".to_string()],
                 last_batch_artifact_ids: vec!["artifact-1".to_string()],
                 updated_at_epoch_ms: 123_456,
             }),
@@ -1279,6 +1279,23 @@ mod tests {
             .expect("deserialize conversation state");
 
         assert_eq!(decoded, state);
+    }
+
+    #[test]
+    fn recent_cat_activity_query_state_reads_legacy_delivered_cursor_but_writes_issued_cursor() {
+        let decoded = serde_json::from_value::<RecentCatActivityQueryState>(json!({
+            "camera_hint": "camera-252",
+            "time_scope": "today",
+            "delivered_artifact_ids": ["artifact-legacy"],
+            "last_batch_artifact_ids": ["artifact-legacy"],
+            "updated_at_epoch_ms": 123456
+        }))
+        .expect("deserialize legacy cat query state");
+
+        assert_eq!(decoded.issued_artifact_ids, vec!["artifact-legacy"]);
+        let encoded = serde_json::to_value(decoded).expect("serialize current cat query state");
+        assert_eq!(encoded["issued_artifact_ids"], json!(["artifact-legacy"]));
+        assert!(encoded.get("delivered_artifact_ids").is_none());
     }
     use crate::control_plane::approvals::{ApprovalStatus, ApprovalTicket};
     use crate::control_plane::events::{EventRecord, EventSeverity, EventSourceKind};

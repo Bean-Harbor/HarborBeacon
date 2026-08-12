@@ -81,7 +81,7 @@ use crate::control_plane::tasks::{
     TaskStepRun, TaskStepRunStatus,
 };
 use crate::domains::knowledge::{DOMAIN as KNOWLEDGE_DOMAIN, OP_SEARCH as KNOWLEDGE_OP_SEARCH};
-use crate::domains::vision::OP_ANALYZE_CAMERA;
+use crate::domains::vision::{stable_vision_image_artifact_id, OP_ANALYZE_CAMERA};
 use crate::orchestrator::approval::{ApprovalManager, AutonomyConfig, AutonomyLevel};
 use crate::orchestrator::contracts::{Action, ExecutionResult, RiskLevel, StepStatus};
 use crate::orchestrator::executors::harbor_ops::{register_harbor_executors, HarborExecutorConfig};
@@ -102,7 +102,7 @@ use crate::runtime::admin_console::{
 };
 use crate::runtime::cat_recording_validation::{
     validation_mode_from_env, CatRecordingValidationMode, CatRecordingValidationRecord,
-    CatRecordingValidationStore,
+    CatRecordingValidationStatus, CatRecordingValidationStore,
 };
 use crate::runtime::hub::{
     looks_like_auth_error, CameraConnectRequest, CameraHubService, HubScanRequest,
@@ -563,6 +563,8 @@ pub enum TaskStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct TaskArtifact {
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
     #[serde(default)]
     pub label: String,
     #[serde(default)]
@@ -3251,6 +3253,8 @@ impl TaskApiService {
                     );
                 }
             };
+        let has_pending_validation =
+            cat_activity_has_pending_validation(&recordings, &validation_records);
         recordings = filter_publishable_cat_recordings(
             recordings,
             CatRecordingValidationMode::Enforce,
@@ -3270,50 +3274,22 @@ impl TaskApiService {
             .iter()
             .enumerate()
             .map(|(index, artifact)| {
-                let validation = validation_records.get(&artifact.artifact_id);
-                TaskArtifact {
-                    kind: "video".to_string(),
-                    label: format!(
+                build_cat_activity_task_artifact(
+                    artifact,
+                    validation_records.get(&artifact.artifact_id),
+                    validation_mode,
+                    format!(
                         "{}猫活动视频 {}",
                         cat_activity_time_scope_label(query.time_scope),
                         index + 1
                     ),
-                    mime_type: artifact.mime_type.clone(),
-                    media_asset_id: None,
-                    path: None,
-                    url: Some(harborlink_artifact_proxy_url(&artifact.artifact_id)),
-                    metadata: json!({
-                        "artifact_role": "cat_activity_video",
-                        "harborlink_artifact_id": artifact.artifact_id,
-                        "event_id": artifact.event_id,
-                        "camera_id": artifact.camera_id,
-                        "started_at_epoch_ms": artifact.started_at_epoch_ms,
-                        "ended_at_epoch_ms": artifact.ended_at_epoch_ms,
-                        "duration_seconds": artifact.duration_seconds,
-                        "labels": artifact.labels,
-                        "validation_mode": validation_mode.as_str(),
-                        "validation_status": validation.map(|record| record.validation_status),
-                        "validation_id": validation.map(|record| record.validation_id.as_str()),
-                        "validation_summary": validation
-                            .and_then(|record| record.decision.as_ref())
-                            .map(|decision| decision.summary.as_str()),
-                        "behavior_tags": validation
-                            .and_then(|record| record.decision.as_ref())
-                            .map(|decision| decision.behavior_tags.as_slice()),
-                        "preferred_transport": "native_video",
-                        "fallback_delivery": "file",
-                    }),
-                }
+                )
             })
             .collect::<Vec<_>>();
+        let delivery_hints = cat_activity_delivery_hints(&artifacts);
         let scope_label = cat_activity_time_scope_label(query.time_scope);
-        let message = if artifacts.is_empty() && query.selection == CatActivitySelection::Remaining
-        {
-            format!("{scope_label}没有更多已通过复核的猫活动视频了。")
-        } else if artifacts.is_empty() && query.selection == CatActivitySelection::ResendLast {
-            "当前会话里没有可重发的上一批猫活动视频。".to_string()
-        } else if artifacts.is_empty() {
-            format!("{scope_label}还没有通过复核的猫活动视频。")
+        let message = if artifacts.is_empty() {
+            cat_activity_query_empty_message(scope_label, query.selection, has_pending_validation)
         } else {
             format!(
                 "{scope_label}找到 {} 段已通过复核的猫活动视频，正在发送。",
@@ -3324,19 +3300,19 @@ impl TaskApiService {
             previous.time_scope == query.time_scope.as_str()
                 && previous.camera_hint.as_deref() == camera_hint
         });
-        let mut delivered_artifact_ids = same_context_previous
-            .map(|previous| previous.delivered_artifact_ids.clone())
+        let mut issued_artifact_ids = same_context_previous
+            .map(|previous| previous.issued_artifact_ids.clone())
             .unwrap_or_default();
-        delivered_artifact_ids.extend(
+        issued_artifact_ids.extend(
             recordings
                 .iter()
                 .map(|recording| recording.artifact_id.clone()),
         );
-        delivered_artifact_ids.sort();
-        delivered_artifact_ids.dedup();
-        if delivered_artifact_ids.len() > CAT_ACTIVITY_CURSOR_MAX_ARTIFACTS {
-            delivered_artifact_ids
-                .drain(..delivered_artifact_ids.len() - CAT_ACTIVITY_CURSOR_MAX_ARTIFACTS);
+        issued_artifact_ids.sort();
+        issued_artifact_ids.dedup();
+        if issued_artifact_ids.len() > CAT_ACTIVITY_CURSOR_MAX_ARTIFACTS {
+            issued_artifact_ids
+                .drain(..issued_artifact_ids.len() - CAT_ACTIVITY_CURSOR_MAX_ARTIFACTS);
         }
         let last_batch_artifact_ids = if recordings.is_empty() {
             same_context_previous
@@ -3352,7 +3328,7 @@ impl TaskApiService {
         conversation.set_recent_cat_activity_query(Some(RecentCatActivityQueryState {
             camera_hint: camera_hint.map(str::to_string),
             time_scope: query.time_scope.as_str().to_string(),
-            delivered_artifact_ids,
+            issued_artifact_ids,
             last_batch_artifact_ids,
             updated_at_epoch_ms: now_epoch_ms,
         }));
@@ -3382,6 +3358,7 @@ impl TaskApiService {
                     && query.selection != CatActivitySelection::ResendLast,
                 "camera_count": targets.len(),
                 "validation_mode": validation_mode.as_str(),
+                "delivery_hints": delivery_hints,
             }),
             artifacts,
             Vec::new(),
@@ -5256,6 +5233,11 @@ impl TaskApiService {
                     .iter()
                     .filter_map(task_artifact_to_notification_attachment)
                     .collect(),
+                delivery_hints: payload
+                    .pointer("/delivery_hints")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
             },
             delivery: NotificationDelivery {
                 mode: delivery_mode,
@@ -6042,8 +6024,10 @@ fn build_vision_artifacts(payload: &Value) -> Vec<TaskArtifact> {
     let annotated_media_asset_id =
         string_at_paths(payload, &["/snapshot/annotated_media_asset_id"]);
     if let Some(path) = string_at_paths(payload, &["/snapshot/image_path"]) {
+        let artifact_id = stable_vision_image_artifact_id("analysis_snapshot", &path);
         artifacts.push(TaskArtifact {
             kind: "image".to_string(),
+            artifact_id: Some(artifact_id),
             label: "抓拍图片".to_string(),
             mime_type: snapshot_mime_type.clone(),
             media_asset_id: snapshot_media_asset_id.clone(),
@@ -6056,8 +6040,10 @@ fn build_vision_artifacts(payload: &Value) -> Vec<TaskArtifact> {
         });
     }
     if let Some(path) = string_at_paths(payload, &["/snapshot/annotated_image_path"]) {
+        let artifact_id = stable_vision_image_artifact_id("analysis_annotation", &path);
         artifacts.push(TaskArtifact {
             kind: "image".to_string(),
+            artifact_id: Some(artifact_id),
             label: "标注图片".to_string(),
             mime_type: snapshot_mime_type,
             media_asset_id: annotated_media_asset_id.clone(),
@@ -6099,6 +6085,7 @@ fn build_harborlink_snapshot_artifact(
 ) -> TaskArtifact {
     TaskArtifact {
         kind: "image".to_string(),
+        artifact_id: Some(snapshot.artifact_id.clone()),
         label: "抓拍图片".to_string(),
         mime_type: snapshot.mime_type.clone(),
         media_asset_id: Some(media_asset.asset_id.clone()),
@@ -6285,16 +6272,16 @@ fn select_cat_activity_recordings(
 
     match query.selection {
         CatActivitySelection::Remaining => {
-            let delivered = previous
+            let issued = previous
                 .map(|previous| {
                     previous
-                        .delivered_artifact_ids
+                        .issued_artifact_ids
                         .iter()
                         .cloned()
                         .collect::<HashSet<_>>()
                 })
                 .unwrap_or_default();
-            recordings.retain(|artifact| !delivered.contains(&artifact.artifact_id));
+            recordings.retain(|artifact| !issued.contains(&artifact.artifact_id));
         }
         CatActivitySelection::ResendLast => {
             let order = previous
@@ -6326,6 +6313,58 @@ fn select_cat_activity_recordings(
     recordings
 }
 
+fn build_cat_activity_task_artifact(
+    artifact: &HarborLinkRecordingArtifact,
+    validation: Option<&CatRecordingValidationRecord>,
+    validation_mode: CatRecordingValidationMode,
+    label: String,
+) -> TaskArtifact {
+    TaskArtifact {
+        kind: "video".to_string(),
+        artifact_id: Some(artifact.artifact_id.clone()),
+        label,
+        mime_type: artifact.mime_type.clone(),
+        media_asset_id: None,
+        path: None,
+        url: Some(harborlink_artifact_proxy_url(&artifact.artifact_id)),
+        metadata: json!({
+            "artifact_role": "cat_activity_video",
+            "harborlink_artifact_id": artifact.artifact_id,
+            "event_id": artifact.event_id,
+            "camera_id": artifact.camera_id,
+            "started_at_epoch_ms": artifact.started_at_epoch_ms,
+            "ended_at_epoch_ms": artifact.ended_at_epoch_ms,
+            "duration_seconds": artifact.duration_seconds,
+            "labels": artifact.labels,
+            "validation_mode": validation_mode.as_str(),
+            "validation_status": validation.map(|record| record.validation_status),
+            "validation_id": validation.map(|record| record.validation_id.as_str()),
+            "validation_summary": validation
+                .and_then(|record| record.decision.as_ref())
+                .map(|decision| decision.summary.as_str()),
+            "behavior_tags": validation
+                .and_then(|record| record.decision.as_ref())
+                .map(|decision| decision.behavior_tags.as_slice()),
+            "preferred_transport": "native_video",
+            "fallback_delivery": "file",
+        }),
+    }
+}
+
+fn cat_activity_delivery_hints(artifacts: &[TaskArtifact]) -> Vec<Value> {
+    artifacts
+        .iter()
+        .filter_map(|artifact| artifact.artifact_id.as_deref())
+        .map(|artifact_id| {
+            json!({
+                "kind": "native_video",
+                "artifact_id": artifact_id,
+                "fallback": "file",
+            })
+        })
+        .collect()
+}
+
 fn cat_activity_time_scope_label(time_scope: CatActivityTimeScope) -> &'static str {
     match time_scope {
         CatActivityTimeScope::Morning => "今天上午",
@@ -6333,6 +6372,39 @@ fn cat_activity_time_scope_label(time_scope: CatActivityTimeScope) -> &'static s
         CatActivityTimeScope::Evening => "今天晚上",
         CatActivityTimeScope::Recent => "最近两小时",
         CatActivityTimeScope::Inherit | CatActivityTimeScope::Today => "今天",
+    }
+}
+
+fn cat_activity_has_pending_validation(
+    recordings: &[HarborLinkRecordingArtifact],
+    validation_records: &HashMap<String, CatRecordingValidationRecord>,
+) -> bool {
+    recordings.iter().any(|artifact| {
+        validation_records
+            .get(&artifact.artifact_id)
+            .is_some_and(|record| {
+                matches!(
+                    record.validation_status,
+                    CatRecordingValidationStatus::PendingValidation
+                        | CatRecordingValidationStatus::Processing
+                )
+            })
+    })
+}
+
+fn cat_activity_query_empty_message(
+    scope_label: &str,
+    selection: CatActivitySelection,
+    has_pending_validation: bool,
+) -> String {
+    if selection == CatActivitySelection::Remaining {
+        format!("{scope_label}没有更多已通过复核的猫活动视频了。")
+    } else if selection == CatActivitySelection::ResendLast {
+        "当前会话里没有可重发的上一批猫活动视频。".to_string()
+    } else if has_pending_validation {
+        format!("{scope_label}检测到猫活动录像，正在复核，完成后即可查询，请稍后再试。")
+    } else {
+        format!("{scope_label}还没有通过复核的猫活动视频。")
     }
 }
 
@@ -6429,6 +6501,7 @@ fn build_clip_confirmation_cover_artifact(
     let cover = keyframes.first()?;
     Some(TaskArtifact {
         kind: "image".to_string(),
+        artifact_id: Some(cover.artifact_id.clone()),
         label: "视频首帧".to_string(),
         mime_type: "image/jpeg".to_string(),
         media_asset_id: None,
@@ -6497,6 +6570,7 @@ fn build_clip_delivery_artifact(recent_clip: &RecentClipPlaybackState) -> TaskAr
     let (path, url) = delivery_path_and_url(&recent_clip.clip_path);
     TaskArtifact {
         kind: "video".to_string(),
+        artifact_id: Some(recent_clip.clip_media_asset_id.clone()),
         label: format!("{} 完整回放", recent_clip.display_name),
         mime_type: recent_clip.clip_mime_type.clone(),
         media_asset_id: Some(recent_clip.clip_media_asset_id.clone()),
@@ -6982,6 +7056,7 @@ fn build_share_link_payload(
 fn build_share_link_artifact(share_link: &Value) -> TaskArtifact {
     TaskArtifact {
         kind: "link".to_string(),
+        artifact_id: None,
         label: "共享观看链接".to_string(),
         mime_type: "text/uri-list".to_string(),
         media_asset_id: None,
@@ -7030,6 +7105,7 @@ fn build_knowledge_search_artifacts(response: &KnowledgeSearchResponse) -> Vec<T
                 } else {
                     "text".to_string()
                 },
+                artifact_id: None,
                 label: hit.title.clone(),
                 mime_type: mime_type_from_path(&path).unwrap_or_else(|| {
                     if is_video_proxy {
@@ -11461,6 +11537,7 @@ fn artifact_kind_from_name(kind: &str) -> ArtifactKind {
 fn task_artifact_from_record(record: ArtifactRecord) -> TaskArtifact {
     TaskArtifact {
         kind: task_artifact_kind_name(record.artifact_kind).to_string(),
+        artifact_id: Some(record.artifact_id.clone()),
         label: record.label,
         mime_type: record.mime_type,
         media_asset_id: record.media_asset_id,
@@ -13798,6 +13875,7 @@ fn task_artifact_to_notification_attachment(
     Some(NotificationAttachment {
         kind,
         label: artifact.label.clone(),
+        artifact_id: artifact.artifact_id.clone(),
         mime_type: artifact.mime_type.clone(),
         path: artifact.path.clone(),
         url: artifact.url.clone(),
@@ -13980,12 +14058,16 @@ fn notification_request_identity(request: &NotificationRequest) -> Value {
                 json!({
                     "kind": serde_json::to_value(attachment.kind).unwrap_or(Value::Null),
                     "label": attachment.label.trim(),
+                    "artifact_id": attachment.artifact_id.clone().unwrap_or_default(),
                     "mime_type": attachment.mime_type.trim(),
                     "path": attachment.path.clone().unwrap_or_default(),
                     "url": attachment.url.clone().unwrap_or_default(),
                     "metadata": normalized_contract_value(&attachment.metadata),
                 })
             }).collect::<Vec<_>>(),
+            "delivery_hints": request.content.delivery_hints.iter()
+                .map(normalized_contract_value)
+                .collect::<Vec<_>>(),
         },
         "delivery": {
             "mode": serde_json::to_value(request.delivery.mode).unwrap_or(Value::Null),
@@ -14155,16 +14237,18 @@ mod tests {
     use tiny_http::{Header, Method, Response, Server};
 
     use super::{
-        artifact_kind_from_name, build_artifact_records, build_general_message_readiness_summary,
-        build_knowledge_search_artifacts, build_redacted_vision_event_summary, conversation_key,
+        artifact_kind_from_name, build_artifact_records, build_cat_activity_task_artifact,
+        build_general_message_readiness_summary, build_knowledge_search_artifacts,
+        build_redacted_vision_event_summary, cat_activity_delivery_hints,
+        cat_activity_has_pending_validation, cat_activity_query_empty_message, conversation_key,
         delivery_hints_from_task_response, effective_autonomy_level,
         effective_autonomy_level_for_task_run, effective_requires_approval,
         fallback_general_message_plan, filter_publishable_cat_recordings,
         format_pending_candidates, general_message_requests_capability_summary,
         infer_home_assistant_natural_action, infer_query_from_raw_text, knowledge_modalities,
-        normalize_command_text, notification_delivery_outcome, parse_general_message_plan,
-        parse_rag_query_understanding, pending_candidates_from_results, protocol_string,
-        rag_knowledge_result_limit, requested_result_limit_from_query,
+        normalize_command_text, notification_delivery_outcome, notification_request_hash,
+        parse_general_message_plan, parse_rag_query_understanding, pending_candidates_from_results,
+        protocol_string, rag_knowledge_result_limit, requested_result_limit_from_query,
         resolve_cat_activity_query_options, resolve_home_assistant_action_entity,
         resolve_notification_recipient, room_aliases, select_cat_activity_recordings,
         should_route_general_message_to_knowledge, CatActivityQueryOptions, CatActivitySelection,
@@ -14193,6 +14277,7 @@ mod tests {
     use crate::control_plane::tasks::{
         ArtifactKind, ConversationSession, ExecutionRoute, TaskRunStatus, TaskStepRunStatus,
     };
+    use crate::domains::vision::VisionAnalyzeCameraPayload;
     use crate::orchestrator::contracts::RiskLevel;
     use crate::runtime::admin_console::{
         AdminConsoleState, AdminConsoleStore, IdentityBindingRecord, KnowledgeSettings,
@@ -14267,14 +14352,21 @@ mod tests {
             attempt_count: 1,
             detection_evidence: Vec::new(),
             next_retry_at_epoch_ms: None,
+            claim_owner: None,
+            claim_token: None,
+            claim_lease_deadline_epoch_ms: None,
             created_at_epoch_ms: 1_000,
             updated_at_epoch_ms: 2_000,
             decision: None,
             last_error: None,
             artifact_disposition: Default::default(),
             discard_attempt_count: 0,
+            discard_attempt_generation: 0,
+            discard_attempt_token: None,
+            discard_attempt_lease_deadline_epoch_ms: None,
             discarded_at_epoch_ms: None,
             discard_error: None,
+            discard_tombstone: None,
         }
     }
 
@@ -14334,6 +14426,87 @@ mod tests {
     }
 
     #[test]
+    fn cat_activity_pending_validation_only_includes_active_review_states() {
+        let artifacts = vec![
+            cat_recording_artifact("pending", 1_000),
+            cat_recording_artifact("processing", 2_000),
+            cat_recording_artifact("rejected", 3_000),
+            cat_recording_artifact("review-required", 4_000),
+            cat_recording_artifact("failed", 5_000),
+        ];
+        let mut records = HashMap::from([
+            (
+                "pending".to_string(),
+                cat_validation_record(
+                    "pending",
+                    CatRecordingValidationStatus::PendingValidation,
+                    CatRecordingPublicationStatus::Unpublished,
+                ),
+            ),
+            (
+                "processing".to_string(),
+                cat_validation_record(
+                    "processing",
+                    CatRecordingValidationStatus::Processing,
+                    CatRecordingPublicationStatus::Unpublished,
+                ),
+            ),
+            (
+                "rejected".to_string(),
+                cat_validation_record(
+                    "rejected",
+                    CatRecordingValidationStatus::Rejected,
+                    CatRecordingPublicationStatus::Unpublished,
+                ),
+            ),
+            (
+                "review-required".to_string(),
+                cat_validation_record(
+                    "review-required",
+                    CatRecordingValidationStatus::ReviewRequired,
+                    CatRecordingPublicationStatus::Unpublished,
+                ),
+            ),
+            (
+                "failed".to_string(),
+                cat_validation_record(
+                    "failed",
+                    CatRecordingValidationStatus::Failed,
+                    CatRecordingPublicationStatus::Unpublished,
+                ),
+            ),
+        ]);
+
+        assert!(cat_activity_has_pending_validation(&artifacts, &records));
+
+        records.get_mut("pending").unwrap().validation_status =
+            CatRecordingValidationStatus::Rejected;
+        records.get_mut("processing").unwrap().validation_status =
+            CatRecordingValidationStatus::Accepted;
+        assert!(!cat_activity_has_pending_validation(&artifacts, &records));
+    }
+
+    #[test]
+    fn cat_activity_empty_reply_distinguishes_active_review_from_no_result() {
+        assert_eq!(
+            cat_activity_query_empty_message("今天", CatActivitySelection::Batch, true),
+            "今天检测到猫活动录像，正在复核，完成后即可查询，请稍后再试。"
+        );
+        assert_eq!(
+            cat_activity_query_empty_message("今天上午", CatActivitySelection::Batch, false),
+            "今天上午还没有通过复核的猫活动视频。"
+        );
+        assert_eq!(
+            cat_activity_query_empty_message("今天", CatActivitySelection::Remaining, true),
+            "今天没有更多已通过复核的猫活动视频了。"
+        );
+        assert_eq!(
+            cat_activity_query_empty_message("今天", CatActivitySelection::ResendLast, true),
+            "当前会话里没有可重发的上一批猫活动视频。"
+        );
+    }
+
+    #[test]
     fn cat_activity_selection_honors_time_window_batch_cursor_and_resend() {
         const HOUR_MS: u128 = 60 * 60 * 1_000;
         const DAY_MS: u128 = 24 * HOUR_MS;
@@ -14365,7 +14538,7 @@ mod tests {
 
         let prior = RecentCatActivityQueryState {
             time_scope: "afternoon".to_string(),
-            delivered_artifact_ids: vec!["afternoon-new".to_string()],
+            issued_artifact_ids: vec!["afternoon-new".to_string()],
             last_batch_artifact_ids: vec!["afternoon-new".to_string()],
             updated_at_epoch_ms: now,
             ..Default::default()
@@ -14402,6 +14575,36 @@ mod tests {
         let selected = select_cat_activity_recordings(recordings, &resend, now, Some(&prior));
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].artifact_id, "afternoon-new");
+    }
+
+    #[test]
+    fn cat_activity_artifact_and_hint_share_stable_top_level_identity() {
+        let recording = cat_recording_artifact("cat-recording-1", 1_000);
+        let artifact = build_cat_activity_task_artifact(
+            &recording,
+            None,
+            CatRecordingValidationMode::Enforce,
+            "cat activity video 1".to_string(),
+        );
+        let hints = cat_activity_delivery_hints(std::slice::from_ref(&artifact));
+
+        assert_eq!(artifact.artifact_id.as_deref(), Some("cat-recording-1"));
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0]["kind"], "native_video");
+        assert_eq!(hints[0]["artifact_id"], "cat-recording-1");
+        assert_eq!(hints[0]["fallback"], "file");
+    }
+
+    #[test]
+    fn task_artifact_without_artifact_id_remains_deserializable() {
+        let artifact = serde_json::from_value::<TaskArtifact>(json!({
+            "kind": "document",
+            "label": "legacy",
+            "mime_type": "text/plain"
+        }))
+        .expect("deserialize legacy artifact without artifact_id");
+
+        assert!(artifact.artifact_id.is_none());
     }
 
     #[test]
@@ -17589,6 +17792,7 @@ mod tests {
             "step-1",
             &[super::TaskArtifact {
                 kind: "image".to_string(),
+                artifact_id: None,
                 label: "抓拍图片".to_string(),
                 mime_type: "image/jpeg".to_string(),
                 media_asset_id: Some("asset-1".to_string()),
@@ -17984,54 +18188,38 @@ mod tests {
             },
             last_seen_at: None,
         };
+        let producer_payload: VisionAnalyzeCameraPayload = serde_json::from_value(json!({
+            "camera_target": target.clone(),
+            "summary": "检测到门口有人活动",
+            "summary_source": "heuristic_fallback",
+            "detections": [],
+            "snapshot": {
+                "image_path": "snap.jpg",
+                "source_image_path": "snap.jpg",
+                "annotated_image_path": "snap-annotated.jpg",
+                "mime_type": "image/jpeg"
+            },
+            "detection_summary": "检测到 1 个 person",
+            "notification_channel": "im_bridge",
+            "notification_format": "lark_card",
+            "notification_card": {
+                "header": {"title": {"content": "Front Door AI 分析"}}
+            }
+        }))
+        .expect("vision producer payload");
+        let payload = serde_json::to_value(producer_payload.with_delivery_contract())
+            .expect("vision delivery payload");
+        let artifacts = super::build_vision_artifacts(&payload);
         let notification = service
-            .build_notification_request(
-                &request,
-                "task.completed",
-                &target,
-                &json!({
-                    "summary": "检测到门口有人活动",
-                    "notification_channel": "im_bridge",
-                    "notification_format": "lark_card",
-                    "notification/destination/recipient/recipient_id": "ou_platform_should_not_be_needed",
-                    "notification/destination/recipient/recipient_type": "open_id",
-                    "notification_card": {
-                        "header": {"title": {"content": "Front Door AI 分析"}}
-                    }
-                }),
-                &[TaskArtifact {
-                    kind: "image".to_string(),
-                    label: "抓拍图片".to_string(),
-                    mime_type: "image/jpeg".to_string(),
-                    media_asset_id: None,
-                    path: Some("snap.jpg".to_string()),
-                    url: None,
-                    metadata: Value::Null,
-                }],
-            )
+            .build_notification_request(&request, "task.completed", &target, &payload, &artifacts)
             .expect("notification request");
         let replay_notification = service
             .build_notification_request(
                 &request,
                 "task.completed",
                 &target,
-                &json!({
-                    "summary": "检测到门口有人活动",
-                    "notification_channel": "im_bridge",
-                    "notification_format": "lark_card",
-                    "notification_card": {
-                        "header": {"title": {"content": "Front Door AI 分析"}}
-                    }
-                }),
-                &[TaskArtifact {
-                    kind: "image".to_string(),
-                    label: "抓拍图片".to_string(),
-                    mime_type: "image/jpeg".to_string(),
-                    media_asset_id: None,
-                    path: Some("snap.jpg".to_string()),
-                    url: None,
-                    metadata: Value::Null,
-                }],
+                &payload,
+                &super::build_vision_artifacts(&payload),
             )
             .expect("replayed notification request");
 
@@ -18046,7 +18234,33 @@ mod tests {
         assert_eq!(notification.destination.route_key, "gw_route_notify");
         assert_eq!(notification.destination.platform, "");
         assert!(notification.destination.recipient.is_none());
-        assert_eq!(notification.content.attachments.len(), 1);
+        assert_eq!(notification.content.attachments.len(), 2);
+        assert_eq!(notification.content.delivery_hints.len(), 2);
+        let artifact_ids = artifacts
+            .iter()
+            .map(|artifact| artifact.artifact_id.as_deref().expect("artifact id"))
+            .collect::<Vec<_>>();
+        assert_ne!(artifact_ids[0], artifact_ids[1]);
+        for (index, artifact_id) in artifact_ids.iter().enumerate() {
+            assert_eq!(
+                notification.content.attachments[index]
+                    .artifact_id
+                    .as_deref(),
+                Some(*artifact_id)
+            );
+            assert_eq!(
+                notification.content.delivery_hints[index]["artifact_id"],
+                *artifact_id
+            );
+            assert_eq!(
+                notification.content.delivery_hints[index]["kind"],
+                "native_image"
+            );
+            assert_eq!(
+                notification.content.delivery_hints[index]["fallback"],
+                "file"
+            );
+        }
         assert_eq!(notification.content.title, "Front Door AI 分析");
         assert_eq!(notification.source.service, "harborbeacon");
         assert_eq!(notification.source.module, "task_api");
@@ -18062,6 +18276,14 @@ mod tests {
             notification.delivery.idempotency_key,
             replay_notification.delivery.idempotency_key
         );
+        let baseline_hash = notification_request_hash(&notification);
+        let mut changed_artifact = notification.clone();
+        changed_artifact.content.attachments[0].artifact_id =
+            Some("harborlink-recording-2".to_string());
+        assert_ne!(baseline_hash, notification_request_hash(&changed_artifact));
+        let mut changed_hint = notification.clone();
+        changed_hint.content.delivery_hints[0]["artifact_id"] = json!("harborlink-recording-2");
+        assert_ne!(baseline_hash, notification_request_hash(&changed_hint));
 
         let _ = fs::remove_file(admin_path);
         let _ = fs::remove_file(registry_path);
@@ -19253,6 +19475,7 @@ mod tests {
                 payload_format: NotificationPayloadFormat::PlainText,
                 structured_payload: Value::Null,
                 attachments: Vec::new(),
+                delivery_hints: Vec::new(),
             },
             delivery: NotificationDelivery {
                 mode: NotificationDeliveryMode::Send,
@@ -19308,6 +19531,7 @@ mod tests {
                 payload_format: NotificationPayloadFormat::PlainText,
                 structured_payload: Value::Null,
                 attachments: Vec::new(),
+                delivery_hints: Vec::new(),
             },
             delivery: NotificationDelivery {
                 mode: NotificationDeliveryMode::Send,
@@ -20323,6 +20547,7 @@ mod tests {
                 artifacts: vec![
                     TaskArtifact {
                         kind: "image".to_string(),
+                        artifact_id: None,
                         label: "spring one".to_string(),
                         mime_type: "image/jpeg".to_string(),
                         media_asset_id: Some("artifact-image-1".to_string()),
@@ -20332,6 +20557,7 @@ mod tests {
                     },
                     TaskArtifact {
                         kind: "image".to_string(),
+                        artifact_id: None,
                         label: "spring two".to_string(),
                         mime_type: "image/jpeg".to_string(),
                         media_asset_id: Some("artifact-image-2".to_string()),
@@ -20373,6 +20599,7 @@ mod tests {
                 data: json!({}),
                 artifacts: vec![TaskArtifact {
                     kind: "image".to_string(),
+                    artifact_id: None,
                     label: "camera snapshot".to_string(),
                     mime_type: "image/jpeg".to_string(),
                     media_asset_id: Some("artifact-snapshot-252".to_string()),

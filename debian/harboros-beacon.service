@@ -12,6 +12,7 @@ Environment=HARBOR_FFPROBE_BIN=/usr/bin/ffprobe
 Environment=HARBORLINK_MEDIA_API_URL=http://127.0.0.1:8790
 Environment=HARBORBEACON_SOUTHBOUND_MODE=harborlink
 Environment=HARBOR_K3_CAT_AUTO_RECORD_ENABLED=true
+Environment=HARBOR_K3_CAT_RECORDING_RECONCILIATION_PATH=/var/lib/harboros-beacon/cat-recording-reconciliation.json
 Environment=HARBOR_K3_CAT_RECORDING_VALIDATION_MODE=enforce
 Environment=HARBOR_K3_CAT_RECORDING_VALIDATION_STORE_PATH=/var/lib/harboros-beacon/cat-recording-validations.jsonl
 Environment=HARBOR_K3_CAT_RECORDING_VALIDATION_TEMP_ROOT=/run/harboros-beacon/cat-recording-validation

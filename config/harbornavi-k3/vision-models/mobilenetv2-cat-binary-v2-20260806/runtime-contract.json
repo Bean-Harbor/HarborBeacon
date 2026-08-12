@@ -12,8 +12,8 @@
   "video_decision": {
     "sampling": "select up to 5 diverse YOLO evidence frames and fill up to 9 with uniform samples",
     "maximum_frames": 9,
-    "minimum_positive_frames": 2,
-    "short_video_behavior": "evaluate every distinct decodable sample; require 2 positives"
+    "minimum_positive_frames": 3,
+    "short_video_behavior": "evaluate every distinct decodable sample; require 3 positives"
   },
   "input": {
     "name": "images",

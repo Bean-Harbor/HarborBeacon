@@ -7,6 +7,16 @@ BUILD_SCRIPT = REPOSITORY_ROOT / "scripts" / "build_harbornavi_k3_deb.sh"
 
 
 class K3DebPackagingTests(unittest.TestCase):
+    def test_cat_recording_reconciliation_uses_the_state_directory(self):
+        unit = (REPOSITORY_ROOT / "debian" / "harboros-beacon.service").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "Environment=HARBOR_K3_CAT_RECORDING_RECONCILIATION_PATH="
+            "/var/lib/harboros-beacon/cat-recording-reconciliation.json",
+            unit,
+        )
+
     def test_all_systemd_units_are_packaged_read_only(self):
         script = BUILD_SCRIPT.read_text(encoding="utf-8")
         unit_copy_start = script.index(
