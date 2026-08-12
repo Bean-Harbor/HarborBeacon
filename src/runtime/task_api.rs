@@ -3255,11 +3255,7 @@ impl TaskApiService {
             };
         let has_pending_validation =
             cat_activity_has_pending_validation(&recordings, &validation_records);
-        recordings = filter_publishable_cat_recordings(
-            recordings,
-            CatRecordingValidationMode::Enforce,
-            &validation_records,
-        );
+        recordings = filter_publishable_cat_recordings(recordings, &validation_records);
         let previous_for_selection = previous_query.as_ref().filter(|previous| {
             previous.time_scope == query.time_scope.as_str()
                 && previous.camera_hint.as_deref() == camera_hint
@@ -6410,18 +6406,15 @@ fn cat_activity_query_empty_message(
 
 fn filter_publishable_cat_recordings(
     mut recordings: Vec<HarborLinkRecordingArtifact>,
-    validation_mode: CatRecordingValidationMode,
     validation_records: &HashMap<String, CatRecordingValidationRecord>,
 ) -> Vec<HarborLinkRecordingArtifact> {
     recordings.sort_by_key(|artifact| artifact.started_at_epoch_ms);
     recordings.dedup_by(|left, right| left.artifact_id == right.artifact_id);
-    if validation_mode.enforces_publication() {
-        recordings.retain(|artifact| {
-            validation_records
-                .get(&artifact.artifact_id)
-                .is_some_and(CatRecordingValidationRecord::is_published)
-        });
-    }
+    recordings.retain(|artifact| {
+        validation_records
+            .get(&artifact.artifact_id)
+            .is_some_and(CatRecordingValidationRecord::is_published)
+    });
     recordings
 }
 
@@ -14415,14 +14408,54 @@ mod tests {
             ),
         ]);
 
-        let filtered = filter_publishable_cat_recordings(
-            artifacts,
-            CatRecordingValidationMode::Enforce,
-            &records,
-        );
+        let filtered = filter_publishable_cat_recordings(artifacts, &records);
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].artifact_id, "accepted-published");
+    }
+
+    #[test]
+    fn publication_filter_is_independent_from_validation_runtime_mode() {
+        let artifacts = vec![
+            cat_recording_artifact("accepted-published", 1_000),
+            cat_recording_artifact("accepted-unpublished", 2_000),
+            cat_recording_artifact("missing-validation", 3_000),
+        ];
+        let records = HashMap::from([
+            (
+                "accepted-published".to_string(),
+                cat_validation_record(
+                    "accepted-published",
+                    CatRecordingValidationStatus::Accepted,
+                    CatRecordingPublicationStatus::Published,
+                ),
+            ),
+            (
+                "accepted-unpublished".to_string(),
+                cat_validation_record(
+                    "accepted-unpublished",
+                    CatRecordingValidationStatus::Accepted,
+                    CatRecordingPublicationStatus::Unpublished,
+                ),
+            ),
+        ]);
+
+        for mode in [
+            CatRecordingValidationMode::Off,
+            CatRecordingValidationMode::Shadow,
+            CatRecordingValidationMode::Enforce,
+        ] {
+            let filtered = filter_publishable_cat_recordings(artifacts.clone(), &records);
+            assert_eq!(
+                filtered
+                    .iter()
+                    .map(|artifact| artifact.artifact_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["accepted-published"],
+                "mode={}",
+                mode.as_str()
+            );
+        }
     }
 
     #[test]

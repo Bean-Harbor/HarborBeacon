@@ -50,6 +50,7 @@ pub struct CatRecordingReconciliationState {
 pub struct CatRecordingReconciliationStore {
     path: PathBuf,
     secure_path: Arc<SecureStorePath>,
+    operation_lock: Arc<Mutex<()>>,
     bound_data_identity: Arc<Mutex<Option<SecureFileIdentity>>>,
 }
 
@@ -74,6 +75,7 @@ impl CatRecordingReconciliationStore {
         Ok(Self {
             path,
             secure_path: Arc::new(secure_path),
+            operation_lock: Arc::new(Mutex::new(())),
             bound_data_identity: Arc::new(Mutex::new(bound_data_identity)),
         })
     }
@@ -108,6 +110,10 @@ impl CatRecordingReconciliationStore {
     }
 
     fn with_lock<T>(&self, action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        let _operation_guard = self
+            .operation_lock
+            .lock()
+            .map_err(|_| "cat reconciliation operation lock is poisoned".to_string())?;
         let lock_file = self.secure_path.open_lock()?;
         lock_file.lock_exclusive().map_err(|error| {
             format!(

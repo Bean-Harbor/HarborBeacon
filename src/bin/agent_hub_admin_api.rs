@@ -2785,6 +2785,13 @@ impl AdminApi {
     }
 
     fn reconcile_cat_recordings(&self) -> Result<(), String> {
+        let (_, first_error) = self.reconcile_cat_recordings_with_failures()?;
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn reconcile_cat_recordings_with_failures(
+        &self,
+    ) -> Result<(HashSet<String>, Option<String>), String> {
         let states = self
             .cat_auto_recording
             .lock()
@@ -2793,6 +2800,7 @@ impl AdminApi {
             .cloned()
             .collect::<Vec<_>>();
         let mut first_error = None;
+        let mut failed_cameras = HashSet::new();
         for state in states {
             if let Err(error) = self.reconcile_cat_recording(&state) {
                 eprintln!(
@@ -2800,10 +2808,11 @@ impl AdminApi {
                     state.camera_id,
                     redact_admin_string(&error)
                 );
+                failed_cameras.insert(state.camera_id);
                 first_error.get_or_insert(error);
             }
         }
-        first_error.map_or(Ok(()), Err)
+        Ok((failed_cameras, first_error))
     }
 
     fn reconcile_cat_recording(&self, state: &CatAutoRecordingState) -> Result<(), String> {
@@ -2843,6 +2852,11 @@ impl AdminApi {
             .and_then(|error| serde_json::from_str::<Value>(error).ok())
             .and_then(|error| error["statusCode"].as_u64())
             == Some(404);
+        if let Err(error) = lease.as_ref() {
+            if !lease_not_found {
+                return Err(error.clone());
+            }
+        }
         let mut artifacts = reconciliation_terminal_artifacts(state, lease.as_ref().ok(), &[]);
         if artifacts.is_empty() {
             let timeline = self.harborlink_media.recording_timeline(&state.camera_id)?;
@@ -2888,7 +2902,9 @@ impl AdminApi {
     }
 
     fn cat_auto_recording_tick(&self, config: CatAutoRecordingConfig) -> Result<(), String> {
-        if let Err(error) = self.reconcile_cat_recordings() {
+        let (reconciliation_failed_cameras, reconciliation_error) =
+            self.reconcile_cat_recordings_with_failures()?;
+        if let Some(error) = reconciliation_error.as_ref() {
             eprintln!(
                 "HarborBeacon cat recording reconciliation remains pending: {}",
                 redact_admin_string(&error)
@@ -2927,7 +2943,9 @@ impl AdminApi {
                 first_error.get_or_insert(error);
             }
         }
-        if let Err(error) = self.stop_orphaned_cat_recordings(&active_cameras) {
+        if let Err(error) =
+            self.stop_orphaned_cat_recordings(&active_cameras, &reconciliation_failed_cameras)
+        {
             first_error.get_or_insert(error);
         }
         first_error.map_or(Ok(()), Err)
@@ -3189,14 +3207,21 @@ impl AdminApi {
         Ok(())
     }
 
-    fn stop_orphaned_cat_recordings(&self, active_cameras: &HashSet<String>) -> Result<(), String> {
+    fn stop_orphaned_cat_recordings(
+        &self,
+        active_cameras: &HashSet<String>,
+        reconciliation_failed_cameras: &HashSet<String>,
+    ) -> Result<(), String> {
         let mut states = self
             .cat_auto_recording
             .lock()
             .map_err(|_| "cat auto-recording state is unavailable".to_string())?;
         let mut completed = Vec::new();
         for (camera_id, state) in states.iter_mut() {
-            if active_cameras.contains(camera_id) {
+            if active_cameras.contains(camera_id)
+                || reconciliation_failed_cameras.contains(camera_id)
+                || state.phase == CatRecordingReconciliationPhase::PendingStart
+            {
                 continue;
             }
             if let Some(lease_id) = state.lease_id.clone() {
@@ -4016,7 +4041,11 @@ impl AdminApi {
                 self.handle_feature_availability(&identity_hints).boxed()
             }
             Method::Get if is_cat_detection_observation_path(&path) => self
-                .handle_cat_detection_observation(&path, &raw_url)
+                .handle_cat_detection_observation(
+                    &path,
+                    &raw_url,
+                    gate_principal.as_ref().expect("gate principal"),
+                )
                 .boxed(),
             Method::Post if path == "/api/vision/detection-jobs" => self
                 .handle_start_detection_job(
@@ -7453,11 +7482,19 @@ impl AdminApi {
         &self,
         path: &str,
         raw_url: &str,
+        gate_principal: &GateAuthenticatedPrincipal,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
         let camera_id = match parse_cat_detection_observation_camera_id(path) {
             Some(camera_id) => camera_id,
             None => return error_json(StatusCode(400), "invalid camera observation path"),
         };
+        if let Err((status, error)) = self.authorize_detection_camera_action(
+            gate_principal,
+            &camera_id,
+            AccessAction::CameraView,
+        ) {
+            return error_json(status, &error);
+        }
         let stream_profile = match parse_query_param(raw_url, "stream_profile")
             .and_then(percent_decode_optional_query_value)
             .map(|value| value.trim().to_ascii_lowercase())
@@ -11954,6 +11991,7 @@ fn is_gate_principal_knowledge_endpoint(method: &Method, path: &str) -> bool {
 
 fn is_gate_principal_endpoint(method: &Method, path: &str) -> bool {
     is_gate_principal_knowledge_endpoint(method, path)
+        || (method == &Method::Get && is_cat_detection_observation_path(path))
         || path == "/api/vision/detection-jobs"
         || path.starts_with("/api/vision/detection-jobs/")
 }
@@ -12051,6 +12089,22 @@ fn authenticate_gate_principal_identity(
     let roles = required_gate_principal_header(headers, "X-Harbor-Principal-Roles")?;
     let workspace_id = required_gate_principal_header(headers, "X-Harbor-Workspace-Id")?;
 
+    if workspace_id != active_workspace_id {
+        return Err(GatePrincipalAuthError::new(
+            StatusCode(403),
+            "principal workspace does not match the active workspace",
+        ));
+    }
+
+    if source.eq_ignore_ascii_case("harbornavi-device") {
+        return authenticate_harbornavi_device_principal(
+            raw_url,
+            headers,
+            principal_id,
+            roles,
+            workspace_id,
+        );
+    }
     if !source.eq_ignore_ascii_case("harboros") {
         return Err(GatePrincipalAuthError::new(
             StatusCode(403),
@@ -12078,18 +12132,58 @@ fn authenticate_gate_principal_identity(
             "FULL_ADMIN role is required",
         ));
     }
-    if workspace_id != active_workspace_id {
-        return Err(GatePrincipalAuthError::new(
-            StatusCode(403),
-            "principal workspace does not match the active workspace",
-        ));
-    }
-
     Ok(GateAuthenticatedPrincipal(AccessPrincipal {
         workspace_id,
         user_id: principal_id.clone(),
         display_name: principal_id,
         role_kind: RoleKind::Admin,
+    }))
+}
+
+fn authenticate_harbornavi_device_principal(
+    raw_url: &str,
+    headers: &[Header],
+    principal_id: String,
+    roles: String,
+    workspace_id: String,
+) -> Result<GateAuthenticatedPrincipal, GatePrincipalAuthError> {
+    let path = raw_url.split('?').next().unwrap_or(raw_url);
+    let camera_id = parse_cat_detection_observation_camera_id(path).ok_or_else(|| {
+        GatePrincipalAuthError::new(
+            StatusCode(403),
+            "HarborNavi device principals are limited to observation reads",
+        )
+    })?;
+    let session_id = principal_id
+        .strip_prefix("harbornavi-device:")
+        .filter(|value| {
+            value.len() == 32 && value.chars().all(|character| character.is_ascii_hexdigit())
+        })
+        .ok_or_else(|| GatePrincipalAuthError::new(StatusCode(400), "principal id is malformed"))?;
+    if session_id.is_empty() {
+        return Err(GatePrincipalAuthError::new(
+            StatusCode(400),
+            "principal id is malformed",
+        ));
+    }
+    if roles.trim() != "CAMERA_VIEW" {
+        return Err(GatePrincipalAuthError::new(
+            StatusCode(403),
+            "CAMERA_VIEW role is required",
+        ));
+    }
+    let camera_scope = required_gate_principal_header(headers, "X-Harbor-Camera-Scope")?;
+    if camera_scope != camera_id {
+        return Err(GatePrincipalAuthError::new(
+            StatusCode(403),
+            "principal camera scope does not match the requested camera",
+        ));
+    }
+    Ok(GateAuthenticatedPrincipal(AccessPrincipal {
+        workspace_id,
+        user_id: principal_id.clone(),
+        display_name: principal_id,
+        role_kind: RoleKind::Viewer,
     }))
 }
 
@@ -27692,6 +27786,266 @@ mod tests {
     }
 
     #[test]
+    fn orphan_cleanup_never_removes_pending_start_state() {
+        let reconciliation_path = unique_store_path("cat-recording-pending-start-orphan");
+        let reconciliation_store =
+            CatRecordingReconciliationStore::new(reconciliation_path.clone());
+        let pending = CatRecordingReconciliationState {
+            camera_id: "camera.pending".to_string(),
+            phase: CatRecordingReconciliationPhase::PendingStart,
+            created_at_epoch_ms: 1,
+            event_id: Some("cat-activity-pending".to_string()),
+            stream_profile: Some("sub".to_string()),
+            detection_evidence: vec![CatDetectionEvidence {
+                sequence: 7,
+                frame_epoch_ms: 7_000,
+                confidence_ppm: 930_000,
+            }],
+            ..Default::default()
+        };
+        reconciliation_store
+            .upsert(pending.clone())
+            .expect("persist pending start");
+        let (mut api, paths) = build_test_admin_api("cat-recording-pending-start-orphan-api");
+        api.cat_recording_reconciliation_store = reconciliation_store.clone();
+        api.cat_auto_recording = Arc::new(Mutex::new(HashMap::from([(
+            pending.camera_id.clone(),
+            pending.clone(),
+        )])));
+
+        api.stop_orphaned_cat_recordings(&HashSet::new(), &HashSet::new())
+            .expect("pending start must be ignored by orphan cleanup");
+
+        assert_eq!(
+            api.cat_auto_recording
+                .lock()
+                .expect("cat auto recording")
+                .get(&pending.camera_id),
+            Some(&pending)
+        );
+        assert_eq!(
+            reconciliation_store
+                .load()
+                .expect("reconciliation ledger")
+                .get(&pending.camera_id),
+            Some(&pending)
+        );
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn pending_start_survives_transient_reconciliation_failure_and_recovers_same_event() {
+        let reconciliation_path = unique_store_path("cat-recording-pending-start-retry");
+        let reconciliation_store =
+            CatRecordingReconciliationStore::new(reconciliation_path.clone());
+        let pending = CatRecordingReconciliationState {
+            camera_id: "camera.retry".to_string(),
+            phase: CatRecordingReconciliationPhase::PendingStart,
+            created_at_epoch_ms: cat_auto_recording_epoch_ms(),
+            event_id: Some("cat-activity-retry".to_string()),
+            stream_profile: Some("sub".to_string()),
+            detection_evidence: vec![CatDetectionEvidence {
+                sequence: 8,
+                frame_epoch_ms: 8_000,
+                confidence_ppm: 940_000,
+            }],
+            ..Default::default()
+        };
+        reconciliation_store
+            .upsert(pending.clone())
+            .expect("persist pending start");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("HarborLink listener");
+        let harborlink_addr = listener.local_addr().expect("HarborLink address");
+        let recovered_lease = HarborLinkEventRecordingLease {
+            camera_id: pending.camera_id.clone(),
+            lease_id: "event-recording-retry".to_string(),
+            event_id: pending.event_id.clone().expect("event id"),
+            owner: "harborbeacon".to_string(),
+            status: "running".to_string(),
+            stream_profile: "sub".to_string(),
+            labels: vec!["cat".to_string()],
+            started_at: "2026-08-12T00:00:00Z".to_string(),
+            updated_at: "2026-08-12T00:00:01Z".to_string(),
+            expires_at: "2999-01-01T00:00:00Z".to_string(),
+            pre_roll_seconds: 3,
+            trigger_epoch_ms: 8_000,
+            artifacts: Vec::new(),
+        };
+        let harborlink_server = thread::spawn(move || {
+            for (status, body) in [
+                (
+                    "500 Internal Server Error",
+                    json!({"error":"temporary"}).to_string(),
+                ),
+                (
+                    "200 OK",
+                    serde_json::to_string(&recovered_lease).expect("serialize lease"),
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().expect("HarborLink accept");
+                let mut buffer = [0_u8; 4096];
+                let read = stream.read(&mut buffer).expect("read HarborLink request");
+                assert!(String::from_utf8_lossy(&buffer[..read])
+                    .starts_with("GET /v1/cameras/camera.retry/event-recordings/current "));
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(), body
+                        )
+                        .as_bytes(),
+                    )
+                    .expect("write HarborLink response");
+            }
+        });
+        let (mut api, paths) = build_test_admin_api("cat-recording-pending-start-retry-api");
+        api.harborlink_media = HarborLinkMediaClient::new(format!("http://{harborlink_addr}"))
+            .expect("HarborLink client");
+        api.cat_recording_reconciliation_store = reconciliation_store.clone();
+        api.cat_auto_recording = Arc::new(Mutex::new(HashMap::from([(
+            pending.camera_id.clone(),
+            pending.clone(),
+        )])));
+
+        api.cat_auto_recording_tick(CatAutoRecordingConfig {
+            start_consecutive_frames: 3,
+            start_duration_ms: 2_000,
+            stop_consecutive_frames: 3,
+            stop_duration_ms: 2_000,
+        })
+        .expect("transient reconciliation failure must remain isolated to its camera");
+        assert_eq!(
+            reconciliation_store
+                .load()
+                .expect("pending ledger")
+                .get(&pending.camera_id),
+            Some(&pending)
+        );
+
+        api.reconcile_cat_recordings()
+            .expect("same event must recover when HarborLink returns");
+        harborlink_server.join().expect("HarborLink server");
+        let recovered = reconciliation_store
+            .load()
+            .expect("recovered ledger")
+            .remove(&pending.camera_id)
+            .expect("recovered state");
+        assert_eq!(recovered.phase, CatRecordingReconciliationPhase::Active);
+        assert_eq!(recovered.event_id, pending.event_id);
+        assert_eq!(recovered.lease_id.as_deref(), Some("event-recording-retry"));
+        assert_eq!(recovered.detection_evidence, pending.detection_evidence);
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn pending_start_survives_timeline_failure_and_recovers_terminal_artifact() {
+        let reconciliation_path = unique_store_path("cat-recording-pending-timeline-retry");
+        let validation_path = unique_store_path("cat-recording-pending-timeline-validation");
+        let reconciliation_store =
+            CatRecordingReconciliationStore::new(reconciliation_path.clone());
+        let validation_store = CatRecordingValidationStore::new(validation_path.clone());
+        let pending = CatRecordingReconciliationState {
+            camera_id: "camera.timeline-retry".to_string(),
+            phase: CatRecordingReconciliationPhase::PendingStart,
+            created_at_epoch_ms: cat_auto_recording_epoch_ms(),
+            event_id: Some("cat-activity-timeline-retry".to_string()),
+            stream_profile: Some("sub".to_string()),
+            detection_evidence: vec![CatDetectionEvidence {
+                sequence: 9,
+                frame_epoch_ms: 9_000,
+                confidence_ppm: 950_000,
+            }],
+            ..Default::default()
+        };
+        reconciliation_store
+            .upsert(pending.clone())
+            .expect("persist pending start");
+        let terminal_artifact = sample_cat_recording_artifact(
+            "recordings~timeline-retry",
+            "cat-activity-timeline-retry",
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").expect("HarborLink listener");
+        let harborlink_addr = listener.local_addr().expect("HarborLink address");
+        let harborlink_server = thread::spawn(move || {
+            for (expected_path, status, body) in [
+                (
+                    "/v1/cameras/camera.timeline-retry/event-recordings/current",
+                    "404 Not Found",
+                    json!({"error":"not_found"}).to_string(),
+                ),
+                (
+                    "/v1/cameras/camera.timeline-retry/artifacts",
+                    "500 Internal Server Error",
+                    json!({"error":"temporary"}).to_string(),
+                ),
+                (
+                    "/v1/cameras/camera.timeline-retry/event-recordings/current",
+                    "404 Not Found",
+                    json!({"error":"not_found"}).to_string(),
+                ),
+                (
+                    "/v1/cameras/camera.timeline-retry/artifacts",
+                    "200 OK",
+                    serde_json::to_string(&vec![terminal_artifact]).expect("serialize timeline"),
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().expect("HarborLink accept");
+                let mut buffer = [0_u8; 4096];
+                let read = stream.read(&mut buffer).expect("read HarborLink request");
+                assert!(String::from_utf8_lossy(&buffer[..read])
+                    .starts_with(&format!("GET {expected_path} ")));
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(), body
+                        )
+                        .as_bytes(),
+                    )
+                    .expect("write HarborLink response");
+            }
+        });
+        let (mut api, paths) = build_test_admin_api("cat-recording-pending-timeline-retry-api");
+        api.harborlink_media = HarborLinkMediaClient::new(format!("http://{harborlink_addr}"))
+            .expect("HarborLink client");
+        api.cat_recording_reconciliation_store = reconciliation_store.clone();
+        api.cat_recording_validation_store = validation_store.clone();
+        api.cat_recording_validation_mode = CatRecordingValidationMode::Enforce;
+        api.cat_auto_recording = Arc::new(Mutex::new(HashMap::from([(
+            pending.camera_id.clone(),
+            pending.clone(),
+        )])));
+
+        api.cat_auto_recording_tick(CatAutoRecordingConfig {
+            start_consecutive_frames: 3,
+            start_duration_ms: 2_000,
+            stop_consecutive_frames: 3,
+            stop_duration_ms: 2_000,
+        })
+        .expect("timeline failure must remain isolated to its camera");
+        assert_eq!(
+            reconciliation_store
+                .load()
+                .expect("pending ledger")
+                .get(&pending.camera_id),
+            Some(&pending)
+        );
+
+        api.reconcile_cat_recordings()
+            .expect("terminal artifact must reconcile after timeline recovers");
+        harborlink_server.join().expect("HarborLink server");
+        assert!(reconciliation_store
+            .load()
+            .expect("reconciliation ledger")
+            .is_empty());
+        let records = validation_store.list_latest().expect("validation records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].artifact_id, "recordings~timeline-retry");
+        assert_eq!(records[0].detection_evidence, pending.detection_evidence);
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
     fn lost_start_response_recovers_same_event_as_active_recording() {
         let _env_lock = cat_auto_recording_env_lock()
             .lock()
@@ -28102,7 +28456,7 @@ mod tests {
                 .collect(),
         ));
 
-        api.stop_orphaned_cat_recordings(&HashSet::new())
+        api.stop_orphaned_cat_recordings(&HashSet::new(), &HashSet::new())
             .expect("lost stop response must reconcile terminal tombstone");
         harborlink_server.join().expect("HarborLink server");
         assert!(api
@@ -33586,6 +33940,23 @@ mod tests {
         .collect()
     }
 
+    fn trusted_harbornavi_device_headers(camera_id: &str) -> Vec<Header> {
+        [
+            ("Authorization", "Bearer service-token"),
+            ("X-Harbor-Principal-Source", "harbornavi-device"),
+            (
+                "X-Harbor-Principal-Id",
+                "harbornavi-device:0123456789abcdef0123456789abcdef",
+            ),
+            ("X-Harbor-Principal-Roles", "CAMERA_VIEW"),
+            ("X-Harbor-Workspace-Id", "home-1"),
+            ("X-Harbor-Camera-Scope", camera_id),
+        ]
+        .into_iter()
+        .map(|(name, value)| Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("header"))
+        .collect()
+    }
+
     #[test]
     fn gate_principal_auth_fails_closed_before_reading_identity() {
         let missing_config = authenticate_gate_principal_headers(
@@ -33726,6 +34097,63 @@ mod tests {
     }
 
     #[test]
+    fn harbornavi_device_principal_is_camera_scoped_and_observation_only() {
+        let observation_path =
+            "/api/cameras/camera.252/cat-detection/observation?stream_profile=sub";
+        let principal = authenticate_gate_principal_headers(
+            Some("service-token"),
+            observation_path,
+            &trusted_harbornavi_device_headers("camera.252"),
+            "home-1",
+        )
+        .expect("camera-scoped device principal");
+        assert_eq!(principal.0.role_kind, RoleKind::Viewer);
+        assert_eq!(principal.0.workspace_id, "home-1");
+
+        let wrong_camera = authenticate_gate_principal_headers(
+            Some("service-token"),
+            observation_path,
+            &trusted_harbornavi_device_headers("camera.999"),
+            "home-1",
+        )
+        .expect_err("camera scope mismatch");
+        assert_eq!(wrong_camera.status, StatusCode(403));
+
+        let detection_jobs = authenticate_gate_principal_headers(
+            Some("service-token"),
+            "/api/vision/detection-jobs",
+            &trusted_harbornavi_device_headers("camera.252"),
+            "home-1",
+        )
+        .expect_err("device principal must not control detection jobs");
+        assert_eq!(detection_jobs.status, StatusCode(403));
+
+        let mut wrong_role = trusted_harbornavi_device_headers("camera.252");
+        wrong_role.retain(|header| {
+            !header
+                .field
+                .as_str()
+                .to_string()
+                .eq_ignore_ascii_case("X-Harbor-Principal-Roles")
+        });
+        wrong_role.push(
+            Header::from_bytes(
+                b"X-Harbor-Principal-Roles".as_slice(),
+                b"FULL_ADMIN".as_slice(),
+            )
+            .expect("header"),
+        );
+        let wrong_role = authenticate_gate_principal_headers(
+            Some("service-token"),
+            observation_path,
+            &wrong_role,
+            "home-1",
+        )
+        .expect_err("device principal role must be CAMERA_VIEW");
+        assert_eq!(wrong_role.status, StatusCode(403));
+    }
+
+    #[test]
     fn every_knowledge_route_alias_uses_the_same_gate_principal_policy() {
         for raw_path in [
             "/api/knowledge/search",
@@ -33767,6 +34195,10 @@ mod tests {
                 "method={method:?} path={path}"
             );
         }
+        assert!(is_gate_principal_endpoint(
+            &Method::Get,
+            "/api/cameras/camera.252/cat-detection/observation"
+        ));
     }
 
     #[test]
@@ -33856,7 +34288,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_cat_detection_observation_is_read_only_and_sanitized() {
+    fn cat_detection_observation_requires_gate_principal_and_is_read_only_and_sanitized() {
         let _env_lock = gate_principal_env_lock()
             .lock()
             .expect("gate principal env lock");
@@ -33931,7 +34363,7 @@ mod tests {
         let base_url = format!("http://{}", server.server_addr());
         let server_api = api.clone();
         let server_thread = thread::spawn(move || {
-            for _ in 0..4 {
+            for _ in 0..5 {
                 let request = server
                     .recv_timeout(Duration::from_secs(3))
                     .expect("receive admin request")
@@ -33944,8 +34376,18 @@ mod tests {
             "{base_url}/api/cameras/camera.252/cat-detection/observation?stream_profile=sub"
         );
 
+        let missing_principal = client
+            .get(&observation_url)
+            .bearer_auth("service-token")
+            .send()
+            .expect("missing principal response");
         let observation = client
             .get(&observation_url)
+            .bearer_auth("service-token")
+            .header("X-Harbor-Principal-Source", "harboros")
+            .header("X-Harbor-Principal-Id", "harboros:uid:1000")
+            .header("X-Harbor-Principal-Roles", "FULL_ADMIN")
+            .header("X-Harbor-Workspace-Id", "home-1")
             .send()
             .expect("observation response");
         let observation_status = observation.status();
@@ -33954,6 +34396,11 @@ mod tests {
             .get(format!(
                 "{base_url}/api/cameras/camera.252/cat-detection/observation?stream_profile=main"
             ))
+            .bearer_auth("service-token")
+            .header("X-Harbor-Principal-Source", "harboros")
+            .header("X-Harbor-Principal-Id", "harboros:uid:1000")
+            .header("X-Harbor-Principal-Roles", "FULL_ADMIN")
+            .header("X-Harbor-Workspace-Id", "home-1")
             .send()
             .expect("wrong profile response");
         let mutation = client
@@ -33966,6 +34413,10 @@ mod tests {
             .expect("protected job response");
         server_thread.join().expect("admin server");
 
+        assert_eq!(
+            missing_principal.status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
         assert_eq!(observation_status, reqwest::StatusCode::OK);
         assert_eq!(observation_body["camera_id"], "camera.252");
         assert_eq!(observation_body["stream_profile"], "sub");
