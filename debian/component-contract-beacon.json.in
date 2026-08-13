@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "package": "harboros-beacon",
+  "source_commit": "SOURCE_COMMIT_PLACEHOLDER",
+  "contracts": [
+    {
+      "id": "harboros.k3.beacon-edge-assertion",
+      "version": 1,
+      "capabilities": [
+        "hmac-sha256",
+        "loopback-only",
+        "nonce-replay-rejection",
+        "role-full-admin",
+        "role-trusted-lan"
+      ]
+    }
+  ]
+}

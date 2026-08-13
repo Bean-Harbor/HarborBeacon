@@ -1658,10 +1658,10 @@ impl Cli {
                 .ok()
                 .or_else(default_analyzer_command),
             model_path: std::env::var("HARBOR_K3_YOLO_MODEL").unwrap_or_else(|_| {
-                "/var/lib/harboros-beacon/models/yolov8n_192x320.q.onnx".to_string()
+                "/data/models/current/detection/yolov8n_192x320.q.onnx".to_string()
             }),
             label_path: std::env::var("HARBOR_K3_YOLO_LABELS")
-                .unwrap_or_else(|_| "/var/lib/harboros-beacon/models/label.txt".to_string()),
+                .unwrap_or_else(|_| "/data/models/current/detection/label.txt".to_string()),
             provider: std::env::var("HARBOR_K3_YOLO_PROVIDER")
                 .unwrap_or_else(|_| "cpu".to_string()),
             redact_paths: false,

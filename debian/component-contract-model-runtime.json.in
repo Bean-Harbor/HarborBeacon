@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "package": "harboros-model-runtime",
+  "source_commit": "SOURCE_COMMIT_PLACEHOLDER",
+  "contracts": [
+    {
+      "id": "harboros.k3.model-runtime",
+      "version": 1,
+      "capabilities": [
+        "lazy-model-loading",
+        "loopback-only",
+        "pinned-model-materials",
+        "signed-model-materials"
+      ]
+    }
+  ]
+}

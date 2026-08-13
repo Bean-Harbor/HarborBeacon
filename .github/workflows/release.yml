@@ -1,91 +1,17 @@
-name: release
+name: legacy-release-disabled
 
 on:
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Tag to release"
-        required: true
-        default: "1.0.0"
+
+permissions:
+  contents: read
 
 jobs:
-  build-deb:
+  legacy-amd64-release-disabled:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    timeout-minutes: 90
-
     steps:
-      - name: Checkout HarborBeacon
-        uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
+      - name: Reject the obsolete public release path
         run: |
-          rustup target add x86_64-unknown-linux-gnu
-
-      - name: Cache cargo builds
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build release binary
-        run: cargo build --release --bin harboros-beacon --target x86_64-unknown-linux-gnu
-
-      - name: Download bootstrap LLM
-        run: |
-          python3 scripts/fetch_hf_bootstrap_model.py \
-            --model-id Qwen/Qwen2.5-0.5B-Instruct \
-            --revision main \
-            --output ./dist/bootstrap-models/qwen2.5-0.5b-instruct
-
-      - name: Create deb package
-        run: |
-          VERSION="${{ inputs.tag }}"
-          PKG_NAME="harboros-beacon_${VERSION}_linux_amd64"
-          PKG_DIR="./deb-package/${PKG_NAME}"
-          BOOTSTRAP_MODEL_DIR="./dist/bootstrap-models/qwen2.5-0.5b-instruct"
-          BOOTSTRAP_MODEL_PKG_DIR="${PKG_DIR}/mnt/software/harborbeacon-agent-ci/model-store/runtimes/harbor-candle/bootstrap-llm"
-
-          mkdir -p ${PKG_DIR}/DEBIAN
-          mkdir -p ${PKG_DIR}/usr/bin
-          mkdir -p ${PKG_DIR}/etc/systemd/system
-
-          cp ./target/x86_64-unknown-linux-gnu/release/harboros-beacon ${PKG_DIR}/usr/bin/harboros-beacon
-          chmod +x ${PKG_DIR}/usr/bin/harboros-beacon
-
-          test -f "${BOOTSTRAP_MODEL_DIR}/model.safetensors"
-          mkdir -p "${BOOTSTRAP_MODEL_PKG_DIR}"
-          cp -a "${BOOTSTRAP_MODEL_DIR}/." "${BOOTSTRAP_MODEL_PKG_DIR}/"
-
-          cp ./debian/harboros-beacon.service ${PKG_DIR}/etc/systemd/system/
-
-          cp ./debian/control ${PKG_DIR}/DEBIAN/control
-          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g" ${PKG_DIR}/DEBIAN/control
-          sed -i "s/ARCH_PLACEHOLDER/amd64/g" ${PKG_DIR}/DEBIAN/control
-
-          cp ./debian/postinst ${PKG_DIR}/DEBIAN/postinst
-          chmod +x ${PKG_DIR}/DEBIAN/postinst
-
-          cp ./debian/prerm ${PKG_DIR}/DEBIAN/prerm
-          chmod +x ${PKG_DIR}/DEBIAN/prerm
-
-          dpkg-deb --build ${PKG_DIR}
-          mkdir -p ./artifacts/
-          mv ./deb-package/${PKG_NAME}.deb ./artifacts/
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ inputs.tag }}
-          name: v${{ inputs.tag }}
-          generate_release_notes: true
-          files: |
-            ./artifacts/*
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          echo "The legacy amd64 packager cannot satisfy the HarborOS K3 component contract."
+          echo "Use k3-evt-package.yml and the central signed HarborOS APT snapshot."
+          exit 1

@@ -1,0 +1,44 @@
+#!/bin/sh
+set -e
+
+if ! getent group harbormodel >/dev/null 2>&1; then
+  addgroup --system harbormodel
+fi
+if ! id harbormodel >/dev/null 2>&1; then
+  adduser --system --ingroup harbormodel --home /data/models --no-create-home harbormodel
+fi
+
+release_root="/data/models/releases/VERSION_PLACEHOLDER"
+source_root="/usr/share/harboros-model-runtime/models"
+staging_root="${release_root}.install.$$"
+
+/usr/lib/harboros-model-runtime/ensure-data-layout /data/models
+rm -rf -- "$staging_root"
+install -d -o harbormodel -g harbormodel -m 0755 "$staging_root"
+cp -a "$source_root/." "$staging_root/"
+chown -R harbormodel:harbormodel "$staging_root"
+find "$staging_root" -type d -exec chmod 0755 {} +
+find "$staging_root" -type f -exec chmod 0644 {} +
+if [ ! -d "$release_root" ]; then
+  mv "$staging_root" "$release_root"
+else
+  rm -rf -- "$staging_root"
+fi
+ln -sfn "releases/VERSION_PLACEHOLDER" /data/models/current.new
+if [ -d /data/models/current ] && [ ! -L /data/models/current ]; then
+  echo "error: /data/models/current is an unmanaged directory" >&2
+  exit 1
+fi
+mv -f /data/models/current.new /data/models/current
+
+if command -v deb-systemd-helper >/dev/null 2>&1; then
+  deb-systemd-helper unmask harboros-model-runtime.service >/dev/null || true
+  deb-systemd-helper enable harboros-model-runtime.service >/dev/null || true
+fi
+
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+  systemctl daemon-reload
+  systemctl try-restart harboros-model-runtime.service || true
+fi
+
+exit 0

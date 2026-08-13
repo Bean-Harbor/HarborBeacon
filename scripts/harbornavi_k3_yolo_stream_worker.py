@@ -28,8 +28,8 @@ from harbornavi_k3_yolov8_analyzer import (
 )
 
 
-DEFAULT_MODEL = "/var/lib/harboros-beacon/models/yolov8n_192x320.q.onnx"
-DEFAULT_LABELS = "/var/lib/harboros-beacon/models/label.txt"
+DEFAULT_MODEL = "/data/models/current/detection/yolov8n_192x320.q.onnx"
+DEFAULT_LABELS = "/data/models/current/detection/label.txt"
 DEFAULT_TARGET_LABEL = "cat"
 STOP_REQUESTED = threading.Event()
 

@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "release_id": "harboros-navi-k3-0.1.0-evt.1",
+  "materials": [
+    {
+      "id": "detection-yolov8n-192x320",
+      "role": "detection",
+      "state": "blocked",
+      "source": "https://gitee.com/bianbu/spacemit-demo/tree/master/examples/CV/yolov8",
+      "revision": null,
+      "files": [
+        {
+          "source_path": "detection/yolov8n_192x320.q.onnx",
+          "package_path": "detection/yolov8n_192x320.q.onnx",
+          "size": null,
+          "sha256": "d4bf61db2a0925a0126052212479ff5044b621b12c6793420e085d36ae6b5438"
+        }
+      ],
+      "blocker": "Freeze the exact upstream revision and byte size for the already measured model hash."
+    },
+    {
+      "id": "detection-coco-labels",
+      "role": "detection-labels",
+      "state": "blocked",
+      "source": "https://gitee.com/bianbu/spacemit-demo/tree/master/examples/CV/yolov8",
+      "revision": null,
+      "files": [
+        {
+          "source_path": "detection/label.txt",
+          "package_path": "detection/label.txt",
+          "size": null,
+          "sha256": "bd17f1ee35d5f3c862a4894605855abbb9dda4b0621fdb0ac4c2c8c7bb7e730a"
+        }
+      ],
+      "blocker": "Freeze the exact upstream revision and byte size for the already measured label hash."
+    },
+    {
+      "id": "semantic-router-bootstrap-llm",
+      "role": "semantic-router",
+      "state": "blocked",
+      "source": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct",
+      "revision": null,
+      "files": [],
+      "blocker": "Freeze an immutable model revision and the SHA256/size of every required file."
+    },
+    {
+      "id": "rag-embedding-model",
+      "role": "embedding",
+      "state": "blocked",
+      "source": "https://huggingface.co/jinaai/jina-embeddings-v2-base-zh",
+      "revision": null,
+      "files": [],
+      "blocker": "Freeze an immutable model revision and the SHA256/size of every required file."
+    },
+    {
+      "id": "event-vlm",
+      "role": "event-vlm",
+      "state": "blocked",
+      "source": "HarborNavi K3 EVT model selection",
+      "revision": null,
+      "files": [],
+      "blocker": "Select and lock the Ubuntu 26.04 K3 VLM runtime and product-quality model; Bianbu-only evidence is not a release input."
+    }
+  ]
+}

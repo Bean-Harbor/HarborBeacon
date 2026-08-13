@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "component": "HarborBeacon",
+  "project_license": "NOASSERTION",
+  "review_status": "blocked",
+  "blocker": "The repository does not currently declare a project-level license. Dependency licenses remain represented in the generated SBOM and must be reviewed before candidate release."
+}

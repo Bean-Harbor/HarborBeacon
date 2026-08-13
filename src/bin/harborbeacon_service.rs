@@ -1,6 +1,7 @@
 use std::env;
 use std::io::Cursor;
 use std::path::PathBuf;
+#[cfg(not(feature = "external-model-runtime"))]
 use std::sync::{Arc, RwLock};
 use std::thread;
 
@@ -12,10 +13,17 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 mod agent_hub_admin_api;
 #[path = "assistant_task_api.rs"]
 mod assistant_task_api;
+#[cfg(not(feature = "external-model-runtime"))]
 #[path = "harbor_model_api_support.rs"]
 mod harbor_model_api_support;
+#[cfg(feature = "external-model-runtime")]
+mod harbor_model_proxy;
 
+#[cfg(not(feature = "external-model-runtime"))]
 use harbor_model_api_support::{BackendKind, ModelApiConfig, ModelApiService};
+#[cfg(feature = "external-model-runtime")]
+use harbor_model_proxy::ModelApiProxy;
+#[cfg(not(feature = "external-model-runtime"))]
 use harborbeacon_local_agent::control_plane::models::{ModelEndpointStatus, ModelKind};
 use harborbeacon_local_agent::runtime::admin_console::AdminConsoleStore;
 use harborbeacon_local_agent::runtime::model_center::ADMIN_STATE_PATH_ENV;
@@ -123,7 +131,10 @@ impl Cli {
 struct HarborBeaconService {
     admin_api: agent_hub_admin_api::AdminApi,
     task_api: assistant_task_api::TaskApiHttpServer,
+    #[cfg(not(feature = "external-model-runtime"))]
     model_api: Arc<RwLock<ModelApiService>>,
+    #[cfg(feature = "external-model-runtime")]
+    model_api: ModelApiProxy,
 }
 
 impl HarborBeaconService {
@@ -133,19 +144,39 @@ impl HarborBeaconService {
         let admin_store = AdminConsoleStore::new(cli.admin_state.clone(), registry_store);
         let conversation_store = TaskConversationStore::new(cli.conversations.clone());
         let task_service = TaskApiService::new(admin_store.clone(), conversation_store);
-        let mut model_config = ModelApiConfig::from_env();
-        model_config.bind = cli.bind.clone();
-        apply_persisted_model_runtime_selection(&mut model_config, &admin_store);
-        let model_api = Arc::new(RwLock::new(ModelApiService::new(model_config)));
-        let model_runtime_activation = build_model_runtime_activation_handler(model_api.clone());
+        #[cfg(not(feature = "external-model-runtime"))]
+        let model_api = {
+            let mut model_config = ModelApiConfig::from_env();
+            model_config.bind = cli.bind.clone();
+            apply_persisted_model_runtime_selection(&mut model_config, &admin_store);
+            Arc::new(RwLock::new(ModelApiService::new(model_config)))
+        };
+        #[cfg(feature = "external-model-runtime")]
+        let model_api = ModelApiProxy::from_env().unwrap_or_else(|error| {
+            eprintln!("invalid external model runtime configuration: {error}");
+            std::process::exit(2);
+        });
+        let admin_api = agent_hub_admin_api::AdminApi::new(
+            admin_store,
+            task_service.clone(),
+            cli.harbor_assistant_dist.clone(),
+            cli.public_origin.clone(),
+        );
+        #[cfg(feature = "external-model-runtime")]
+        let admin_api = admin_api.with_edge_assertion_verifier(
+            agent_hub_admin_api::EdgeAssertionVerifier::from_credential_env().unwrap_or_else(
+                |error| {
+                    eprintln!("invalid HarborOS edge assertion credential: {error}");
+                    std::process::exit(2);
+                },
+            ),
+        );
+        #[cfg(not(feature = "external-model-runtime"))]
+        let admin_api = admin_api.with_model_runtime_activation_handler(
+            build_model_runtime_activation_handler(model_api.clone()),
+        );
         Self {
-            admin_api: agent_hub_admin_api::AdminApi::new(
-                admin_store,
-                task_service.clone(),
-                cli.harbor_assistant_dist.clone(),
-                cli.public_origin.clone(),
-            )
-            .with_model_runtime_activation_handler(model_runtime_activation),
+            admin_api,
             task_api: assistant_task_api::TaskApiHttpServer::new(task_service, service_token),
             model_api,
         }
@@ -153,6 +184,19 @@ impl HarborBeaconService {
 
     fn handle(&self, request: Request) {
         let path = request.url().split('?').next().unwrap_or("/").to_string();
+        let handled_outside_admin = path == "/healthz"
+            || assistant_task_api::is_turn_api_path(&path)
+            || is_inference_api_path(&path);
+        if handled_outside_admin {
+            if let Err(response) = self.admin_api.reject_presented_edge_headers(
+                request.method(),
+                request.url(),
+                request.headers(),
+            ) {
+                let _ = request.respond(response);
+                return;
+            }
+        }
         if path == "/healthz" {
             let _ = request.respond(ok_json(&json!({
                 "status": "ok",
@@ -180,6 +224,7 @@ impl HarborBeaconService {
         let method = request.method().clone();
         let path = request.url().split('?').next().unwrap_or("/");
         let model_path = inference_model_path(path);
+        #[cfg(not(feature = "external-model-runtime"))]
         let headers = request.headers().to_vec();
         let body = if method == Method::Post {
             match read_request_body(&mut request) {
@@ -196,6 +241,7 @@ impl HarborBeaconService {
         } else {
             Vec::new()
         };
+        #[cfg(not(feature = "external-model-runtime"))]
         let response = match self.model_api.read() {
             Ok(model_api) => model_api.route(method, &model_path, &headers, &body),
             Err(_) => error_json(
@@ -204,10 +250,13 @@ impl HarborBeaconService {
                 "model runtime lock is poisoned",
             ),
         };
+        #[cfg(feature = "external-model-runtime")]
+        let response = self.model_api.route(method, &model_path, &body);
         let _ = request.respond(response);
     }
 }
 
+#[cfg(not(feature = "external-model-runtime"))]
 fn build_model_runtime_activation_handler(
     model_api: Arc<RwLock<ModelApiService>>,
 ) -> agent_hub_admin_api::ModelRuntimeActivationHandler {
@@ -240,6 +289,7 @@ fn build_model_runtime_activation_handler(
     })
 }
 
+#[cfg(not(feature = "external-model-runtime"))]
 fn apply_activation_request_to_model_config(
     config: &mut ModelApiConfig,
     request: &agent_hub_admin_api::ModelRuntimeActivationRequest,
@@ -278,6 +328,7 @@ fn apply_activation_request_to_model_config(
     }
 }
 
+#[cfg(not(feature = "external-model-runtime"))]
 fn runtime_model_id_for_activation(config: &ModelApiConfig, kind: ModelKind) -> Option<String> {
     match kind {
         ModelKind::Llm => Some(match config.backend {
@@ -294,6 +345,7 @@ fn runtime_model_id_for_activation(config: &ModelApiConfig, kind: ModelKind) -> 
     }
 }
 
+#[cfg(not(feature = "external-model-runtime"))]
 fn apply_persisted_model_runtime_selection(
     config: &mut ModelApiConfig,
     admin_store: &AdminConsoleStore,
@@ -342,6 +394,7 @@ fn apply_persisted_model_runtime_selection(
     }
 }
 
+#[cfg(not(feature = "external-model-runtime"))]
 fn should_auto_switch_to_embedded_candle(
     request: &agent_hub_admin_api::ModelRuntimeActivationRequest,
 ) -> bool {
@@ -355,6 +408,7 @@ fn should_auto_switch_to_embedded_candle(
             .any(|profile| profile == "harbor-candle" || profile == "harbor-model-api-candle")
 }
 
+#[cfg(not(feature = "external-model-runtime"))]
 fn endpoint_supports_embedded_candle(metadata: &serde_json::Value, model_name: &str) -> bool {
     let profiles_match = metadata
         .get("runtime_profiles")
@@ -366,6 +420,7 @@ fn endpoint_supports_embedded_candle(metadata: &serde_json::Value, model_name: &
     profiles_match || matches_legacy_candle_model_id(model_name)
 }
 
+#[cfg(not(feature = "external-model-runtime"))]
 fn matches_legacy_candle_model_id(model_id: &str) -> bool {
     matches!(
         model_id.trim(),
@@ -373,6 +428,7 @@ fn matches_legacy_candle_model_id(model_id: &str) -> bool {
     )
 }
 
+#[cfg(not(feature = "external-model-runtime"))]
 fn metadata_string(metadata: &serde_json::Value, key: &str) -> Option<String> {
     metadata
         .get(key)
@@ -382,6 +438,7 @@ fn metadata_string(metadata: &serde_json::Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+#[cfg(not(feature = "external-model-runtime"))]
 fn model_backend_env_is_explicit() -> bool {
     env::var("HARBOR_MODEL_API_BACKEND")
         .ok()
@@ -515,18 +572,24 @@ fn print_usage() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "external-model-runtime"))]
     use std::sync::{Mutex, OnceLock};
+    #[cfg(not(feature = "external-model-runtime"))]
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    #[cfg(not(feature = "external-model-runtime"))]
     use harborbeacon_local_agent::control_plane::models::{ModelEndpoint, ModelEndpointKind};
+    #[cfg(not(feature = "external-model-runtime"))]
     use harborbeacon_local_agent::runtime::registry::DeviceRegistryStore;
 
+    #[cfg(not(feature = "external-model-runtime"))]
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    #[cfg(not(feature = "external-model-runtime"))]
     fn temp_path(label: &str) -> PathBuf {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -535,11 +598,13 @@ mod tests {
         std::env::temp_dir().join(format!("harborbeacon-service-{label}-{suffix}.json"))
     }
 
+    #[cfg(not(feature = "external-model-runtime"))]
     struct EnvGuard {
         key: &'static str,
         previous: Option<String>,
     }
 
+    #[cfg(not(feature = "external-model-runtime"))]
     impl EnvGuard {
         fn set(key: &'static str, value: &str) -> Self {
             let previous = env::var(key).ok();
@@ -554,6 +619,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "external-model-runtime"))]
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             if let Some(value) = self.previous.as_ref() {
@@ -564,6 +630,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "external-model-runtime"))]
     fn candle_llm_activation_request() -> agent_hub_admin_api::ModelRuntimeActivationRequest {
         agent_hub_admin_api::ModelRuntimeActivationRequest {
             capability_id: "semantic_router".to_string(),
@@ -626,6 +693,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "external-model-runtime"))]
     fn local_candle_profile_auto_switches_when_backend_is_implicit() {
         let _lock = env_lock().lock().expect("env lock");
         let _backend = EnvGuard::remove("HARBOR_MODEL_API_BACKEND");
@@ -643,6 +711,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "external-model-runtime"))]
     fn explicit_backend_env_prevents_auto_candle_switch() {
         let _lock = env_lock().lock().expect("env lock");
         let _backend = EnvGuard::set("HARBOR_MODEL_API_BACKEND", "openai_proxy");
@@ -661,6 +730,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "external-model-runtime"))]
     fn persisted_candle_endpoint_restores_embedded_backend_when_implicit() {
         let _lock = env_lock().lock().expect("env lock");
         let _backend = EnvGuard::remove("HARBOR_MODEL_API_BACKEND");

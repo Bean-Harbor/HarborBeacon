@@ -1,29 +1,43 @@
 [Unit]
 Description=HarborOS Beacon API Service
-Wants=harborlink.target
-After=network.target harborlink.target
+Wants=network-online.target harborlink.target harboros-model-runtime.service
+Requires=harboros-bootstrap.service
+After=network-online.target harboros-bootstrap.service harborlink.target harboros-model-runtime.service
+RequiresMountsFor=/data
 
 [Service]
 Type=simple
 User=harborbeacon
 Group=harborbeacon
+UMask=0077
 Environment=HARBOR_FFMPEG_BIN=/usr/bin/ffmpeg
 Environment=HARBOR_FFPROBE_BIN=/usr/bin/ffprobe
 Environment=HARBORLINK_MEDIA_API_URL=http://127.0.0.1:8790
 Environment=HARBORBEACON_SOUTHBOUND_MODE=harborlink
-LoadCredential=harborlink-local-api-token:/etc/harborlink/local-api.token
+LoadCredential=harborlink-local-api-token:/data/harborlink/secrets/local-api.token
 Environment=HARBORLINK_LOCAL_API_TOKEN_FILE=%d/harborlink-local-api-token
-Environment=HARBOR_VISION_EVENT_STORE_PATH=/var/lib/harboros-beacon/vision-events.jsonl
-EnvironmentFile=-/etc/default/harboros-beacon-gate
-EnvironmentFile=-/etc/default/harboros-beacon
-ExecStart=/usr/bin/harboros-beacon --bind 127.0.0.1:4174 --admin-state /var/lib/harboros-beacon/admin-console.json --device-registry /var/lib/harboros-beacon/device-registry.json --conversations /var/lib/harboros-beacon/task-api-conversations.json --harbor-assistant-dist /usr/share/truenas/webui --public-origin http://127.0.0.1:4174
-Restart=always
+LoadCredential=harbor-edge-assertion-key:/data/harboros/secrets/edge-assertion.key
+Environment=HARBOR_HARBOROS_WRITABLE_ROOT=/data/harborbeacon
+Environment=HARBOR_VISION_EVENT_STORE_PATH=/data/harborbeacon/events/vision-events.jsonl
+Environment=HARBOR_K3_YOLO_MODEL=/data/models/current/detection/yolov8n_192x320.q.onnx
+Environment=HARBOR_K3_YOLO_LABELS=/data/models/current/detection/label.txt
+Environment=HARBOR_MODEL_API_BASE_URL=http://127.0.0.1:8792/v1
+Environment=HARBOR_MODEL_API_BACKEND=openai_proxy
+Environment=HARBOR_MODEL_API_UPSTREAM_BASE_URL=http://127.0.0.1:8792
+EnvironmentFile=/data/harboros/secrets/beacon-gate.env
+Environment=HARBOR_EDGE_ASSERTION_KEY_FILE=%d/harbor-edge-assertion-key
+ExecStart=/usr/bin/harboros-beacon --bind 127.0.0.1:4174 --admin-state /data/harborbeacon/admin-console.json --device-registry /data/harborbeacon/device-registry.json --conversations /data/harborbeacon/task-api-conversations.json --harbor-assistant-dist /usr/share/harboros/webui --public-origin http://127.0.0.1:4174
+Restart=on-failure
 RestartSec=5s
 MemoryAccounting=true
 MemoryHigh=8G
 MemoryMax=12G
 RuntimeDirectory=harboros-beacon
-StateDirectory=harboros-beacon
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/data/harborbeacon /run/harboros-beacon
 
 [Install]
 WantedBy=multi-user.target

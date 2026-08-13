@@ -1,0 +1,88 @@
+name: k3-evt-package
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/k3-evt-package.yml
+      - Cargo.lock
+      - Cargo.toml
+      - debian/**
+      - models/**
+      - scripts/**
+      - src/**
+  workflow_dispatch:
+    inputs:
+      debian_version:
+        description: Exact Debian version for the qualification package
+        required: true
+        default: 0.1.0+harbornavi.k3.evt1.riscv64
+
+permissions:
+  contents: read
+
+env:
+  BUILD_CONTAINER_DIGEST: sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663
+  DEBIAN_SNAPSHOT: 20260801T000000Z
+  DEBIAN_VERSION: ${{ inputs.debian_version || '0.1.0+harbornavi.k3.evt1.riscv64' }}
+
+jobs:
+  beacon-riscv64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    container:
+      image: rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install fixed packaging toolchain
+        env:
+          HARBORBEACON_DEBIAN_SNAPSHOT: ${{ env.DEBIAN_SNAPSHOT }}
+        run: |
+          bash scripts/configure_debian_snapshot.sh
+          apt-get update
+          apt-get install --yes --no-install-recommends dpkg-dev gcc-riscv64-linux-gnu python3 xz-utils
+          rustup target add riscv64gc-unknown-linux-gnu
+      - name: Verify the model lock is still fail-closed
+        run: |
+          python3 scripts/validate_k3_model_materials.py \
+            --manifest models/k3-evt1-model-materials.json \
+            --expect-blocked
+      - name: Verify reproducible Beacon package without embedded Candle
+        env:
+          DEB_ARCH: riscv64
+          RUST_TARGET: riscv64gc-unknown-linux-gnu
+          HARBORBEACON_BUILD_CONTAINER_DIGEST: ${{ env.BUILD_CONTAINER_DIGEST }}
+          HARBORBEACON_DEBIAN_SNAPSHOT: ${{ env.DEBIAN_SNAPSHOT }}
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          ./scripts/verify_k3_reproducible.sh beacon
+          ./scripts/build_harbornavi_k3_deb.sh
+          dpkg-deb --info dist/harbornavi-k3-debs/harboros-beacon_*.deb
+          dpkg-deb --contents dist/harbornavi-k3-debs/harboros-beacon_*.deb
+          (cd dist/harbornavi-k3-debs && sha256sum --check ./*.sha256)
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: harboros-beacon-riscv64
+          path: dist/harbornavi-k3-debs/harboros-beacon_*
+
+  model-runtime-lock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Require fail-closed model materials until the release lock is complete
+        run: |
+          python3 scripts/validate_k3_model_materials.py \
+            --manifest models/k3-evt1-model-materials.json \
+            --expect-blocked
+
+  model-runtime-riscv64:
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    # The controlled Linux builder supplies the signed private model bundle.
+    # Public CI never downloads floating model revisions or publishes this deb.
+    steps:
+      - run: echo "model runtime packages require the signed private bundle"

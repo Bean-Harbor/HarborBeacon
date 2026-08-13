@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+if [ "${1:-}" != "/data/models" ]; then
+  echo "error: model runtime data root must be /data/models" >&2
+  exit 2
+fi
+
+install -d -o harbormodel -g harbormodel -m 0755 \
+  /data/models \
+  /data/models/releases
+install -d -o harbormodel -g harbormodel -m 0750 /data/models/cache

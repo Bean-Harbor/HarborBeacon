@@ -5,7 +5,7 @@
   "beaconUrl": "http://127.0.0.1:4174",
   "outputDir": "/tmp/harbornavi-p1/4ch-mixed-simulation",
   "analyzerCommand": "/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py",
-  "modelPath": "/var/lib/harboros-beacon/models/yolov8n_192x320.q.onnx",
+  "modelPath": "/data/models/current/detection/yolov8n_192x320.q.onnx",
   "labelPath": "/var/lib/harboros-beacon/models/label.txt",
   "provider": "cpu",
   "vlmEnrich": false,

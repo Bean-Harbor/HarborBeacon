@@ -47,6 +47,7 @@ path = "src/bin/assistant_task_api.rs"
 [[bin]]
 name = "harbor-model-api"
 path = "src/bin/harbor-model-api.rs"
+required-features = ["embedded-model-runtime"]
 
 [[bin]]
 name = "harborbeacon-service"
@@ -105,13 +106,18 @@ quick-xml = "0.38"
 markitdown = "0.1.11"
 memmap2 = "0.9"
 fast-hnsw = "1.0.1"
-candle = { package = "candle-core", version = "0.10.2" }
-candle-nn = "0.10.2"
-candle-transformers = { version = "0.10.2", default-features = false }
+candle = { package = "candle-core", version = "0.10.2", optional = true }
+candle-nn = { version = "0.10.2", optional = true }
+candle-transformers = { version = "0.10.2", default-features = false, optional = true }
 hf-hub = { version = "0.4.1", default-features = false, features = ["ureq"] }
-tokenizers = { version = "0.22.0", default-features = false }
+tokenizers = { version = "0.22.0", default-features = false, features = ["fancy-regex"] }
 tantivy = "0.22"
 time = { version = "0.3.41", features = ["parsing"] }
+
+[features]
+default = ["embedded-model-runtime"]
+embedded-model-runtime = ["dep:candle", "dep:candle-nn", "dep:candle-transformers"]
+external-model-runtime = []
 
 [patch.crates-io]
 rig-core = { path = "vendor/rig-core-0.8.0" }

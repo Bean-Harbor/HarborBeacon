@@ -14,7 +14,7 @@ deb_arch="${DEB_ARCH:-riscv64}"
 : "${SOURCE_DATE_EPOCH:?SOURCE_DATE_EPOCH is required}"
 : "${HARBORBEACON_BUILD_CONTAINER_DIGEST:?HARBORBEACON_BUILD_CONTAINER_DIGEST is required}"
 : "${HARBORBEACON_DEBIAN_SNAPSHOT:?HARBORBEACON_DEBIAN_SNAPSHOT is required}"
-[[ "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]] || { echo "error: invalid SOURCE_DATE_EPOCH" >&2; exit 2; }
+: "${MODEL_BUNDLE_ROOT:?MODEL_BUNDLE_ROOT is required}"
 dpkg --validate-version "$DEBIAN_VERSION"
 [[ "$HARBORBEACON_BUILD_CONTAINER_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || {
   echo "error: HARBORBEACON_BUILD_CONTAINER_DIGEST must be a sha256 digest" >&2
@@ -24,14 +24,13 @@ dpkg --validate-version "$DEBIAN_VERSION"
   echo "error: HARBORBEACON_DEBIAN_SNAPSHOT must be an immutable snapshot timestamp" >&2
   exit 2
 }
-
 source_commit="${SOURCE_COMMIT:-$(git rev-parse HEAD)}"
 [[ "$source_commit" =~ ^[0-9a-f]{40}$ && "$source_commit" == "$(git rev-parse HEAD)" ]] || {
   echo "error: SOURCE_COMMIT must match the checked out full commit" >&2
   exit 2
 }
 if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
-  echo "error: HarborBeacon release build requires a clean worktree" >&2
+  echo "error: HarborBeacon model-runtime release build requires a clean worktree" >&2
   exit 2
 fi
 for command_name in cargo dpkg-deb python3 riscv64-linux-gnu-gcc sha256sum touch; do
@@ -44,64 +43,52 @@ export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }--remap-path-prefix=${repo_root}=."
 out_dir="${OUT_DIR:-${repo_root}/dist/harbornavi-k3-debs}"
 work_parent="${PACKAGE_WORK_ROOT:-${TMPDIR:-/tmp}}"
 mkdir -p "$out_dir" "$work_parent"
-build_root="$(mktemp -d "${work_parent%/}/harborbeacon-deb.XXXXXX")"
+build_root="$(mktemp -d "${work_parent%/}/harbormodel-deb.XXXXXX")"
 trap 'rm -rf -- "$build_root"' EXIT
 pkg_dir="${build_root}/root"
+model_stage="$pkg_dir/usr/share/harboros-model-runtime/models"
 cargo_target_dir="${CARGO_TARGET_DIR:-${repo_root}/target}"
 
+python3 scripts/validate_k3_model_materials.py \
+  --manifest models/k3-evt1-model-materials.json \
+  --bundle-root "$MODEL_BUNDLE_ROOT" \
+  --stage "$model_stage"
 cargo build --locked --release --target "$target" \
-  --no-default-features --features external-model-runtime \
-  --bin harboros-beacon \
-  --bin harbornavi-k3-local-vision-smoke \
-  --bin harbornavi-k3-multi-vision-smoke \
-  --bin harbornavi-ha-mqtt-event-contract-smoke
-if cargo tree --locked --target "$target" \
-  --no-default-features --features external-model-runtime \
-  | grep -Eq '(^| )candle-(core|nn|transformers) '; then
-  echo "error: K3 Beacon dependency tree still contains the embedded model runtime" >&2
-  exit 2
-fi
+  --no-default-features --features embedded-model-runtime --bin harbor-model-api
 
 install -d \
   "$pkg_dir/DEBIAN" \
   "$pkg_dir/usr/bin" \
-  "$pkg_dir/usr/lib/harborbeacon" \
-  "$pkg_dir/usr/lib/harboros-beacon" \
+  "$pkg_dir/usr/lib/harboros-model-runtime" \
   "$pkg_dir/usr/lib/systemd/system" \
-  "$pkg_dir/usr/share/doc/harboros-beacon" \
-  "$pkg_dir/usr/share/harboros"
-for binary in \
-  harboros-beacon \
-  harbornavi-k3-local-vision-smoke \
-  harbornavi-k3-multi-vision-smoke \
-  harbornavi-ha-mqtt-event-contract-smoke; do
-  install -m 0755 "$cargo_target_dir/$target/release/$binary" "$pkg_dir/usr/bin/$binary"
-done
-install -m 0755 scripts/harbornavi_k3_yolov8_analyzer.py \
-  "$pkg_dir/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py"
-install -m 0755 scripts/harbornavi_k3_yolo_stream_worker.py \
-  "$pkg_dir/usr/lib/harboros-beacon/harbornavi_k3_yolo_stream_worker.py"
-install -m 0755 debian/ensure-beacon-data-layout \
-  "$pkg_dir/usr/lib/harborbeacon/ensure-data-layout"
-install -m 0644 debian/harboros-beacon.service \
-  "$pkg_dir/usr/lib/systemd/system/harboros-beacon.service"
+  "$pkg_dir/usr/share/doc/harboros-model-runtime" \
+  "$pkg_dir/usr/share/harboros/component-contracts"
+install -m 0755 "$cargo_target_dir/$target/release/harbor-model-api" \
+  "$pkg_dir/usr/bin/harbor-model-api"
+install -m 0755 debian/ensure-model-runtime-data-layout \
+  "$pkg_dir/usr/lib/harboros-model-runtime/ensure-data-layout"
+install -m 0644 debian/harboros-model-runtime.service \
+  "$pkg_dir/usr/lib/systemd/system/harboros-model-runtime.service"
 sed -e "s/VERSION_PLACEHOLDER/${DEBIAN_VERSION}/g" \
-  -e "s/ARCH_PLACEHOLDER/${deb_arch}/g" debian/control \
-  | sed 's/^Depends: .*/Depends: libc6, ca-certificates, adduser, init-system-helpers, harboros-system, harborlink, harboros-model-runtime, python3, python3-opencv, python3-spacemit-ort/' \
-  > "$pkg_dir/DEBIAN/control"
-sed 's/\r$//' debian/postinst > "$pkg_dir/DEBIAN/postinst"
-sed 's/\r$//' debian/prerm > "$pkg_dir/DEBIAN/prerm"
+  -e "s/ARCH_PLACEHOLDER/${deb_arch}/g" \
+  debian/model-runtime-control.in > "$pkg_dir/DEBIAN/control"
+sed -e "s/VERSION_PLACEHOLDER/${DEBIAN_VERSION}/g" \
+  debian/model-runtime-postinst > "$pkg_dir/DEBIAN/postinst"
+sed 's/\r$//' debian/model-runtime-prerm > "$pkg_dir/DEBIAN/prerm"
 chmod 0755 "$pkg_dir/DEBIAN/postinst" "$pkg_dir/DEBIAN/prerm"
 sed "s/SOURCE_COMMIT_PLACEHOLDER/${source_commit}/g" \
-  debian/component-contract-beacon.json.in \
-  > "$pkg_dir/usr/share/harboros/component-contract.json"
+  debian/component-contract-model-runtime.json.in \
+  > "$pkg_dir/usr/share/harboros/component-contracts/harboros-model-runtime.json"
+install -m 0644 models/k3-evt1-model-materials.json \
+  "$pkg_dir/usr/share/harboros-model-runtime/model-materials.json"
 install -m 0644 debian/license-report.json \
-  "$pkg_dir/usr/share/doc/harboros-beacon/license-report.json"
+  "$pkg_dir/usr/share/doc/harboros-model-runtime/license-report.json"
 
 python3 scripts/generate_k3_supply_chain.py \
-  --package harboros-beacon \
+  --package harboros-model-runtime \
   --cargo-lock "$repo_root/Cargo.lock" \
-  --binary "$pkg_dir/usr/bin/harboros-beacon" \
+  --materials "$repo_root/models/k3-evt1-model-materials.json" \
+  --binary "$pkg_dir/usr/bin/harbor-model-api" \
   --version "$DEBIAN_VERSION" \
   --target "$target" \
   --arch "$deb_arch" \
@@ -109,26 +96,34 @@ python3 scripts/generate_k3_supply_chain.py \
   --source-date-epoch "$SOURCE_DATE_EPOCH" \
   --container-digest "$HARBORBEACON_BUILD_CONTAINER_DIGEST" \
   --debian-snapshot "$HARBORBEACON_DEBIAN_SNAPSHOT" \
-  --output-dir "$pkg_dir/usr/share/doc/harboros-beacon"
+  --output-dir "$pkg_dir/usr/share/doc/harboros-model-runtime"
 
 find "$pkg_dir" -print0 | xargs -0 touch --no-dereference --date="@${SOURCE_DATE_EPOCH}"
-artifact="${out_dir}/harboros-beacon_${DEBIAN_VERSION}_${deb_arch}.deb"
+artifact="${out_dir}/harboros-model-runtime_${DEBIAN_VERSION}_${deb_arch}.deb"
 artifact_name="$(basename "$artifact")"
 material_prefix="${artifact_name%.deb}"
 SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" dpkg-deb \
   --root-owner-group --build --uniform-compression -Zxz -z9 "$pkg_dir" "$artifact"
-install -m 0644 "$pkg_dir/usr/share/doc/harboros-beacon/sbom.spdx.json" \
+install -m 0644 \
+  "$pkg_dir/usr/share/doc/harboros-model-runtime/sbom.spdx.json" \
   "$out_dir/${material_prefix}.sbom.spdx.json"
-install -m 0644 "$pkg_dir/usr/share/doc/harboros-beacon/sbom.cdx.json" \
+install -m 0644 \
+  "$pkg_dir/usr/share/doc/harboros-model-runtime/sbom.cdx.json" \
   "$out_dir/${material_prefix}.sbom.cdx.json"
-install -m 0644 "$pkg_dir/usr/share/doc/harboros-beacon/build-provenance.json" \
+install -m 0644 \
+  "$pkg_dir/usr/share/doc/harboros-model-runtime/build-provenance.json" \
   "$out_dir/${material_prefix}.build-provenance.json"
-install -m 0644 "$pkg_dir/usr/share/doc/harboros-beacon/license-report.json" \
+install -m 0644 \
+  "$pkg_dir/usr/share/doc/harboros-model-runtime/license-report.json" \
   "$out_dir/${material_prefix}.license-report.json"
-install -m 0644 "$pkg_dir/usr/share/harboros/component-contract.json" \
+install -m 0644 \
+  "$pkg_dir/usr/share/harboros/component-contracts/harboros-model-runtime.json" \
   "$out_dir/${material_prefix}.component-contract.json"
+install -m 0644 \
+  "$pkg_dir/usr/share/harboros-model-runtime/model-materials.json" \
+  "$out_dir/${material_prefix}.model-materials.json"
 python3 scripts/generate_package_provenance.py \
-  --package harboros-beacon \
+  --package harboros-model-runtime \
   --version "$DEBIAN_VERSION" \
   --arch "$deb_arch" \
   --artifact "$artifact" \
@@ -149,6 +144,7 @@ touch --date="@${SOURCE_DATE_EPOCH}" "$out_dir/${material_prefix}."*.json
     "${material_prefix}.package-provenance.json" \
     "${material_prefix}.license-report.json" \
     "${material_prefix}.component-contract.json" \
+    "${material_prefix}.model-materials.json" \
     > "${artifact_name}.materials.sha256"
 )
 printf '%s\n' "$artifact"
