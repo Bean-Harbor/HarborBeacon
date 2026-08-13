@@ -3118,6 +3118,10 @@ mod tests {
             Some("ocr")
         );
         assert!(ocr_response
+            .supported_modalities
+            .iter()
+            .any(|item| item == "vlm"));
+        assert!(!ocr_response
             .pending_modalities
             .iter()
             .any(|item| item == "vlm"));
