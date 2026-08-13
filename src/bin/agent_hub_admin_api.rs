@@ -12105,6 +12105,15 @@ fn authenticate_gate_principal_identity(
             workspace_id,
         );
     }
+    if source.eq_ignore_ascii_case("harbornavi-lan") {
+        return authenticate_harbornavi_lan_principal(
+            raw_url,
+            headers,
+            principal_id,
+            roles,
+            workspace_id,
+        );
+    }
     if !source.eq_ignore_ascii_case("harboros") {
         return Err(GatePrincipalAuthError::new(
             StatusCode(403),
@@ -12161,6 +12170,47 @@ fn authenticate_harbornavi_device_principal(
         })
         .ok_or_else(|| GatePrincipalAuthError::new(StatusCode(400), "principal id is malformed"))?;
     if session_id.is_empty() {
+        return Err(GatePrincipalAuthError::new(
+            StatusCode(400),
+            "principal id is malformed",
+        ));
+    }
+    if roles.trim() != "CAMERA_VIEW" {
+        return Err(GatePrincipalAuthError::new(
+            StatusCode(403),
+            "CAMERA_VIEW role is required",
+        ));
+    }
+    let camera_scope = required_gate_principal_header(headers, "X-Harbor-Camera-Scope")?;
+    if camera_scope != camera_id {
+        return Err(GatePrincipalAuthError::new(
+            StatusCode(403),
+            "principal camera scope does not match the requested camera",
+        ));
+    }
+    Ok(GateAuthenticatedPrincipal(AccessPrincipal {
+        workspace_id,
+        user_id: principal_id.clone(),
+        display_name: principal_id,
+        role_kind: RoleKind::Viewer,
+    }))
+}
+
+fn authenticate_harbornavi_lan_principal(
+    raw_url: &str,
+    headers: &[Header],
+    principal_id: String,
+    roles: String,
+    workspace_id: String,
+) -> Result<GateAuthenticatedPrincipal, GatePrincipalAuthError> {
+    let path = raw_url.split('?').next().unwrap_or(raw_url);
+    let camera_id = parse_cat_detection_observation_camera_id(path).ok_or_else(|| {
+        GatePrincipalAuthError::new(
+            StatusCode(403),
+            "HarborNavi LAN principals are limited to observation reads",
+        )
+    })?;
+    if principal_id != "harbornavi-lan:anonymous" {
         return Err(GatePrincipalAuthError::new(
             StatusCode(400),
             "principal id is malformed",
@@ -34151,6 +34201,58 @@ mod tests {
         )
         .expect_err("device principal role must be CAMERA_VIEW");
         assert_eq!(wrong_role.status, StatusCode(403));
+    }
+
+    #[test]
+    fn harbornavi_lan_principal_is_camera_scoped_and_observation_only() {
+        let observation_path =
+            "/api/cameras/camera.252/cat-detection/observation?stream_profile=sub";
+        let headers = vec![
+            Header::from_bytes(b"Authorization", b"Bearer service-token").expect("header"),
+            Header::from_bytes(b"X-Harbor-Principal-Source", b"harbornavi-lan").expect("header"),
+            Header::from_bytes(b"X-Harbor-Principal-Id", b"harbornavi-lan:anonymous")
+                .expect("header"),
+            Header::from_bytes(b"X-Harbor-Principal-Roles", b"CAMERA_VIEW").expect("header"),
+            Header::from_bytes(b"X-Harbor-Workspace-Id", b"home-1").expect("header"),
+            Header::from_bytes(b"X-Harbor-Camera-Scope", b"camera.252").expect("header"),
+        ];
+        let principal = authenticate_gate_principal_headers(
+            Some("service-token"),
+            observation_path,
+            &headers,
+            "home-1",
+        )
+        .expect("camera-scoped LAN principal");
+        assert_eq!(principal.0.role_kind, RoleKind::Viewer);
+        assert_eq!(principal.0.user_id, "harbornavi-lan:anonymous");
+
+        let detection_jobs = authenticate_gate_principal_headers(
+            Some("service-token"),
+            "/api/vision/detection-jobs",
+            &headers,
+            "home-1",
+        )
+        .expect_err("LAN principal must not control detection jobs");
+        assert_eq!(detection_jobs.status, StatusCode(403));
+
+        let mut wrong_camera = headers.clone();
+        wrong_camera.retain(|header| {
+            !header
+                .field
+                .as_str()
+                .to_string()
+                .eq_ignore_ascii_case("X-Harbor-Camera-Scope")
+        });
+        wrong_camera
+            .push(Header::from_bytes(b"X-Harbor-Camera-Scope", b"camera.999").expect("header"));
+        let wrong_camera = authenticate_gate_principal_headers(
+            Some("service-token"),
+            observation_path,
+            &wrong_camera,
+            "home-1",
+        )
+        .expect_err("LAN principal camera scope mismatch");
+        assert_eq!(wrong_camera.status, StatusCode(403));
     }
 
     #[test]
