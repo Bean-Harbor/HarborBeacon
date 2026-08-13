@@ -38,7 +38,6 @@ for command_name in cargo dpkg-deb python3 riscv64-linux-gnu-gcc sha256sum touch
 done
 export CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER="${CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER:-riscv64-linux-gnu-gcc}"
 export CARGO_INCREMENTAL=0
-export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }--remap-path-prefix=${repo_root}=."
 
 out_dir="${OUT_DIR:-${repo_root}/dist/harbornavi-k3-debs}"
 work_parent="${PACKAGE_WORK_ROOT:-${TMPDIR:-/tmp}}"
@@ -48,6 +47,9 @@ trap 'rm -rf -- "$build_root"' EXIT
 pkg_dir="${build_root}/root"
 model_stage="$pkg_dir/usr/share/harboros-model-runtime/models"
 cargo_target_dir="${CARGO_TARGET_DIR:-${repo_root}/target}"
+mkdir -p "$cargo_target_dir"
+cargo_target_dir="$(cd "$cargo_target_dir" && pwd -P)"
+export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }--remap-path-prefix=${cargo_target_dir}=./target --remap-path-prefix=${repo_root}=."
 
 python3 scripts/validate_k3_model_materials.py \
   --manifest models/k3-evt1-model-materials.json \

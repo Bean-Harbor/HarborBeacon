@@ -39,7 +39,6 @@ for command_name in cargo dpkg-deb python3 riscv64-linux-gnu-gcc sha256sum touch
 done
 export CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER="${CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER:-riscv64-linux-gnu-gcc}"
 export CARGO_INCREMENTAL=0
-export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }--remap-path-prefix=${repo_root}=."
 
 out_dir="${OUT_DIR:-${repo_root}/dist/harbornavi-k3-debs}"
 work_parent="${PACKAGE_WORK_ROOT:-${TMPDIR:-/tmp}}"
@@ -48,6 +47,9 @@ build_root="$(mktemp -d "${work_parent%/}/harborbeacon-deb.XXXXXX")"
 trap 'rm -rf -- "$build_root"' EXIT
 pkg_dir="${build_root}/root"
 cargo_target_dir="${CARGO_TARGET_DIR:-${repo_root}/target}"
+mkdir -p "$cargo_target_dir"
+cargo_target_dir="$(cd "$cargo_target_dir" && pwd -P)"
+export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }--remap-path-prefix=${cargo_target_dir}=./target --remap-path-prefix=${repo_root}=."
 
 cargo build --locked --release --target "$target" \
   --no-default-features --features external-model-runtime \

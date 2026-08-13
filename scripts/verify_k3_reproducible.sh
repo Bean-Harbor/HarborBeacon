@@ -12,8 +12,7 @@ esac
 work_root="$(mktemp -d "${TMPDIR:-/tmp}/harborbeacon-repro.XXXXXX")"
 trap 'rm -rf -- "$work_root"' EXIT
 for run in first second; do
-  rm -rf -- "$work_root/target"
-  OUT_DIR="$work_root/$run/out" CARGO_TARGET_DIR="$work_root/target" \
+  OUT_DIR="$work_root/$run/out" CARGO_TARGET_DIR="$work_root/$run/target" \
     bash "$build_script"
 done
 first="$work_root/first/out"

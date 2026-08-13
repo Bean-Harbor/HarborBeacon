@@ -155,12 +155,17 @@ class K3PackagingContractTests(unittest.TestCase):
             self.assertIn("cd \"$out_dir\"", script)
             self.assertIn("sbom.cdx.json", script)
             self.assertIn("generate_package_provenance.py", script)
+            self.assertIn(
+                "--remap-path-prefix=${cargo_target_dir}=./target", script
+            )
 
         reproducible = (ROOT / "scripts" / "verify_k3_reproducible.sh").read_text(
             encoding="utf-8"
         )
         self.assertIn("diff --no-dereference --recursive", reproducible)
         self.assertIn("sha256sum --check ./*.sha256", reproducible)
+        self.assertIn('CARGO_TARGET_DIR="$work_root/$run/target"', reproducible)
+        self.assertNotIn('CARGO_TARGET_DIR="$work_root/target"', reproducible)
         supply_chain = (ROOT / "scripts" / "generate_k3_supply_chain.py").read_text(
             encoding="utf-8"
         )
