@@ -71,6 +71,8 @@ install -m 0755 debian/ensure-model-runtime-data-layout \
   "$pkg_dir/usr/lib/harboros-model-runtime/ensure-data-layout"
 install -m 0644 debian/harboros-model-runtime.service \
   "$pkg_dir/usr/lib/systemd/system/harboros-model-runtime.service"
+install -m 0644 debian/harboros-vlm-runtime.service \
+  "$pkg_dir/usr/lib/systemd/system/harboros-vlm-runtime.service"
 sed -e "s/VERSION_PLACEHOLDER/${DEBIAN_VERSION}/g" \
   -e "s/ARCH_PLACEHOLDER/${deb_arch}/g" \
   debian/model-runtime-control.in > "$pkg_dir/DEBIAN/control"
@@ -90,6 +92,18 @@ python3 scripts/generate_k3_supply_chain.py \
   --package harboros-model-runtime \
   --cargo-lock "$repo_root/Cargo.lock" \
   --materials "$repo_root/models/k3-evt1-model-materials.json" \
+  --input-file "$repo_root/debian/model-runtime-control.in" \
+  --input-file "$repo_root/debian/model-runtime-postinst" \
+  --input-file "$repo_root/debian/model-runtime-prerm" \
+  --input-file "$repo_root/debian/ensure-model-runtime-data-layout" \
+  --input-file "$repo_root/debian/harboros-model-runtime.service" \
+  --input-file "$repo_root/debian/harboros-vlm-runtime.service" \
+  --input-file "$repo_root/debian/component-contract-model-runtime.json.in" \
+  --input-file "$repo_root/debian/license-report.json" \
+  --model-root "$model_stage" \
+  --runtime-dependency "llama.cpp-tools-spacemit=0.1.1" \
+  --runtime-dependency "spacemit-onnxruntime=2.0.3+3" \
+  --runtime-dependency "spacemit-tcm=3.0.0+3" \
   --binary "$pkg_dir/usr/bin/harbor-model-api" \
   --version "$DEBIAN_VERSION" \
   --target "$target" \

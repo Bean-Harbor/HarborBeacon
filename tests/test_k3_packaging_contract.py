@@ -1,3 +1,4 @@
+import json
 import unittest
 from pathlib import Path
 
@@ -119,6 +120,100 @@ class K3PackagingContractTests(unittest.TestCase):
         self.assertIn("harboros-system (>= 0.1.0~evt.1)", control)
         self.assertIn("harboros-system (<< 0.2)", control)
 
+    def test_k3_event_vlm_is_loopback_only_and_fully_pinned(self):
+        vlm_unit = (ROOT / "debian" / "harboros-vlm-runtime.service").read_text(
+            encoding="utf-8"
+        )
+        beacon_unit = (ROOT / "debian" / "harboros-beacon.service").read_text(
+            encoding="utf-8"
+        )
+        control = (ROOT / "debian" / "model-runtime-control.in").read_text(
+            encoding="utf-8"
+        )
+        build = (ROOT / "scripts" / "build_model_runtime_k3_deb.sh").read_text(
+            encoding="utf-8"
+        )
+        contract = json.loads(
+            (ROOT / "debian" / "component-contract-model-runtime.json.in").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        self.assertIn("--host 127.0.0.1 --port 8080", vlm_unit)
+        self.assertIn("--vision-backend smt", vlm_unit)
+        self.assertIn("--ctx-size 4096 -t 8 -tb 8", vlm_unit)
+        self.assertIn("--no-warmup", vlm_unit)
+        self.assertIn("Environment=OMP_NUM_THREADS=8", vlm_unit)
+        self.assertIn("LimitNOFILE=1048576", vlm_unit)
+        self.assertNotIn("taskset", vlm_unit)
+        self.assertNotIn("--media-path", vlm_unit)
+        self.assertIn("ReadOnlyPaths=/data/models/current", vlm_unit)
+        self.assertNotIn("0.0.0.0", vlm_unit)
+        self.assertIn("HARBORNAVI_VLM_API_BASE=http://127.0.0.1:8080/v1", beacon_unit)
+        self.assertIn("harboros-vlm-runtime.service", beacon_unit)
+
+        exact_dependencies = (
+            "llama.cpp-tools-spacemit (= 0.1.1)",
+            "spacemit-onnxruntime (= 2.0.3+3)",
+            "spacemit-tcm (= 3.0.0+3)",
+        )
+        build_dependencies = (
+            "llama.cpp-tools-spacemit=0.1.1",
+            "spacemit-onnxruntime=2.0.3+3",
+            "spacemit-tcm=3.0.0+3",
+        )
+        for dependency in exact_dependencies:
+            self.assertIn(dependency, control)
+        for dependency in build_dependencies:
+            self.assertIn(dependency, build)
+
+        services = {service["unit"]: service for service in contract["services"]}
+        self.assertEqual(
+            services["harboros-model-runtime.service"]["health"],
+            "http://127.0.0.1:8792/healthz",
+        )
+        self.assertEqual(
+            services["harboros-vlm-runtime.service"]["health"],
+            "http://127.0.0.1:8080/health",
+        )
+
+    def test_model_manifest_locks_only_selected_vlm_resolution(self):
+        manifest = json.loads(
+            (ROOT / "models" / "k3-evt1-model-materials.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertTrue(all(item["state"] == "locked" for item in manifest["materials"]))
+        paths = [
+            file_entry["package_path"]
+            for material in manifest["materials"]
+            for file_entry in material["files"]
+        ]
+        self.assertEqual(len(paths), 11)
+        self.assertIn(
+            "vlm/Qwen3.5-0.8B/qwen3_5vl_0.8b-vision-384-op23.f16.onnx",
+            paths,
+        )
+        self.assertFalse(any("vision-224" in path or "vision-768" in path for path in paths))
+        self.assertTrue(
+            all(
+                isinstance(file_entry["size"], int)
+                and len(file_entry["sha256"]) == 64
+                for material in manifest["materials"]
+                for file_entry in material["files"]
+            )
+        )
+
+        workflow = (ROOT / ".github" / "workflows" / "k3-evt-package.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("--expect-blocked", workflow)
+        license_report = json.loads(
+            (ROOT / "debian" / "license-report.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(license_report["project_license"], "NOASSERTION")
+        self.assertEqual(license_report["review_status"], "blocked")
+
     def test_data_layout_helpers_are_fixed_and_installed(self):
         cases = [
             (
@@ -170,6 +265,10 @@ class K3PackagingContractTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn('parser.add_argument("--debian-snapshot", required=True)', supply_chain)
+        self.assertIn('parser.add_argument("--model-root", type=Path)', supply_chain)
+        self.assertIn('parser.add_argument("--input-file", type=Path', supply_chain)
+        self.assertIn('parser.add_argument("--runtime-dependency"', supply_chain)
+        self.assertIn('"relationshipType": "CONTAINS"', supply_chain)
         self.assertIn('"toolchain"', supply_chain)
         self.assertIn('"riscv64_linux_gnu_gcc"', supply_chain)
         self.assertIn('"xz"', supply_chain)

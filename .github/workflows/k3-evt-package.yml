@@ -50,11 +50,10 @@ jobs:
             python3 \
             xz-utils
           rustup target add riscv64gc-unknown-linux-gnu
-      - name: Verify the model lock is still fail-closed
+      - name: Verify the immutable model material lock
         run: |
           python3 scripts/validate_k3_model_materials.py \
-            --manifest models/k3-evt1-model-materials.json \
-            --expect-blocked
+            --manifest models/k3-evt1-model-materials.json
       - name: Verify reproducible Beacon package without embedded Candle
         env:
           DEB_ARCH: riscv64
@@ -80,16 +79,15 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - name: Require fail-closed model materials until the release lock is complete
+      - name: Verify the immutable model material lock
         run: |
           python3 scripts/validate_k3_model_materials.py \
-            --manifest models/k3-evt1-model-materials.json \
-            --expect-blocked
+            --manifest models/k3-evt1-model-materials.json
 
   model-runtime-riscv64:
     if: ${{ false }}
     runs-on: ubuntu-latest
-    # The controlled Linux builder supplies the signed private model bundle.
-    # Public CI never downloads floating model revisions or publishes this deb.
+    # The controlled Linux builder supplies the immutable model bundle. Public
+    # CI verifies the lock but never downloads or republishes model materials.
     steps:
-      - run: echo "model runtime packages require the signed private bundle"
+      - run: echo "model runtime packages require the controlled immutable bundle"

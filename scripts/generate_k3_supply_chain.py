@@ -26,6 +26,32 @@ def spdx_id(name: str, version: str) -> str:
     return "SPDXRef-" + re.sub(r"[^A-Za-z0-9.-]", "-", f"Package-{name}-{version}")
 
 
+def file_spdx_id(name: str, digest: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9.-]", "-", name)
+    return f"SPDXRef-File-{normalized}-{digest[:12]}"
+
+
+def runtime_dependency(value: str, arch: str) -> dict[str, str]:
+    if "=" not in value:
+        raise ValueError(f"runtime dependency must be name=version: {value}")
+    name, version = value.split("=", 1)
+    if not re.fullmatch(r"[a-z0-9][a-z0-9+.-]+", name) or not version.strip():
+        raise ValueError(f"invalid runtime dependency: {value}")
+    return {
+        "name": name,
+        "version": version,
+        "purl": f"pkg:deb/ubuntu/{name}@{version}?arch={arch}",
+    }
+
+
+def stable_input_name(path: Path) -> str:
+    resolved = path.resolve(strict=True)
+    try:
+        return resolved.relative_to(Path.cwd().resolve()).as_posix()
+    except ValueError:
+        return resolved.name
+
+
 def cargo_components(lock_path: Path) -> list[dict[str, str]]:
     payload = tomllib.loads(lock_path.read_text(encoding="utf-8"))
     return [
@@ -68,6 +94,9 @@ def main() -> None:
     parser.add_argument("--binary", type=Path, action="append", required=True)
     parser.add_argument("--cargo-lock", type=Path, required=True)
     parser.add_argument("--materials", type=Path)
+    parser.add_argument("--input-file", type=Path, action="append", default=[])
+    parser.add_argument("--model-root", type=Path)
+    parser.add_argument("--runtime-dependency", action="append", default=[])
     parser.add_argument("--version", required=True)
     parser.add_argument("--target", required=True)
     parser.add_argument("--arch", required=True)
@@ -82,6 +111,18 @@ def main() -> None:
         "+00:00", "Z"
     )
     binaries = sorted(args.binary, key=lambda path: path.name)
+    inputs = sorted(args.input_file, key=stable_input_name)
+    runtime_dependencies = sorted(
+        (runtime_dependency(value, args.arch) for value in args.runtime_dependency),
+        key=lambda dependency: dependency["name"],
+    )
+    model_files = []
+    if args.model_root is not None:
+        model_root = args.model_root.resolve(strict=True)
+        model_files = sorted(
+            (path for path in model_root.rglob("*") if path.is_file() and not path.is_symlink()),
+            key=lambda path: path.relative_to(model_root).as_posix(),
+        )
     root_purl = f"pkg:deb/{args.package}@{args.version}?arch={args.arch}"
     root_id = spdx_id(args.package, args.version)
     components = cargo_components(args.cargo_lock)
@@ -140,6 +181,72 @@ def main() -> None:
                 "relatedSpdxElement": package_id,
             }
         )
+    for dependency in runtime_dependencies:
+        package_id = spdx_id(dependency["name"], dependency["version"])
+        packages.append(
+            {
+                "name": dependency["name"],
+                "SPDXID": package_id,
+                "versionInfo": dependency["version"],
+                "downloadLocation": "NOASSERTION",
+                "filesAnalyzed": False,
+                "licenseConcluded": "NOASSERTION",
+                "licenseDeclared": "NOASSERTION",
+                "externalRefs": [
+                    {
+                        "referenceCategory": "PACKAGE-MANAGER",
+                        "referenceType": "purl",
+                        "referenceLocator": dependency["purl"],
+                    }
+                ],
+            }
+        )
+        relationships.append(
+            {
+                "spdxElementId": root_id,
+                "relationshipType": "DEPENDS_ON",
+                "relatedSpdxElement": package_id,
+            }
+        )
+
+    spdx_files = []
+    model_subjects = []
+    model_components = []
+    if args.model_root is not None:
+        for model_file in model_files:
+            relative_name = model_file.relative_to(model_root).as_posix()
+            model_digest = sha256(model_file)
+            model_id = file_spdx_id(relative_name, model_digest)
+            package_model_name = f"usr/share/harboros-model-runtime/models/{relative_name}"
+            spdx_files.append(
+                {
+                    "fileName": f"./{package_model_name}",
+                    "SPDXID": model_id,
+                    "checksums": [
+                        {"algorithm": "SHA256", "checksumValue": model_digest}
+                    ],
+                    "licenseConcluded": "NOASSERTION",
+                    "copyrightText": "NOASSERTION",
+                }
+            )
+            relationships.append(
+                {
+                    "spdxElementId": root_id,
+                    "relationshipType": "CONTAINS",
+                    "relatedSpdxElement": model_id,
+                }
+            )
+            model_subjects.append(
+                {"name": package_model_name, "digest": {"sha256": model_digest}}
+            )
+            model_components.append(
+                {
+                    "type": "file",
+                    "name": relative_name,
+                    "bom-ref": f"model:{relative_name}",
+                    "hashes": [{"alg": "SHA-256", "content": model_digest}],
+                }
+            )
 
     spdx = {
         "spdxVersion": "SPDX-2.3",
@@ -151,6 +258,7 @@ def main() -> None:
         ),
         "creationInfo": {"created": created, "creators": ["Organization: Harbor"]},
         "packages": packages,
+        "files": spdx_files,
         "relationships": relationships,
     }
     cyclonedx = {
@@ -180,7 +288,17 @@ def main() -> None:
                 ),
             }
             for component in components
-        ],
+        ]
+        + [
+            {
+                "type": "library",
+                "name": dependency["name"],
+                "version": dependency["version"],
+                "purl": dependency["purl"],
+            }
+            for dependency in runtime_dependencies
+        ]
+        + model_components,
     }
     resolved = [
         {
@@ -199,6 +317,19 @@ def main() -> None:
                 "digest": {"sha256": sha256(args.materials)},
             }
         )
+    for input_file in inputs:
+        resolved.append(
+            {
+                "uri": stable_input_name(input_file),
+                "digest": {"sha256": sha256(input_file)},
+            }
+        )
+    for dependency in runtime_dependencies:
+        resolved.append(
+            {
+                "uri": dependency["purl"],
+            }
+        )
     resolved.append(
         {
             "uri": (
@@ -212,7 +343,8 @@ def main() -> None:
         "subject": [
             {"name": binary.name, "digest": {"sha256": sha256(binary)}}
             for binary in binaries
-        ],
+        ]
+        + model_subjects,
         "predicateType": "https://slsa.dev/provenance/v1",
         "predicate": {
             "buildDefinition": {
@@ -223,6 +355,10 @@ def main() -> None:
                     "version": args.version,
                     "source_date_epoch": args.source_date_epoch,
                     "debian_snapshot": args.debian_snapshot,
+                    "runtime_dependencies": [
+                        f"{dependency['name']}={dependency['version']}"
+                        for dependency in runtime_dependencies
+                    ],
                 },
                 "resolvedDependencies": resolved,
             },

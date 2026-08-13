@@ -32,13 +32,16 @@ fi
 mv -f /data/models/current.new /data/models/current
 
 if command -v deb-systemd-helper >/dev/null 2>&1; then
-  deb-systemd-helper unmask harboros-model-runtime.service >/dev/null || true
-  deb-systemd-helper enable harboros-model-runtime.service >/dev/null || true
+  for unit in harboros-model-runtime.service harboros-vlm-runtime.service; do
+    deb-systemd-helper unmask "$unit" >/dev/null || true
+    deb-systemd-helper enable "$unit" >/dev/null || true
+  done
 fi
 
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   systemctl daemon-reload
   systemctl try-restart harboros-model-runtime.service || true
+  systemctl try-restart harboros-vlm-runtime.service || true
 fi
 
 exit 0

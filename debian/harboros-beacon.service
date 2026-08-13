@@ -1,8 +1,8 @@
 [Unit]
 Description=HarborOS Beacon API Service
-Wants=network-online.target harborlink.target harboros-model-runtime.service
+Wants=network-online.target harborlink.target harboros-model-runtime.service harboros-vlm-runtime.service
 Requires=harboros-bootstrap.service
-After=network-online.target harboros-bootstrap.service harborlink.target harboros-model-runtime.service
+After=network-online.target harboros-bootstrap.service harborlink.target harboros-model-runtime.service harboros-vlm-runtime.service
 RequiresMountsFor=/data
 
 [Service]
@@ -24,6 +24,8 @@ Environment=HARBOR_K3_YOLO_LABELS=/data/models/current/detection/label.txt
 Environment=HARBOR_MODEL_API_BASE_URL=http://127.0.0.1:8792/v1
 Environment=HARBOR_MODEL_API_BACKEND=openai_proxy
 Environment=HARBOR_MODEL_API_UPSTREAM_BASE_URL=http://127.0.0.1:8792
+Environment=HARBORNAVI_VLM_API_BASE=http://127.0.0.1:8080/v1
+Environment=HARBORNAVI_VLM_MODEL=qwen3_5vl_0.8b-text-q41.gguf
 EnvironmentFile=/data/harboros/secrets/beacon-gate.env
 Environment=HARBOR_EDGE_ASSERTION_KEY_FILE=%d/harbor-edge-assertion-key
 ExecStart=/usr/bin/harboros-beacon --bind 127.0.0.1:4174 --admin-state /data/harborbeacon/admin-console.json --device-registry /data/harborbeacon/device-registry.json --conversations /data/harborbeacon/task-api-conversations.json --harbor-assistant-dist /usr/share/harboros/webui --public-origin http://127.0.0.1:4174

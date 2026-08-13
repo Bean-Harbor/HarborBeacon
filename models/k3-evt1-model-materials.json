@@ -5,61 +5,113 @@
     {
       "id": "detection-yolov8n-192x320",
       "role": "detection",
-      "state": "blocked",
-      "source": "https://gitee.com/bianbu/spacemit-demo/tree/master/examples/CV/yolov8",
-      "revision": null,
+      "state": "locked",
+      "source": "https://gitee.com/bianbu/spacemit-demo.git",
+      "revision": "dc4477d3ea712598bb675f730642a43fe280c569",
       "files": [
         {
           "source_path": "detection/yolov8n_192x320.q.onnx",
           "package_path": "detection/yolov8n_192x320.q.onnx",
-          "size": null,
+          "size": 1925676,
           "sha256": "d4bf61db2a0925a0126052212479ff5044b621b12c6793420e085d36ae6b5438"
         }
-      ],
-      "blocker": "Freeze the exact upstream revision and byte size for the already measured model hash."
+      ]
     },
     {
       "id": "detection-coco-labels",
       "role": "detection-labels",
-      "state": "blocked",
-      "source": "https://gitee.com/bianbu/spacemit-demo/tree/master/examples/CV/yolov8",
-      "revision": null,
+      "state": "locked",
+      "source": "https://gitee.com/bianbu/spacemit-demo.git",
+      "revision": "dc4477d3ea712598bb675f730642a43fe280c569",
       "files": [
         {
           "source_path": "detection/label.txt",
           "package_path": "detection/label.txt",
-          "size": null,
+          "size": 621,
           "sha256": "bd17f1ee35d5f3c862a4894605855abbb9dda4b0621fdb0ac4c2c8c7bb7e730a"
         }
-      ],
-      "blocker": "Freeze the exact upstream revision and byte size for the already measured label hash."
+      ]
     },
     {
       "id": "semantic-router-bootstrap-llm",
       "role": "semantic-router",
-      "state": "blocked",
+      "state": "locked",
       "source": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct",
-      "revision": null,
-      "files": [],
-      "blocker": "Freeze an immutable model revision and the SHA256/size of every required file."
+      "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+      "files": [
+        {
+          "source_path": "semantic-router/qwen2.5-0.5b-instruct/config.json",
+          "package_path": "semantic-router/qwen2.5-0.5b-instruct/config.json",
+          "size": 659,
+          "sha256": "18e18afcaccafade98daf13a54092927904649e1dd4eba8299ab717d5d94ff45"
+        },
+        {
+          "source_path": "semantic-router/qwen2.5-0.5b-instruct/model.safetensors",
+          "package_path": "semantic-router/qwen2.5-0.5b-instruct/model.safetensors",
+          "size": 988097824,
+          "sha256": "fdf756fa7fcbe7404d5c60e26bff1a0c8b8aa1f72ced49e7dd0210fe288fb7fe"
+        },
+        {
+          "source_path": "semantic-router/qwen2.5-0.5b-instruct/tokenizer.json",
+          "package_path": "semantic-router/qwen2.5-0.5b-instruct/tokenizer.json",
+          "size": 7031645,
+          "sha256": "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539"
+        }
+      ]
     },
     {
       "id": "rag-embedding-model",
       "role": "embedding",
-      "state": "blocked",
+      "state": "locked",
       "source": "https://huggingface.co/jinaai/jina-embeddings-v2-base-zh",
-      "revision": null,
-      "files": [],
-      "blocker": "Freeze an immutable model revision and the SHA256/size of every required file."
+      "revision": "998b9133910ffcb127a7bff233f41db6ed9be4d2",
+      "files": [
+        {
+          "source_path": "embedding/jina-embeddings-v2-base-zh/config.json",
+          "package_path": "embedding/jina-embeddings-v2-base-zh/config.json",
+          "size": 1413,
+          "sha256": "7dd45199b9f70a59a0ada4c126077b1410e1d8b948d5cc08a43f7937a3c010d4"
+        },
+        {
+          "source_path": "embedding/jina-embeddings-v2-base-zh/model.safetensors",
+          "package_path": "embedding/jina-embeddings-v2-base-zh/model.safetensors",
+          "size": 321648328,
+          "sha256": "29b7cdda0c8fa9b18f8e0fbc4aba0c9537555fb16b139fa44be92c1e1b3253a8"
+        },
+        {
+          "source_path": "embedding/jina-embeddings-v2-base-zh/tokenizer.json",
+          "package_path": "embedding/jina-embeddings-v2-base-zh/tokenizer.json",
+          "size": 2030772,
+          "sha256": "0046da43cc8c424b317f56b092b0512aaaa65c4f925d2f16af9d9eeb4d0ef902"
+        }
+      ]
     },
     {
-      "id": "event-vlm",
+      "id": "event-vlm-qwen3.5-0.8b-384",
       "role": "event-vlm",
-      "state": "blocked",
-      "source": "HarborNavi K3 EVT model selection",
-      "revision": null,
-      "files": [],
-      "blocker": "Select and lock the Ubuntu 26.04 K3 VLM runtime and product-quality model; Bianbu-only evidence is not a release input."
+      "state": "locked",
+      "source": "https://archive.spacemit.com/spacemit-ai/model_zoo/vlm/Qwen3.5-0.8B.tar.gz",
+      "revision": "20a0fa9353a326f1751340dc469d6929fbd5ba95",
+      "files": [
+        {
+          "source_path": "vlm/Qwen3.5-0.8B/qwen3_5vl_0.8b-vision-384-op23.f16.onnx",
+          "package_path": "vlm/Qwen3.5-0.8B/qwen3_5vl_0.8b-vision-384-op23.f16.onnx",
+          "size": 201460594,
+          "sha256": "51b71bdcbb47f0e325dbfde7e1ef54609864ec4f261ee422e5503d6757c6b364"
+        },
+        {
+          "source_path": "vlm/Qwen3.5-0.8B/qwen3_5vl_0.8b-text-q41.gguf",
+          "package_path": "vlm/Qwen3.5-0.8B/qwen3_5vl_0.8b-text-q41.gguf",
+          "size": 532553184,
+          "sha256": "143617d3e4a67206c2a23c331684496f595560d0d893dd291c642c97fe677e4a"
+        },
+        {
+          "source_path": "vlm/Qwen3.5-0.8B/config.json",
+          "package_path": "vlm/Qwen3.5-0.8B/config.json",
+          "size": 353,
+          "sha256": "26a1971ed1061e7bd0ad1365698c339e553f4d46cc5b8eca7830022375f96172"
+        }
+      ]
     }
   ]
 }

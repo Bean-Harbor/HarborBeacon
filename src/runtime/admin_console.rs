@@ -910,6 +910,10 @@ fn default_automation_review_status() -> String {
 const MODEL_API_TOKEN_ENV: &str = "HARBOR_MODEL_API_TOKEN";
 const DEFAULT_MODEL_API_BASE_URL: &str = "http://127.0.0.1:4174/api/inference/v1";
 const DEFAULT_MODEL_API_TOKEN: &str = "harbor-local-model-token";
+const VLM_API_BASE_URL_ENV: &str = "HARBORNAVI_VLM_API_BASE";
+const DEFAULT_VLM_API_BASE_URL: &str = "http://127.0.0.1:8080/v1";
+const DEFAULT_VLM_HEALTH_URL: &str = "http://127.0.0.1:8080/health";
+const DEFAULT_VLM_MODEL: &str = "qwen3_5vl_0.8b-text-q41.gguf";
 
 impl AdminConsoleStore {
     pub fn new(path: impl Into<PathBuf>, registry_store: DeviceRegistryStore) -> Self {
@@ -3202,6 +3206,31 @@ pub fn sanitize_model_runtime(
                 .entry("bootstrap_model_id".to_string())
                 .or_insert_with(|| json!("Qwen/Qwen2.5-0.5B-Instruct"));
         }
+    } else if runtime.runtime_id == "harbor-vlm-sidecar" {
+        runtime.enabled = true;
+        runtime.installable = true;
+        if matches!(runtime.status.as_str(), "not_installed" | "not_available") {
+            runtime.status = "idle".to_string();
+        }
+        runtime.bind_url = Some(local_vlm_api_base_url());
+        runtime.healthz_url = Some(DEFAULT_VLM_HEALTH_URL.to_string());
+        if let Some(object) = runtime.metadata.as_object_mut() {
+            object
+                .entry("install_mode".to_string())
+                .or_insert_with(|| json!("managed_sidecar_package"));
+            object
+                .entry("external_endpoint".to_string())
+                .or_insert_with(|| json!(false));
+            object
+                .entry("default_enabled".to_string())
+                .or_insert_with(|| json!(true));
+            object
+                .entry("systemd_unit".to_string())
+                .or_insert_with(|| json!("harboros-vlm-runtime.service"));
+            object
+                .entry("model_id".to_string())
+                .or_insert_with(|| json!(DEFAULT_VLM_MODEL));
+        }
     }
     Ok(runtime)
 }
@@ -3249,6 +3278,7 @@ pub fn sanitize_model_endpoint(mut endpoint: ModelEndpoint) -> Result<ModelEndpo
     endpoint.cost_policy = normalize_json_object(endpoint.cost_policy);
     endpoint.metadata = normalize_json_object(endpoint.metadata);
     normalize_builtin_local_model_api_endpoint(&mut endpoint);
+    normalize_builtin_vlm_endpoint(&mut endpoint);
     align_embedding_endpoint_identity_with_runtime(&mut endpoint);
     Ok(endpoint)
 }
@@ -3419,6 +3449,7 @@ pub fn default_model_runtimes() -> Vec<ModelRuntimeRecord> {
 pub fn default_model_runtimes_for_store_root(model_store_root: &str) -> Vec<ModelRuntimeRecord> {
     let local_base_url = local_model_api_base_url();
     let local_healthz_url = local_model_api_healthz_url(&local_base_url);
+    let vlm_base_url = local_vlm_api_base_url();
     vec![
         ModelRuntimeRecord {
             runtime_id: "harbor-candle".to_string(),
@@ -3454,21 +3485,24 @@ pub fn default_model_runtimes_for_store_root(model_store_root: &str) -> Vec<Mode
             display_name: "Harbor Vision Runtime".to_string(),
             runtime_kind: "managed_sidecar".to_string(),
             provider_key: "harbor".to_string(),
-            status: "not_available".to_string(),
+            status: "idle".to_string(),
             managed: true,
-            installable: false,
-            enabled: false,
+            installable: true,
+            enabled: true,
             capabilities: vec!["vlm".to_string()],
             runtime_profiles: vec!["harbor-vlm-sidecar".to_string()],
-            bind_url: None,
-            healthz_url: None,
+            bind_url: Some(vlm_base_url),
+            healthz_url: Some(DEFAULT_VLM_HEALTH_URL.to_string()),
             model_store_path: model_runtime_store_path(model_store_root, "harbor-vlm-sidecar"),
-            message: "Harbor Vision Runtime is reserved for managed VLM packages; use advanced OpenAI-compatible endpoint until the package is available.".to_string(),
+            message: "Harbor-managed K3 event VLM is installed as a loopback-only sidecar.".to_string(),
             installed_at: None,
             updated_at: None,
             metadata: json!({
                 "install_mode": "managed_sidecar_package",
                 "external_endpoint": false,
+                "default_enabled": true,
+                "systemd_unit": "harboros-vlm-runtime.service",
+                "model_id": DEFAULT_VLM_MODEL,
             }),
         },
         ModelRuntimeRecord {
@@ -3594,6 +3628,7 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
     let local_base_url = local_model_api_base_url();
     let local_healthz_url = local_model_api_healthz_url(&local_base_url);
     let local_api_key = local_model_api_token();
+    let vlm_base_url = local_vlm_api_base_url();
     vec![
         ModelEndpoint {
             model_endpoint_id: "ocr-local-tesseract".to_string(),
@@ -3724,20 +3759,23 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
             model_kind: ModelKind::Vlm,
             endpoint_kind: ModelEndpointKind::Local,
             provider_key: "openai_compatible".to_string(),
-            model_name: "vision".to_string(),
+            model_name: DEFAULT_VLM_MODEL.to_string(),
             capability_tags: vec![
                 "image".to_string(),
                 "local_first".to_string(),
                 "multimodal".to_string(),
             ],
             cost_policy: json!({"cost_hint": "local_or_sidecar"}),
-            status: ModelEndpointStatus::Disabled,
+            status: ModelEndpointStatus::Degraded,
             metadata: json!({
                 "builtin": true,
-                "base_url": local_base_url,
-                "healthz_url": local_healthz_url,
-                "api_key": local_api_key,
-                "api_key_configured": true,
+                "base_url": vlm_base_url,
+                "healthz_url": DEFAULT_VLM_HEALTH_URL,
+                "api_key": "",
+                "api_key_configured": false,
+                "model": DEFAULT_VLM_MODEL,
+                "local_only": true,
+                "cloud_fallback_allowed": false,
             }),
         },
     ]
@@ -3766,6 +3804,49 @@ fn local_model_api_token() -> String {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| DEFAULT_MODEL_API_TOKEN.to_string())
+}
+
+fn normalize_builtin_vlm_endpoint(endpoint: &mut ModelEndpoint) {
+    if endpoint.model_endpoint_id != "vlm-local-openai-compatible"
+        || endpoint.model_kind != ModelKind::Vlm
+        || !endpoint
+            .provider_key
+            .eq_ignore_ascii_case("openai_compatible")
+        || !model_endpoint_metadata_bool(endpoint, "builtin")
+    {
+        return;
+    }
+
+    let legacy_base_url = model_endpoint_metadata_string(endpoint, "base_url")
+        .map(|value| value.contains("127.0.0.1:8792") || value.contains("localhost:8792"))
+        .unwrap_or(true);
+    let legacy_model_name = matches!(endpoint.model_name.as_str(), "vision" | "vlm");
+    if !legacy_base_url && !legacy_model_name {
+        return;
+    }
+
+    endpoint.model_name = DEFAULT_VLM_MODEL.to_string();
+    if endpoint.status == ModelEndpointStatus::Disabled {
+        endpoint.status = ModelEndpointStatus::Degraded;
+    }
+    for tag in ["image", "local_first", "multimodal"] {
+        ensure_model_endpoint_tag(endpoint, tag);
+    }
+    set_model_endpoint_metadata_string(endpoint, "base_url", local_vlm_api_base_url());
+    set_model_endpoint_metadata_string(endpoint, "healthz_url", DEFAULT_VLM_HEALTH_URL.to_string());
+    set_model_endpoint_metadata_string(endpoint, "api_key", String::new());
+    set_model_endpoint_metadata_bool(endpoint, "api_key_configured", false);
+    set_model_endpoint_metadata_string(endpoint, "model", DEFAULT_VLM_MODEL.to_string());
+    set_model_endpoint_metadata_bool(endpoint, "local_only", true);
+    set_model_endpoint_metadata_bool(endpoint, "cloud_fallback_allowed", false);
+}
+
+fn local_vlm_api_base_url() -> String {
+    env::var(VLM_API_BASE_URL_ENV)
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_VLM_API_BASE_URL.to_string())
 }
 
 pub fn default_model_route_policies() -> Vec<ModelRoutePolicy> {
@@ -3859,7 +3940,7 @@ pub fn default_model_route_policies() -> Vec<ModelRoutePolicy> {
             local_preferred: true,
             max_cost_per_run: None,
             fallback_order: vec!["local".to_string(), "sidecar".to_string()],
-            status: "degraded".to_string(),
+            status: "active".to_string(),
             metadata: json!({
                 "capability": "vision_summary",
                 "cloud_fallback": false,
@@ -5841,12 +5922,14 @@ mod tests {
         normalize_binding_code, normalize_loaded_admin_state, parse_rtsp_auth, parse_rtsp_path,
         resolved_identity_binding_records, resolved_remote_view_config,
         sanitize_bridge_provider_config, sanitize_defaults, sanitize_knowledge_settings,
-        sanitize_model_center_state, sync_platform_from_legacy, user_default_delivery_surface,
-        user_recent_interactive_surface, AdminConsoleState, AdminConsoleStore, AdminDefaults,
-        AdminModelCenterState, AutomationRuleReview, BridgeProviderCapabilities,
-        BridgeProviderConfig, DeviceCredentialSecret, DeviceEvidenceRecord, IdentityBindingRecord,
-        KnowledgeSettings, KnowledgeSourceRoot, ModelCapabilityBindingRecord, RemoteViewConfig,
-        BRIDGE_PROVIDER_ACCOUNT_ID, LOCAL_RTSP_CREDENTIAL_ID, LOCAL_RTSP_PROVIDER_ACCOUNT_ID,
+        sanitize_model_center_state, sanitize_model_endpoint, sync_platform_from_legacy,
+        user_default_delivery_surface, user_recent_interactive_surface, AdminConsoleState,
+        AdminConsoleStore, AdminDefaults, AdminModelCenterState, AutomationRuleReview,
+        BridgeProviderCapabilities, BridgeProviderConfig, DeviceCredentialSecret,
+        DeviceEvidenceRecord, IdentityBindingRecord, KnowledgeSettings, KnowledgeSourceRoot,
+        ModelCapabilityBindingRecord, RemoteViewConfig, BRIDGE_PROVIDER_ACCOUNT_ID,
+        DEFAULT_MODEL_WORKSPACE_ID, DEFAULT_VLM_MODEL, LOCAL_RTSP_CREDENTIAL_ID,
+        LOCAL_RTSP_PROVIDER_ACCOUNT_ID,
     };
 
     #[test]
@@ -7025,6 +7108,78 @@ mod tests {
             .model_store_path
             .replace('\\', "/")
             .ends_with("runtimes/harbor-candle"));
+
+        let vlm_runtime = runtimes
+            .iter()
+            .find(|runtime| runtime.runtime_id == "harbor-vlm-sidecar")
+            .expect("harbor VLM runtime");
+        assert!(vlm_runtime.managed);
+        assert!(vlm_runtime.installable);
+        assert!(vlm_runtime.enabled);
+        assert_eq!(vlm_runtime.status, "idle");
+        assert_eq!(
+            vlm_runtime.bind_url.as_deref(),
+            Some("http://127.0.0.1:8080/v1")
+        );
+        assert_eq!(
+            vlm_runtime.healthz_url.as_deref(),
+            Some("http://127.0.0.1:8080/health")
+        );
+
+        let vlm_endpoint = endpoints
+            .iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "vlm-local-openai-compatible")
+            .expect("harbor VLM endpoint");
+        assert_eq!(vlm_endpoint.status, ModelEndpointStatus::Degraded);
+        assert_eq!(
+            vlm_endpoint.metadata["base_url"],
+            json!("http://127.0.0.1:8080/v1")
+        );
+        assert_eq!(
+            vlm_endpoint.metadata["healthz_url"],
+            json!("http://127.0.0.1:8080/health")
+        );
+        assert_eq!(
+            vlm_endpoint.metadata["cloud_fallback_allowed"],
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn sanitize_model_center_migrates_builtin_vlm_to_k3_sidecar() {
+        let endpoint = sanitize_model_endpoint(ModelEndpoint {
+            model_endpoint_id: "vlm-local-openai-compatible".to_string(),
+            workspace_id: Some(DEFAULT_MODEL_WORKSPACE_ID.to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Vlm,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "openai_compatible".to_string(),
+            model_name: "vision".to_string(),
+            capability_tags: vec!["multimodal".to_string()],
+            cost_policy: json!({}),
+            status: ModelEndpointStatus::Disabled,
+            metadata: json!({
+                "builtin": true,
+                "base_url": "http://127.0.0.1:8792/v1",
+                "healthz_url": "http://127.0.0.1:8792/healthz",
+                "api_key": "legacy-token",
+                "api_key_configured": true,
+            }),
+        })
+        .expect("sanitize builtin VLM endpoint");
+
+        assert_eq!(endpoint.model_name, DEFAULT_VLM_MODEL);
+        assert_eq!(endpoint.status, ModelEndpointStatus::Degraded);
+        assert_eq!(
+            endpoint.metadata["base_url"],
+            json!("http://127.0.0.1:8080/v1")
+        );
+        assert_eq!(
+            endpoint.metadata["healthz_url"],
+            json!("http://127.0.0.1:8080/health")
+        );
+        assert_eq!(endpoint.metadata["api_key_configured"], json!(false));
+        assert_eq!(endpoint.metadata["cloud_fallback_allowed"], json!(false));
     }
 
     #[test]

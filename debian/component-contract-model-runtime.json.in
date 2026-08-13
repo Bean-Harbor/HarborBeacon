@@ -2,6 +2,23 @@
   "schema_version": 1,
   "package": "harboros-model-runtime",
   "source_commit": "SOURCE_COMMIT_PLACEHOLDER",
+  "services": [
+    {
+      "unit": "harboros-model-runtime.service",
+      "bind": "127.0.0.1:8792",
+      "health": "http://127.0.0.1:8792/healthz"
+    },
+    {
+      "unit": "harboros-vlm-runtime.service",
+      "bind": "127.0.0.1:8080",
+      "health": "http://127.0.0.1:8080/health"
+    }
+  ],
+  "runtime_dependencies": [
+    "llama.cpp-tools-spacemit=0.1.1",
+    "spacemit-onnxruntime=2.0.3+3",
+    "spacemit-tcm=3.0.0+3"
+  ],
   "contracts": [
     {
       "id": "harboros.k3.model-runtime",
@@ -11,6 +28,16 @@
         "loopback-only",
         "pinned-model-materials",
         "signed-model-materials"
+      ]
+    },
+    {
+      "id": "harboros.k3.vlm-runtime",
+      "version": 1,
+      "capabilities": [
+        "event-vlm",
+        "loopback-only",
+        "qwen3.5-0.8b",
+        "smt-tcm-vision"
       ]
     }
   ]
