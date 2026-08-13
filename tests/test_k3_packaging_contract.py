@@ -172,10 +172,15 @@ class K3PackagingContractTests(unittest.TestCase):
         for package in (
             "dpkg-dev",
             "gcc-riscv64-linux-gnu",
+            "libc6-dev-riscv64-cross",
             "python3",
             "xz-utils",
         ):
             self.assertIn(f'"{package}"', supply_chain)
+        workflow = (ROOT / ".github" / "workflows" / "k3-evt-package.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("libc6-dev-riscv64-cross", workflow)
         package_provenance = (
             ROOT / "scripts" / "generate_package_provenance.py"
         ).read_text(encoding="utf-8")

@@ -236,6 +236,7 @@ def main() -> None:
                         "debian_packages": debian_package_versions(
                             "dpkg-dev",
                             "gcc-riscv64-linux-gnu",
+                            "libc6-dev-riscv64-cross",
                             "python3",
                             "xz-utils",
                         ),

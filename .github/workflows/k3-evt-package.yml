@@ -43,7 +43,12 @@ jobs:
         run: |
           bash scripts/configure_debian_snapshot.sh
           apt-get update
-          apt-get install --yes --no-install-recommends dpkg-dev gcc-riscv64-linux-gnu python3 xz-utils
+          apt-get install --yes --no-install-recommends \
+            dpkg-dev \
+            gcc-riscv64-linux-gnu \
+            libc6-dev-riscv64-cross \
+            python3 \
+            xz-utils
           rustup target add riscv64gc-unknown-linux-gnu
       - name: Verify the model lock is still fail-closed
         run: |
