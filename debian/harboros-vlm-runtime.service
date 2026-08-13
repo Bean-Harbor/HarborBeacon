@@ -11,6 +11,8 @@ Group=harbormodel
 UMask=0077
 Environment=OMP_NUM_THREADS=8
 ExecStart=/usr/bin/llama-server -m /data/models/current/vlm/Qwen3.5-0.8B/qwen3_5vl_0.8b-text-q41.gguf --vision-backend smt --smt-config-dir /data/models/current/vlm/Qwen3.5-0.8B -ngl 0 --ctx-size 4096 -t 8 -tb 8 --host 127.0.0.1 --port 8080 --no-warmup --reasoning off
+ExecStartPost=/usr/lib/harboros-model-runtime/wait-health http://127.0.0.1:8080/health 300
+TimeoutStartSec=315
 Restart=on-failure
 RestartSec=5s
 MemoryAccounting=true
@@ -21,7 +23,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadOnlyPaths=/data/models/current
+ReadOnlyPaths=/data/models
 
 [Install]
 WantedBy=multi-user.target

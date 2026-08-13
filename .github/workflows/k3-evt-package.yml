@@ -75,10 +75,18 @@ jobs:
 
   model-runtime-lock:
     runs-on: ubuntu-latest
+    container:
+      image: rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify model runtime scripts and transactional lifecycle
+        run: |
+          python3 -m unittest tests.test_k3_packaging_contract
+          bash scripts/build_model_runtime_lifecycle_fixture.sh /tmp/harbor-model-runtime-lifecycle.deb
+          HARBOR_MODEL_LIFECYCLE_DISPOSABLE=1 \
+            bash scripts/test_model_runtime_deb_lifecycle.sh /tmp/harbor-model-runtime-lifecycle.deb
       - name: Verify the immutable model material lock
         run: |
           python3 scripts/validate_k3_model_materials.py \

@@ -1,4 +1,6 @@
 import json
+import shutil
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -7,6 +9,42 @@ ROOT = Path(__file__).parents[1]
 
 
 class K3PackagingContractTests(unittest.TestCase):
+    def test_maintainer_and_runtime_shell_scripts_parse(self):
+        shell = shutil.which("sh")
+        if shell is None:
+            self.skipTest("POSIX sh is not available on this host")
+        for relative in (
+            "debian/ensure-model-runtime-data-layout",
+            "debian/model-runtime-postinst",
+            "debian/model-runtime-prerm",
+            "debian/wait-model-runtime-health",
+        ):
+            subprocess.run(
+                [shell, "-n", str(ROOT / relative)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+    def test_lifecycle_executes_failure_and_deadline_paths(self):
+        lifecycle = (
+            ROOT / "scripts" / "test_model_runtime_deb_lifecycle.sh"
+        ).read_text(encoding="utf-8")
+        fixture = (
+            ROOT / "scripts" / "build_model_runtime_lifecycle_fixture.sh"
+        ).read_text(encoding="utf-8")
+        for evidence in (
+            '"$work_root/control/prerm" upgrade',
+            "HARBOR_TEST_FAIL_VLM_ONCE",
+            "HARBOR_TEST_VERIFY_FAULT",
+            "kill -TERM \"$PPID\"",
+            "runuser -u harbormodel",
+            "curl-success",
+            "date-deadline",
+        ):
+            self.assertIn(evidence, lifecycle)
+        self.assertIn("dpkg-deb --root-owner-group --build", fixture)
+
     def test_beacon_service_uses_system_owned_credentials_fail_closed(self):
         unit = (ROOT / "debian" / "harboros-beacon.service").read_text(
             encoding="utf-8"
@@ -147,7 +185,13 @@ class K3PackagingContractTests(unittest.TestCase):
         self.assertIn("LimitNOFILE=1048576", vlm_unit)
         self.assertNotIn("taskset", vlm_unit)
         self.assertNotIn("--media-path", vlm_unit)
-        self.assertIn("ReadOnlyPaths=/data/models/current", vlm_unit)
+        self.assertIn("ReadOnlyPaths=/data/models", vlm_unit)
+        self.assertIn(
+            "ExecStartPost=/usr/lib/harboros-model-runtime/wait-health "
+            "http://127.0.0.1:8080/health 300",
+            vlm_unit,
+        )
+        self.assertIn("TimeoutStartSec=315", vlm_unit)
         self.assertNotIn("0.0.0.0", vlm_unit)
         self.assertIn("HARBORNAVI_VLM_API_BASE=http://127.0.0.1:8080/v1", beacon_unit)
         self.assertIn("harboros-vlm-runtime.service", beacon_unit)
@@ -176,6 +220,55 @@ class K3PackagingContractTests(unittest.TestCase):
             services["harboros-vlm-runtime.service"]["health"],
             "http://127.0.0.1:8080/health",
         )
+
+    def test_model_release_install_is_root_owned_atomic_and_manifest_verified(self):
+        postinst = (ROOT / "debian" / "model-runtime-postinst").read_text(
+            encoding="utf-8"
+        )
+        prerm = (ROOT / "debian" / "model-runtime-prerm").read_text(
+            encoding="utf-8"
+        )
+        layout = (ROOT / "debian" / "ensure-model-runtime-data-layout").read_text(
+            encoding="utf-8"
+        )
+        verifier = (ROOT / "scripts" / "verify_k3_model_release.py").read_text(
+            encoding="utf-8"
+        )
+        model_unit = (ROOT / "debian" / "harboros-model-runtime.service").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('mktemp -d "/data/models/releases/.VERSION_PLACEHOLDER.install.XXXXXXXX"', postinst)
+        self.assertIn('chown root:root "$staging_root"', postinst)
+        self.assertIn('"$verify" --manifest "$manifest" --root "$staging_root"', postinst)
+        self.assertIn('mv -- "$release_root" "$backup_root"', postinst)
+        self.assertIn('mv -- "$staging_root" "$release_root"', postinst)
+        self.assertIn("mv -Tf /data/models/current.new /data/models/current", postinst)
+        self.assertNotIn("chown -R harbormodel", postinst)
+        self.assertIn("systemctl restart harboros-model-runtime.service", postinst)
+        self.assertIn("systemctl restart harboros-vlm-runtime.service", postinst)
+        self.assertIn("remove|upgrade|deconfigure", prerm)
+        self.assertIn(
+            "systemctl stop harboros-model-runtime.service "
+            "harboros-vlm-runtime.service",
+            prerm,
+        )
+        self.assertIn("install -d -o root -g root -m 0755", layout)
+        self.assertIn("ReadOnlyPaths=/data/models", model_unit)
+        self.assertIn("ReadWritePaths=/data/models/cache", model_unit)
+        self.assertIn("TimeoutStartSec=75", model_unit)
+        self.assertIn('transaction_committed=0', postinst)
+        self.assertIn("trap cleanup EXIT", postinst)
+        self.assertIn("trap 'exit 1' HUP INT TERM", postinst)
+        self.assertIn("/run/harboros-model-runtime/upgrade-active", postinst)
+        self.assertIn("/run/harboros-model-runtime", prerm)
+        self.assertIn("systemctl is-active --quiet harboros-model-runtime.service", postinst)
+        self.assertIn("systemctl is-active --quiet harboros-vlm-runtime.service", postinst)
+        self.assertIn('mv -- "$backup_root" "$release_root"', postinst)
+        self.assertIn("os.lstat", verifier)
+        self.assertIn("followlinks=False", verifier)
+        self.assertIn("unexpected file:", verifier)
+        self.assertIn("SHA256 mismatch:", verifier)
 
     def test_model_manifest_locks_only_selected_vlm_resolution(self):
         manifest = json.loads(

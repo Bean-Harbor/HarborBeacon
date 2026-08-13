@@ -69,6 +69,10 @@ install -m 0755 "$cargo_target_dir/$target/release/harbor-model-api" \
   "$pkg_dir/usr/bin/harbor-model-api"
 install -m 0755 debian/ensure-model-runtime-data-layout \
   "$pkg_dir/usr/lib/harboros-model-runtime/ensure-data-layout"
+install -m 0755 scripts/verify_k3_model_release.py \
+  "$pkg_dir/usr/lib/harboros-model-runtime/verify-release"
+install -m 0755 debian/wait-model-runtime-health \
+  "$pkg_dir/usr/lib/harboros-model-runtime/wait-health"
 install -m 0644 debian/harboros-model-runtime.service \
   "$pkg_dir/usr/lib/systemd/system/harboros-model-runtime.service"
 install -m 0644 debian/harboros-vlm-runtime.service \
@@ -96,10 +100,12 @@ python3 scripts/generate_k3_supply_chain.py \
   --input-file "$repo_root/debian/model-runtime-postinst" \
   --input-file "$repo_root/debian/model-runtime-prerm" \
   --input-file "$repo_root/debian/ensure-model-runtime-data-layout" \
+  --input-file "$repo_root/debian/wait-model-runtime-health" \
   --input-file "$repo_root/debian/harboros-model-runtime.service" \
   --input-file "$repo_root/debian/harboros-vlm-runtime.service" \
   --input-file "$repo_root/debian/component-contract-model-runtime.json.in" \
   --input-file "$repo_root/debian/license-report.json" \
+  --input-file "$repo_root/scripts/verify_k3_model_release.py" \
   --model-root "$model_stage" \
   --runtime-dependency "llama.cpp-tools-spacemit=0.1.1" \
   --runtime-dependency "spacemit-onnxruntime=2.0.3+3" \

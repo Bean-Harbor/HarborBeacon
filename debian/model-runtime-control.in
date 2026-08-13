@@ -3,7 +3,7 @@ Version: VERSION_PLACEHOLDER
 Section: utils
 Priority: optional
 Architecture: ARCH_PLACEHOLDER
-Depends: libc6, ca-certificates, adduser, init-system-helpers, llama.cpp-tools-spacemit (= 0.1.1), spacemit-onnxruntime (= 2.0.3+3), spacemit-tcm (= 3.0.0+3), harboros-system (>= 0.1.0~evt.1), harboros-system (<< 0.2)
+Depends: libc6, ca-certificates, adduser, curl, init-system-helpers, python3, llama.cpp-tools-spacemit (= 0.1.1), spacemit-onnxruntime (= 2.0.3+3), spacemit-tcm (= 3.0.0+3), harboros-system (>= 0.1.0~evt.1), harboros-system (<< 0.2)
 Maintainer: Harborinno Ltd.
 Description: HarborOS K3 local model runtime and pinned model materials
  Provides the loopback-only text, embedding, and event VLM inference services

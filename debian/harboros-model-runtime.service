@@ -18,6 +18,8 @@ Environment=HARBOR_MODEL_API_CANDLE_CACHE_DIR=/data/models/cache
 Environment=HARBOR_MODEL_API_CANDLE_MAX_NEW_TOKENS=128
 Environment=HARBOR_MODEL_API_CANDLE_TEMPERATURE=0.1
 ExecStart=/usr/bin/harbor-model-api
+ExecStartPost=/usr/lib/harboros-model-runtime/wait-health http://127.0.0.1:8792/healthz 60
+TimeoutStartSec=75
 Restart=on-failure
 RestartSec=5s
 MemoryAccounting=true
@@ -28,7 +30,7 @@ PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
 ReadWritePaths=/data/models/cache
-ReadOnlyPaths=/data/models/current
+ReadOnlyPaths=/data/models
 
 [Install]
 WantedBy=multi-user.target

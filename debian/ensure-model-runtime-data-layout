@@ -6,7 +6,7 @@ if [ "${1:-}" != "/data/models" ]; then
   exit 2
 fi
 
-install -d -o harbormodel -g harbormodel -m 0755 \
+install -d -o root -g root -m 0755 \
   /data/models \
   /data/models/releases
 install -d -o harbormodel -g harbormodel -m 0750 /data/models/cache

@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fmt;
-use std::fs;
+use std::fs::{self, File};
 use std::io::{Cursor, Read};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1277,10 +1277,14 @@ impl CandleBackend {
     fn health(&self, config: &ModelApiConfig) -> HealthReport {
         let chat_state = candle_runtime_state_summary(&self.chat_state, "chat");
         let embedding_state = candle_runtime_state_summary(&self.embedding_state, "embedding");
-        let chat_available =
-            chat_state.loaded || local_model_assets_available(&self.config.chat_model_id);
-        let embedding_available =
-            embedding_state.loaded || local_model_assets_available(&self.config.embedding_model_id);
+        let chat_assets = validate_local_model_assets(&self.config.chat_model_id, true);
+        let embedding_assets = validate_local_model_assets(&self.config.embedding_model_id, false);
+        let chat_available = chat_assets.is_ok();
+        let embedding_available = embedding_assets.is_ok();
+        let ready = chat_available
+            && embedding_available
+            && chat_state.last_error.is_none()
+            && embedding_state.last_error.is_none();
         let mut notes = vec![CANDLE_CANDIDATE_NOTE.to_string()];
         if chat_state.loaded || embedding_state.loaded {
             notes.push("model weights are loaded".to_string());
@@ -1303,16 +1307,16 @@ impl CandleBackend {
                 "not loaded"
             }
         ));
-        if !chat_available {
+        if let Err(error) = chat_assets {
             notes.push(format!(
-                "chat model assets are not present at {}",
-                self.config.chat_model_id
+                "chat model assets invalid: {}",
+                trim_for_note(&format!("{error:#}"))
             ));
         }
-        if !embedding_available {
+        if let Err(error) = embedding_assets {
             notes.push(format!(
-                "embedding model assets are not present at {}",
-                self.config.embedding_model_id
+                "embedding model assets invalid: {}",
+                trim_for_note(&format!("{error:#}"))
             ));
         }
         if let Some(error) = chat_state.last_error.as_ref() {
@@ -1324,10 +1328,10 @@ impl CandleBackend {
 
         HealthReport {
             service: SERVICE_NAME,
-            status: HEALTH_OK,
+            status: if ready { HEALTH_OK } else { HEALTH_DEGRADED },
             backend: BackendSummary {
                 kind: BackendKind::Candle.as_str(),
-                ready: true,
+                ready,
                 model_loaded: Some(chat_state.loaded || embedding_state.loaded),
                 chat_model_loaded: Some(chat_state.loaded),
                 embedding_model_loaded: Some(embedding_state.loaded),
@@ -1342,7 +1346,7 @@ impl CandleBackend {
             chat_model: chat_available.then(|| self.config.chat_model_id.clone()),
             embedding_model: embedding_available.then(|| self.config.embedding_model_id.clone()),
             note: Some(notes.join("; ")),
-            ready: true,
+            ready,
         }
     }
 
@@ -2490,13 +2494,137 @@ fn strip_prefix_case_insensitive<'a>(text: &'a str, prefix: &str) -> Option<&'a 
     }
 }
 
-fn local_model_assets_available(model_id: &str) -> bool {
+fn validate_local_model_assets(model_id: &str, is_chat: bool) -> AnyResult<()> {
     let trimmed = model_id.trim();
     if trimmed.is_empty() {
-        return false;
+        return Err(anyhow!("candle model id is empty"));
     }
     let model_path = PathBuf::from(trimmed);
-    model_path.exists() && resolve_local_model_assets(&model_path).is_ok()
+    if !model_path.is_absolute() {
+        return Err(anyhow!(
+            "health requires a locked absolute local model path, got {trimmed}"
+        ));
+    }
+    let assets = resolve_local_model_assets(&model_path)?;
+    let config_bytes = validate_json_object_file(&assets.config_file, "model config")?;
+    if is_chat {
+        match detect_candle_chat_model_family(&config_bytes)? {
+            CandleChatModelFamily::Qwen2 => {
+                serde_json::from_slice::<Qwen2Config>(&config_bytes)
+                    .context("failed to parse qwen2 model config")?;
+            }
+            CandleChatModelFamily::Qwen3 => {
+                serde_json::from_slice::<Qwen3Config>(&config_bytes)
+                    .context("failed to parse qwen3 model config")?;
+            }
+        }
+    } else {
+        serde_json::from_slice::<JinaBertConfig>(&config_bytes)
+            .context("failed to parse jina embedding config")?;
+    }
+    validate_regular_file(&assets.tokenizer_file, "tokenizer")?;
+    Tokenizer::from_file(&assets.tokenizer_file)
+        .map_err(|error| anyhow!("failed to parse tokenizer: {error}"))?;
+    for weight_file in &assets.weight_files {
+        validate_safetensor_file(weight_file)?;
+    }
+    Ok(())
+}
+
+fn validate_regular_file(path: &Path, label: &str) -> AnyResult<fs::Metadata> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("{label} is missing: {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(anyhow!("{label} is not a regular file: {}", path.display()));
+    }
+    if metadata.len() == 0 {
+        return Err(anyhow!("{label} is empty: {}", path.display()));
+    }
+    Ok(metadata)
+}
+
+fn validate_json_object_file(path: &Path, label: &str) -> AnyResult<Vec<u8>> {
+    validate_regular_file(path, label)?;
+    let bytes =
+        fs::read(path).with_context(|| format!("failed to read {label}: {}", path.display()))?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {label}: {}", path.display()))?;
+    if !value.as_object().is_some_and(|object| !object.is_empty()) {
+        return Err(anyhow!(
+            "{label} must be a non-empty JSON object: {}",
+            path.display()
+        ));
+    }
+    Ok(bytes)
+}
+
+fn validate_safetensor_file(path: &Path) -> AnyResult<()> {
+    let metadata = validate_regular_file(path, "safetensor weights")?;
+    if metadata.len() < 9 {
+        return Err(anyhow!("invalid safetensor header: {}", path.display()));
+    }
+    let mut file = File::open(path)
+        .with_context(|| format!("failed to open safetensor weights: {}", path.display()))?;
+    let mut length_bytes = [0_u8; 8];
+    file.read_exact(&mut length_bytes)
+        .with_context(|| format!("failed to read safetensor header: {}", path.display()))?;
+    let header_length = u64::from_le_bytes(length_bytes);
+    if header_length == 0
+        || header_length > metadata.len().saturating_sub(8)
+        || header_length > 64 * 1024 * 1024
+    {
+        return Err(anyhow!(
+            "invalid safetensor header length: {}",
+            path.display()
+        ));
+    }
+    let mut header = vec![0_u8; header_length as usize];
+    file.read_exact(&mut header)
+        .with_context(|| format!("failed to read safetensor header: {}", path.display()))?;
+    let value: Value = serde_json::from_slice(&header)
+        .with_context(|| format!("invalid safetensor header JSON: {}", path.display()))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("safetensor header is not an object: {}", path.display()))?;
+    let data_length = metadata.len() - 8 - header_length;
+    let mut tensor_count = 0;
+    for (name, tensor) in object {
+        if name == "__metadata__" {
+            continue;
+        }
+        let tensor = tensor
+            .as_object()
+            .ok_or_else(|| anyhow!("invalid safetensor entry {name}: {}", path.display()))?;
+        let offsets = tensor
+            .get("data_offsets")
+            .and_then(Value::as_array)
+            .filter(|offsets| offsets.len() == 2)
+            .ok_or_else(|| anyhow!("missing safetensor offsets for {name}: {}", path.display()))?;
+        let start = offsets[0]
+            .as_u64()
+            .ok_or_else(|| anyhow!("invalid safetensor start for {name}: {}", path.display()))?;
+        let end = offsets[1]
+            .as_u64()
+            .ok_or_else(|| anyhow!("invalid safetensor end for {name}: {}", path.display()))?;
+        if start > end
+            || end > data_length
+            || tensor.get("dtype").and_then(Value::as_str).is_none()
+            || tensor.get("shape").and_then(Value::as_array).is_none()
+        {
+            return Err(anyhow!(
+                "invalid safetensor tensor metadata for {name}: {}",
+                path.display()
+            ));
+        }
+        tensor_count += 1;
+    }
+    if tensor_count == 0 {
+        return Err(anyhow!(
+            "safetensor contains no tensors: {}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn resolve_model_assets(model_id: &str) -> AnyResult<ResolvedModelAssets> {
@@ -2506,7 +2634,7 @@ fn resolve_model_assets(model_id: &str) -> AnyResult<ResolvedModelAssets> {
     }
 
     let model_path = PathBuf::from(trimmed);
-    if model_path.exists() {
+    if model_path.is_absolute() || model_path.exists() {
         resolve_local_model_assets(&model_path)
     } else {
         resolve_hf_model_assets(trimmed)
@@ -2584,37 +2712,50 @@ fn resolve_local_model_assets(model_path: &PathBuf) -> AnyResult<ResolvedModelAs
             .ok_or_else(|| anyhow!("local candle model path has no parent directory"))?
     };
 
+    let base_metadata = fs::symlink_metadata(&base_dir).with_context(|| {
+        format!(
+            "local candle model directory is missing: {}",
+            base_dir.display()
+        )
+    })?;
+    if base_metadata.file_type().is_symlink() || !base_metadata.is_dir() {
+        return Err(anyhow!(
+            "local candle model path is not a real directory: {}",
+            base_dir.display()
+        ));
+    }
+
     let tokenizer_file = base_dir.join("tokenizer.json");
     let config_file = base_dir.join("config.json");
     for required in [&tokenizer_file, &config_file] {
-        if !required.exists() {
-            return Err(anyhow!(
-                "local candle model directory is missing {}",
-                required.display()
-            ));
-        }
+        validate_regular_file(required, "required candle model material")?;
     }
 
     let index_file = base_dir.join("model.safetensors.index.json");
-    let weight_files = if index_file.exists() {
+    let weight_files = if index_file.try_exists().unwrap_or(false) {
+        validate_regular_file(&index_file, "safetensor index")?;
         resolve_weight_files_from_index(&index_file, |relative| {
-            let shard = base_dir.join(relative);
-            if !shard.exists() {
-                return Err(anyhow!(
-                    "local candle model directory is missing shard {}",
-                    shard.display()
-                ));
+            let relative_path = Path::new(relative);
+            if relative_path.is_absolute()
+                || relative_path.components().any(|component| {
+                    matches!(
+                        component,
+                        Component::ParentDir
+                            | Component::CurDir
+                            | Component::RootDir
+                            | Component::Prefix(_)
+                    )
+                })
+            {
+                return Err(anyhow!("unsafe safetensor shard path: {relative}"));
             }
+            let shard = base_dir.join(relative);
+            validate_regular_file(&shard, "safetensor shard")?;
             Ok(shard)
         })?
     } else {
         let weight_file = base_dir.join("model.safetensors");
-        if !weight_file.exists() {
-            return Err(anyhow!(
-                "local candle model directory is missing {}",
-                weight_file.display()
-            ));
-        }
+        validate_regular_file(&weight_file, "safetensor weights")?;
         vec![weight_file]
     };
 
@@ -2855,6 +2996,93 @@ pub fn print_startup_banner(config: &ModelApiConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_minimal_safetensor(path: &Path) {
+        let mut header = br#"{"weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#.to_vec();
+        while header.len() % 8 != 0 {
+            header.push(b' ');
+        }
+        let mut contents = (header.len() as u64).to_le_bytes().to_vec();
+        contents.extend(header);
+        contents.extend([0_u8; 4]);
+        fs::write(path, contents).unwrap();
+    }
+
+    fn create_health_test_model() -> PathBuf {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "harbor-model-health-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+        fs::write(
+            temp_dir.join("config.json"),
+            serde_json::to_vec(&json!({
+                "model_type": "qwen2",
+                "architectures": ["Qwen2ForCausalLM"],
+                "vocab_size": 1,
+                "hidden_size": 2,
+                "intermediate_size": 2,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "max_position_embeddings": 8,
+                "sliding_window": 8,
+                "max_window_layers": 1,
+                "tie_word_embeddings": false,
+                "rope_theta": 10000.0,
+                "rms_norm_eps": 0.000001,
+                "use_sliding_window": false,
+                "hidden_act": "silu",
+                "type_vocab_size": 1,
+                "initializer_range": 0.02,
+                "layer_norm_eps": 0.000000000001,
+                "pad_token_id": 0,
+                "position_embedding_type": "alibi"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.join("tokenizer.json"),
+            serde_json::to_vec(&json!({
+                "version": "1.0",
+                "truncation": null,
+                "padding": null,
+                "added_tokens": [],
+                "normalizer": null,
+                "pre_tokenizer": null,
+                "post_processor": null,
+                "decoder": null,
+                "model": {
+                    "type": "WordLevel",
+                    "vocab": {"[UNK]": 0},
+                    "unk_token": "[UNK]"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        write_minimal_safetensor(&temp_dir.join("model.safetensors"));
+        temp_dir
+    }
+
+    fn health_test_backend(model_dir: &Path) -> (ModelApiConfig, CandleBackend) {
+        let config = ModelApiConfig {
+            backend: BackendKind::Candle,
+            ..ModelApiConfig::default()
+        };
+        let candle = CandleConfig {
+            chat_model_id: model_dir.display().to_string(),
+            embedding_model_id: model_dir.display().to_string(),
+            cache_dir: model_dir.join("cache").display().to_string(),
+            ..CandleConfig::default()
+        };
+        (config, CandleBackend::new(candle))
+    }
 
     #[test]
     fn backend_kind_parsing_accepts_alternates() {
@@ -3209,27 +3437,68 @@ mod tests {
     }
 
     #[test]
-    fn candle_health_reports_idle_without_loading_missing_models() {
-        let config = ModelApiConfig {
-            backend: BackendKind::Candle,
-            ..ModelApiConfig::default()
-        };
-        let mut candle = CandleConfig::default();
-        candle.chat_model_id = std::env::temp_dir().display().to_string();
-        candle.embedding_model_id = std::env::temp_dir().display().to_string();
-        let backend = CandleBackend::new(candle);
+    fn candle_health_reports_ready_but_unloaded_for_complete_local_models() {
+        let model_dir = create_health_test_model();
+        let (config, backend) = health_test_backend(&model_dir);
         let report = backend.health(&config);
         assert!(report.ready);
         assert_eq!(report.status, HEALTH_OK);
         assert_eq!(report.backend.kind, "candle");
         assert_eq!(report.backend.ready, true);
         assert_eq!(report.backend.model_loaded, Some(false));
-        assert!(report.chat_model.is_none());
-        assert!(report.embedding_model.is_none());
+        assert!(report.chat_model.is_some());
+        assert!(report.embedding_model.is_some());
         assert!(report
             .note
             .as_deref()
             .is_some_and(|note| note.contains("runtime is idle")));
+        let _ = fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
+    fn candle_health_returns_503_for_each_missing_material_class() {
+        for missing in ["config.json", "tokenizer.json", "model.safetensors"] {
+            let model_dir = create_health_test_model();
+            fs::remove_file(model_dir.join(missing)).unwrap();
+            let mut service_config = ModelApiConfig {
+                backend: BackendKind::Candle,
+                ..ModelApiConfig::default()
+            };
+            service_config.candle.chat_model_id = model_dir.display().to_string();
+            service_config.candle.embedding_model_id = model_dir.display().to_string();
+            service_config.candle.cache_dir = model_dir.join("cache").display().to_string();
+            let service = ModelApiService::new(service_config);
+            let response = service.route(Method::Get, "/healthz", &[], &[]);
+            assert_eq!(response.status_code(), StatusCode(503), "missing {missing}");
+            fs::remove_dir_all(model_dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn candle_health_returns_503_for_structurally_invalid_material() {
+        let model_dir = create_health_test_model();
+        fs::write(model_dir.join("config.json"), b"{}").unwrap();
+        let (config, backend) = health_test_backend(&model_dir);
+        let report = backend.health(&config);
+        assert!(!report.ready);
+        assert_eq!(report.status, HEALTH_DEGRADED);
+        fs::remove_dir_all(model_dir).unwrap();
+    }
+
+    #[test]
+    fn candle_health_returns_503_after_first_load_failure() {
+        let model_dir = create_health_test_model();
+        let (config, backend) = health_test_backend(&model_dir);
+        assert!(backend.health(&config).ready);
+        assert!(backend.with_chat_runtime(|_| Ok(())).is_err());
+        let report = backend.health(&config);
+        assert!(!report.ready);
+        assert_eq!(report.status, HEALTH_DEGRADED);
+        assert!(report
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("chat load error")));
+        let _ = fs::remove_dir_all(model_dir);
     }
 
     #[test]
