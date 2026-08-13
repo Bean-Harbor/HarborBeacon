@@ -43,7 +43,13 @@ class K3PackagingContractTests(unittest.TestCase):
         build = (ROOT / "scripts" / "build_harbornavi_k3_deb.sh").read_text(
             encoding="utf-8"
         )
-        self.assertIn("Depends: libc6, ca-certificates, adduser, init-system-helpers, harboros-system,", build)
+        for package in (
+            "harboros-system",
+            "harborlink",
+            "harboros-model-runtime",
+        ):
+            self.assertIn(f"{package} (>= 0.1.0~evt.1)", build)
+            self.assertIn(f"{package} (<< 0.2)", build)
 
     def test_component_contract_paths_do_not_collide(self):
         beacon_build = (ROOT / "scripts" / "build_harbornavi_k3_deb.sh").read_text(
@@ -97,6 +103,21 @@ class K3PackagingContractTests(unittest.TestCase):
             'const HARBOR_EDGE_ASSERTION_KEY_FILE_ENV: &str = "HARBOR_EDGE_ASSERTION_KEY_FILE";',
             admin,
         )
+
+    def test_model_runtime_is_bootstrap_gated_and_not_legacy_overridable(self):
+        unit = (ROOT / "debian" / "harboros-model-runtime.service").read_text(
+            encoding="utf-8"
+        )
+        control = (ROOT / "debian" / "model-runtime-control.in").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("Requires=harboros-bootstrap.service", unit)
+        self.assertIn("After=local-fs.target harboros-bootstrap.service", unit)
+        self.assertIn("Environment=HARBOR_MODEL_API_BIND=127.0.0.1:8792", unit)
+        self.assertIn("Environment=HARBOR_MODEL_API_BACKEND=candle", unit)
+        self.assertNotIn("EnvironmentFile=", unit)
+        self.assertIn("harboros-system (>= 0.1.0~evt.1)", control)
+        self.assertIn("harboros-system (<< 0.2)", control)
 
     def test_data_layout_helpers_are_fixed_and_installed(self):
         cases = [

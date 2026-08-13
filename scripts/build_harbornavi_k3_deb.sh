@@ -87,7 +87,7 @@ install -m 0644 debian/harboros-beacon.service \
   "$pkg_dir/usr/lib/systemd/system/harboros-beacon.service"
 sed -e "s/VERSION_PLACEHOLDER/${DEBIAN_VERSION}/g" \
   -e "s/ARCH_PLACEHOLDER/${deb_arch}/g" debian/control \
-  | sed 's/^Depends: .*/Depends: libc6, ca-certificates, adduser, init-system-helpers, harboros-system, harborlink, harboros-model-runtime, python3, python3-opencv, python3-spacemit-ort/' \
+  | sed 's/^Depends: .*/Depends: libc6, ca-certificates, adduser, init-system-helpers, harboros-system (>= 0.1.0~evt.1), harboros-system (<< 0.2), harborlink (>= 0.1.0~evt.1), harborlink (<< 0.2), harboros-model-runtime (>= 0.1.0~evt.1), harboros-model-runtime (<< 0.2), python3, python3-opencv, python3-spacemit-ort/' \
   > "$pkg_dir/DEBIAN/control"
 sed 's/\r$//' debian/postinst > "$pkg_dir/DEBIAN/postinst"
 sed 's/\r$//' debian/prerm > "$pkg_dir/DEBIAN/prerm"

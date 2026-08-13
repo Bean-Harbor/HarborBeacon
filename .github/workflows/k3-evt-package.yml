@@ -35,6 +35,8 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Trust the checked-out container workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Install fixed packaging toolchain
         env:
           HARBORBEACON_DEBIAN_SNAPSHOT: ${{ env.DEBIAN_SNAPSHOT }}
@@ -57,8 +59,8 @@ jobs:
           SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
-          ./scripts/verify_k3_reproducible.sh beacon
-          ./scripts/build_harbornavi_k3_deb.sh
+          bash scripts/verify_k3_reproducible.sh beacon
+          bash scripts/build_harbornavi_k3_deb.sh
           dpkg-deb --info dist/harbornavi-k3-debs/harboros-beacon_*.deb
           dpkg-deb --contents dist/harbornavi-k3-debs/harboros-beacon_*.deb
           (cd dist/harbornavi-k3-debs && sha256sum --check ./*.sha256)

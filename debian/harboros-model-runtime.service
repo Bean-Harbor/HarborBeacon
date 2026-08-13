@@ -1,6 +1,7 @@
 [Unit]
 Description=HarborOS K3 Local Model Runtime
-After=local-fs.target
+Requires=harboros-bootstrap.service
+After=local-fs.target harboros-bootstrap.service
 RequiresMountsFor=/data
 
 [Service]
@@ -16,7 +17,6 @@ Environment=HARBOR_MODEL_API_CANDLE_EMBEDDING_MODEL_ID=/data/models/current/embe
 Environment=HARBOR_MODEL_API_CANDLE_CACHE_DIR=/data/models/cache
 Environment=HARBOR_MODEL_API_CANDLE_MAX_NEW_TOKENS=128
 Environment=HARBOR_MODEL_API_CANDLE_TEMPERATURE=0.1
-EnvironmentFile=-/etc/default/harboros-model-runtime
 ExecStart=/usr/bin/harbor-model-api
 Restart=on-failure
 RestartSec=5s

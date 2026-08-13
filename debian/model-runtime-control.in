@@ -3,7 +3,7 @@ Version: VERSION_PLACEHOLDER
 Section: utils
 Priority: optional
 Architecture: ARCH_PLACEHOLDER
-Depends: libc6, ca-certificates, adduser, init-system-helpers
+Depends: libc6, ca-certificates, adduser, init-system-helpers, harboros-system (>= 0.1.0~evt.1), harboros-system (<< 0.2)
 Maintainer: Harborinno Ltd.
 Description: HarborOS K3 local model runtime and pinned model materials
  Provides the loopback-only lazy-loading inference sidecar and the exact model
