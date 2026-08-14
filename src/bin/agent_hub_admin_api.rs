@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -93,8 +93,8 @@ use harborbeacon_local_agent::runtime::admin_console::{
     ModelRuntimeRecord, NotificationTargetRecord, RagResourceProfile,
 };
 use harborbeacon_local_agent::runtime::ai_resource_scheduler::{
-    acquire_ai_resource_lease, ai_resource_scheduler_snapshot, AiLeaseErrorKind, AiResourceLease,
-    AiWorkload, AI_RESOURCE_QUEUE_MODE,
+    acquire_ai_resource_lease, ai_resource_scheduler_snapshot, AiLeaseErrorKind,
+    AiLeaseQuarantineReason, AiResourceLease, AiWorkload, AI_RESOURCE_QUEUE_MODE,
 };
 use harborbeacon_local_agent::runtime::cat_recording_classifier::{
     aggregate_cat_recording_predictions, build_classifier_command, classifier_config_from_env,
@@ -7114,7 +7114,7 @@ impl AdminApi {
         let ai_lease = acquire_ai_resource_lease(AiWorkload::Yolo).map_err(|error| {
             let status = match error.kind() {
                 AiLeaseErrorKind::QueueFull => StatusCode(429),
-                AiLeaseErrorKind::WaitTimeout => StatusCode(503),
+                AiLeaseErrorKind::WaitTimeout | AiLeaseErrorKind::Quarantined => StatusCode(503),
             };
             (status, format!("YOLO A100 resource is busy: {error}"))
         })?;
@@ -12541,13 +12541,37 @@ fn media_error_requires_ai_lease_quarantine(error: &BoundedMediaCommandError) ->
     !error.exit_confirmed
 }
 
+fn classifier_ai_quarantine_reason(
+    timed_out: bool,
+    status_success: bool,
+    stderr: &[u8],
+) -> Option<AiLeaseQuarantineReason> {
+    if timed_out {
+        return Some(AiLeaseQuarantineReason::InferenceTimeout);
+    }
+    if status_success {
+        return None;
+    }
+
+    let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    const RUNTIME_FAILURE_MARKERS: [&str; 5] = [
+        "onnxruntimeerror",
+        "onnx runtime error",
+        "spacemitexecutionprovider",
+        "spacemit execution provider",
+        "spacemit_onnx_runtime",
+    ];
+    (RUNTIME_FAILURE_MARKERS
+        .iter()
+        .any(|marker| stderr.contains(marker))
+        || stderr
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .any(|token| matches!(token, "npu" | "tcm")))
+    .then_some(AiLeaseQuarantineReason::RuntimeFailure)
+}
+
 fn quarantine_ai_resource_lease(lease: AiResourceLease) {
-    static QUARANTINED_LEASES: OnceLock<Mutex<Vec<AiResourceLease>>> = OnceLock::new();
-    let leases = QUARANTINED_LEASES.get_or_init(|| Mutex::new(Vec::new()));
-    leases
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push(lease);
+    lease.quarantine(AiLeaseQuarantineReason::ProcessExitUnconfirmed);
 }
 
 fn run_cat_recording_classifier(
@@ -12571,12 +12595,23 @@ fn run_cat_recording_classifier(
         }
         Err(error) => return Err(format!("cat_classifier_runner_error={error}")),
     };
-    if output.timed_out {
-        return Err(if output.forced_stop {
+    if let Some(reason) =
+        classifier_ai_quarantine_reason(output.timed_out, output.status.success(), &output.stderr)
+    {
+        let failure = if output.timed_out && output.forced_stop {
             "cat_classifier_timeout_forced".to_string()
-        } else {
+        } else if output.timed_out {
             "cat_classifier_timeout".to_string()
-        });
+        } else {
+            format!(
+                "cat_classifier_failed {}",
+                summarize_media_tool_stderr(&output.stderr, &[])
+            )
+        };
+        lease.quarantine(reason);
+        return Err(format!(
+            "{failure}; ai_resource_lease_quarantined=true; cluster_one_restart_required=true"
+        ));
     }
     if !output.status.success() {
         return Err(format!(
@@ -27365,6 +27400,34 @@ mod tests {
             &unconfirmed
         ));
         assert!(unconfirmed.to_string().contains("kill and wait failed"));
+    }
+
+    #[test]
+    fn classifier_runtime_failure_quarantine_policy_is_fail_closed() {
+        assert_eq!(
+            super::classifier_ai_quarantine_reason(true, true, b""),
+            Some(super::AiLeaseQuarantineReason::InferenceTimeout)
+        );
+        assert_eq!(
+            super::classifier_ai_quarantine_reason(
+                false,
+                false,
+                b"[ONNXRuntimeError] SpacemitExecutionProvider NPU failure",
+            ),
+            Some(super::AiLeaseQuarantineReason::RuntimeFailure)
+        );
+        assert_eq!(
+            super::classifier_ai_quarantine_reason(false, false, b"invalid result contract"),
+            None
+        );
+        assert_eq!(
+            super::classifier_ai_quarantine_reason(false, false, b"invalid input tensor"),
+            None
+        );
+        assert_eq!(
+            super::classifier_ai_quarantine_reason(false, true, b"NPU diagnostic noise"),
+            None
+        );
     }
 
     #[cfg(unix)]

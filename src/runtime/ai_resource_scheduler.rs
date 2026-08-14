@@ -43,10 +43,14 @@ impl AiWorkload {
 
     const fn required_resources(self) -> &'static [AiResource] {
         match self {
-            Self::Yolo => &[AiResource::A100Cluster0, AiResource::SpacemitOnnxRuntime],
-            Self::CatRecordingVerifier => {
-                &[AiResource::A100Cluster1, AiResource::SpacemitOnnxRuntime]
-            }
+            Self::Yolo => &[
+                AiResource::A100Cluster0,
+                AiResource::SpacemitOnnxRuntimeCluster0,
+            ],
+            Self::CatRecordingVerifier => &[
+                AiResource::A100Cluster1,
+                AiResource::SpacemitOnnxRuntimeCluster1,
+            ],
             Self::Llm | Self::Vlm => &[AiResource::A100Cluster1],
         }
     }
@@ -84,6 +88,7 @@ impl AiWorkload {
 pub enum AiLeaseErrorKind {
     QueueFull,
     WaitTimeout,
+    Quarantined,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +107,24 @@ impl AiLeaseError {
         match self.kind {
             AiLeaseErrorKind::QueueFull => "ai_resource_queue_full",
             AiLeaseErrorKind::WaitTimeout => "ai_resource_wait_timeout",
+            AiLeaseErrorKind::Quarantined => "ai_resource_quarantined",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiLeaseQuarantineReason {
+    ProcessExitUnconfirmed,
+    InferenceTimeout,
+    RuntimeFailure,
+}
+
+impl AiLeaseQuarantineReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProcessExitUnconfirmed => "process_exit_unconfirmed",
+            Self::InferenceTimeout => "inference_timeout",
+            Self::RuntimeFailure => "runtime_failure",
         }
     }
 }
@@ -128,21 +151,24 @@ enum AiCluster {
 enum AiResource {
     A100Cluster0,
     A100Cluster1,
-    SpacemitOnnxRuntime,
+    SpacemitOnnxRuntimeCluster0,
+    SpacemitOnnxRuntimeCluster1,
 }
 
 impl AiResource {
-    const ALL: [Self; 3] = [
+    const ALL: [Self; 4] = [
         Self::A100Cluster0,
         Self::A100Cluster1,
-        Self::SpacemitOnnxRuntime,
+        Self::SpacemitOnnxRuntimeCluster0,
+        Self::SpacemitOnnxRuntimeCluster1,
     ];
 
     const fn as_str(self) -> &'static str {
         match self {
             Self::A100Cluster0 => "a100_cluster_0",
             Self::A100Cluster1 => "a100_cluster_1",
-            Self::SpacemitOnnxRuntime => "spacemit_onnx_runtime",
+            Self::SpacemitOnnxRuntimeCluster0 => "spacemit_onnx_runtime_cluster_0",
+            Self::SpacemitOnnxRuntimeCluster1 => "spacemit_onnx_runtime_cluster_1",
         }
     }
 
@@ -150,7 +176,8 @@ impl AiResource {
         match self {
             Self::A100Cluster0 => 0,
             Self::A100Cluster1 => 1,
-            Self::SpacemitOnnxRuntime => 2,
+            Self::SpacemitOnnxRuntimeCluster0 => 2,
+            Self::SpacemitOnnxRuntimeCluster1 => 3,
         }
     }
 
@@ -167,6 +194,13 @@ impl AiResource {
 }
 
 impl AiCluster {
+    const fn other(self) -> Self {
+        match self {
+            Self::A100Cluster0 => Self::A100Cluster1,
+            Self::A100Cluster1 => Self::A100Cluster0,
+        }
+    }
+
     const fn as_str(self) -> &'static str {
         match self {
             Self::A100Cluster0 => "a100_cluster_0",
@@ -202,6 +236,7 @@ struct LeaseWaiter {
 struct ResourceMetrics {
     acquired_total: u64,
     released_total: u64,
+    lease_quarantined_total: u64,
     queued_total: u64,
     queue_full_total: u64,
     timed_out_total: u64,
@@ -214,6 +249,8 @@ struct WorkloadMetrics {
     requested_total: u64,
     acquired_total: u64,
     released_total: u64,
+    cross_cluster_parallel_acquired_total: u64,
+    quarantine_rejected_total: u64,
     queued_total: u64,
     queue_full_total: u64,
     timed_out_total: u64,
@@ -224,6 +261,7 @@ struct WorkloadMetrics {
 #[derive(Debug, Default)]
 struct ResourceState {
     holder: Option<LeaseHolder>,
+    quarantine_reason: Option<AiLeaseQuarantineReason>,
     metrics: ResourceMetrics,
 }
 
@@ -231,7 +269,7 @@ struct ResourceState {
 struct SchedulerState {
     next_ticket: u64,
     next_lease_id: u64,
-    resources: [ResourceState; 3],
+    resources: [ResourceState; 4],
     waiters: VecDeque<LeaseWaiter>,
     workloads: [WorkloadMetrics; 4],
 }
@@ -277,6 +315,15 @@ impl AiResourceScheduler {
         let mut state = self.lock_state();
         state.workloads[workload_index].requested_total += 1;
 
+        if required_resources_are_quarantined(&state, workload) {
+            state.workloads[workload_index].quarantine_rejected_total += 1;
+            return Err(AiLeaseError {
+                kind: AiLeaseErrorKind::Quarantined,
+                workload,
+                cluster,
+            });
+        }
+
         if can_grant_new_request(&state, workload) {
             return Ok(self.grant(&mut state, workload, resource_mask, 0));
         }
@@ -311,6 +358,17 @@ impl AiResourceScheduler {
         let deadline = Instant::now() + self.wait_timeout;
 
         loop {
+            if required_resources_are_quarantined(&state, workload) {
+                remove_waiter(&mut state.waiters, ticket);
+                state.workloads[workload_index].quarantine_rejected_total += 1;
+                self.changed.notify_all();
+                return Err(AiLeaseError {
+                    kind: AiLeaseErrorKind::Quarantined,
+                    workload,
+                    cluster,
+                });
+            }
+
             if waiter_can_be_granted(&state, ticket) {
                 let waiter_index = state
                     .waiters
@@ -354,6 +412,10 @@ impl AiResourceScheduler {
         state.next_lease_id = state.next_lease_id.wrapping_add(1).max(1);
         let lease_id = state.next_lease_id;
         let acquired_at = Instant::now();
+        let other_cluster_busy = state.resources
+            [AiResource::from_cluster(workload.cluster().other()).index()]
+        .holder
+        .is_some();
         for resource in resources_in_mask(resource_mask) {
             let resource_state = &mut state.resources[resource.index()];
             resource_state.holder = Some(LeaseHolder {
@@ -371,6 +433,9 @@ impl AiResourceScheduler {
 
         let workload_metrics = &mut state.workloads[workload.index()];
         workload_metrics.acquired_total += 1;
+        if other_cluster_busy {
+            workload_metrics.cross_cluster_parallel_acquired_total += 1;
+        }
         workload_metrics.total_wait_ms = workload_metrics.total_wait_ms.saturating_add(waited_ms);
         workload_metrics.max_wait_ms = workload_metrics.max_wait_ms.max(waited_ms);
         AiResourceLease {
@@ -406,10 +471,42 @@ impl AiResourceScheduler {
         }
     }
 
+    fn quarantine(
+        &self,
+        resource_mask: u8,
+        workload: AiWorkload,
+        lease_id: u64,
+        reason: AiLeaseQuarantineReason,
+    ) {
+        let mut state = self.lock_state();
+        let mut quarantined = false;
+        for resource in resources_in_mask(resource_mask) {
+            let resource_state = &mut state.resources[resource.index()];
+            if resource_state
+                .holder
+                .as_ref()
+                .is_some_and(|holder| holder.lease_id == lease_id)
+            {
+                resource_state.quarantine_reason = Some(reason);
+                resource_state.metrics.lease_quarantined_total += 1;
+                quarantined = true;
+            }
+        }
+        drop(state);
+        if quarantined {
+            eprintln!(
+                "K3 AI resource lease quarantined: workload={} reason={}",
+                workload.as_str(),
+                reason.as_str()
+            );
+            self.changed.notify_all();
+        }
+    }
+
     fn snapshot(&self) -> Value {
         let state = self.lock_state();
         json!({
-            "kind": "k3_ai_resource_scheduler_v1",
+            "kind": "k3_ai_resource_scheduler_v2",
             "mode": "bounded_priority_fifo_lease",
             "atomic_multi_resource_leases": true,
             "queue_capacity_per_cluster": self.queue_capacity,
@@ -421,9 +518,13 @@ impl AiResourceScheduler {
                 cluster_snapshot(&state, AiCluster::A100Cluster1),
             ],
             "resource_domains": {
-                "spacemit_onnx_runtime": resource_domain_snapshot(
+                "spacemit_onnx_runtime_cluster_0": resource_domain_snapshot(
                     &state,
-                    AiResource::SpacemitOnnxRuntime,
+                    AiResource::SpacemitOnnxRuntimeCluster0,
+                ),
+                "spacemit_onnx_runtime_cluster_1": resource_domain_snapshot(
+                    &state,
+                    AiResource::SpacemitOnnxRuntimeCluster1,
                 ),
             },
             "workloads": {
@@ -473,6 +574,14 @@ impl Drop for AiResourceLease {
     }
 }
 
+impl AiResourceLease {
+    pub fn quarantine(mut self, reason: AiLeaseQuarantineReason) {
+        self.scheduler
+            .quarantine(self.resource_mask, self.workload, self.lease_id, reason);
+        self.released = true;
+    }
+}
+
 pub fn acquire_ai_resource_lease(workload: AiWorkload) -> Result<AiResourceLease, AiLeaseError> {
     global_scheduler().acquire(workload)
 }
@@ -505,10 +614,13 @@ fn cluster_snapshot(state: &SchedulerState, cluster: AiCluster) -> Value {
         "core_ids": cluster.core_ids(),
         "busy": holder.is_some(),
         "holder": holder,
+        "quarantined": resource_state.quarantine_reason.is_some(),
+        "quarantine_reason": resource_state.quarantine_reason.map(AiLeaseQuarantineReason::as_str),
         "queue_depth": queued_count_for_resource(&state.waiters, resource),
         "waiting_by_workload": waiting,
         "acquired_total": resource_state.metrics.acquired_total,
         "released_total": resource_state.metrics.released_total,
+        "lease_quarantined_total": resource_state.metrics.lease_quarantined_total,
         "queued_total": resource_state.metrics.queued_total,
         "queue_full_total": resource_state.metrics.queue_full_total,
         "timed_out_total": resource_state.metrics.timed_out_total,
@@ -529,10 +641,13 @@ fn resource_domain_snapshot(state: &SchedulerState, resource: AiResource) -> Val
         "resource_id": resource.as_str(),
         "busy": holder.is_some(),
         "holder": holder,
+        "quarantined": resource_state.quarantine_reason.is_some(),
+        "quarantine_reason": resource_state.quarantine_reason.map(AiLeaseQuarantineReason::as_str),
         "queue_depth": queued_count_for_resource(&state.waiters, resource),
         "waiting_by_workload": waiting_by_workload(state, resource),
         "acquired_total": resource_state.metrics.acquired_total,
         "released_total": resource_state.metrics.released_total,
+        "lease_quarantined_total": resource_state.metrics.lease_quarantined_total,
         "queued_total": resource_state.metrics.queued_total,
         "queue_full_total": resource_state.metrics.queue_full_total,
         "timed_out_total": resource_state.metrics.timed_out_total,
@@ -576,9 +691,11 @@ fn workload_snapshot(
         "wait_timeout_ms": duration_millis(scheduler.wait_timeout),
         "started_total": metrics.acquired_total,
         "completed_total": metrics.released_total,
-        "busy_total": metrics.queued_total + metrics.queue_full_total,
-        "failed_total": metrics.queue_full_total + metrics.timed_out_total,
+        "busy_total": metrics.queued_total + metrics.queue_full_total + metrics.quarantine_rejected_total,
+        "failed_total": metrics.queue_full_total + metrics.timed_out_total + metrics.quarantine_rejected_total,
         "requested_total": metrics.requested_total,
+        "cross_cluster_parallel_acquired_total": metrics.cross_cluster_parallel_acquired_total,
+        "quarantine_rejected_total": metrics.quarantine_rejected_total,
         "queued_total": metrics.queued_total,
         "queue_full_total": metrics.queue_full_total,
         "timed_out_total": metrics.timed_out_total,
@@ -623,8 +740,18 @@ fn resources_in_mask(resource_mask: u8) -> impl Iterator<Item = AiResource> {
 }
 
 fn resources_are_free(state: &SchedulerState, resource_mask: u8) -> bool {
-    resources_in_mask(resource_mask)
-        .all(|resource| state.resources[resource.index()].holder.is_none())
+    resources_in_mask(resource_mask).all(|resource| {
+        let resource_state = &state.resources[resource.index()];
+        resource_state.holder.is_none() && resource_state.quarantine_reason.is_none()
+    })
+}
+
+fn required_resources_are_quarantined(state: &SchedulerState, workload: AiWorkload) -> bool {
+    workload.required_resources().iter().any(|resource| {
+        state.resources[resource.index()]
+            .quarantine_reason
+            .is_some()
+    })
 }
 
 fn resources_overlap(left: u8, right: u8) -> bool {
@@ -705,19 +832,6 @@ mod tests {
         panic!("queue did not reach depth {depth}");
     }
 
-    fn wait_for_runtime_queue_depth(scheduler: &AiResourceScheduler, depth: usize) {
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while Instant::now() < deadline {
-            if scheduler.snapshot()["resource_domains"]["spacemit_onnx_runtime"]["queue_depth"]
-                == json!(depth)
-            {
-                return;
-            }
-            thread::yield_now();
-        }
-        panic!("runtime domain queue did not reach depth {depth}");
-    }
-
     #[test]
     fn different_four_core_clusters_can_be_leased_together() {
         let scheduler = Arc::new(AiResourceScheduler::new(4, Duration::from_secs(1)));
@@ -734,65 +848,56 @@ mod tests {
     }
 
     #[test]
-    fn yolo_and_cat_verifier_share_runtime_without_partially_holding_cluster_one() {
-        let scheduler = Arc::new(AiResourceScheduler::new(1, Duration::from_secs(2)));
+    fn yolo_and_cat_verifier_use_independent_cluster_runtime_domains() {
+        let scheduler = Arc::new(AiResourceScheduler::new(1, Duration::from_millis(10)));
         let yolo = scheduler.acquire(AiWorkload::Yolo).expect("YOLO lease");
-        let (cat_result_tx, cat_result_rx) = mpsc::channel();
+        let cat = scheduler
+            .acquire(AiWorkload::CatRecordingVerifier)
+            .expect("classifier must run on cluster one while YOLO holds cluster zero");
 
-        let cat_scheduler = Arc::clone(&scheduler);
-        let cat_thread = thread::spawn(move || {
-            cat_result_tx
-                .send(cat_scheduler.acquire(AiWorkload::CatRecordingVerifier))
-                .expect("report classifier result");
-        });
-
-        wait_for_runtime_queue_depth(&scheduler, 1);
-        assert_eq!(scheduler.snapshot()["clusters"][1]["busy"], false);
-
-        let llm = scheduler
-            .acquire(AiWorkload::Llm)
-            .expect("classifier waiting for runtime must not occupy cluster one");
+        let snapshot = scheduler.snapshot();
         assert_eq!(
-            scheduler.snapshot()["clusters"][1]["holder"]["workload"],
-            "llm"
+            snapshot["resource_domains"]["spacemit_onnx_runtime_cluster_0"]["holder"]["workload"],
+            "yolo",
         );
-        assert!(cat_result_rx.try_recv().is_err());
-
-        drop(llm);
-        drop(yolo);
-        let cat = cat_result_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("classifier must acquire after YOLO exits")
-            .expect("classifier lease");
         assert_eq!(
-            scheduler.snapshot()["resource_domains"]["spacemit_onnx_runtime"]["holder"]["workload"],
-            "cat_recording_verifier"
+            snapshot["resource_domains"]["spacemit_onnx_runtime_cluster_1"]["holder"]["workload"],
+            "cat_recording_verifier",
         );
-        drop(cat);
-        cat_thread.join().expect("classifier thread");
+        assert_eq!(
+            snapshot["workloads"]["cat_recording_verifier"]
+                ["cross_cluster_parallel_acquired_total"],
+            1
+        );
+
+        drop((cat, yolo));
     }
 
     #[test]
-    fn snapshot_reports_atomic_runtime_domain_requirements() {
+    fn snapshot_reports_cluster_scoped_runtime_domain_requirements() {
         let scheduler = Arc::new(AiResourceScheduler::new(4, Duration::from_secs(1)));
         let yolo = scheduler.acquire(AiWorkload::Yolo).expect("YOLO lease");
 
         let snapshot = scheduler.snapshot();
         assert_eq!(
-            snapshot["resource_domains"]["spacemit_onnx_runtime"]["busy"],
+            snapshot["resource_domains"]["spacemit_onnx_runtime_cluster_0"]["busy"],
             true
         );
         assert_eq!(
-            snapshot["resource_domains"]["spacemit_onnx_runtime"]["holder"]["workload"],
+            snapshot["resource_domains"]["spacemit_onnx_runtime_cluster_0"]["holder"]["workload"],
             "yolo"
         );
         assert_eq!(
+            snapshot["resource_domains"]["spacemit_onnx_runtime_cluster_1"]["busy"],
+            false
+        );
+        assert_eq!(
             snapshot["workloads"]["yolo"]["required_resource_ids"],
-            json!(["a100_cluster_0", "spacemit_onnx_runtime"])
+            json!(["a100_cluster_0", "spacemit_onnx_runtime_cluster_0"])
         );
         assert_eq!(
             snapshot["workloads"]["cat_recording_verifier"]["required_resource_ids"],
-            json!(["a100_cluster_1", "spacemit_onnx_runtime"])
+            json!(["a100_cluster_1", "spacemit_onnx_runtime_cluster_1"])
         );
         assert_eq!(
             snapshot["workloads"]["llm"]["required_resource_ids"],
@@ -801,9 +906,87 @@ mod tests {
 
         drop(yolo);
         assert_eq!(
-            scheduler.snapshot()["resource_domains"]["spacemit_onnx_runtime"]["busy"],
+            scheduler.snapshot()["resource_domains"]["spacemit_onnx_runtime_cluster_0"]["busy"],
             false
         );
+    }
+
+    #[test]
+    fn quarantining_classifier_blocks_only_cluster_one_runtime_domain() {
+        let scheduler = Arc::new(AiResourceScheduler::new(4, Duration::from_millis(10)));
+        let yolo = scheduler.acquire(AiWorkload::Yolo).expect("YOLO lease");
+        let classifier = scheduler
+            .acquire(AiWorkload::CatRecordingVerifier)
+            .expect("classifier lease");
+
+        classifier.quarantine(AiLeaseQuarantineReason::ProcessExitUnconfirmed);
+
+        let error = scheduler
+            .acquire(AiWorkload::CatRecordingVerifier)
+            .expect_err("quarantined classifier domain must fail closed");
+        assert_eq!(error.kind(), AiLeaseErrorKind::Quarantined);
+        assert_eq!(error.code(), "ai_resource_quarantined");
+        let llm_error = scheduler
+            .acquire(AiWorkload::Llm)
+            .expect_err("unconfirmed classifier process must fence cluster one");
+        assert_eq!(llm_error.kind(), AiLeaseErrorKind::Quarantined);
+        let snapshot = scheduler.snapshot();
+        assert_eq!(
+            snapshot["resource_domains"]["spacemit_onnx_runtime_cluster_1"]["quarantined"],
+            true
+        );
+        assert_eq!(
+            snapshot["resource_domains"]["spacemit_onnx_runtime_cluster_1"]["quarantine_reason"],
+            "process_exit_unconfirmed"
+        );
+        assert_eq!(
+            snapshot["resource_domains"]["spacemit_onnx_runtime_cluster_1"]
+                ["lease_quarantined_total"],
+            1
+        );
+        assert_eq!(
+            snapshot["resource_domains"]["spacemit_onnx_runtime_cluster_0"]["quarantined"],
+            false
+        );
+        assert_eq!(
+            snapshot["workloads"]["cat_recording_verifier"]["quarantine_rejected_total"],
+            1
+        );
+        assert_eq!(
+            snapshot["workloads"]["cat_recording_verifier"]["failed_total"],
+            1
+        );
+        assert_eq!(snapshot["workloads"]["llm"]["quarantine_rejected_total"], 1);
+        assert_eq!(snapshot["workloads"]["llm"]["failed_total"], 1);
+        assert_eq!(snapshot["workloads"]["yolo"]["holder_workload"], "yolo");
+
+        drop(yolo);
+    }
+
+    #[test]
+    fn queued_cluster_one_waiter_fails_immediately_when_domain_is_quarantined() {
+        let scheduler = Arc::new(AiResourceScheduler::new(4, Duration::from_secs(2)));
+        let classifier = scheduler
+            .acquire(AiWorkload::CatRecordingVerifier)
+            .expect("classifier lease");
+        let (result_tx, result_rx) = mpsc::channel();
+        let waiter_scheduler = Arc::clone(&scheduler);
+        let waiter = thread::spawn(move || {
+            result_tx
+                .send(waiter_scheduler.acquire(AiWorkload::Llm))
+                .expect("report LLM result");
+        });
+        wait_for_queue_depth(&scheduler, 1);
+
+        classifier.quarantine(AiLeaseQuarantineReason::ProcessExitUnconfirmed);
+
+        let error = result_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("queued waiter must wake after quarantine")
+            .expect_err("queued waiter must fail closed");
+        assert_eq!(error.kind(), AiLeaseErrorKind::Quarantined);
+        assert_eq!(scheduler.snapshot()["clusters"][1]["queue_depth"], 0);
+        waiter.join().expect("LLM waiter");
     }
 
     #[test]
