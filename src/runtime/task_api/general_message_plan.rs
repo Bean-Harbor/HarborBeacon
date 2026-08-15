@@ -13,8 +13,11 @@ pub(super) enum GeneralMessagePlanKind {
     Clarify,
     ConversationAct,
     CameraReplayRecentClip,
+    CameraLiveView,
     CameraSnapshot,
+    CameraSnapshotAndRecordClip,
     CameraRecordClip,
+    CatActivityQuery,
     KnowledgeSearch,
     RagAnswer,
     HomeAssistantServiceAction,
@@ -42,6 +45,92 @@ pub(super) enum GeneralMessagePlanKind {
     FamilyMemoryShowFavorites,
     #[allow(dead_code)]
     Unsupported,
+}
+
+pub(super) const CAT_ACTIVITY_DEFAULT_BATCH_LIMIT: usize = 3;
+pub(super) const CAT_ACTIVITY_MAX_BATCH_LIMIT: usize = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum CatActivityTimeScope {
+    #[default]
+    Inherit,
+    Today,
+    Morning,
+    Afternoon,
+    Evening,
+    Recent,
+}
+
+impl CatActivityTimeScope {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Inherit => "inherit",
+            Self::Today => "today",
+            Self::Morning => "morning",
+            Self::Afternoon => "afternoon",
+            Self::Evening => "evening",
+            Self::Recent => "recent",
+        }
+    }
+
+    pub(super) fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "inherit" | "same" | "previous" => Some(Self::Inherit),
+            "today" => Some(Self::Today),
+            "morning" => Some(Self::Morning),
+            "afternoon" => Some(Self::Afternoon),
+            "evening" | "night" => Some(Self::Evening),
+            "recent" | "just_now" => Some(Self::Recent),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum CatActivitySelection {
+    #[default]
+    Batch,
+    Latest,
+    Remaining,
+    ResendLast,
+}
+
+impl CatActivitySelection {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Batch => "batch",
+            Self::Latest => "latest",
+            Self::Remaining => "remaining",
+            Self::ResendLast => "resend_last",
+        }
+    }
+
+    pub(super) fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "batch" | "all" => Some(Self::Batch),
+            "latest" => Some(Self::Latest),
+            "remaining" | "more" => Some(Self::Remaining),
+            "resend_last" | "resend" => Some(Self::ResendLast),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CatActivityQueryOptions {
+    pub(super) time_scope: CatActivityTimeScope,
+    pub(super) selection: CatActivitySelection,
+    pub(super) limit: usize,
+}
+
+impl Default for CatActivityQueryOptions {
+    fn default() -> Self {
+        Self {
+            time_scope: CatActivityTimeScope::Inherit,
+            selection: CatActivitySelection::Batch,
+            limit: CAT_ACTIVITY_DEFAULT_BATCH_LIMIT,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +172,7 @@ pub(super) struct GeneralMessagePlan {
     pub(super) canonical_phrase: Option<String>,
     pub(super) camera_hint: Option<String>,
     pub(super) query: Option<String>,
+    pub(super) cat_activity: CatActivityQueryOptions,
     pub(super) home_assistant_action: Option<HomeAssistantNaturalAction>,
     pub(super) guardian_rule: Option<Value>,
     pub(super) event_id: Option<String>,
@@ -112,6 +202,8 @@ pub(super) struct GeneralMessagePlanPayload {
     #[serde(default)]
     pub(super) query: Option<String>,
     #[serde(default)]
+    pub(super) cat_activity: Option<GeneralMessageCatActivityPlanPayload>,
+    #[serde(default)]
     pub(super) domain: Option<String>,
     #[serde(default)]
     pub(super) service: Option<String>,
@@ -134,6 +226,16 @@ pub(super) struct GeneralMessagePlanPayload {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub(super) struct GeneralMessageCatActivityPlanPayload {
+    #[serde(default)]
+    pub(super) time_scope: Option<String>,
+    #[serde(default)]
+    pub(super) selection: Option<String>,
+    #[serde(default)]
+    pub(super) limit: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 pub(super) struct GeneralMessageHomeAssistantPlanPayload {
     #[serde(default)]
     pub(super) domain: Option<String>,
@@ -148,6 +250,7 @@ pub(super) struct GeneralMessageSignals {
     pub(super) normalized: String,
     pub(super) asks_capability: bool,
     pub(super) explicit_clip_playback: bool,
+    pub(super) explicit_live_view: bool,
     pub(super) explicit_snapshot: bool,
     pub(super) explicit_clip: bool,
     pub(super) explicit_search: bool,

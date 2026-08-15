@@ -6,7 +6,6 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -17,16 +16,20 @@ use serde_json::{json, Value};
 use tokenizers::Tokenizer;
 
 use crate::connectors::ai_provider::{
-    EmbeddingRequest, OpenAiCompatibleConfig, OpenAiCompatibleEmbeddingClient,
-    OpenAiCompatibleTextClient, OpenAiCompatibleVisionClient, RerankCompatibleClient,
-    RerankCompatibleConfig, RerankRequest, RerankScore, TextCompletionRequest,
-    VisionSummaryRequest,
+    CatFrameVerificationResponse, EmbeddingRequest, OpenAiCompatibleConfig,
+    OpenAiCompatibleEmbeddingClient, OpenAiCompatibleTextClient, OpenAiCompatibleVisionClient,
+    RerankCompatibleClient, RerankCompatibleConfig, RerankRequest, RerankScore,
+    TextCompletionRequest, VisionSummaryRequest,
 };
 use crate::control_plane::models::{
     ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, PrivacyLevel,
 };
 use crate::runtime::admin_console::{
     default_model_endpoints, sanitize_model_center_state, AdminConsoleState, AdminModelCenterState,
+};
+use crate::runtime::ai_resource_scheduler::{
+    acquire_ai_resource_lease, ai_resource_workload_snapshot, AiLeaseError, AiResourceLease,
+    AiWorkload,
 };
 
 pub const ADMIN_STATE_PATH_ENV: &str = "HARBOR_ADMIN_STATE_PATH";
@@ -47,11 +50,6 @@ const MODEL_API_TOKEN_ENV: &str = "HARBOR_MODEL_API_TOKEN";
 const DEFAULT_SEMANTIC_ROUTER_BASE_URL: &str = "http://127.0.0.1:4176/v1";
 const DEFAULT_SEMANTIC_ROUTER_MODEL: &str = "Qwen/Qwen2.5-0.5B-Instruct";
 const LLM_TOKENIZER_PATH_ENV: &str = "HARBOR_LLM_TOKENIZER_PATH";
-static VLM_EXECUTION_BUSY: AtomicBool = AtomicBool::new(false);
-static VLM_EXECUTION_STARTED_TOTAL: AtomicU64 = AtomicU64::new(0);
-static VLM_EXECUTION_BUSY_TOTAL: AtomicU64 = AtomicU64::new(0);
-static VLM_EXECUTION_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
-static VLM_EXECUTION_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static LLM_TOKENIZER: OnceLock<Option<Tokenizer>> = OnceLock::new();
 
 pub fn llm_text_token_count(text: &str) -> usize {
@@ -155,6 +153,32 @@ pub struct VlmSummaryExecution {
     pub text: String,
     #[serde(default)]
     pub details: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct CatRecordingVlmExecution {
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub provider_key: String,
+    #[serde(default)]
+    pub model_endpoint_id: Option<String>,
+    #[serde(default)]
+    pub model_name: String,
+    #[serde(default)]
+    pub cat_present: bool,
+    #[serde(default)]
+    pub cat_frame_indices: Vec<u8>,
+    #[serde(default)]
+    pub behavior_tags: Vec<String>,
+    #[serde(default)]
+    pub reason_code: String,
+    #[serde(default)]
+    pub sampled_frame_count: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -438,22 +462,6 @@ pub fn run_vlm_summary_with_state(
     image_path: &Path,
     state: &AdminModelCenterState,
 ) -> VlmSummaryExecution {
-    let Some(_guard) = VlmExecutionGuard::try_acquire() else {
-        return VlmSummaryExecution {
-            available: false,
-            status: "busy".to_string(),
-            summary: "VLM queue is busy; retry after the current local request completes."
-                .to_string(),
-            provider_key: String::new(),
-            model_endpoint_id: None,
-            text: String::new(),
-            details: json!({
-                "queue_result": "busy",
-                "local_only": true,
-                "fallback_allowed": false,
-            }),
-        };
-    };
     let Some(endpoint) = resolve_endpoint(state, ModelKind::Vlm, VLM_POLICY_ID) else {
         return VlmSummaryExecution {
             available: false,
@@ -575,6 +583,24 @@ pub fn run_vlm_summary_with_state(
             };
         }
     };
+    let _ai_lease = match acquire_endpoint_ai_lease(&endpoint, AiWorkload::Vlm) {
+        Ok(lease) => lease,
+        Err(error) => {
+            return VlmSummaryExecution {
+                available: false,
+                status: "busy".to_string(),
+                summary: format!("VLM A100 resource is busy: {error}"),
+                provider_key: endpoint.provider_key.clone(),
+                model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
+                text: String::new(),
+                details: json!({
+                    "ai_resource_error": error.code(),
+                    "local_only": true,
+                    "fallback_allowed": false,
+                }),
+            };
+        }
+    };
 
     match client.describe_frame(&VisionSummaryRequest {
         image_data_url,
@@ -616,17 +642,238 @@ pub fn run_vlm_summary_with_state(
     }
 }
 
+pub fn run_cat_recording_validation(sample_frames: &[(u8, PathBuf)]) -> CatRecordingVlmExecution {
+    let state = load_model_center_state();
+    run_cat_recording_validation_with_state(sample_frames, &state)
+}
+
+pub fn run_cat_recording_validation_with_state(
+    sample_frames: &[(u8, PathBuf)],
+    state: &AdminModelCenterState,
+) -> CatRecordingVlmExecution {
+    let Some(endpoint) = resolve_endpoint(state, ModelKind::Vlm, VLM_POLICY_ID) else {
+        return cat_recording_vlm_error("disabled", "No VLM endpoint is enabled.", None);
+    };
+    if let Some(reason) = vlm_endpoint_local_only_blocker(&endpoint) {
+        return cat_recording_vlm_error("blocked", &reason, Some(&endpoint));
+    }
+    if !endpoint
+        .provider_key
+        .eq_ignore_ascii_case("openai_compatible")
+    {
+        return cat_recording_vlm_error(
+            "degraded",
+            "Configured VLM provider does not support cat recording validation.",
+            Some(&endpoint),
+        );
+    }
+    let Some(config) = openai_compatible_config_from_endpoint(&endpoint) else {
+        return cat_recording_vlm_error(
+            "degraded",
+            "VLM endpoint configuration is incomplete.",
+            Some(&endpoint),
+        );
+    };
+    if sample_frames.is_empty() || sample_frames.len() > 5 {
+        return cat_recording_vlm_error(
+            "degraded",
+            "Cat recording validation requires between one and five sampled frames per round.",
+            Some(&endpoint),
+        );
+    }
+    let mut frame_indices = sample_frames
+        .iter()
+        .map(|(index, _)| *index)
+        .collect::<Vec<_>>();
+    frame_indices.sort_unstable();
+    frame_indices.dedup();
+    if frame_indices.len() != sample_frames.len()
+        || frame_indices.iter().any(|index| !(1..=10).contains(index))
+    {
+        return cat_recording_vlm_error(
+            "degraded",
+            "Cat recording validation sampled frame indices are invalid.",
+            Some(&endpoint),
+        );
+    }
+    let client = match OpenAiCompatibleVisionClient::new(config) {
+        Ok(client) => client,
+        Err(error) => {
+            return cat_recording_vlm_error("degraded", &error, Some(&endpoint));
+        }
+    };
+    let _ai_lease = match acquire_endpoint_ai_lease(&endpoint, AiWorkload::Vlm) {
+        Ok(lease) => lease,
+        Err(error) => {
+            return cat_recording_vlm_error(
+                "busy",
+                &format!("VLM A100 resource is busy: {error}"),
+                Some(&endpoint),
+            );
+        }
+    };
+    let mut responses = Vec::with_capacity(sample_frames.len());
+    for (frame_index, image_path) in sample_frames {
+        let image_data_url = match build_image_data_url(image_path) {
+            Ok(value) => value,
+            Err(error) => {
+                return cat_recording_vlm_error("degraded", &error, Some(&endpoint));
+            }
+        };
+        let response = match client.verify_cat_frame(&image_data_url) {
+            Ok(response) => response,
+            Err(error) => {
+                return cat_recording_vlm_error("degraded", &error, Some(&endpoint));
+            }
+        };
+        responses.push((*frame_index, response));
+    }
+    aggregate_cat_frame_verifications(&endpoint, &responses)
+}
+
+fn aggregate_cat_frame_verifications(
+    endpoint: &ModelEndpoint,
+    responses: &[(u8, CatFrameVerificationResponse)],
+) -> CatRecordingVlmExecution {
+    let mut cat_frame_indices = responses
+        .iter()
+        .filter_map(|(index, response)| response.cat_present.then_some(*index))
+        .collect::<Vec<_>>();
+    cat_frame_indices.sort_unstable();
+    cat_frame_indices.dedup();
+
+    let mut behavior_tags = Vec::new();
+    let mut positive_summaries = Vec::new();
+    let mut uncertain = false;
+    for (_, response) in responses {
+        if response.cat_present {
+            for tag in &response.behavior_tags {
+                if !behavior_tags.contains(tag) {
+                    behavior_tags.push(tag.clone());
+                }
+            }
+            if !response.summary.trim().is_empty() {
+                positive_summaries.push(response.summary.trim().to_string());
+            }
+        } else if response.reason_code != "no_cat_visible" {
+            uncertain = true;
+        }
+    }
+
+    let sampled_frame_count = u8::try_from(responses.len()).unwrap_or(u8::MAX);
+    let cat_present = !cat_frame_indices.is_empty();
+    let (summary, reason_code) = if cat_frame_indices.len() >= 2 {
+        (
+            format!(
+                "抽样 {sampled_frame_count} 帧，其中 {} 帧确认出现猫。{}",
+                cat_frame_indices.len(),
+                positive_summaries.first().cloned().unwrap_or_default()
+            )
+            .trim()
+            .to_string(),
+            "cat_visible".to_string(),
+        )
+    } else if let Some(frame_index) = cat_frame_indices.first() {
+        (
+            format!(
+                "抽样 {sampled_frame_count} 帧，仅第 {frame_index} 帧确认出现猫，需要复核。{}",
+                positive_summaries.first().cloned().unwrap_or_default()
+            )
+            .trim()
+            .to_string(),
+            "uncertain".to_string(),
+        )
+    } else if uncertain {
+        (
+            format!("抽样 {sampled_frame_count} 帧未形成明确结论，需要复核。"),
+            "uncertain".to_string(),
+        )
+    } else {
+        (
+            format!("抽样 {sampled_frame_count} 帧均未看见猫。"),
+            "no_cat_visible".to_string(),
+        )
+    };
+
+    CatRecordingVlmExecution {
+        available: true,
+        status: "active".to_string(),
+        summary,
+        provider_key: endpoint.provider_key.clone(),
+        model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
+        model_name: endpoint.model_name.clone(),
+        cat_present,
+        cat_frame_indices,
+        behavior_tags,
+        reason_code,
+        sampled_frame_count,
+    }
+}
+
+fn cat_recording_vlm_error(
+    status: &str,
+    summary: &str,
+    endpoint: Option<&ModelEndpoint>,
+) -> CatRecordingVlmExecution {
+    CatRecordingVlmExecution {
+        available: false,
+        status: status.to_string(),
+        summary: summary.to_string(),
+        provider_key: endpoint
+            .map(|endpoint| endpoint.provider_key.clone())
+            .unwrap_or_default(),
+        model_endpoint_id: endpoint.map(|endpoint| endpoint.model_endpoint_id.clone()),
+        model_name: endpoint
+            .map(|endpoint| endpoint.model_name.clone())
+            .unwrap_or_default(),
+        ..CatRecordingVlmExecution::default()
+    }
+}
+
 pub fn vlm_execution_runtime_snapshot() -> Value {
-    json!({
-        "busy": VLM_EXECUTION_BUSY.load(Ordering::Relaxed),
-        "mode": "global_serial_try_lock",
-        "started_total": VLM_EXECUTION_STARTED_TOTAL.load(Ordering::Relaxed),
-        "busy_total": VLM_EXECUTION_BUSY_TOTAL.load(Ordering::Relaxed),
-        "completed_total": VLM_EXECUTION_COMPLETED_TOTAL.load(Ordering::Relaxed),
-        "failed_total": VLM_EXECUTION_FAILED_TOTAL.load(Ordering::Relaxed),
-        "metadata_only": true,
-        "secret_scan": "clean",
-    })
+    ai_resource_workload_snapshot(AiWorkload::Vlm)
+}
+
+fn acquire_endpoint_ai_lease(
+    endpoint: &ModelEndpoint,
+    workload: AiWorkload,
+) -> Result<Option<AiResourceLease>, AiLeaseError> {
+    if endpoint_requires_a100_cluster_1(endpoint, workload) {
+        acquire_ai_resource_lease(workload).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+fn endpoint_requires_a100_cluster_1(endpoint: &ModelEndpoint, workload: AiWorkload) -> bool {
+    if endpoint.endpoint_kind != ModelEndpointKind::Local {
+        return false;
+    }
+    if metadata_string(&endpoint.metadata, "ai_resource_cluster")
+        .is_some_and(|cluster| cluster.eq_ignore_ascii_case("a100_cluster_1"))
+    {
+        return true;
+    }
+    match workload {
+        AiWorkload::Llm => {
+            metadata_string(&endpoint.metadata, "runtime")
+                .is_some_and(|runtime| runtime.eq_ignore_ascii_case("spacemit-llama-server"))
+                || endpoint_uses_loopback_port(endpoint, 8091)
+        }
+        AiWorkload::Vlm => endpoint_uses_loopback_port(endpoint, 8080),
+        AiWorkload::Yolo | AiWorkload::CatRecordingVerifier => false,
+    }
+}
+
+fn endpoint_uses_loopback_port(endpoint: &ModelEndpoint, port: u16) -> bool {
+    metadata_string(&endpoint.metadata, "base_url")
+        .and_then(|base_url| Url::parse(&base_url).ok())
+        .is_some_and(|url| {
+            url.port_or_known_default() == Some(port)
+                && url
+                    .host_str()
+                    .is_some_and(|host| matches!(host, "127.0.0.1" | "localhost" | "::1"))
+        })
 }
 
 pub fn vlm_endpoint_readiness(state: &AdminModelCenterState) -> Value {
@@ -643,9 +890,19 @@ pub fn vlm_endpoint_readiness(state: &AdminModelCenterState) -> Value {
             "secret_scan": "clean",
         });
     };
-    let blocker = vlm_endpoint_local_only_blocker(endpoint);
+    let local_only = vlm_endpoint_local_only_blocker(endpoint).is_none();
+    let mut blocker = vlm_endpoint_local_only_blocker(endpoint);
     let configured = endpoint.status != ModelEndpointStatus::Disabled;
-    let endpoint_ready = configured && blocker.is_none();
+    let healthz_url = metadata_string(&endpoint.metadata, "healthz_url");
+    let health_reachable = if configured && blocker.is_none() {
+        healthz_url.as_deref().map(probe_loopback_health_endpoint)
+    } else {
+        None
+    };
+    if health_reachable == Some(false) {
+        blocker = Some("Configured local VLM health endpoint is unreachable.".to_string());
+    }
+    let endpoint_ready = configured && blocker.is_none() && health_reachable != Some(false);
     json!({
         "status": if endpoint_ready {
             "available"
@@ -655,7 +912,7 @@ pub fn vlm_endpoint_readiness(state: &AdminModelCenterState) -> Value {
             "not_configured"
         },
         "endpoint_ready": endpoint_ready,
-        "local_only": blocker.is_none(),
+        "local_only": local_only,
         "fallback_allowed": false,
         "endpoint_bound": true,
         "endpoint": {
@@ -667,43 +924,32 @@ pub fn vlm_endpoint_readiness(state: &AdminModelCenterState) -> Value {
             "base_url_redacted": metadata_string(&endpoint.metadata, "base_url").is_some(),
         },
         "blocker": blocker,
+        "runtime_probe": {
+            "healthz_configured": healthz_url.is_some(),
+            "reachable": health_reachable,
+            "local_only": healthz_url.as_deref().is_none_or(url_is_loopback),
+        },
         "queue": vlm_execution_runtime_snapshot(),
         "metadata_only": true,
         "secret_scan": "clean",
     })
 }
 
-struct VlmExecutionGuard {
-    completed: bool,
-}
-
-impl VlmExecutionGuard {
-    fn try_acquire() -> Option<Self> {
-        match VLM_EXECUTION_BUSY.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        {
-            Ok(_) => {
-                VLM_EXECUTION_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                Some(Self { completed: false })
-            }
-            Err(_) => {
-                VLM_EXECUTION_BUSY_TOTAL.fetch_add(1, Ordering::Relaxed);
-                None
-            }
-        }
+fn probe_loopback_health_endpoint(raw_url: &str) -> bool {
+    if !url_is_loopback(raw_url) {
+        return false;
     }
-}
-
-impl Drop for VlmExecutionGuard {
-    fn drop(&mut self) {
-        if self.completed {
-            VLM_EXECUTION_COMPLETED_TOTAL.fetch_add(1, Ordering::Relaxed);
-        } else if !std::thread::panicking() {
-            VLM_EXECUTION_COMPLETED_TOTAL.fetch_add(1, Ordering::Relaxed);
-        } else {
-            VLM_EXECUTION_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
-        }
-        VLM_EXECUTION_BUSY.store(false, Ordering::Release);
-    }
+    let Ok(client) = Client::builder()
+        .connect_timeout(Duration::from_millis(500))
+        .timeout(Duration::from_secs(1))
+        .build()
+    else {
+        return false;
+    };
+    client
+        .get(raw_url)
+        .send()
+        .is_ok_and(|response| response.status().is_success())
 }
 
 fn vlm_endpoint_local_only_blocker(endpoint: &ModelEndpoint) -> Option<String> {
@@ -1007,6 +1253,18 @@ pub fn run_llm_text_with_state_and_options(
             "available": result.available,
             "summary": result.summary,
         }));
+        if result.status == "busy" && result.details.get("ai_resource_error").is_some() {
+            merge_llm_execution_details(
+                &mut result,
+                route_policy_id,
+                &attempted_endpoints,
+                None,
+                false,
+                endpoint.endpoint_kind.as_str(),
+                attempt_summaries,
+            );
+            return result;
+        }
         if result.available {
             let selected_endpoint_id = result.model_endpoint_id.clone();
             let selected_endpoint_kind = endpoint.endpoint_kind.as_str();
@@ -1297,6 +1555,24 @@ fn run_llm_text_on_endpoint(
                 model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
                 text: String::new(),
                 details: json!({}),
+            };
+        }
+    };
+    let _ai_lease = match acquire_endpoint_ai_lease(endpoint, AiWorkload::Llm) {
+        Ok(lease) => lease,
+        Err(error) => {
+            return LlmTextExecution {
+                available: false,
+                status: "busy".to_string(),
+                summary: format!("LLM A100 resource is busy: {error}"),
+                provider_key: endpoint.provider_key.clone(),
+                model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
+                text: String::new(),
+                details: json!({
+                    "ai_resource_error": error.code(),
+                    "local_only": true,
+                    "fallback_allowed": false,
+                }),
             };
         }
     };
@@ -2453,14 +2729,15 @@ mod tests {
     use tiny_http::{Header, Method, Response, Server};
 
     use super::{
-        clear_local_runtime_projection_cache, connectivity_url,
+        aggregate_cat_frame_verifications, clear_local_runtime_projection_cache, connectivity_url,
         embedding_endpoint_identity_with_state, embedding_query_input,
         endpoint_uses_openai_compatible_api, openai_compatible_config_from_endpoint,
-        redact_model_endpoint, run_embedding_with_state, run_llm_text_with_state,
-        run_llm_text_with_state_and_options, run_rerank_with_state, run_vlm_summary_with_state,
-        semantic_router_local_only_model_state, test_model_endpoint, vlm_endpoint_readiness,
-        LlmTextOptions, RERANK_POLICY_ID,
+        redact_model_endpoint, run_cat_recording_validation_with_state, run_embedding_with_state,
+        run_llm_text_with_state, run_llm_text_with_state_and_options, run_rerank_with_state,
+        run_vlm_summary_with_state, semantic_router_local_only_model_state, test_model_endpoint,
+        vlm_endpoint_readiness, LlmTextOptions, RERANK_POLICY_ID,
     };
+    use crate::connectors::ai_provider::CatFrameVerificationResponse;
     use crate::control_plane::models::{
         ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, ModelRoutePolicy,
         PrivacyLevel,
@@ -2468,6 +2745,157 @@ mod tests {
     use crate::runtime::admin_console::AdminModelCenterState;
 
     static MODEL_RUNTIME_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn cat_frame_response(
+        cat_present: bool,
+        reason_code: &str,
+        behavior_tags: &[&str],
+    ) -> CatFrameVerificationResponse {
+        CatFrameVerificationResponse {
+            cat_present,
+            behavior_tags: behavior_tags
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            summary: if cat_present {
+                "清晰看到猫".to_string()
+            } else {
+                "未看到猫".to_string()
+            },
+            reason_code: reason_code.to_string(),
+            raw_response: json!({}),
+        }
+    }
+
+    fn cat_vlm_endpoint() -> ModelEndpoint {
+        ModelEndpoint {
+            model_endpoint_id: "vlm-local".to_string(),
+            workspace_id: Some("home-1".to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Vlm,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "openai_compatible".to_string(),
+            model_name: "test-vlm".to_string(),
+            capability_tags: vec!["vision".to_string()],
+            cost_policy: json!({}),
+            status: ModelEndpointStatus::Active,
+            metadata: json!({}),
+        }
+    }
+
+    #[test]
+    fn cat_frame_aggregation_requires_two_positive_frames() {
+        let endpoint = cat_vlm_endpoint();
+        let accepted = aggregate_cat_frame_verifications(
+            &endpoint,
+            &[
+                (3, cat_frame_response(true, "cat_visible", &["walking"])),
+                (2, cat_frame_response(true, "cat_visible", &["walking"])),
+            ],
+        );
+        assert!(accepted.cat_present);
+        assert_eq!(accepted.cat_frame_indices, vec![2, 3]);
+        assert_eq!(accepted.behavior_tags, vec!["walking"]);
+        assert_eq!(accepted.reason_code, "cat_visible");
+        assert_eq!(accepted.sampled_frame_count, 2);
+
+        let review = aggregate_cat_frame_verifications(
+            &endpoint,
+            &[
+                (3, cat_frame_response(true, "cat_visible", &["resting"])),
+                (2, cat_frame_response(false, "no_cat_visible", &[])),
+            ],
+        );
+        assert!(review.cat_present);
+        assert_eq!(review.cat_frame_indices, vec![3]);
+        assert_eq!(review.reason_code, "uncertain");
+    }
+
+    #[test]
+    fn cat_frame_aggregation_preserves_uncertain_negative_for_review() {
+        let endpoint = cat_vlm_endpoint();
+        let result = aggregate_cat_frame_verifications(
+            &endpoint,
+            &[
+                (3, cat_frame_response(false, "no_cat_visible", &[])),
+                (2, cat_frame_response(false, "uncertain", &[])),
+            ],
+        );
+
+        assert!(!result.cat_present);
+        assert!(result.cat_frame_indices.is_empty());
+        assert_eq!(result.reason_code, "uncertain");
+    }
+
+    #[test]
+    fn cat_recording_validation_calls_direct_classifier_once_per_frame() {
+        let server = Server::http("127.0.0.1:0").expect("bind cat VLM test server");
+        let port = server.server_addr().to_ip().expect("server address").port();
+        let responder = thread::spawn(move || {
+            for _ in 0..2 {
+                let mut request = server.recv().expect("cat VLM request");
+                assert_eq!(request.method(), &Method::Post);
+                let mut body = String::new();
+                request
+                    .as_reader()
+                    .read_to_string(&mut body)
+                    .expect("read cat VLM request");
+                assert!(body.contains("visual cat-presence classifier"));
+                assert!(!body.contains("Describe only the scene"));
+                let response = Response::from_string(
+                    json!({
+                        "choices": [{
+                            "message": {
+                                "content": "{\"summary\":\"清晰看到猫\",\"reason_code\":\"cat_visible\",\"behavior_tags\":[\"unknown\"]}"
+                            }
+                        }]
+                    })
+                    .to_string(),
+                )
+                .with_header(
+                    Header::from_bytes("Content-Type", "application/json")
+                        .expect("content type header"),
+                );
+                request.respond(response).expect("cat VLM response");
+            }
+        });
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("cat-vlm-direct-{unique}"));
+        fs::create_dir_all(&temp_dir).expect("cat VLM temp directory");
+        let first = temp_dir.join("frame-1.jpg");
+        let second = temp_dir.join("frame-2.jpg");
+        fs::write(&first, b"first-frame").expect("first frame");
+        fs::write(&second, b"second-frame").expect("second frame");
+        let state = AdminModelCenterState {
+            endpoints: vec![ModelEndpoint {
+                model_endpoint_id: "vlm-cat-direct".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Vlm,
+                endpoint_kind: ModelEndpointKind::Local,
+                provider_key: "openai_compatible".to_string(),
+                model_name: "cat-vlm".to_string(),
+                capability_tags: vec!["vision".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({
+                    "base_url": format!("http://127.0.0.1:{port}/v1"),
+                }),
+            }],
+            ..Default::default()
+        };
+
+        let execution = run_cat_recording_validation_with_state(&[(6, first), (7, second)], &state);
+
+        assert!(execution.available);
+        assert_eq!(execution.cat_frame_indices, vec![6, 7]);
+        assert_eq!(execution.sampled_frame_count, 2);
+        responder.join().expect("cat VLM responder");
+        let _ = fs::remove_dir_all(temp_dir);
+    }
 
     #[test]
     fn qwen_runtime_profile_uses_openai_compatible_api_and_runtime_embedding_model() {
@@ -2786,6 +3214,39 @@ mod tests {
         assert_eq!(remote_readiness["endpoint_ready"], json!(false));
         assert_eq!(remote_readiness["local_only"], json!(false));
         assert_eq!(remote_readiness["fallback_allowed"], json!(false));
+    }
+
+    #[test]
+    fn vlm_endpoint_readiness_reports_unreachable_loopback_runtime() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind temporary port");
+        let port = listener.local_addr().expect("temporary address").port();
+        drop(listener);
+        let state = AdminModelCenterState {
+            endpoints: vec![ModelEndpoint {
+                model_endpoint_id: "vlm-local-down".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Vlm,
+                endpoint_kind: ModelEndpointKind::Local,
+                provider_key: "openai_compatible".to_string(),
+                model_name: "local-vlm".to_string(),
+                capability_tags: vec!["vision".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({
+                    "base_url": format!("http://127.0.0.1:{port}/v1"),
+                    "healthz_url": format!("http://127.0.0.1:{port}/health"),
+                }),
+            }],
+            ..Default::default()
+        };
+
+        let readiness = vlm_endpoint_readiness(&state);
+
+        assert_eq!(readiness["status"], json!("blocked"));
+        assert_eq!(readiness["endpoint_ready"], json!(false));
+        assert_eq!(readiness["local_only"], json!(true));
+        assert_eq!(readiness["runtime_probe"]["reachable"], json!(false));
     }
 
     #[test]

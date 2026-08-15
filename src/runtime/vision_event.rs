@@ -718,6 +718,7 @@ pub fn build_local_vision_notification_request(
             payload_format: NotificationPayloadFormat::PlainText,
             structured_payload: local_vision_notification_metadata(stored),
             attachments: Vec::new(),
+            delivery_hints: Vec::new(),
         },
         delivery: NotificationDelivery {
             mode: NotificationDeliveryMode::Send,

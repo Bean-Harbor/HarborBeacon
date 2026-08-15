@@ -59,6 +59,7 @@ mkdir -p "$pkg_dir/usr/bin"
 mkdir -p "$pkg_dir/etc/systemd/system"
 mkdir -p "$pkg_dir/usr/lib/harboros-beacon"
 mkdir -p "$pkg_dir/usr/share/doc/harboros-beacon"
+mkdir -p "$pkg_dir/var/lib/harboros-beacon/vision-models/mobilenetv2-cat-binary-v2-20260806"
 find "$build_root" -type d -exec chmod a-s,u=rwx,go=rx {} +
 
 cp "${cargo_release_dir}/harboros-beacon" "$pkg_dir/usr/bin/harboros-beacon"
@@ -69,18 +70,30 @@ cp "${cargo_release_dir}/harbornavi-ha-mqtt-event-contract-smoke" "$pkg_dir/usr/
 chmod 0755 "$pkg_dir/usr/bin/harboros-beacon" "$pkg_dir/usr/bin/harbor-model-api" "$pkg_dir/usr/bin/harbornavi-k3-local-vision-smoke" "$pkg_dir/usr/bin/harbornavi-k3-multi-vision-smoke" "$pkg_dir/usr/bin/harbornavi-ha-mqtt-event-contract-smoke"
 sed 's/\r$//' scripts/harbornavi_k3_yolov8_analyzer.py > "$pkg_dir/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py"
 sed 's/\r$//' scripts/harbornavi_k3_yolo_stream_worker.py > "$pkg_dir/usr/lib/harboros-beacon/harbornavi_k3_yolo_stream_worker.py"
+sed 's/\r$//' scripts/harbornavi_k3_cat_recording_classifier.py > "$pkg_dir/usr/lib/harboros-beacon/harbornavi_k3_cat_recording_classifier.py"
 chmod 0755 \
   "$pkg_dir/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py" \
-  "$pkg_dir/usr/lib/harboros-beacon/harbornavi_k3_yolo_stream_worker.py"
+  "$pkg_dir/usr/lib/harboros-beacon/harbornavi_k3_yolo_stream_worker.py" \
+  "$pkg_dir/usr/lib/harboros-beacon/harbornavi_k3_cat_recording_classifier.py"
+cp config/harbornavi-k3/vision-models/mobilenetv2-cat-binary-v2-20260806/mobilenetv2_cat_binary_int8.onnx \
+  "$pkg_dir/var/lib/harboros-beacon/vision-models/mobilenetv2-cat-binary-v2-20260806/mobilenetv2_cat_binary_int8.onnx"
+sed 's/\r$//' config/harbornavi-k3/vision-models/mobilenetv2-cat-binary-v2-20260806/runtime-contract.json \
+  > "$pkg_dir/var/lib/harboros-beacon/vision-models/mobilenetv2-cat-binary-v2-20260806/runtime-contract.json"
+chmod 0644 \
+  "$pkg_dir/var/lib/harboros-beacon/vision-models/mobilenetv2-cat-binary-v2-20260806/mobilenetv2_cat_binary_int8.onnx" \
+  "$pkg_dir/var/lib/harboros-beacon/vision-models/mobilenetv2-cat-binary-v2-20260806/runtime-contract.json"
 
 sed 's/\r$//' debian/harboros-beacon.service > "$pkg_dir/etc/systemd/system/harboros-beacon.service"
 sed 's/\r$//' debian/semantic-router.service > "$pkg_dir/etc/systemd/system/semantic-router.service"
+chmod 0644 \
+  "$pkg_dir/etc/systemd/system/harboros-beacon.service" \
+  "$pkg_dir/etc/systemd/system/semantic-router.service"
 
 sed \
   -e "s/VERSION_PLACEHOLDER/${debian_version}/g" \
   -e "s/ARCH_PLACEHOLDER/${deb_arch}/g" \
   debian/control \
-  | sed 's/^Depends: .*/Depends: libc6, openssl, ca-certificates, harborlink (>= 0.1.0), python3, python3-opencv, python3-spacemit-ort/' \
+  | sed 's/^Depends: .*/Depends: libc6, openssl, ca-certificates, harborlink (>= 0.1.0), python3, python3-numpy, python3-pil, python3-opencv, python3-spacemit-ort/' \
   > "$pkg_dir/DEBIAN/control"
 printf 'X-HarborNavi-Version: %s\n' "$release_label" >> "$pkg_dir/DEBIAN/control"
 
@@ -96,6 +109,11 @@ rust_target=${target}
 deb_arch=${deb_arch}
 analyzer=/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py
 stream_worker=/usr/lib/harboros-beacon/harbornavi_k3_yolo_stream_worker.py
+cat_recording_validator=mobilenet_v2_int8
+cat_recording_classifier=/usr/lib/harboros-beacon/harbornavi_k3_cat_recording_classifier.py
+cat_recording_classifier_model=/var/lib/harboros-beacon/vision-models/mobilenetv2-cat-binary-v2-20260806/mobilenetv2_cat_binary_int8.onnx
+cat_recording_classifier_sha256=d0c1bdcf973ca7f6efc6e62af764ff59300e0d27abbc75c20c7f86515769d825
+cat_recording_classifier_policy=up_to_9_frames_at_least_3_positive
 single_runner=/usr/bin/harbornavi-k3-local-vision-smoke
 multi_runner=/usr/bin/harbornavi-k3-multi-vision-smoke
 ha_mqtt_runner=/usr/bin/harbornavi-ha-mqtt-event-contract-smoke

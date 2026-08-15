@@ -1,0 +1,41 @@
+{
+  "schema_version": 2,
+  "architecture": "MobileNetV2",
+  "model_variant": "SpaceMIT xquant INT8 ONNX",
+  "model_sha256": "d0c1bdcf973ca7f6efc6e62af764ff59300e0d27abbc75c20c7f86515769d825",
+  "classes": {
+    "0": "non_cat",
+    "1": "cat"
+  },
+  "positive_class_index": 1,
+  "frame_decision": "softmax(logits)[1] >= 0.620000",
+  "video_decision": {
+    "sampling": "select up to 5 diverse YOLO evidence frames and fill up to 9 with uniform samples",
+    "maximum_frames": 9,
+    "minimum_positive_frames": 3,
+    "short_video_behavior": "evaluate every distinct decodable sample; require 3 positives"
+  },
+  "input": {
+    "name": "images",
+    "dtype": "float32",
+    "layout": "NCHW",
+    "shape": [1, 3, 224, 224],
+    "color": "RGB",
+    "resize": "bilinear direct resize to 224x224",
+    "scale": "uint8 / 255.0",
+    "mean": [0.485, 0.456, 0.406],
+    "std": [0.229, 0.224, 0.225]
+  },
+  "output": {
+    "name": "logits",
+    "dtype": "float32",
+    "shape": [1, 2]
+  },
+  "onnx_opset": 17,
+  "runtime": {
+    "provider": "SpaceMITExecutionProvider",
+    "ai_threads": 4,
+    "affinity": "12;13;14;15",
+    "cpu_fallback_acceptance": "forbidden"
+  }
+}

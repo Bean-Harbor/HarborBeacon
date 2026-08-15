@@ -2,8 +2,12 @@
 
 pub mod access_control;
 pub mod admin_console;
+pub mod ai_resource_scheduler;
 pub mod asr;
 pub mod automation;
+pub mod cat_recording_classifier;
+pub mod cat_recording_reconciliation;
+pub mod cat_recording_validation;
 pub mod discovery;
 pub mod document_parser;
 pub mod dvr;
@@ -23,6 +27,7 @@ pub mod node_runtime;
 pub mod privacy_gateway;
 pub mod registry;
 pub mod remote_view;
+mod secure_store_path;
 pub mod task_api;
 pub mod task_session;
 pub mod topology;
