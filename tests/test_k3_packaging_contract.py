@@ -1,7 +1,11 @@
+import hashlib
 import importlib.util
+import io
 import json
 import shutil
 import subprocess
+import tarfile
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -16,6 +20,7 @@ class K3PackagingContractTests(unittest.TestCase):
             "debian/component-contract-beacon.json.in",
             "debian/component-contract-model-runtime.json.in",
             "debian/model-runtime-manifest.json.in",
+            "debian/model-runtime-third-party.json",
         ):
             path = ROOT / relative
             value = json.loads(path.read_text(encoding="utf-8"))
@@ -39,8 +44,102 @@ class K3PackagingContractTests(unittest.TestCase):
             ROOT / "models" / "k3-evt1-model-materials.json"
         )
         self.assertEqual(model_review["total"], 5)
-        self.assertEqual(model_review["approved"], 0)
-        self.assertEqual(model_review["blocked"], 5)
+        self.assertEqual(model_review["approved"], 2)
+        self.assertEqual(model_review["blocked"], 3)
+        runtime_review = module.runtime_license_review(
+            ROOT / "debian" / "model-runtime-manifest.json.in",
+            ROOT / "debian" / "model-runtime-third-party.json",
+            "riscv64",
+        )
+        self.assertEqual(runtime_review["approved"], 0)
+        self.assertEqual(runtime_review["blocked"], 3)
+
+    def test_registry_license_declaration_is_bound_to_cargo_lock_checksum(self):
+        script_path = ROOT / "scripts" / "generate_package_materials.py"
+        spec = importlib.util.spec_from_file_location("generate_package_materials", script_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root_manifest = root / "Cargo.toml"
+            registry_key = "index.crates.io-fixture"
+            dependency_root = (
+                root / "registry" / "src" / registry_key / "fixture-dep-1.0.0"
+            )
+            dependency_root.mkdir(parents=True)
+            dependency_manifest = dependency_root / "Cargo.toml"
+            root_manifest.write_text("[package]\nname='fixture-root'\nversion='0.1.0'\n")
+            dependency_manifest_bytes = (
+                b"[package]\nname='fixture-dep'\nversion='1.0.0'\nlicense='MIT'\n"
+            )
+            dependency_manifest.write_bytes(dependency_manifest_bytes)
+            crate_archive = (
+                root
+                / "registry"
+                / "cache"
+                / registry_key
+                / "fixture-dep-1.0.0.crate"
+            )
+            crate_archive.parent.mkdir(parents=True)
+            with tarfile.open(crate_archive, "w:gz") as archive:
+                member = tarfile.TarInfo("fixture-dep-1.0.0/Cargo.toml")
+                member.size = len(dependency_manifest_bytes)
+                archive.addfile(member, io.BytesIO(dependency_manifest_bytes))
+            checksum = hashlib.sha256(crate_archive.read_bytes()).hexdigest()
+            cargo_lock = root / "Cargo.lock"
+            cargo_lock.write_text(
+                "version = 4\n\n"
+                "[[package]]\nname = \"fixture-root\"\nversion = \"0.1.0\"\n\n"
+                "[[package]]\nname = \"fixture-dep\"\nversion = \"1.0.0\"\n"
+                "source = \"registry+https://github.com/rust-lang/crates.io-index\"\n"
+                f"checksum = \"{checksum}\"\n"
+            )
+            root_id = "path+file:///fixture#fixture-root@0.1.0"
+            dependency_id = (
+                "registry+https://github.com/rust-lang/crates.io-index"
+                "#fixture-dep@1.0.0"
+            )
+            metadata = root / "metadata.json"
+            metadata.write_text(
+                json.dumps(
+                    {
+                        "packages": [
+                            {
+                                "id": root_id,
+                                "license": None,
+                                "manifest_path": str(root_manifest),
+                                "name": "fixture-root",
+                                "source": None,
+                                "version": "0.1.0",
+                            },
+                            {
+                                "id": dependency_id,
+                                "license": "MIT",
+                                "manifest_path": str(dependency_manifest),
+                                "name": "fixture-dep",
+                                "source": "registry+https://github.com/rust-lang/crates.io-index",
+                                "version": "1.0.0",
+                            },
+                        ],
+                        "resolve": {
+                            "nodes": [{"id": root_id}, {"id": dependency_id}]
+                        },
+                    }
+                )
+            )
+            review = module.cargo_license_review(metadata, root_manifest, cargo_lock)
+            self.assertEqual(review["approved"], 1)
+            self.assertEqual(review["blocked"], 0)
+            dependency = review["dependencies"][0]
+            self.assertEqual(dependency["checksum"], checksum)
+            self.assertEqual(
+                dependency["evidence_basis"],
+                "cargo-lock-checksum-bound-manifest-declaration",
+            )
+            self.assertEqual(dependency["license_evidence"], [])
 
     def test_maintainer_and_runtime_shell_scripts_parse(self):
         shell = shutil.which("sh")
@@ -51,6 +150,7 @@ class K3PackagingContractTests(unittest.TestCase):
             "debian/model-runtime-postinst",
             "debian/model-runtime-prerm",
             "debian/wait-model-runtime-health",
+            "scripts/run_k3_materials_ab_in_container.sh",
         ):
             subprocess.run(
                 [shell, "-n", str(ROOT / relative)],
@@ -404,6 +504,7 @@ class K3PackagingContractTests(unittest.TestCase):
             self.assertIn("generate_package_provenance.py", script)
             self.assertIn("generate_package_materials.py", script)
             self.assertIn("--cargo-metadata", script)
+            self.assertIn("--cargo-lock", script)
             self.assertIn("release-materials", (
                 ROOT / "scripts" / "generate_package_materials.py"
             ).read_text(encoding="utf-8"))
@@ -448,6 +549,14 @@ class K3PackagingContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn('"subject"', package_provenance)
         self.assertIn("sha256(args.artifact)", package_provenance)
+        driver = (
+            ROOT / "scripts" / "run_k3_materials_ab_in_container.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("inspect_harbor_package_materials", driver)
+        self.assertIn("--verify-license-evidence", driver)
+        self.assertIn("diff --no-dereference --recursive", driver)
+        self.assertIn("root-a", driver)
+        self.assertIn("root-b", driver)
 
     def test_obsolete_public_release_path_is_fail_closed(self):
         workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(

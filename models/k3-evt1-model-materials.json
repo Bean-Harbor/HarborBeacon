@@ -53,7 +53,7 @@
       "source": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct",
       "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
       "license": {
-        "blocking_reason": "The exact Apache-2.0 license evidence is verified upstream but is not yet included in the immutable model bundle.",
+        "blocking_reason": null,
         "concluded_license": "Apache-2.0",
         "declared_license": "Apache-2.0",
         "evidence": {
@@ -61,7 +61,7 @@
           "sha256": "832dd9e00a68dd83b3c3fb9f5588dad7dcf337a0db50f7d9483f310cd292e92e",
           "source": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/7ae557604adf67be50417f59c2c2f167def9a775/LICENSE"
         },
-        "review_status": "declared"
+        "review_status": "approved"
       },
       "files": [
         {
@@ -91,7 +91,7 @@
       "source": "https://huggingface.co/jinaai/jina-embeddings-v2-base-zh",
       "revision": "998b9133910ffcb127a7bff233f41db6ed9be4d2",
       "license": {
-        "blocking_reason": "The pinned model card declares Apache-2.0 but the revision contains no standalone license file in the immutable model bundle.",
+        "blocking_reason": null,
         "concluded_license": "Apache-2.0",
         "declared_license": "Apache-2.0",
         "evidence": {
@@ -99,7 +99,7 @@
           "sha256": "d94c902fe88c81437eb2a1877d21c829a967351c38bc720f4516c312632c1b33",
           "source": "https://huggingface.co/jinaai/jina-embeddings-v2-base-zh/resolve/998b9133910ffcb127a7bff233f41db6ed9be4d2/README.md"
         },
-        "review_status": "declared"
+        "review_status": "approved"
       },
       "files": [
         {

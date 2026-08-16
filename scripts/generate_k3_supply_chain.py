@@ -9,6 +9,7 @@ import hashlib
 import json
 import re
 import subprocess
+import tomllib
 import uuid
 from pathlib import Path
 
@@ -113,9 +114,33 @@ def valid_spdx_expression(value: str) -> bool:
     return bool(tokens) and expression() and position == len(tokens)
 
 
-def cargo_components(metadata_path: Path, root_manifest: Path) -> list[dict[str, object]]:
+def cargo_lock_packages(cargo_lock: Path) -> dict[tuple[str, str, str], dict[str, object]]:
+    try:
+        payload = tomllib.loads(cargo_lock.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+        raise RuntimeError(f"invalid Cargo.lock: {exc}") from exc
+    packages: dict[tuple[str, str, str], dict[str, object]] = {}
+    for package in payload.get("package", []):
+        if not isinstance(package, dict):
+            raise RuntimeError("Cargo.lock contains an invalid package entry")
+        name = package.get("name")
+        version = package.get("version")
+        source = package.get("source") or "vendored-path"
+        if not all(isinstance(value, str) and value for value in (name, version, source)):
+            raise RuntimeError("Cargo.lock contains an incomplete package identity")
+        identity = (name, version, source)
+        if identity in packages:
+            raise RuntimeError(f"Cargo.lock repeats package identity {name}@{version}")
+        packages[identity] = package
+    return packages
+
+
+def cargo_components(
+    metadata_path: Path, root_manifest: Path, cargo_lock: Path
+) -> list[dict[str, object]]:
     payload = json.loads(metadata_path.read_text(encoding="utf-8"))
     packages = {package["id"]: package for package in payload.get("packages", [])}
+    locked_packages = cargo_lock_packages(cargo_lock)
     resolve = payload.get("resolve")
     if not isinstance(resolve, dict) or not isinstance(resolve.get("nodes"), list):
         raise RuntimeError("Cargo metadata has no resolved dependency graph")
@@ -137,6 +162,30 @@ def cargo_components(metadata_path: Path, root_manifest: Path) -> list[dict[str,
             raise RuntimeError(f"Cargo metadata repeats package identity {name}@{version}")
         seen.add(identity)
         declared_license = normalize_license_expression(package.get("license"))
+        source = package.get("source") or "vendored-path"
+        locked = locked_packages.get((name, version, source))
+        if locked is None:
+            raise RuntimeError(f"Cargo.lock omits resolved package {name}@{version}")
+        checksum = locked.get("checksum") or ""
+        if source.startswith("registry+"):
+            if not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-f]{64}", checksum):
+                raise RuntimeError(f"Cargo.lock omits registry checksum for {name}@{version}")
+            package_root = manifest.parent
+            registry_key = package_root.parent.name
+            crate_archive = (
+                package_root.parents[2]
+                / "cache"
+                / registry_key
+                / f"{name}-{version}.crate"
+            )
+            if (
+                not crate_archive.is_file()
+                or crate_archive.is_symlink()
+                or sha256(crate_archive) != checksum
+            ):
+                raise RuntimeError(
+                    f"registry archive differs from Cargo.lock for {name}@{version}"
+                )
         license_files = sorted(
             (
                 {
@@ -153,13 +202,13 @@ def cargo_components(metadata_path: Path, root_manifest: Path) -> list[dict[str,
                 "name": name,
                 "version": version,
                 "purl": f"pkg:cargo/{name}@{version}",
-                "checksum": package.get("checksum") or "",
+                "checksum": checksum,
                 "declared_license": declared_license,
                 "concluded_license": (
                     declared_license if valid_spdx_expression(declared_license) else "NOASSERTION"
                 ),
                 "license_files": license_files,
-                "source": package.get("source") or "vendored-path",
+                "source": source,
             }
         )
     return sorted(components, key=lambda item: (item["name"], item["version"]))
@@ -233,7 +282,11 @@ def main() -> None:
         )
     root_purl = f"pkg:deb/{args.package}@{args.version}?arch={args.arch}"
     root_id = spdx_id(args.package, args.version)
-    components = cargo_components(args.cargo_metadata, args.cargo_lock.parent / "Cargo.toml")
+    components = cargo_components(
+        args.cargo_metadata,
+        args.cargo_lock.parent / "Cargo.toml",
+        args.cargo_lock,
+    )
     packages = [
         {
             "name": args.package,

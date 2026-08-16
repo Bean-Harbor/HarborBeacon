@@ -100,6 +100,8 @@ install -m 0644 debian/first-party-rights.json \
   "$pkg_dir/usr/share/doc/harboros-model-runtime/first-party-rights.json"
 install -m 0644 debian/FIRST_PARTY_RIGHTS.txt \
   "$pkg_dir/usr/share/doc/harboros-model-runtime/FIRST_PARTY_RIGHTS.txt"
+install -m 0644 debian/model-runtime-third-party.json \
+  "$pkg_dir/usr/share/doc/harboros-model-runtime/runtime-license-evidence.json"
 
 python3 scripts/generate_k3_supply_chain.py \
   --package harboros-model-runtime \
@@ -115,6 +117,7 @@ python3 scripts/generate_k3_supply_chain.py \
   --input-file "$repo_root/debian/harboros-vlm-runtime.service" \
   --input-file "$repo_root/debian/component-contract-model-runtime.json.in" \
   --input-file "$repo_root/debian/model-runtime-manifest.json.in" \
+  --input-file "$repo_root/debian/model-runtime-third-party.json" \
   --input-file "$repo_root/debian/first-party-rights.json" \
   --input-file "$repo_root/debian/FIRST_PARTY_RIGHTS.txt" \
   --input-file "$repo_root/scripts/verify_k3_model_release.py" \
@@ -160,6 +163,7 @@ python3 scripts/generate_package_materials.py \
   --architecture "$deb_arch" \
   --source-commit "$source_commit" \
   --root-manifest "$repo_root/Cargo.toml" \
+  --cargo-lock "$repo_root/Cargo.lock" \
   --cargo-metadata "$build_root/cargo-metadata.json" \
   --component-contract "$pkg_dir/usr/share/harboros/component-contracts/harboros-model-runtime.json" \
   --component-contract-installed-path /usr/share/harboros/component-contracts/harboros-model-runtime.json \
@@ -171,5 +175,6 @@ python3 scripts/generate_package_materials.py \
   --package-provenance "$out_dir/${material_prefix}.package-provenance.json" \
   --model-materials "$pkg_dir/usr/share/harboros-model-runtime/model-materials.json" \
   --runtime-manifest "$pkg_dir/usr/share/doc/harboros-model-runtime/runtime-manifest.json" \
+  --runtime-license-evidence "$pkg_dir/usr/share/doc/harboros-model-runtime/runtime-license-evidence.json" \
   --output-dir "$out_dir"
 printf '%s\n' "$artifact"

@@ -8,6 +8,8 @@ import hashlib
 import json
 import shutil
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path, PurePosixPath
 
 
@@ -20,6 +22,7 @@ LICENSE_FIELDS = {
     "review_status",
 }
 LICENSE_EVIDENCE_FIELDS = {"kind", "sha256", "source"}
+MAX_LICENSE_EVIDENCE_BYTES = 8 * 1024 * 1024
 
 
 def sha256(path: Path) -> str:
@@ -170,17 +173,57 @@ def validate_manifest(payload: object, bundle_root: Path | None, stage: Path | N
     return errors
 
 
+def verify_approved_license_evidence(payload: dict[str, object]) -> list[str]:
+    errors = []
+    for material in payload["materials"]:
+        review = material["license"]
+        if review["review_status"] != "approved":
+            continue
+        material_id = material["id"]
+        revision = material["revision"]
+        evidence = review["evidence"]
+        source = evidence["source"]
+        if not source.startswith("https://") or revision not in source:
+            errors.append(
+                f"{material_id} license evidence is not bound to its HTTPS revision"
+            )
+            continue
+        request = urllib.request.Request(
+            source, headers={"User-Agent": "HarborOS-Qualification-License-Audit/1"}
+        )
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                if not response.geturl().startswith("https://"):
+                    raise ValueError("license evidence redirected away from HTTPS")
+                while chunk := response.read(1024 * 1024):
+                    size += len(chunk)
+                    if size > MAX_LICENSE_EVIDENCE_BYTES:
+                        raise ValueError("license evidence exceeds the size limit")
+                    digest.update(chunk)
+        except (OSError, ValueError, urllib.error.URLError) as exc:
+            errors.append(f"{material_id} license evidence fetch failed: {exc}")
+            continue
+        if digest.hexdigest() != evidence["sha256"]:
+            errors.append(f"{material_id} license evidence SHA256 changed")
+    return errors
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--bundle-root", type=Path)
     parser.add_argument("--stage", type=Path)
     parser.add_argument("--expect-blocked", action="store_true")
+    parser.add_argument("--verify-license-evidence", action="store_true")
     args = parser.parse_args()
     if args.stage is not None and args.bundle_root is None:
         parser.error("--stage requires --bundle-root")
     payload = json.loads(args.manifest.read_text(encoding="utf-8"))
     errors = validate_manifest(payload, args.bundle_root, args.stage)
+    if args.verify_license_evidence and not errors:
+        errors.extend(verify_approved_license_evidence(payload))
     if args.expect_blocked:
         if not errors:
             print("error: model manifest unexpectedly became release-ready", file=sys.stderr)
@@ -193,7 +236,10 @@ def main() -> int:
         for error in errors:
             print(f"error: {error}", file=sys.stderr)
         return 2
-    print("model material byte lock and files are verified")
+    if args.verify_license_evidence:
+        print("model material byte lock, files, and approved license evidence are verified")
+    else:
+        print("model material byte lock and files are verified")
     return 0
 
 

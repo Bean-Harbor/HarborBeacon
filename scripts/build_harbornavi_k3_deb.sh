@@ -150,6 +150,7 @@ python3 scripts/generate_package_materials.py \
   --architecture "$deb_arch" \
   --source-commit "$source_commit" \
   --root-manifest "$repo_root/Cargo.toml" \
+  --cargo-lock "$repo_root/Cargo.lock" \
   --cargo-metadata "$build_root/cargo-metadata.json" \
   --component-contract "$pkg_dir/usr/share/harboros/component-contract.json" \
   --component-contract-installed-path /usr/share/harboros/component-contract.json \

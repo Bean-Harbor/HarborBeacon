@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import tarfile
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -104,9 +105,33 @@ def valid_spdx_expression(value: str) -> bool:
     return bool(tokens) and expression() and position == len(tokens)
 
 
-def cargo_license_review(metadata_path: Path, root_manifest: Path) -> dict[str, Any]:
+def cargo_lock_packages(cargo_lock: Path) -> dict[tuple[str, str, str], dict[str, Any]]:
+    try:
+        payload = tomllib.loads(cargo_lock.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+        raise ValueError(f"invalid Cargo.lock: {exc}") from exc
+    packages: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for package in payload.get("package", []):
+        if not isinstance(package, dict):
+            raise ValueError("Cargo.lock contains an invalid package entry")
+        name = package.get("name")
+        version = package.get("version")
+        source = package.get("source") or "vendored-path"
+        if not all(isinstance(value, str) and value for value in (name, version, source)):
+            raise ValueError("Cargo.lock contains an incomplete package identity")
+        identity = (name, version, source)
+        if identity in packages:
+            raise ValueError(f"Cargo.lock repeats package identity {name}@{version}")
+        packages[identity] = package
+    return packages
+
+
+def cargo_license_review(
+    metadata_path: Path, root_manifest: Path, cargo_lock: Path
+) -> dict[str, Any]:
     metadata = load_json(metadata_path, "Cargo metadata")
     packages = {package["id"]: package for package in metadata.get("packages", [])}
+    locked_packages = cargo_lock_packages(cargo_lock)
     resolve = metadata.get("resolve")
     if not isinstance(resolve, dict) or not isinstance(resolve.get("nodes"), list):
         raise ValueError("Cargo metadata has no resolved dependency graph")
@@ -127,6 +152,12 @@ def cargo_license_review(metadata_path: Path, root_manifest: Path) -> dict[str, 
             )
         seen.add(identity)
         package_root = manifest.parent
+        source = package.get("source") or "vendored-path"
+        locked = locked_packages.get((identity[0], identity[1], source))
+        if locked is None:
+            raise ValueError(
+                f"Cargo.lock omits resolved package {identity[0]}@{identity[1]}"
+            )
         evidence_paths = {
             path.resolve(): path
             for path in package_root.iterdir()
@@ -154,7 +185,108 @@ def cargo_license_review(metadata_path: Path, root_manifest: Path) -> dict[str, 
         ]
         declared = normalize_license_expression(package.get("license"))
         expression_valid = valid_spdx_expression(declared)
-        approved = expression_valid and bool(evidence)
+        registry_evidence = None
+        checksum = locked.get("checksum")
+        if source.startswith("registry+"):
+            if not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-f]{64}", checksum):
+                raise ValueError(
+                    f"Cargo.lock omits registry checksum for {identity[0]}@{identity[1]}"
+                )
+            registry_key = package_root.parent.name
+            crate_archive = (
+                package_root.parents[2]
+                / "cache"
+                / registry_key
+                / f"{identity[0]}-{identity[1]}.crate"
+            )
+            if (
+                not crate_archive.is_file()
+                or crate_archive.is_symlink()
+                or sha256(crate_archive) != checksum
+            ):
+                raise ValueError(
+                    "registry archive differs from Cargo.lock for "
+                    f"{identity[0]}@{identity[1]}"
+                )
+            vcs_path = package_root / ".cargo_vcs_info.json"
+            relative_evidence = [manifest.name, *(item["path"] for item in evidence)]
+            if vcs_path.is_file() and not vcs_path.is_symlink():
+                relative_evidence.append(vcs_path.name)
+            archive_prefix = f"{identity[0]}-{identity[1]}"
+            requested = {
+                f"{archive_prefix}/{relative}": relative for relative in relative_evidence
+            }
+            archive_hashes: dict[str, str] = {}
+            try:
+                with tarfile.open(crate_archive, mode="r:*") as archive:
+                    for member in archive:
+                        name = member.name
+                        while name.startswith("./"):
+                            name = name[2:]
+                        relative = requested.get(name)
+                        if relative is None:
+                            continue
+                        if relative in archive_hashes or not member.isfile():
+                            raise ValueError(
+                                "registry archive evidence is unsafe or duplicated for "
+                                f"{identity[0]}@{identity[1]}: {relative}"
+                            )
+                        stream = archive.extractfile(member)
+                        if stream is None:
+                            raise ValueError(
+                                "registry archive evidence cannot be read for "
+                                f"{identity[0]}@{identity[1]}: {relative}"
+                            )
+                        digest = hashlib.sha256()
+                        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                        archive_hashes[relative] = digest.hexdigest()
+            except (OSError, tarfile.TarError) as exc:
+                raise ValueError(
+                    f"invalid registry archive for {identity[0]}@{identity[1]}: {exc}"
+                ) from exc
+            expected_hashes = {
+                manifest.name: sha256(manifest),
+                **{item["path"]: item["sha256"] for item in evidence},
+            }
+            if vcs_path.is_file() and not vcs_path.is_symlink():
+                expected_hashes[vcs_path.name] = sha256(vcs_path)
+            if archive_hashes != expected_hashes:
+                raise ValueError(
+                    "registry extraction differs from checksum-bound archive for "
+                    f"{identity[0]}@{identity[1]}"
+                )
+            vcs_evidence = None
+            if vcs_path.is_file() and not vcs_path.is_symlink():
+                vcs_payload = load_json(
+                    vcs_path, f"Cargo VCS evidence for {identity[0]}@{identity[1]}"
+                )
+                git = vcs_payload.get("git")
+                git_sha = git.get("sha1") if isinstance(git, dict) else None
+                if not isinstance(git_sha, str) or not re.fullmatch(
+                    r"[0-9a-f]{40}", git_sha
+                ):
+                    raise ValueError(
+                        f"Cargo VCS evidence is invalid for {identity[0]}@{identity[1]}"
+                    )
+                vcs_evidence = {
+                    "git_commit": git_sha,
+                    "path": vcs_path.name,
+                    "path_in_vcs": vcs_payload.get("path_in_vcs") or ".",
+                    "sha256": sha256(vcs_path),
+                }
+            registry_evidence = {
+                "archive_sha256": checksum,
+                "crate_archive": {
+                    "filename": crate_archive.name,
+                    "sha256": sha256(crate_archive),
+                },
+                "manifest": {"path": manifest.name, "sha256": sha256(manifest)},
+                "vcs": vcs_evidence,
+            }
+        approved = expression_valid and (
+            registry_evidence is not None or bool(evidence)
+        )
         entries.append(
             {
                 "blocking_reason": (
@@ -163,16 +295,22 @@ def cargo_license_review(metadata_path: Path, root_manifest: Path) -> dict[str, 
                     else (
                         "invalid-or-missing-license-expression"
                         if not expression_valid
-                        else "package-local-license-evidence-missing"
+                        else "checksum-bound-license-declaration-missing"
                     )
                 ),
-                "checksum": package.get("checksum") or None,
+                "checksum": checksum,
                 "declared_license": declared,
+                "evidence_basis": (
+                    "cargo-lock-checksum-bound-manifest-declaration"
+                    if registry_evidence is not None
+                    else "package-local-license-file"
+                ),
                 "license_evidence": evidence,
+                "registry_evidence": registry_evidence,
                 "name": package["name"],
                 "purl": f"pkg:cargo/{package['name']}@{package['version']}",
                 "review_status": "approved" if approved else "blocked",
-                "source": package.get("source") or "vendored-path",
+                "source": source,
                 "version": package["version"],
             }
         )
@@ -227,29 +365,100 @@ def model_license_review(path: Path | None) -> dict[str, Any] | None:
     }
 
 
-def runtime_license_review(path: Path | None, architecture: str) -> dict[str, Any] | None:
-    if path is None:
+def runtime_license_review(
+    path: Path | None, evidence_path: Path | None, architecture: str
+) -> dict[str, Any] | None:
+    if path is None and evidence_path is None:
         return None
+    if path is None or evidence_path is None:
+        raise ValueError("runtime manifest and license evidence must be provided together")
     payload = load_canonical_json(path, "model runtime manifest")
-    entries = []
+    evidence_payload = load_canonical_json(
+        evidence_path, "model runtime third-party evidence"
+    )
+    if (
+        evidence_payload.get("schema_version") != 1
+        or evidence_payload.get("architecture") != architecture
+        or not isinstance(evidence_payload.get("repository"), str)
+        or not evidence_payload["repository"].startswith("https://")
+        or not isinstance(evidence_payload.get("suite"), str)
+        or not evidence_payload["suite"]
+    ):
+        raise ValueError("model runtime third-party evidence has invalid provenance")
+    expected = {}
     for value in payload.get("runtime_dependencies", []):
         if not isinstance(value, str) or "=" not in value:
             raise ValueError(f"invalid model runtime dependency: {value!r}")
         name, version = value.split("=", 1)
+        if name in expected:
+            raise ValueError(f"model runtime dependency is repeated: {name}")
+        expected[name] = version
+    entries = []
+    seen = set()
+    for item in evidence_payload.get("packages", []):
+        if not isinstance(item, dict) or set(item) != {
+            "artifact",
+            "blocking_reason",
+            "concluded_license",
+            "copyright_file",
+            "declared_license",
+            "name",
+            "review_status",
+            "version",
+        }:
+            raise ValueError("model runtime package license evidence has invalid fields")
+        name = item.get("name")
+        version = item.get("version")
+        if not isinstance(name, str) or not isinstance(version, str):
+            raise ValueError("model runtime package license evidence has no identity")
+        if name in seen or expected.get(name) != version:
+            raise ValueError(f"model runtime package evidence differs from manifest: {name}")
+        seen.add(name)
+        artifact = item.get("artifact")
+        copyright_file = item.get("copyright_file")
+        for label, value in (("artifact", artifact), ("copyright", copyright_file)):
+            if (
+                not isinstance(value, dict)
+                or not isinstance(value.get("sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", value["sha256"])
+            ):
+                raise ValueError(f"model runtime {label} evidence is invalid: {name}")
+        if set(artifact) != {"filename", "sha256"} or set(copyright_file) != {
+            "installed_path",
+            "sha256",
+        }:
+            raise ValueError(f"model runtime evidence has invalid identity fields: {name}")
+        declared = normalize_license_expression(item.get("declared_license"))
+        concluded = normalize_license_expression(item.get("concluded_license"))
+        approved = (
+            item.get("review_status") == "approved"
+            and valid_spdx_expression(declared)
+            and valid_spdx_expression(concluded)
+            and item.get("blocking_reason") is None
+        )
         entries.append(
             {
-                "blocking_reason": "apt-package-license-evidence-not-bound",
+                "artifact": artifact,
+                "blocking_reason": None if approved else item.get("blocking_reason"),
+                "concluded_license": concluded,
+                "copyright_file": copyright_file,
+                "declared_license": declared,
                 "name": name,
                 "purl": f"pkg:deb/ubuntu/{name}@{version}?arch={architecture}",
-                "review_status": "blocked",
+                "review_status": "approved" if approved else "blocked",
                 "version": version,
             }
         )
+    if seen != set(expected):
+        raise ValueError("model runtime package evidence is incomplete")
     entries.sort(key=lambda item: item["name"])
+    approved_count = sum(item["review_status"] == "approved" for item in entries)
     return {
-        "approved": 0,
-        "blocked": len(entries),
+        "approved": approved_count,
+        "blocked": len(entries) - approved_count,
         "dependencies": entries,
+        "repository": evidence_payload["repository"],
+        "suite": evidence_payload["suite"],
         "total": len(entries),
     }
 
@@ -403,9 +612,13 @@ def generate(args: argparse.Namespace) -> dict[str, Path]:
         }
     )
 
-    cargo = cargo_license_review(args.cargo_metadata, args.root_manifest)
+    cargo = cargo_license_review(
+        args.cargo_metadata, args.root_manifest, args.cargo_lock
+    )
     models = model_license_review(args.model_materials)
-    runtime = runtime_license_review(args.runtime_manifest, args.architecture)
+    runtime = runtime_license_review(
+        args.runtime_manifest, args.runtime_license_evidence, args.architecture
+    )
     blockers = []
     if cargo["blocked"]:
         blockers.append("third_party_cargo_license_evidence_incomplete")
@@ -491,6 +704,12 @@ def generate(args: argparse.Namespace) -> dict[str, Path]:
             args.output_dir / f"{prefix}.runtime-manifest.json",
             canonical_json=True,
         )
+    if args.runtime_license_evidence is not None:
+        outputs["runtime-license-evidence"] = export_copy(
+            args.runtime_license_evidence,
+            args.output_dir / f"{prefix}.runtime-license-evidence.json",
+            canonical_json=True,
+        )
 
     checksum = args.output_dir / f"{args.artifact.name}.sha256"
     expected_checksum = f"{artifact_digest}  {args.artifact.name}\n"
@@ -536,6 +755,16 @@ def generate(args: argparse.Namespace) -> dict[str, Path]:
             {
                 **identities["runtime-manifest"],
                 "installed_path": "/usr/share/doc/harboros-model-runtime/runtime-manifest.json",
+            }
+        )
+    if "runtime-license-evidence" in identities:
+        installed.append(
+            {
+                **identities["runtime-license-evidence"],
+                "installed_path": (
+                    "/usr/share/doc/harboros-model-runtime/"
+                    "runtime-license-evidence.json"
+                ),
             }
         )
     verify_installed_evidence(args.artifact, installed)
@@ -593,6 +822,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--architecture", required=True)
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--root-manifest", type=Path, required=True)
+    parser.add_argument("--cargo-lock", type=Path, required=True)
     parser.add_argument("--cargo-metadata", type=Path, required=True)
     parser.add_argument("--component-contract", type=Path, required=True)
     parser.add_argument("--component-contract-installed-path", required=True)
@@ -604,6 +834,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--package-provenance", type=Path, required=True)
     parser.add_argument("--model-materials", type=Path)
     parser.add_argument("--runtime-manifest", type=Path)
+    parser.add_argument("--runtime-license-evidence", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser.parse_args()
 
