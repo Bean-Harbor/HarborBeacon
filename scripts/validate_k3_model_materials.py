@@ -12,6 +12,14 @@ from pathlib import Path, PurePosixPath
 
 
 LOCKED_STATE = "locked"
+LICENSE_FIELDS = {
+    "blocking_reason",
+    "concluded_license",
+    "declared_license",
+    "evidence",
+    "review_status",
+}
+LICENSE_EVIDENCE_FIELDS = {"kind", "sha256", "source"}
 
 
 def sha256(path: Path) -> str:
@@ -76,6 +84,40 @@ def validate_manifest(payload: object, bundle_root: Path | None, stage: Path | N
         source = material.get("source")
         if not isinstance(source, str) or not source:
             errors.append(f"{material_id} has no source")
+        license_review = material.get("license")
+        if not isinstance(license_review, dict) or set(license_review) != LICENSE_FIELDS:
+            errors.append(f"{material_id} has an invalid license review")
+        else:
+            review_status = license_review.get("review_status")
+            if review_status not in {"approved", "blocked", "declared"}:
+                errors.append(f"{material_id} has an invalid license review status")
+            for field in ("declared_license", "concluded_license"):
+                if not isinstance(license_review.get(field), str) or not license_review[field]:
+                    errors.append(f"{material_id} has an invalid {field}")
+            blocking_reason = license_review.get("blocking_reason")
+            if review_status == "approved" and blocking_reason is not None:
+                errors.append(f"{material_id} repeats a blocker after approval")
+            if review_status != "approved" and (
+                not isinstance(blocking_reason, str) or not blocking_reason
+            ):
+                errors.append(f"{material_id} has no license blocking reason")
+            evidence = license_review.get("evidence")
+            if evidence is not None:
+                if not isinstance(evidence, dict) or set(evidence) != LICENSE_EVIDENCE_FIELDS:
+                    errors.append(f"{material_id} has invalid license evidence")
+                else:
+                    evidence_sha = evidence.get("sha256")
+                    if (
+                        not isinstance(evidence_sha, str)
+                        or len(evidence_sha) != 64
+                        or any(character not in "0123456789abcdef" for character in evidence_sha)
+                    ):
+                        errors.append(f"{material_id} has invalid license evidence SHA256")
+                    for field in ("kind", "source"):
+                        if not isinstance(evidence.get(field), str) or not evidence[field]:
+                            errors.append(f"{material_id} has invalid license evidence {field}")
+            elif review_status == "approved":
+                errors.append(f"{material_id} approval has no license evidence")
         files = material.get("files")
         if not isinstance(files, list) or not files:
             errors.append(f"{material_id} has no locked files")
@@ -151,7 +193,7 @@ def main() -> int:
         for error in errors:
             print(f"error: {error}", file=sys.stderr)
         return 2
-    print("model material manifest and files are release-ready")
+    print("model material byte lock and files are verified")
     return 0
 
 

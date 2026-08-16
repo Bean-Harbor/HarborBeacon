@@ -1,0 +1,21 @@
+{
+  "approval_id": "harbornavi-qualification-first-party-rights-2026-08-16",
+  "approved_scope": [
+    "HarborBeacon first-party source code and package recipes",
+    "harboros-model-runtime first-party integration code and package recipes",
+    "Harbor Innovations brand materials",
+    "Harbor-developed model artifacts whose provenance identifies Harbor Innovations"
+  ],
+  "authorization": "Inclusion and distribution in HarborNavi qualification artifacts",
+  "copyright": "Copyright (c) Harbor Innovations",
+  "declared_license": "LicenseRef-Harbor-Innovations-Proprietary",
+  "effective_date": "2026-08-16",
+  "license_notice": "FIRST_PARTY_RIGHTS.txt",
+  "rights_holder": "Harbor Innovations",
+  "schema_version": 1,
+  "third_party": {
+    "authorization_basis": "Original upstream license only",
+    "covered_by_approval": false,
+    "review_required": true
+  }
+}

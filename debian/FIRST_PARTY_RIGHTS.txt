@@ -1,0 +1,13 @@
+Harbor Innovations First-Party Qualification Distribution Notice
+
+Copyright (c) Harbor Innovations. All rights reserved.
+
+Harbor Innovations authorizes inclusion and distribution of its first-party
+HarborBeacon and harboros-model-runtime code, package recipes, brand materials,
+and Harbor-developed model artifacts in HarborNavi qualification artifacts.
+
+This record is limited to first-party materials whose provenance identifies
+Harbor Innovations as the source. It is not a public open-source license and it
+does not authorize or relicense third-party software, third-party models, model
+conversions, datasets, labels, or other upstream materials. Those materials
+remain governed by their original licenses and require independent review.

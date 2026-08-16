@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import shutil
 import subprocess
@@ -9,6 +10,38 @@ ROOT = Path(__file__).parents[1]
 
 
 class K3PackagingContractTests(unittest.TestCase):
+    def test_release_material_templates_are_canonical_and_fail_closed(self):
+        for relative in (
+            "debian/first-party-rights.json",
+            "debian/component-contract-beacon.json.in",
+            "debian/component-contract-model-runtime.json.in",
+            "debian/model-runtime-manifest.json.in",
+        ):
+            path = ROOT / relative
+            value = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                path.read_bytes(),
+                (json.dumps(value, ensure_ascii=True, indent=2, sort_keys=True) + "\n").encode(),
+            )
+
+        script_path = ROOT / "scripts" / "generate_package_materials.py"
+        spec = importlib.util.spec_from_file_location("generate_package_materials", script_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(
+            module.normalize_license_expression("MIT/Apache-2.0"),
+            "MIT OR Apache-2.0",
+        )
+        self.assertTrue(module.valid_spdx_expression("MIT OR Apache-2.0"))
+        model_review = module.model_license_review(
+            ROOT / "models" / "k3-evt1-model-materials.json"
+        )
+        self.assertEqual(model_review["total"], 5)
+        self.assertEqual(model_review["approved"], 0)
+        self.assertEqual(model_review["blocked"], 5)
+
     def test_maintainer_and_runtime_shell_scripts_parse(self):
         shell = shutil.which("sh")
         if shell is None:
@@ -111,6 +144,10 @@ class K3PackagingContractTests(unittest.TestCase):
         model_contract = (
             ROOT / "debian" / "component-contract-model-runtime.json.in"
         ).read_text(encoding="utf-8")
+        self.assertEqual(
+            set(json.loads(model_contract)),
+            {"contracts", "package", "schema_version", "source_commit"},
+        )
         for capability in (
             "lazy-model-loading",
             "loopback-only",
@@ -171,8 +208,8 @@ class K3PackagingContractTests(unittest.TestCase):
         build = (ROOT / "scripts" / "build_model_runtime_k3_deb.sh").read_text(
             encoding="utf-8"
         )
-        contract = json.loads(
-            (ROOT / "debian" / "component-contract-model-runtime.json.in").read_text(
+        runtime_manifest = json.loads(
+            (ROOT / "debian" / "model-runtime-manifest.json.in").read_text(
                 encoding="utf-8"
             )
         )
@@ -211,7 +248,9 @@ class K3PackagingContractTests(unittest.TestCase):
         for dependency in build_dependencies:
             self.assertIn(dependency, build)
 
-        services = {service["unit"]: service for service in contract["services"]}
+        services = {
+            service["unit"]: service for service in runtime_manifest["services"]
+        }
         self.assertEqual(
             services["harboros-model-runtime.service"]["health"],
             "http://127.0.0.1:8792/healthz",
@@ -296,16 +335,36 @@ class K3PackagingContractTests(unittest.TestCase):
                 for file_entry in material["files"]
             )
         )
+        reviews = {item["id"]: item["license"] for item in manifest["materials"]}
+        self.assertEqual(
+            reviews["semantic-router-bootstrap-llm"]["declared_license"],
+            "Apache-2.0",
+        )
+        self.assertEqual(
+            reviews["rag-embedding-model"]["declared_license"],
+            "Apache-2.0",
+        )
+        self.assertEqual(
+            reviews["event-vlm-qwen3.5-0.8b-384"]["review_status"],
+            "blocked",
+        )
 
         workflow = (ROOT / ".github" / "workflows" / "k3-evt-package.yml").read_text(
             encoding="utf-8"
         )
         self.assertNotIn("--expect-blocked", workflow)
-        license_report = json.loads(
-            (ROOT / "debian" / "license-report.json").read_text(encoding="utf-8")
+        rights = json.loads(
+            (ROOT / "debian" / "first-party-rights.json").read_text(
+                encoding="utf-8"
+            )
         )
-        self.assertEqual(license_report["project_license"], "NOASSERTION")
-        self.assertEqual(license_report["review_status"], "blocked")
+        self.assertEqual(rights["rights_holder"], "Harbor Innovations")
+        self.assertEqual(
+            rights["declared_license"],
+            "LicenseRef-Harbor-Innovations-Proprietary",
+        )
+        self.assertFalse(rights["third_party"]["covered_by_approval"])
+        self.assertTrue(rights["third_party"]["review_required"])
 
     def test_data_layout_helpers_are_fixed_and_installed(self):
         cases = [
@@ -343,6 +402,11 @@ class K3PackagingContractTests(unittest.TestCase):
             self.assertIn("cd \"$out_dir\"", script)
             self.assertIn("sbom.cdx.json", script)
             self.assertIn("generate_package_provenance.py", script)
+            self.assertIn("generate_package_materials.py", script)
+            self.assertIn("--cargo-metadata", script)
+            self.assertIn("release-materials", (
+                ROOT / "scripts" / "generate_package_materials.py"
+            ).read_text(encoding="utf-8"))
             self.assertIn(
                 "--remap-path-prefix=${cargo_target_dir}=./target", script
             )
@@ -358,6 +422,7 @@ class K3PackagingContractTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn('parser.add_argument("--debian-snapshot", required=True)', supply_chain)
+        self.assertIn('parser.add_argument("--cargo-metadata", type=Path, required=True)', supply_chain)
         self.assertIn('parser.add_argument("--model-root", type=Path)', supply_chain)
         self.assertIn('parser.add_argument("--input-file", type=Path', supply_chain)
         self.assertIn('parser.add_argument("--runtime-dependency"', supply_chain)

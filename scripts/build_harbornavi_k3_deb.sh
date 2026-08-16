@@ -63,6 +63,10 @@ if cargo tree --locked --target "$target" \
   echo "error: K3 Beacon dependency tree still contains the embedded model runtime" >&2
   exit 2
 fi
+cargo metadata --locked --offline --format-version 1 \
+  --filter-platform "$target" \
+  --no-default-features --features external-model-runtime \
+  > "$build_root/cargo-metadata.json"
 
 install -d \
   "$pkg_dir/DEBIAN" \
@@ -87,6 +91,10 @@ install -m 0755 debian/ensure-beacon-data-layout \
   "$pkg_dir/usr/lib/harborbeacon/ensure-data-layout"
 install -m 0644 debian/harboros-beacon.service \
   "$pkg_dir/usr/lib/systemd/system/harboros-beacon.service"
+install -m 0644 debian/first-party-rights.json \
+  "$pkg_dir/usr/share/doc/harboros-beacon/first-party-rights.json"
+install -m 0644 debian/FIRST_PARTY_RIGHTS.txt \
+  "$pkg_dir/usr/share/doc/harboros-beacon/FIRST_PARTY_RIGHTS.txt"
 sed -e "s/VERSION_PLACEHOLDER/${DEBIAN_VERSION}/g" \
   -e "s/ARCH_PLACEHOLDER/${deb_arch}/g" debian/control \
   | sed 's/^Depends: .*/Depends: libc6, ca-certificates, adduser, init-system-helpers, harboros-system (>= 0.1.0~evt.1), harboros-system (<< 0.2), harborlink (>= 0.1.0~evt.1), harborlink (<< 0.2), harboros-model-runtime (>= 0.1.0~evt.1), harboros-model-runtime (<< 0.2), python3, python3-opencv, python3-spacemit-ort/' \
@@ -97,12 +105,13 @@ chmod 0755 "$pkg_dir/DEBIAN/postinst" "$pkg_dir/DEBIAN/prerm"
 sed "s/SOURCE_COMMIT_PLACEHOLDER/${source_commit}/g" \
   debian/component-contract-beacon.json.in \
   > "$pkg_dir/usr/share/harboros/component-contract.json"
-install -m 0644 debian/license-report.json \
-  "$pkg_dir/usr/share/doc/harboros-beacon/license-report.json"
 
 python3 scripts/generate_k3_supply_chain.py \
   --package harboros-beacon \
   --cargo-lock "$repo_root/Cargo.lock" \
+  --cargo-metadata "$build_root/cargo-metadata.json" \
+  --input-file "$repo_root/debian/first-party-rights.json" \
+  --input-file "$repo_root/debian/FIRST_PARTY_RIGHTS.txt" \
   --binary "$pkg_dir/usr/bin/harboros-beacon" \
   --version "$DEBIAN_VERSION" \
   --target "$target" \
@@ -119,16 +128,6 @@ artifact_name="$(basename "$artifact")"
 material_prefix="${artifact_name%.deb}"
 SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" dpkg-deb \
   --root-owner-group --build --uniform-compression -Zxz -z9 "$pkg_dir" "$artifact"
-install -m 0644 "$pkg_dir/usr/share/doc/harboros-beacon/sbom.spdx.json" \
-  "$out_dir/${material_prefix}.sbom.spdx.json"
-install -m 0644 "$pkg_dir/usr/share/doc/harboros-beacon/sbom.cdx.json" \
-  "$out_dir/${material_prefix}.sbom.cdx.json"
-install -m 0644 "$pkg_dir/usr/share/doc/harboros-beacon/build-provenance.json" \
-  "$out_dir/${material_prefix}.build-provenance.json"
-install -m 0644 "$pkg_dir/usr/share/doc/harboros-beacon/license-report.json" \
-  "$out_dir/${material_prefix}.license-report.json"
-install -m 0644 "$pkg_dir/usr/share/harboros/component-contract.json" \
-  "$out_dir/${material_prefix}.component-contract.json"
 python3 scripts/generate_package_provenance.py \
   --package harboros-beacon \
   --version "$DEBIAN_VERSION" \
@@ -140,17 +139,25 @@ python3 scripts/generate_package_provenance.py \
   --container-digest "$HARBORBEACON_BUILD_CONTAINER_DIGEST" \
   --debian-snapshot "$HARBORBEACON_DEBIAN_SNAPSHOT" \
   --output "$out_dir/${material_prefix}.package-provenance.json"
-touch --date="@${SOURCE_DATE_EPOCH}" "$out_dir/${material_prefix}."*.json
 (
   cd "$out_dir"
   sha256sum "$artifact_name" > "${artifact_name}.sha256"
-  sha256sum \
-    "${material_prefix}.sbom.spdx.json" \
-    "${material_prefix}.sbom.cdx.json" \
-    "${material_prefix}.build-provenance.json" \
-    "${material_prefix}.package-provenance.json" \
-    "${material_prefix}.license-report.json" \
-    "${material_prefix}.component-contract.json" \
-    > "${artifact_name}.materials.sha256"
 )
+python3 scripts/generate_package_materials.py \
+  --artifact "$artifact" \
+  --package harboros-beacon \
+  --version "$DEBIAN_VERSION" \
+  --architecture "$deb_arch" \
+  --source-commit "$source_commit" \
+  --root-manifest "$repo_root/Cargo.toml" \
+  --cargo-metadata "$build_root/cargo-metadata.json" \
+  --component-contract "$pkg_dir/usr/share/harboros/component-contract.json" \
+  --component-contract-installed-path /usr/share/harboros/component-contract.json \
+  --first-party-rights "$pkg_dir/usr/share/doc/harboros-beacon/first-party-rights.json" \
+  --first-party-notice "$pkg_dir/usr/share/doc/harboros-beacon/FIRST_PARTY_RIGHTS.txt" \
+  --sbom-spdx "$pkg_dir/usr/share/doc/harboros-beacon/sbom.spdx.json" \
+  --sbom-cyclonedx "$pkg_dir/usr/share/doc/harboros-beacon/sbom.cdx.json" \
+  --build-provenance "$pkg_dir/usr/share/doc/harboros-beacon/build-provenance.json" \
+  --package-provenance "$out_dir/${material_prefix}.package-provenance.json" \
+  --output-dir "$out_dir"
 printf '%s\n' "$artifact"

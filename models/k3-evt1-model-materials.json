@@ -8,6 +8,13 @@
       "state": "locked",
       "source": "https://gitee.com/bianbu/spacemit-demo.git",
       "revision": "dc4477d3ea712598bb675f730642a43fe280c569",
+      "license": {
+        "blocking_reason": "The pinned spacemit-demo revision has no repository license declaration.",
+        "concluded_license": "NOASSERTION",
+        "declared_license": "NOASSERTION",
+        "evidence": null,
+        "review_status": "blocked"
+      },
       "files": [
         {
           "source_path": "detection/yolov8n_192x320.q.onnx",
@@ -23,6 +30,13 @@
       "state": "locked",
       "source": "https://gitee.com/bianbu/spacemit-demo.git",
       "revision": "dc4477d3ea712598bb675f730642a43fe280c569",
+      "license": {
+        "blocking_reason": "The pinned spacemit-demo revision has no repository license declaration for the labels.",
+        "concluded_license": "NOASSERTION",
+        "declared_license": "NOASSERTION",
+        "evidence": null,
+        "review_status": "blocked"
+      },
       "files": [
         {
           "source_path": "detection/label.txt",
@@ -38,6 +52,17 @@
       "state": "locked",
       "source": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct",
       "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+      "license": {
+        "blocking_reason": "The exact Apache-2.0 license evidence is verified upstream but is not yet included in the immutable model bundle.",
+        "concluded_license": "Apache-2.0",
+        "declared_license": "Apache-2.0",
+        "evidence": {
+          "kind": "upstream-license-file",
+          "sha256": "832dd9e00a68dd83b3c3fb9f5588dad7dcf337a0db50f7d9483f310cd292e92e",
+          "source": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/7ae557604adf67be50417f59c2c2f167def9a775/LICENSE"
+        },
+        "review_status": "declared"
+      },
       "files": [
         {
           "source_path": "semantic-router/qwen2.5-0.5b-instruct/config.json",
@@ -65,6 +90,17 @@
       "state": "locked",
       "source": "https://huggingface.co/jinaai/jina-embeddings-v2-base-zh",
       "revision": "998b9133910ffcb127a7bff233f41db6ed9be4d2",
+      "license": {
+        "blocking_reason": "The pinned model card declares Apache-2.0 but the revision contains no standalone license file in the immutable model bundle.",
+        "concluded_license": "Apache-2.0",
+        "declared_license": "Apache-2.0",
+        "evidence": {
+          "kind": "upstream-model-card",
+          "sha256": "d94c902fe88c81437eb2a1877d21c829a967351c38bc720f4516c312632c1b33",
+          "source": "https://huggingface.co/jinaai/jina-embeddings-v2-base-zh/resolve/998b9133910ffcb127a7bff233f41db6ed9be4d2/README.md"
+        },
+        "review_status": "declared"
+      },
       "files": [
         {
           "source_path": "embedding/jina-embeddings-v2-base-zh/config.json",
@@ -92,6 +128,13 @@
       "state": "locked",
       "source": "https://archive.spacemit.com/spacemit-ai/model_zoo/vlm/Qwen3.5-0.8B.tar.gz",
       "revision": "20a0fa9353a326f1751340dc469d6929fbd5ba95",
+      "license": {
+        "blocking_reason": "The pinned SpacemiT conversion archive does not provide license evidence for redistribution of the converted model files.",
+        "concluded_license": "NOASSERTION",
+        "declared_license": "NOASSERTION",
+        "evidence": null,
+        "review_status": "blocked"
+      },
       "files": [
         {
           "source_path": "vlm/Qwen3.5-0.8B/qwen3_5vl_0.8b-vision-384-op23.f16.onnx",

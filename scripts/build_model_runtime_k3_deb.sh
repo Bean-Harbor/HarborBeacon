@@ -57,6 +57,10 @@ python3 scripts/validate_k3_model_materials.py \
   --stage "$model_stage"
 cargo build --locked --release --target "$target" \
   --no-default-features --features embedded-model-runtime --bin harbor-model-api
+cargo metadata --locked --offline --format-version 1 \
+  --filter-platform "$target" \
+  --no-default-features --features embedded-model-runtime \
+  > "$build_root/cargo-metadata.json"
 
 install -d \
   "$pkg_dir/DEBIAN" \
@@ -87,14 +91,20 @@ chmod 0755 "$pkg_dir/DEBIAN/postinst" "$pkg_dir/DEBIAN/prerm"
 sed "s/SOURCE_COMMIT_PLACEHOLDER/${source_commit}/g" \
   debian/component-contract-model-runtime.json.in \
   > "$pkg_dir/usr/share/harboros/component-contracts/harboros-model-runtime.json"
+sed "s/SOURCE_COMMIT_PLACEHOLDER/${source_commit}/g" \
+  debian/model-runtime-manifest.json.in \
+  > "$pkg_dir/usr/share/doc/harboros-model-runtime/runtime-manifest.json"
 install -m 0644 models/k3-evt1-model-materials.json \
   "$pkg_dir/usr/share/harboros-model-runtime/model-materials.json"
-install -m 0644 debian/license-report.json \
-  "$pkg_dir/usr/share/doc/harboros-model-runtime/license-report.json"
+install -m 0644 debian/first-party-rights.json \
+  "$pkg_dir/usr/share/doc/harboros-model-runtime/first-party-rights.json"
+install -m 0644 debian/FIRST_PARTY_RIGHTS.txt \
+  "$pkg_dir/usr/share/doc/harboros-model-runtime/FIRST_PARTY_RIGHTS.txt"
 
 python3 scripts/generate_k3_supply_chain.py \
   --package harboros-model-runtime \
   --cargo-lock "$repo_root/Cargo.lock" \
+  --cargo-metadata "$build_root/cargo-metadata.json" \
   --materials "$repo_root/models/k3-evt1-model-materials.json" \
   --input-file "$repo_root/debian/model-runtime-control.in" \
   --input-file "$repo_root/debian/model-runtime-postinst" \
@@ -104,7 +114,9 @@ python3 scripts/generate_k3_supply_chain.py \
   --input-file "$repo_root/debian/harboros-model-runtime.service" \
   --input-file "$repo_root/debian/harboros-vlm-runtime.service" \
   --input-file "$repo_root/debian/component-contract-model-runtime.json.in" \
-  --input-file "$repo_root/debian/license-report.json" \
+  --input-file "$repo_root/debian/model-runtime-manifest.json.in" \
+  --input-file "$repo_root/debian/first-party-rights.json" \
+  --input-file "$repo_root/debian/FIRST_PARTY_RIGHTS.txt" \
   --input-file "$repo_root/scripts/verify_k3_model_release.py" \
   --model-root "$model_stage" \
   --runtime-dependency "llama.cpp-tools-spacemit=0.1.1" \
@@ -126,24 +138,6 @@ artifact_name="$(basename "$artifact")"
 material_prefix="${artifact_name%.deb}"
 SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" dpkg-deb \
   --root-owner-group --build --uniform-compression -Zxz -z9 "$pkg_dir" "$artifact"
-install -m 0644 \
-  "$pkg_dir/usr/share/doc/harboros-model-runtime/sbom.spdx.json" \
-  "$out_dir/${material_prefix}.sbom.spdx.json"
-install -m 0644 \
-  "$pkg_dir/usr/share/doc/harboros-model-runtime/sbom.cdx.json" \
-  "$out_dir/${material_prefix}.sbom.cdx.json"
-install -m 0644 \
-  "$pkg_dir/usr/share/doc/harboros-model-runtime/build-provenance.json" \
-  "$out_dir/${material_prefix}.build-provenance.json"
-install -m 0644 \
-  "$pkg_dir/usr/share/doc/harboros-model-runtime/license-report.json" \
-  "$out_dir/${material_prefix}.license-report.json"
-install -m 0644 \
-  "$pkg_dir/usr/share/harboros/component-contracts/harboros-model-runtime.json" \
-  "$out_dir/${material_prefix}.component-contract.json"
-install -m 0644 \
-  "$pkg_dir/usr/share/harboros-model-runtime/model-materials.json" \
-  "$out_dir/${material_prefix}.model-materials.json"
 python3 scripts/generate_package_provenance.py \
   --package harboros-model-runtime \
   --version "$DEBIAN_VERSION" \
@@ -155,18 +149,27 @@ python3 scripts/generate_package_provenance.py \
   --container-digest "$HARBORBEACON_BUILD_CONTAINER_DIGEST" \
   --debian-snapshot "$HARBORBEACON_DEBIAN_SNAPSHOT" \
   --output "$out_dir/${material_prefix}.package-provenance.json"
-touch --date="@${SOURCE_DATE_EPOCH}" "$out_dir/${material_prefix}."*.json
 (
   cd "$out_dir"
   sha256sum "$artifact_name" > "${artifact_name}.sha256"
-  sha256sum \
-    "${material_prefix}.sbom.spdx.json" \
-    "${material_prefix}.sbom.cdx.json" \
-    "${material_prefix}.build-provenance.json" \
-    "${material_prefix}.package-provenance.json" \
-    "${material_prefix}.license-report.json" \
-    "${material_prefix}.component-contract.json" \
-    "${material_prefix}.model-materials.json" \
-    > "${artifact_name}.materials.sha256"
 )
+python3 scripts/generate_package_materials.py \
+  --artifact "$artifact" \
+  --package harboros-model-runtime \
+  --version "$DEBIAN_VERSION" \
+  --architecture "$deb_arch" \
+  --source-commit "$source_commit" \
+  --root-manifest "$repo_root/Cargo.toml" \
+  --cargo-metadata "$build_root/cargo-metadata.json" \
+  --component-contract "$pkg_dir/usr/share/harboros/component-contracts/harboros-model-runtime.json" \
+  --component-contract-installed-path /usr/share/harboros/component-contracts/harboros-model-runtime.json \
+  --first-party-rights "$pkg_dir/usr/share/doc/harboros-model-runtime/first-party-rights.json" \
+  --first-party-notice "$pkg_dir/usr/share/doc/harboros-model-runtime/FIRST_PARTY_RIGHTS.txt" \
+  --sbom-spdx "$pkg_dir/usr/share/doc/harboros-model-runtime/sbom.spdx.json" \
+  --sbom-cyclonedx "$pkg_dir/usr/share/doc/harboros-model-runtime/sbom.cdx.json" \
+  --build-provenance "$pkg_dir/usr/share/doc/harboros-model-runtime/build-provenance.json" \
+  --package-provenance "$out_dir/${material_prefix}.package-provenance.json" \
+  --model-materials "$pkg_dir/usr/share/harboros-model-runtime/model-materials.json" \
+  --runtime-manifest "$pkg_dir/usr/share/doc/harboros-model-runtime/runtime-manifest.json" \
+  --output-dir "$out_dir"
 printf '%s\n' "$artifact"

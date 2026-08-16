@@ -9,9 +9,18 @@ import hashlib
 import json
 import re
 import subprocess
-import tomllib
 import uuid
 from pathlib import Path
+
+
+ROOT_LICENSE = "LicenseRef-Harbor-Innovations-Proprietary"
+ROOT_COPYRIGHT = "Copyright (c) Harbor Innovations"
+SOURCE_REPOSITORY = "https://github.com/Bean-Harbor/HarborBeacon"
+SPDX_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*\+?$")
+LICENSE_FILE_RE = re.compile(
+    r"^(?:LICENSE|LICENCE|COPYING|NOTICE|UNLICENSE)(?:[._-].*)?$",
+    re.IGNORECASE,
+)
 
 
 def sha256(path: Path) -> str:
@@ -20,6 +29,13 @@ def sha256(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def canonical_json_sha256(value: object) -> str:
+    payload = json.dumps(
+        value, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    ).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def spdx_id(name: str, version: str) -> str:
@@ -52,17 +68,101 @@ def stable_input_name(path: Path) -> str:
         return resolved.name
 
 
-def cargo_components(lock_path: Path) -> list[dict[str, str]]:
-    payload = tomllib.loads(lock_path.read_text(encoding="utf-8"))
-    return [
-        {
-            "name": package["name"],
-            "version": package["version"],
-            "purl": f"pkg:cargo/{package['name']}@{package['version']}",
-            "checksum": package.get("checksum", ""),
-        }
-        for package in payload.get("package", [])
-    ]
+def normalize_license_expression(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return "NOASSERTION"
+    return re.sub(r"\s+", " ", re.sub(r"\s*/\s*", " OR ", value.strip()))
+
+
+def valid_spdx_expression(value: str) -> bool:
+    if value in {"NOASSERTION", "NONE"}:
+        return False
+    tokens = value.replace("(", " ( ").replace(")", " ) ").split()
+    position = 0
+
+    def primary() -> bool:
+        nonlocal position
+        if position >= len(tokens):
+            return False
+        if tokens[position] == "(":
+            position += 1
+            if not expression() or position >= len(tokens) or tokens[position] != ")":
+                return False
+            position += 1
+            return True
+        if not SPDX_ID_RE.fullmatch(tokens[position]):
+            return False
+        position += 1
+        if position < len(tokens) and tokens[position] == "WITH":
+            position += 1
+            if position >= len(tokens) or not SPDX_ID_RE.fullmatch(tokens[position]):
+                return False
+            position += 1
+        return True
+
+    def expression() -> bool:
+        nonlocal position
+        if not primary():
+            return False
+        while position < len(tokens) and tokens[position] in {"AND", "OR"}:
+            position += 1
+            if not primary():
+                return False
+        return True
+
+    return bool(tokens) and expression() and position == len(tokens)
+
+
+def cargo_components(metadata_path: Path, root_manifest: Path) -> list[dict[str, object]]:
+    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    packages = {package["id"]: package for package in payload.get("packages", [])}
+    resolve = payload.get("resolve")
+    if not isinstance(resolve, dict) or not isinstance(resolve.get("nodes"), list):
+        raise RuntimeError("Cargo metadata has no resolved dependency graph")
+    reachable = {node["id"] for node in resolve["nodes"]}
+    root_manifest = root_manifest.resolve(strict=True)
+    components: list[dict[str, object]] = []
+    seen: set[tuple[str, str]] = set()
+    for package_id in sorted(reachable):
+        package = packages.get(package_id)
+        if not isinstance(package, dict):
+            raise RuntimeError(f"Cargo metadata omits resolved package {package_id}")
+        manifest = Path(package["manifest_path"]).resolve(strict=True)
+        if manifest == root_manifest:
+            continue
+        name = package["name"]
+        version = package["version"]
+        identity = (name, version)
+        if identity in seen:
+            raise RuntimeError(f"Cargo metadata repeats package identity {name}@{version}")
+        seen.add(identity)
+        declared_license = normalize_license_expression(package.get("license"))
+        license_files = sorted(
+            (
+                {
+                    "filename": path.name,
+                    "sha256": sha256(path),
+                }
+                for path in manifest.parent.iterdir()
+                if path.is_file() and not path.is_symlink() and LICENSE_FILE_RE.fullmatch(path.name)
+            ),
+            key=lambda item: item["filename"],
+        )
+        components.append(
+            {
+                "name": name,
+                "version": version,
+                "purl": f"pkg:cargo/{name}@{version}",
+                "checksum": package.get("checksum") or "",
+                "declared_license": declared_license,
+                "concluded_license": (
+                    declared_license if valid_spdx_expression(declared_license) else "NOASSERTION"
+                ),
+                "license_files": license_files,
+                "source": package.get("source") or "vendored-path",
+            }
+        )
+    return sorted(components, key=lambda item: (item["name"], item["version"]))
 
 
 def command_version(*command: str) -> str:
@@ -93,6 +193,7 @@ def main() -> None:
     parser.add_argument("--package", required=True)
     parser.add_argument("--binary", type=Path, action="append", required=True)
     parser.add_argument("--cargo-lock", type=Path, required=True)
+    parser.add_argument("--cargo-metadata", type=Path, required=True)
     parser.add_argument("--materials", type=Path)
     parser.add_argument("--input-file", type=Path, action="append", default=[])
     parser.add_argument("--model-root", type=Path)
@@ -117,6 +218,13 @@ def main() -> None:
         key=lambda dependency: dependency["name"],
     )
     model_files = []
+    model_license_by_path: dict[str, dict[str, object]] = {}
+    if args.materials is not None:
+        materials_payload = json.loads(args.materials.read_text(encoding="utf-8"))
+        for material in materials_payload.get("materials", []):
+            license_review = material.get("license", {})
+            for file_entry in material.get("files", []):
+                model_license_by_path[file_entry["package_path"]] = license_review
     if args.model_root is not None:
         model_root = args.model_root.resolve(strict=True)
         model_files = sorted(
@@ -125,16 +233,17 @@ def main() -> None:
         )
     root_purl = f"pkg:deb/{args.package}@{args.version}?arch={args.arch}"
     root_id = spdx_id(args.package, args.version)
-    components = cargo_components(args.cargo_lock)
+    components = cargo_components(args.cargo_metadata, args.cargo_lock.parent / "Cargo.toml")
     packages = [
         {
             "name": args.package,
             "SPDXID": root_id,
             "versionInfo": args.version,
-            "downloadLocation": "NOASSERTION",
+            "downloadLocation": SOURCE_REPOSITORY,
             "filesAnalyzed": False,
-            "licenseConcluded": "NOASSERTION",
-            "licenseDeclared": "NOASSERTION",
+            "licenseConcluded": ROOT_LICENSE,
+            "licenseDeclared": ROOT_LICENSE,
+            "copyrightText": ROOT_COPYRIGHT,
             "externalRefs": [
                 {
                     "referenceCategory": "PACKAGE-MANAGER",
@@ -159,8 +268,9 @@ def main() -> None:
             "versionInfo": component["version"],
             "downloadLocation": "NOASSERTION",
             "filesAnalyzed": False,
-            "licenseConcluded": "NOASSERTION",
-            "licenseDeclared": "NOASSERTION",
+            "licenseConcluded": component["concluded_license"],
+            "licenseDeclared": component["declared_license"],
+            "copyrightText": "NOASSERTION",
             "externalRefs": [
                 {
                     "referenceCategory": "PACKAGE-MANAGER",
@@ -192,6 +302,7 @@ def main() -> None:
                 "filesAnalyzed": False,
                 "licenseConcluded": "NOASSERTION",
                 "licenseDeclared": "NOASSERTION",
+                "copyrightText": "NOASSERTION",
                 "externalRefs": [
                     {
                         "referenceCategory": "PACKAGE-MANAGER",
@@ -218,6 +329,15 @@ def main() -> None:
             model_digest = sha256(model_file)
             model_id = file_spdx_id(relative_name, model_digest)
             package_model_name = f"usr/share/harboros-model-runtime/models/{relative_name}"
+            license_review = model_license_by_path.get(relative_name, {})
+            declared_license = normalize_license_expression(
+                license_review.get("declared_license")
+            )
+            concluded_license = normalize_license_expression(
+                license_review.get("concluded_license")
+            )
+            if not valid_spdx_expression(concluded_license):
+                concluded_license = "NOASSERTION"
             spdx_files.append(
                 {
                     "fileName": f"./{package_model_name}",
@@ -225,7 +345,8 @@ def main() -> None:
                     "checksums": [
                         {"algorithm": "SHA256", "checksumValue": model_digest}
                     ],
-                    "licenseConcluded": "NOASSERTION",
+                    "licenseConcluded": concluded_license,
+                    "licenseInfoInFiles": [declared_license],
                     "copyrightText": "NOASSERTION",
                 }
             )
@@ -245,6 +366,11 @@ def main() -> None:
                     "name": relative_name,
                     "bom-ref": f"model:{relative_name}",
                     "hashes": [{"alg": "SHA-256", "content": model_digest}],
+                    **(
+                        {"licenses": [{"expression": concluded_license}]}
+                        if concluded_license != "NOASSERTION"
+                        else {}
+                    ),
                 }
             )
 
@@ -273,6 +399,12 @@ def main() -> None:
                 "name": args.package,
                 "version": args.version,
                 "purl": root_purl,
+                "licenses": [{"expression": ROOT_LICENSE}],
+                "properties": [
+                    {"name": "harboros:copyright", "value": ROOT_COPYRIGHT},
+                    {"name": "harboros:license-concluded", "value": ROOT_LICENSE},
+                    {"name": "harboros:license-declared", "value": ROOT_LICENSE},
+                ],
             },
         },
         "components": [
@@ -281,6 +413,11 @@ def main() -> None:
                 "name": component["name"],
                 "version": component["version"],
                 "purl": component["purl"],
+                **(
+                    {"licenses": [{"expression": component["concluded_license"]}]}
+                    if component["concluded_license"] != "NOASSERTION"
+                    else {}
+                ),
                 **(
                     {"hashes": [{"alg": "SHA-256", "content": component["checksum"]}]}
                     if component["checksum"]
@@ -303,12 +440,15 @@ def main() -> None:
     resolved = [
         {
             "uri": (
-                "git+https://github.com/Bean-Harbor/HarborBeacon@"
-                f"{args.source_commit}"
+                f"git+{SOURCE_REPOSITORY}@{args.source_commit}"
             ),
             "digest": {"gitCommit": args.source_commit},
         },
         {"uri": "Cargo.lock", "digest": {"sha256": sha256(args.cargo_lock)}},
+        {
+            "uri": "cargo-metadata:resolved-packages",
+            "digest": {"sha256": canonical_json_sha256(components)},
+        },
     ]
     if args.materials is not None:
         resolved.append(
@@ -396,7 +536,7 @@ def main() -> None:
         ("build-provenance.json", provenance),
     ):
         (args.output_dir / name).write_text(
-            json.dumps(payload, ensure_ascii=True, indent=2) + "\n",
+            json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
 
