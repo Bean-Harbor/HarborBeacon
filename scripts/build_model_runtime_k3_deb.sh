@@ -146,7 +146,7 @@ python3 scripts/generate_package_provenance.py \
   --version "$DEBIAN_VERSION" \
   --arch "$deb_arch" \
   --artifact "$artifact" \
-  --build-provenance "$out_dir/${material_prefix}.build-provenance.json" \
+  --build-provenance "$pkg_dir/usr/share/doc/harboros-model-runtime/build-provenance.json" \
   --source-commit "$source_commit" \
   --source-date-epoch "$SOURCE_DATE_EPOCH" \
   --container-digest "$HARBORBEACON_BUILD_CONTAINER_DIGEST" \

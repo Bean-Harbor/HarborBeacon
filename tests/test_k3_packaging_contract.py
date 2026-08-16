@@ -505,6 +505,10 @@ class K3PackagingContractTests(unittest.TestCase):
             self.assertIn("generate_package_materials.py", script)
             self.assertIn("--cargo-metadata", script)
             self.assertIn("--cargo-lock", script)
+            self.assertNotIn(
+                '--build-provenance "$out_dir/${material_prefix}.build-provenance.json"',
+                script,
+            )
             self.assertIn("release-materials", (
                 ROOT / "scripts" / "generate_package_materials.py"
             ).read_text(encoding="utf-8"))
