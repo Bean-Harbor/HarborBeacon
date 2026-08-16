@@ -80,6 +80,8 @@ apt-get install --yes --no-install-recommends \
   init-system-helpers \
   libc6-dev-riscv64-cross \
   python3 \
+  python3-jsonschema \
+  python3-yaml \
   xz-utils
 rustup target add "$target"
 
