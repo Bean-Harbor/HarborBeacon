@@ -1,4 +1,5 @@
 import hashlib
+import base64
 import importlib.util
 import io
 import json
@@ -140,6 +141,118 @@ class K3PackagingContractTests(unittest.TestCase):
                 "cargo-lock-checksum-bound-manifest-declaration",
             )
             self.assertEqual(dependency["license_evidence"], [])
+            review, sidecar = module.build_cargo_third_party_licenses(
+                metadata,
+                root_manifest,
+                cargo_lock,
+                package="fixture-package",
+                source_commit="a" * 40,
+            )
+            self.assertEqual(review["approved"], 1)
+            self.assertEqual(sidecar["total"], 1)
+            self.assertEqual(sidecar["unresolved"], [])
+            carried = sidecar["dependencies"][0]
+            self.assertEqual(
+                carried["binding"],
+                {"kind": "cargo-lock-checksum", "sha256": checksum},
+            )
+            self.assertEqual(len(carried["evidence"]), 1)
+            self.assertEqual(
+                carried["evidence"][0]["kind"],
+                "cargo-manifest-license-declaration",
+            )
+            self.assertEqual(
+                carried["evidence"][0]["content_base64"],
+                base64.b64encode(dependency_manifest_bytes).decode("ascii"),
+            )
+            sidecar_path = root / "third-party-licenses.json"
+            module.write_json(sidecar_path, sidecar)
+            self.assertEqual(
+                module.verify_cargo_third_party_licenses(sidecar_path, sidecar),
+                sidecar,
+            )
+
+            tampered = json.loads(json.dumps(sidecar))
+            tampered["dependencies"][0]["evidence"][0]["content_base64"] = "dGFtcGVyZWQ="
+            module.write_json(sidecar_path, tampered)
+            with self.assertRaisesRegex(ValueError, "checksum-bound source evidence"):
+                module.verify_cargo_third_party_licenses(sidecar_path, sidecar)
+
+            missing = json.loads(json.dumps(sidecar))
+            missing["dependencies"] = []
+            missing["total"] = 0
+            module.write_json(sidecar_path, missing)
+            with self.assertRaisesRegex(ValueError, "checksum-bound source evidence"):
+                module.verify_cargo_third_party_licenses(sidecar_path, sidecar)
+
+    def test_spdx_root_license_ref_requires_exact_notice_bytes(self):
+        script_path = ROOT / "scripts" / "generate_package_materials.py"
+        spec = importlib.util.spec_from_file_location("generate_package_materials", script_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        notice = (ROOT / "debian" / "FIRST_PARTY_RIGHTS.txt").read_bytes()
+        spdx = {
+            "packages": [
+                {
+                    "licenseConcluded": module.ROOT_LICENSE,
+                    "licenseDeclared": module.ROOT_LICENSE,
+                }
+            ],
+            "files": [],
+        }
+
+        with self.assertRaisesRegex(ValueError, "omits extracted text"):
+            module.verify_spdx_extracted_licenses(
+                spdx, root_license=module.ROOT_LICENSE, notice_bytes=notice
+            )
+
+        spdx["hasExtractedLicensingInfos"] = [
+            {"licenseId": module.ROOT_LICENSE, "extractedText": "drifted\n"}
+        ]
+        with self.assertRaisesRegex(ValueError, "differs from FIRST_PARTY_RIGHTS"):
+            module.verify_spdx_extracted_licenses(
+                spdx, root_license=module.ROOT_LICENSE, notice_bytes=notice
+            )
+
+        spdx["hasExtractedLicensingInfos"][0]["extractedText"] = notice.decode("utf-8")
+        module.verify_spdx_extracted_licenses(
+            spdx, root_license=module.ROOT_LICENSE, notice_bytes=notice
+        )
+
+    def test_installed_third_party_license_sidecar_is_byte_identical(self):
+        script_path = ROOT / "scripts" / "generate_package_materials.py"
+        spec = importlib.util.spec_from_file_location("generate_package_materials", script_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        sidecar = b'{"schema_version":1}\n'
+        identity = {
+            "kind": "third-party-licenses",
+            "filename": "package.third-party-licenses.json",
+            "sha256": hashlib.sha256(sidecar).hexdigest(),
+            "installed_path": "/usr/share/doc/package/third-party-licenses.json",
+        }
+
+        def payload(content=None):
+            stream = io.BytesIO()
+            with tarfile.open(fileobj=stream, mode="w") as archive:
+                if content is not None:
+                    member = tarfile.TarInfo(
+                        "./usr/share/doc/package/third-party-licenses.json"
+                    )
+                    member.size = len(content)
+                    archive.addfile(member, io.BytesIO(content))
+            stream.seek(0)
+            return stream
+
+        module.verify_installed_evidence_tar(payload(sidecar), [identity])
+        with self.assertRaisesRegex(ValueError, "differs from sidecar"):
+            module.verify_installed_evidence_tar(payload(b"tampered\n"), [identity])
+        with self.assertRaisesRegex(ValueError, "installed evidence is missing"):
+            module.verify_installed_evidence_tar(payload(), [identity])
 
     def test_maintainer_and_runtime_shell_scripts_parse(self):
         shell = shutil.which("sh")
@@ -505,6 +618,9 @@ class K3PackagingContractTests(unittest.TestCase):
             self.assertIn("generate_package_materials.py", script)
             self.assertIn("--cargo-metadata", script)
             self.assertIn("--cargo-lock", script)
+            self.assertIn("generate_cargo_license_sidecar.py", script)
+            self.assertIn("--first-party-notice", script)
+            self.assertIn("--third-party-licenses", script)
             self.assertNotIn(
                 '--build-provenance "$out_dir/${material_prefix}.build-provenance.json"',
                 script,

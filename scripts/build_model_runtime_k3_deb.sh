@@ -102,11 +102,19 @@ install -m 0644 debian/FIRST_PARTY_RIGHTS.txt \
   "$pkg_dir/usr/share/doc/harboros-model-runtime/FIRST_PARTY_RIGHTS.txt"
 install -m 0644 debian/model-runtime-third-party.json \
   "$pkg_dir/usr/share/doc/harboros-model-runtime/runtime-license-evidence.json"
+python3 scripts/generate_cargo_license_sidecar.py \
+  --package harboros-model-runtime \
+  --source-commit "$source_commit" \
+  --root-manifest "$repo_root/Cargo.toml" \
+  --cargo-lock "$repo_root/Cargo.lock" \
+  --cargo-metadata "$build_root/cargo-metadata.json" \
+  --output "$pkg_dir/usr/share/doc/harboros-model-runtime/third-party-licenses.json"
 
 python3 scripts/generate_k3_supply_chain.py \
   --package harboros-model-runtime \
   --cargo-lock "$repo_root/Cargo.lock" \
   --cargo-metadata "$build_root/cargo-metadata.json" \
+  --first-party-notice "$repo_root/debian/FIRST_PARTY_RIGHTS.txt" \
   --materials "$repo_root/models/k3-evt1-model-materials.json" \
   --input-file "$repo_root/debian/model-runtime-control.in" \
   --input-file "$repo_root/debian/model-runtime-postinst" \
@@ -169,6 +177,7 @@ python3 scripts/generate_package_materials.py \
   --component-contract-installed-path /usr/share/harboros/component-contracts/harboros-model-runtime.json \
   --first-party-rights "$pkg_dir/usr/share/doc/harboros-model-runtime/first-party-rights.json" \
   --first-party-notice "$pkg_dir/usr/share/doc/harboros-model-runtime/FIRST_PARTY_RIGHTS.txt" \
+  --third-party-licenses "$pkg_dir/usr/share/doc/harboros-model-runtime/third-party-licenses.json" \
   --sbom-spdx "$pkg_dir/usr/share/doc/harboros-model-runtime/sbom.spdx.json" \
   --sbom-cyclonedx "$pkg_dir/usr/share/doc/harboros-model-runtime/sbom.cdx.json" \
   --build-provenance "$pkg_dir/usr/share/doc/harboros-model-runtime/build-provenance.json" \

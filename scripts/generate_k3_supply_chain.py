@@ -243,6 +243,7 @@ def main() -> None:
     parser.add_argument("--binary", type=Path, action="append", required=True)
     parser.add_argument("--cargo-lock", type=Path, required=True)
     parser.add_argument("--cargo-metadata", type=Path, required=True)
+    parser.add_argument("--first-party-notice", type=Path, required=True)
     parser.add_argument("--materials", type=Path)
     parser.add_argument("--input-file", type=Path, action="append", default=[])
     parser.add_argument("--model-root", type=Path)
@@ -256,6 +257,19 @@ def main() -> None:
     parser.add_argument("--debian-snapshot", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
+
+    try:
+        notice_bytes = args.first_party_notice.read_bytes()
+        notice_text = notice_bytes.decode("utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeError("FIRST_PARTY_RIGHTS.txt must be exact UTF-8 bytes") from exc
+    if (
+        not args.first_party_notice.is_file()
+        or args.first_party_notice.is_symlink()
+        or not notice_bytes
+        or notice_text.encode("utf-8") != notice_bytes
+    ):
+        raise RuntimeError("FIRST_PARTY_RIGHTS.txt must be non-empty exact UTF-8 bytes")
 
     created = dt.datetime.fromtimestamp(args.source_date_epoch, dt.UTC).isoformat().replace(
         "+00:00", "Z"
@@ -436,6 +450,9 @@ def main() -> None:
             f"https://harboros.ai/sbom/{args.package}/{args.version}/{args.arch}"
         ),
         "creationInfo": {"created": created, "creators": ["Organization: Harbor"]},
+        "hasExtractedLicensingInfos": [
+            {"extractedText": notice_text, "licenseId": ROOT_LICENSE}
+        ],
         "packages": packages,
         "files": spdx_files,
         "relationships": relationships,

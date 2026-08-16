@@ -95,6 +95,13 @@ install -m 0644 debian/first-party-rights.json \
   "$pkg_dir/usr/share/doc/harboros-beacon/first-party-rights.json"
 install -m 0644 debian/FIRST_PARTY_RIGHTS.txt \
   "$pkg_dir/usr/share/doc/harboros-beacon/FIRST_PARTY_RIGHTS.txt"
+python3 scripts/generate_cargo_license_sidecar.py \
+  --package harboros-beacon \
+  --source-commit "$source_commit" \
+  --root-manifest "$repo_root/Cargo.toml" \
+  --cargo-lock "$repo_root/Cargo.lock" \
+  --cargo-metadata "$build_root/cargo-metadata.json" \
+  --output "$pkg_dir/usr/share/doc/harboros-beacon/third-party-licenses.json"
 sed -e "s/VERSION_PLACEHOLDER/${DEBIAN_VERSION}/g" \
   -e "s/ARCH_PLACEHOLDER/${deb_arch}/g" debian/control \
   | sed 's/^Depends: .*/Depends: libc6, ca-certificates, adduser, init-system-helpers, harboros-system (>= 0.1.0~evt.1), harboros-system (<< 0.2), harborlink (>= 0.1.0~evt.1), harborlink (<< 0.2), harboros-model-runtime (>= 0.1.0~evt.1), harboros-model-runtime (<< 0.2), python3, python3-opencv, python3-spacemit-ort/' \
@@ -110,6 +117,7 @@ python3 scripts/generate_k3_supply_chain.py \
   --package harboros-beacon \
   --cargo-lock "$repo_root/Cargo.lock" \
   --cargo-metadata "$build_root/cargo-metadata.json" \
+  --first-party-notice "$repo_root/debian/FIRST_PARTY_RIGHTS.txt" \
   --input-file "$repo_root/debian/first-party-rights.json" \
   --input-file "$repo_root/debian/FIRST_PARTY_RIGHTS.txt" \
   --binary "$pkg_dir/usr/bin/harboros-beacon" \
@@ -156,6 +164,7 @@ python3 scripts/generate_package_materials.py \
   --component-contract-installed-path /usr/share/harboros/component-contract.json \
   --first-party-rights "$pkg_dir/usr/share/doc/harboros-beacon/first-party-rights.json" \
   --first-party-notice "$pkg_dir/usr/share/doc/harboros-beacon/FIRST_PARTY_RIGHTS.txt" \
+  --third-party-licenses "$pkg_dir/usr/share/doc/harboros-beacon/third-party-licenses.json" \
   --sbom-spdx "$pkg_dir/usr/share/doc/harboros-beacon/sbom.spdx.json" \
   --sbom-cyclonedx "$pkg_dir/usr/share/doc/harboros-beacon/sbom.cdx.json" \
   --build-provenance "$pkg_dir/usr/share/doc/harboros-beacon/build-provenance.json" \

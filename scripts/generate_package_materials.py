@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import re
@@ -19,10 +20,15 @@ SOURCE_REPOSITORY = "https://github.com/Bean-Harbor/HarborBeacon"
 ROOT_LICENSE = "LicenseRef-Harbor-Innovations-Proprietary"
 ROOT_COPYRIGHT = "Copyright (c) Harbor Innovations"
 SPDX_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*\+?$")
+LOCAL_LICENSE_REF_RE = re.compile(
+    r"(?<![A-Za-z0-9.+:-])LicenseRef-[A-Za-z0-9.-]+(?![A-Za-z0-9.+-])"
+)
 LICENSE_FILE_RE = re.compile(
-    r"^(?:LICENSE|LICENCE|COPYING|UNLICENSE)(?:[._-].*)?$",
+    r"^(?:LICENSE|LICENCE|COPYING|NOTICE|UNLICENSE)(?:[._-].*)?$",
     re.IGNORECASE,
 )
+MAX_LICENSE_EVIDENCE_BYTES = 4 * 1024 * 1024
+MAX_THIRD_PARTY_LICENSE_BYTES = 64 * 1024 * 1024
 
 
 def sha256(path: Path) -> str:
@@ -58,6 +64,91 @@ def load_canonical_json(path: Path, label: str) -> dict[str, Any]:
 
 def write_json(path: Path, value: dict[str, Any]) -> None:
     path.write_bytes(canonical_bytes(value))
+
+
+def read_utf8_bytes(path: Path, label: str) -> tuple[bytes, str]:
+    if not path.is_file() or path.is_symlink():
+        raise ValueError(f"{label} is missing or unsafe: {path}")
+    try:
+        payload = path.read_bytes()
+        text = payload.decode("utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"{label} must be exact UTF-8 bytes: {path}") from exc
+    if not payload or text.encode("utf-8") != payload:
+        raise ValueError(f"{label} must be non-empty exact UTF-8 bytes: {path}")
+    return payload, text
+
+
+def read_license_evidence_bytes(path: Path, label: str) -> bytes:
+    if not path.is_file() or path.is_symlink():
+        raise ValueError(f"{label} is missing or unsafe: {path}")
+    try:
+        size = path.stat().st_size
+        if size <= 0 or size > MAX_LICENSE_EVIDENCE_BYTES:
+            raise ValueError(f"{label} has an invalid size: {size}")
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"unable to read {label}: {path}") from exc
+    if len(payload) != size:
+        raise ValueError(f"{label} changed while being read: {path}")
+    return payload
+
+
+def local_license_refs(value: dict[str, Any]) -> set[str]:
+    refs: set[str] = set()
+    for collection, fields in (
+        (value.get("packages"), ("licenseDeclared", "licenseConcluded", "licenseInfoFromFiles")),
+        (value.get("files"), ("licenseConcluded", "licenseInfoInFiles")),
+    ):
+        if not isinstance(collection, list):
+            continue
+        for item in collection:
+            if not isinstance(item, dict):
+                continue
+            for field in fields:
+                raw = item.get(field)
+                expressions = raw if isinstance(raw, list) else [raw]
+                for expression in expressions:
+                    if isinstance(expression, str):
+                        refs.update(LOCAL_LICENSE_REF_RE.findall(expression))
+    return refs
+
+
+def verify_spdx_extracted_licenses(
+    value: dict[str, Any], *, root_license: str, notice_bytes: bytes
+) -> None:
+    refs = local_license_refs(value)
+    extracted = value.get("hasExtractedLicensingInfos")
+    if not isinstance(extracted, list):
+        raise ValueError("SPDX SBOM omits extracted text for local LicenseRef values")
+    by_id: dict[str, dict[str, Any]] = {}
+    for item in extracted:
+        if not isinstance(item, dict):
+            raise ValueError("SPDX SBOM has an invalid extracted license entry")
+        license_id = item.get("licenseId")
+        text = item.get("extractedText")
+        if (
+            not isinstance(license_id, str)
+            or license_id in by_id
+            or not isinstance(text, str)
+            or not text.strip()
+            or text.strip() in {"NONE", "NOASSERTION"}
+        ):
+            raise ValueError("SPDX SBOM has an invalid extracted license entry")
+        by_id[license_id] = item
+    if set(by_id) != refs:
+        raise ValueError("SPDX SBOM extracted licenses differ from local LicenseRef values")
+    root_refs = set(LOCAL_LICENSE_REF_RE.findall(root_license))
+    if root_refs != {ROOT_LICENSE}:
+        raise ValueError("root package license must identify the approved local LicenseRef")
+    try:
+        extracted_bytes = by_id[ROOT_LICENSE]["extractedText"].encode("utf-8")
+    except KeyError as exc:
+        raise ValueError("SPDX SBOM omits the root LicenseRef extracted text") from exc
+    if extracted_bytes != notice_bytes:
+        raise ValueError(
+            "SPDX root LicenseRef text differs from FIRST_PARTY_RIGHTS.txt bytes"
+        )
 
 
 def normalize_license_expression(value: object) -> str:
@@ -126,9 +217,13 @@ def cargo_lock_packages(cargo_lock: Path) -> dict[tuple[str, str, str], dict[str
     return packages
 
 
-def cargo_license_review(
-    metadata_path: Path, root_manifest: Path, cargo_lock: Path
-) -> dict[str, Any]:
+def _cargo_license_inventory(
+    metadata_path: Path,
+    root_manifest: Path,
+    cargo_lock: Path,
+    *,
+    source_commit: str | None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     metadata = load_json(metadata_path, "Cargo metadata")
     packages = {package["id"]: package for package in metadata.get("packages", [])}
     locked_packages = cargo_lock_packages(cargo_lock)
@@ -137,6 +232,8 @@ def cargo_license_review(
         raise ValueError("Cargo metadata has no resolved dependency graph")
     root_manifest = root_manifest.resolve(strict=True)
     entries = []
+    sidecar_entries: list[dict[str, Any]] = []
+    sidecar_bytes = 0
     seen: set[tuple[str, str]] = set()
     for package_id in sorted(node["id"] for node in resolve["nodes"]):
         package = packages.get(package_id)
@@ -183,6 +280,16 @@ def cargo_license_review(
             }
             for path in sorted(evidence_paths, key=lambda item: item.as_posix())
         ]
+        local_evidence = {
+            item["path"]: read_license_evidence_bytes(
+                package_root / item["path"],
+                f"Cargo license evidence for {identity[0]}@{identity[1]}",
+            )
+            for item in evidence
+        }
+        manifest_bytes = read_license_evidence_bytes(
+            manifest, f"Cargo manifest evidence for {identity[0]}@{identity[1]}"
+        )
         declared = normalize_license_expression(package.get("license"))
         expression_valid = valid_spdx_expression(declared)
         registry_evidence = None
@@ -216,7 +323,7 @@ def cargo_license_review(
             requested = {
                 f"{archive_prefix}/{relative}": relative for relative in relative_evidence
             }
-            archive_hashes: dict[str, str] = {}
+            archive_contents: dict[str, bytes] = {}
             try:
                 with tarfile.open(crate_archive, mode="r:*") as archive:
                     for member in archive:
@@ -226,7 +333,7 @@ def cargo_license_review(
                         relative = requested.get(name)
                         if relative is None:
                             continue
-                        if relative in archive_hashes or not member.isfile():
+                        if relative in archive_contents or not member.isfile():
                             raise ValueError(
                                 "registry archive evidence is unsafe or duplicated for "
                                 f"{identity[0]}@{identity[1]}: {relative}"
@@ -237,23 +344,33 @@ def cargo_license_review(
                                 "registry archive evidence cannot be read for "
                                 f"{identity[0]}@{identity[1]}: {relative}"
                             )
-                        digest = hashlib.sha256()
-                        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                            digest.update(chunk)
-                        archive_hashes[relative] = digest.hexdigest()
+                        if member.size <= 0 or member.size > MAX_LICENSE_EVIDENCE_BYTES:
+                            raise ValueError(
+                                "registry archive evidence has an invalid size for "
+                                f"{identity[0]}@{identity[1]}: {relative}"
+                            )
+                        payload = stream.read(MAX_LICENSE_EVIDENCE_BYTES + 1)
+                        if len(payload) != member.size:
+                            raise ValueError(
+                                "registry archive evidence size changed for "
+                                f"{identity[0]}@{identity[1]}: {relative}"
+                            )
+                        archive_contents[relative] = payload
             except (OSError, tarfile.TarError) as exc:
                 raise ValueError(
                     f"invalid registry archive for {identity[0]}@{identity[1]}: {exc}"
                 ) from exc
-            expected_hashes = {
-                manifest.name: sha256(manifest),
-                **{item["path"]: item["sha256"] for item in evidence},
+            expected_contents = {
+                manifest.name: manifest_bytes,
+                **local_evidence,
             }
             if vcs_path.is_file() and not vcs_path.is_symlink():
-                expected_hashes[vcs_path.name] = sha256(vcs_path)
-            if archive_hashes != expected_hashes:
+                expected_contents[vcs_path.name] = read_license_evidence_bytes(
+                    vcs_path, f"Cargo VCS evidence for {identity[0]}@{identity[1]}"
+                )
+            if archive_contents != expected_contents:
                 raise ValueError(
-                    "registry extraction differs from checksum-bound archive for "
+                    "registry extraction bytes differ from checksum-bound archive for "
                     f"{identity[0]}@{identity[1]}"
                 )
             vcs_evidence = None
@@ -284,6 +401,36 @@ def cargo_license_review(
                 "manifest": {"path": manifest.name, "sha256": sha256(manifest)},
                 "vcs": vcs_evidence,
             }
+        selected_evidence = evidence if evidence else [
+            {"path": manifest.name, "sha256": hashlib.sha256(manifest_bytes).hexdigest()}
+        ]
+        evidence_contents = (
+            archive_contents if registry_evidence is not None else local_evidence
+        )
+        sidecar_evidence = []
+        for item in selected_evidence:
+            payload = evidence_contents.get(item["path"])
+            if payload is None:
+                raise ValueError(
+                    f"Cargo license bytes are missing for {identity[0]}@{identity[1]}: "
+                    f"{item['path']}"
+                )
+            sidecar_bytes += len(payload)
+            if sidecar_bytes > MAX_THIRD_PARTY_LICENSE_BYTES:
+                raise ValueError("Cargo third-party license evidence exceeds the size limit")
+            sidecar_evidence.append(
+                {
+                    "content_base64": base64.b64encode(payload).decode("ascii"),
+                    "kind": (
+                        "license-file"
+                        if evidence
+                        else "cargo-manifest-license-declaration"
+                    ),
+                    "path": item["path"],
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "size": len(payload),
+                }
+            )
         approved = expression_valid and (
             registry_evidence is not None or bool(evidence)
         )
@@ -301,7 +448,11 @@ def cargo_license_review(
                 "checksum": checksum,
                 "declared_license": declared,
                 "evidence_basis": (
-                    "cargo-lock-checksum-bound-manifest-declaration"
+                    (
+                        "cargo-lock-checksum-bound-license-files"
+                        if evidence
+                        else "cargo-lock-checksum-bound-manifest-declaration"
+                    )
                     if registry_evidence is not None
                     else "package-local-license-file"
                 ),
@@ -314,14 +465,91 @@ def cargo_license_review(
                 "version": package["version"],
             }
         )
+        if source_commit is not None:
+            binding = (
+                {"kind": "cargo-lock-checksum", "sha256": checksum}
+                if registry_evidence is not None
+                else {"git_commit": source_commit, "kind": "source-commit"}
+            )
+            sidecar_entries.append(
+                {
+                    "binding": binding,
+                    "declared_license": declared,
+                    "evidence": sidecar_evidence,
+                    "name": package["name"],
+                    "purl": f"pkg:cargo/{package['name']}@{package['version']}",
+                    "source": source,
+                    "version": package["version"],
+                }
+            )
     entries.sort(key=lambda item: (item["name"], item["version"]))
     approved_count = sum(item["review_status"] == "approved" for item in entries)
-    return {
+    review = {
         "approved": approved_count,
         "blocked": len(entries) - approved_count,
         "dependencies": entries,
         "total": len(entries),
     }
+    sidecar_entries.sort(key=lambda item: (item["name"], item["version"]))
+    return review, sidecar_entries
+
+
+def cargo_license_review(
+    metadata_path: Path, root_manifest: Path, cargo_lock: Path
+) -> dict[str, Any]:
+    review, _entries = _cargo_license_inventory(
+        metadata_path, root_manifest, cargo_lock, source_commit=None
+    )
+    return review
+
+
+def build_cargo_third_party_licenses(
+    metadata_path: Path,
+    root_manifest: Path,
+    cargo_lock: Path,
+    *,
+    package: str,
+    source_commit: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not re.fullmatch(r"[0-9a-f]{40}", source_commit):
+        raise ValueError("Cargo license sidecar source commit is invalid")
+    review, dependencies = _cargo_license_inventory(
+        metadata_path, root_manifest, cargo_lock, source_commit=source_commit
+    )
+    unresolved = [
+        {
+            "name": item["name"],
+            "reason": item["blocking_reason"],
+            "version": item["version"],
+        }
+        for item in review["dependencies"]
+        if item["review_status"] != "approved"
+    ]
+    sidecar = {
+        "cargo_lock": {"filename": cargo_lock.name, "sha256": sha256(cargo_lock)},
+        "dependencies": dependencies,
+        "package": package,
+        "schema_version": 1,
+        "source_commit": source_commit,
+        "total": len(dependencies),
+        "unresolved": unresolved,
+    }
+    return review, sidecar
+
+
+def verify_cargo_third_party_licenses(
+    path: Path, expected: dict[str, Any]
+) -> dict[str, Any]:
+    actual = load_canonical_json(path, "Cargo third-party license sidecar")
+    if actual != expected:
+        raise ValueError(
+            "Cargo third-party license sidecar differs from checksum-bound source evidence"
+        )
+    if actual.get("unresolved") != []:
+        raise ValueError("Cargo third-party license sidecar has unresolved dependencies")
+    if actual.get("total") != len(actual.get("dependencies", [])):
+        raise ValueError("Cargo third-party license sidecar is incomplete")
+    return actual
 
 
 def model_license_review(path: Path | None) -> dict[str, Any] | None:
@@ -482,9 +710,46 @@ def verify_deb_identity(
         raise ValueError(f"final Debian identity changed: {fields!r}")
 
 
-def verify_installed_evidence(artifact: Path, entries: list[dict[str, str]]) -> None:
+def verify_installed_evidence_tar(
+    payload: Any, entries: list[dict[str, str]]
+) -> None:
     expected = {entry["installed_path"].lstrip("/"): entry for entry in entries}
+    if len(expected) != len(entries):
+        raise ValueError("installed evidence repeats a package path")
     found: set[str] = set()
+    with tarfile.open(fileobj=payload, mode="r|*") as archive:
+        for member in archive:
+            name = member.name
+            while name.startswith("./"):
+                name = name[2:]
+            if name not in expected:
+                continue
+            if name in found or not member.isfile():
+                raise ValueError(f"installed evidence is unsafe or duplicated: {name}")
+            if member.size < 0 or member.size > MAX_THIRD_PARTY_LICENSE_BYTES:
+                raise ValueError(f"installed evidence has an invalid size: {name}")
+            stream = archive.extractfile(member)
+            if stream is None:
+                raise ValueError(f"installed evidence cannot be read: {name}")
+            digest = hashlib.sha256()
+            remaining = member.size
+            while remaining:
+                chunk = stream.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise ValueError(f"installed evidence is truncated: {name}")
+                digest.update(chunk)
+                remaining -= len(chunk)
+            if stream.read(1):
+                raise ValueError(f"installed evidence has an inconsistent size: {name}")
+            if digest.hexdigest() != expected[name]["sha256"]:
+                raise ValueError(f"installed evidence differs from sidecar: {name}")
+            found.add(name)
+    missing = sorted(set(expected) - found)
+    if missing:
+        raise ValueError("installed evidence is missing: " + ", ".join(missing))
+
+
+def verify_installed_evidence(artifact: Path, entries: list[dict[str, str]]) -> None:
     try:
         process = subprocess.Popen(
             ["dpkg-deb", "--fsys-tarfile", str(artifact)],
@@ -495,33 +760,13 @@ def verify_installed_evidence(artifact: Path, entries: list[dict[str, str]]) -> 
         raise ValueError("dpkg-deb is required to verify installed evidence") from exc
     assert process.stdout is not None
     try:
-        with tarfile.open(fileobj=process.stdout, mode="r|*") as archive:
-            for member in archive:
-                name = member.name
-                while name.startswith("./"):
-                    name = name[2:]
-                if name not in expected:
-                    continue
-                if name in found or not member.isfile():
-                    raise ValueError(f"installed evidence is unsafe or duplicated: {name}")
-                stream = archive.extractfile(member)
-                if stream is None:
-                    raise ValueError(f"installed evidence cannot be read: {name}")
-                digest = hashlib.sha256()
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(chunk)
-                if digest.hexdigest() != expected[name]["sha256"]:
-                    raise ValueError(f"installed evidence differs from sidecar: {name}")
-                found.add(name)
+        verify_installed_evidence_tar(process.stdout, entries)
     finally:
         process.stdout.close()
     stderr = process.stderr.read().decode("utf-8", errors="replace") if process.stderr else ""
     return_code = process.wait(timeout=300)
     if return_code:
         raise ValueError(f"dpkg-deb payload inspection failed: {stderr.strip()}")
-    missing = sorted(set(expected) - found)
-    if missing:
-        raise ValueError("installed evidence is missing: " + ", ".join(missing))
 
 
 def export_copy(source: Path, destination: Path, *, canonical_json: bool = False) -> Path:
@@ -562,6 +807,9 @@ def generate(args: argparse.Namespace) -> dict[str, Path]:
         "review_required": True,
     }:
         raise ValueError("first-party rights decision does not preserve third-party review")
+    notice_bytes, _notice_text = read_utf8_bytes(
+        args.first_party_notice, "FIRST_PARTY_RIGHTS.txt"
+    )
 
     contract = load_canonical_json(args.component_contract, "component contract")
     if set(contract) != {"contracts", "package", "schema_version", "source_commit"}:
@@ -576,6 +824,9 @@ def generate(args: argparse.Namespace) -> dict[str, Path]:
         raise ValueError("component contract does not bind the package source")
 
     spdx = load_canonical_json(args.sbom_spdx, "base SPDX SBOM")
+    verify_spdx_extracted_licenses(
+        spdx, root_license=ROOT_LICENSE, notice_bytes=notice_bytes
+    )
     root_packages = [
         item
         for item in spdx.get("packages", [])
@@ -612,8 +863,15 @@ def generate(args: argparse.Namespace) -> dict[str, Path]:
         }
     )
 
-    cargo = cargo_license_review(
-        args.cargo_metadata, args.root_manifest, args.cargo_lock
+    cargo, expected_third_party_licenses = build_cargo_third_party_licenses(
+        args.cargo_metadata,
+        args.root_manifest,
+        args.cargo_lock,
+        package=args.package,
+        source_commit=args.source_commit,
+    )
+    verify_cargo_third_party_licenses(
+        args.third_party_licenses, expected_third_party_licenses
     )
     models = model_license_review(args.model_materials)
     runtime = runtime_license_review(
@@ -674,6 +932,11 @@ def generate(args: argparse.Namespace) -> dict[str, Path]:
         "first-party-rights": export_copy(
             args.first_party_rights,
             args.output_dir / f"{prefix}.first-party-rights.json",
+            canonical_json=True,
+        ),
+        "third-party-licenses": export_copy(
+            args.third_party_licenses,
+            args.output_dir / f"{prefix}.third-party-licenses.json",
             canonical_json=True,
         ),
         "build-provenance": export_copy(
@@ -742,6 +1005,10 @@ def generate(args: argparse.Namespace) -> dict[str, Path]:
             **identities["first-party-license"],
             "installed_path": f"/usr/share/doc/{args.package}/FIRST_PARTY_RIGHTS.txt",
         },
+        {
+            **identities["third-party-licenses"],
+            "installed_path": f"/usr/share/doc/{args.package}/third-party-licenses.json",
+        },
     ]
     if "model-materials" in identities:
         installed.append(
@@ -785,6 +1052,7 @@ def generate(args: argparse.Namespace) -> dict[str, Path]:
                 "provenance",
                 "sbom-cyclonedx",
                 "sbom-spdx",
+                "third-party-licenses",
             )
         ],
         "decision": decision,
@@ -828,6 +1096,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--component-contract-installed-path", required=True)
     parser.add_argument("--first-party-rights", type=Path, required=True)
     parser.add_argument("--first-party-notice", type=Path, required=True)
+    parser.add_argument("--third-party-licenses", type=Path, required=True)
     parser.add_argument("--sbom-spdx", type=Path, required=True)
     parser.add_argument("--sbom-cyclonedx", type=Path, required=True)
     parser.add_argument("--build-provenance", type=Path, required=True)
