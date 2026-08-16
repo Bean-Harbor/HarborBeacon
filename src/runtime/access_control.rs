@@ -112,6 +112,38 @@ pub fn authorize_access(
     })
 }
 
+pub fn authorize_authenticated_principal(
+    state: &AdminConsoleState,
+    principal: &AccessPrincipal,
+    action: AccessAction,
+    resource: &str,
+) -> Result<AccessPrincipal, String> {
+    let workspace = active_workspace(state)?;
+    if principal.workspace_id != workspace.workspace_id {
+        return Err(format!(
+            "当前身份不属于活动工作空间 {}。",
+            workspace.display_name
+        ));
+    }
+
+    let role_key = role_kind_key(principal.role_kind);
+    if !action_allowed(
+        &state.platform.permission_bindings,
+        &workspace.workspace_id,
+        role_key,
+        resource,
+        action.permission_key(),
+    ) {
+        return Err(format!(
+            "当前身份没有{}权限（role={}）。",
+            action.label(),
+            role_key
+        ));
+    }
+
+    Ok(principal.clone())
+}
+
 fn active_workspace(state: &AdminConsoleState) -> Result<&Workspace, String> {
     state
         .platform

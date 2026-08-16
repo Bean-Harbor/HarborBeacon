@@ -11,6 +11,7 @@ use crate::connectors::notifications::NotificationDeliveryService;
 use crate::control_plane::events::EventSeverity;
 use crate::orchestrator::contracts::RiskLevel;
 use crate::runtime::admin_console::NotificationTargetRecord;
+use crate::runtime::ai_resource_scheduler::AI_RESOURCE_QUEUE_MODE;
 use crate::runtime::model_center::run_vlm_summary_with_state;
 use crate::runtime::vision_event::{
     attach_vlm_summary_to_event, build_local_vision_notification_intent,
@@ -225,7 +226,7 @@ impl TaskApiService {
                         "vlm_describe_latest_event"
                     },
                     "frame_source": "fresh_camera_snapshot",
-                    "queue_mode": "global_serial_try_lock",
+                    "queue_mode": AI_RESOURCE_QUEUE_MODE,
                     "local_only": true,
                     "fallback_allowed": false,
                     "model_endpoint_id": execution.model_endpoint_id,

@@ -12,11 +12,13 @@ use super::{
     looks_like_vision_event_notify_request, looks_like_vision_event_summary_request, matches_any,
     normalize_command_text, normalize_optional_general_message_plan_field,
     parse_json_object_from_text, recent_clip_playback_request_from_normalized,
-    recent_search_query_from_recap, GeneralMessageCandidate, GeneralMessageControllerTrace,
+    recent_search_query_from_recap, CatActivityQueryOptions, CatActivitySelection,
+    CatActivityTimeScope, GeneralMessageCandidate, GeneralMessageControllerTrace,
     GeneralMessageConversationAct, GeneralMessagePlan, GeneralMessagePlanKind,
     GeneralMessagePlanPayload, GeneralMessageSignals, HomeAssistantNaturalAction,
-    HomeAssistantNaturalActionRequest, TaskRequest, GENERAL_MESSAGE_NSP_MIN_CONFIDENCE,
-    GENERAL_MESSAGE_RECAP_LIMIT, KNOWLEDGE_DOMAIN, KNOWLEDGE_OP_SEARCH,
+    HomeAssistantNaturalActionRequest, TaskRequest, CAT_ACTIVITY_DEFAULT_BATCH_LIMIT,
+    CAT_ACTIVITY_MAX_BATCH_LIMIT, GENERAL_MESSAGE_NSP_MIN_CONFIDENCE, GENERAL_MESSAGE_RECAP_LIMIT,
+    KNOWLEDGE_DOMAIN, KNOWLEDGE_OP_SEARCH,
 };
 pub(super) fn extract_general_message_signals(
     request: &TaskRequest,
@@ -49,8 +51,21 @@ pub(super) fn extract_general_message_signals(
         &normalized,
         &["抓拍", "拍照", "拍一张", "来一张", "快照", "截图", "截一张"],
     );
+    let explicit_live_view = matches_any(
+        &normalized,
+        &[
+            "实时直播",
+            "实时画面",
+            "实时视频",
+            "打开直播",
+            "查看直播",
+            "liveview",
+            "livestream",
+        ],
+    );
     let explicit_video_search = looks_like_video_search_request(&normalized);
-    let explicit_clip = !explicit_video_search
+    let explicit_clip = !explicit_live_view
+        && !explicit_video_search
         && matches_any(
             &normalized,
             &[
@@ -61,6 +76,7 @@ pub(super) fn extract_general_message_signals(
                 "录视频",
                 "拍视频",
                 "短视频",
+                "一段视频",
             ],
         );
     let explicit_search = explicit_video_search
@@ -120,6 +136,7 @@ pub(super) fn extract_general_message_signals(
     let ambiguous_visual_request = !asks_capability
         && !explicit_snapshot
         && !explicit_clip
+        && !explicit_live_view
         && !explicit_search
         && (matches_any(
             &normalized,
@@ -130,6 +147,7 @@ pub(super) fn extract_general_message_signals(
         normalized,
         asks_capability,
         explicit_clip_playback,
+        explicit_live_view,
         explicit_snapshot,
         explicit_clip,
         explicit_search,
@@ -144,6 +162,39 @@ pub(super) fn extract_general_message_signals(
         recent_clip_available,
         recent_search_context,
     }
+}
+
+fn requests_cat_activity_today(normalized: &str) -> bool {
+    normalized.contains('猫')
+        && (matches_any(normalized, &["今天", "今日", "最近"])
+            || matches_any(
+                normalized,
+                &[
+                    "干了什么",
+                    "做了什么",
+                    "活动",
+                    "去哪了",
+                    "出现过",
+                    "来过",
+                    "看见",
+                ],
+            ))
+        && matches_any(
+            normalized,
+            &[
+                "干了什么",
+                "做了什么",
+                "活动",
+                "视频",
+                "录像",
+                "去哪了",
+                "看看",
+                "出现过",
+                "来过",
+                "看见",
+                "怎么样",
+            ],
+        )
 }
 
 pub(super) fn build_general_message_candidates(
@@ -200,6 +251,19 @@ pub(super) fn build_general_message_candidates(
             },
         );
     }
+    if signals.explicit_live_view {
+        push_general_message_candidate(
+            &mut candidates,
+            GeneralMessageCandidate {
+                kind: GeneralMessagePlanKind::CameraLiveView,
+                confidence: 100,
+                camera_hint: camera_hint.clone(),
+                query: None,
+                recent_clip: None,
+                reason: "structured_signal_live_view".to_string(),
+            },
+        );
+    }
     if signals.explicit_event_notify {
         push_general_message_candidate(
             &mut candidates,
@@ -252,7 +316,20 @@ pub(super) fn build_general_message_candidates(
             },
         );
     }
-    if signals.explicit_snapshot {
+    if signals.explicit_snapshot && signals.explicit_clip {
+        push_general_message_candidate(
+            &mut candidates,
+            GeneralMessageCandidate {
+                kind: GeneralMessagePlanKind::CameraSnapshotAndRecordClip,
+                confidence: 100,
+                camera_hint: camera_hint.clone(),
+                query: None,
+                recent_clip: None,
+                reason: "structured_signal_snapshot_and_clip".to_string(),
+            },
+        );
+    }
+    if signals.explicit_snapshot && !signals.explicit_clip {
         push_general_message_candidate(
             &mut candidates,
             GeneralMessageCandidate {
@@ -265,7 +342,7 @@ pub(super) fn build_general_message_candidates(
             },
         );
     }
-    if signals.explicit_clip {
+    if signals.explicit_clip && !signals.explicit_snapshot {
         push_general_message_candidate(
             &mut candidates,
             GeneralMessageCandidate {
@@ -275,6 +352,19 @@ pub(super) fn build_general_message_candidates(
                 query: None,
                 recent_clip: None,
                 reason: "structured_signal_clip".to_string(),
+            },
+        );
+    }
+    if requests_cat_activity_today(&signals.normalized) {
+        push_general_message_candidate(
+            &mut candidates,
+            GeneralMessageCandidate {
+                kind: GeneralMessagePlanKind::CatActivityQuery,
+                confidence: 100,
+                camera_hint: camera_hint.clone(),
+                query: None,
+                recent_clip: None,
+                reason: "structured_signal_cat_activity_today".to_string(),
             },
         );
     }
@@ -574,6 +664,7 @@ pub(super) fn plan_from_general_message_candidate(
         canonical_phrase: None,
         camera_hint: candidate.camera_hint.clone(),
         query: candidate.query.clone(),
+        cat_activity: CatActivityQueryOptions::default(),
         home_assistant_action: None,
         guardian_rule: None,
         event_id: None,
@@ -648,6 +739,7 @@ pub(super) fn enforce_general_message_nsp_hard_guards(
     plan.home_assistant_action = None;
     plan.camera_hint = None;
     plan.query = None;
+    plan.cat_activity = CatActivityQueryOptions::default();
     plan.reply_text = long_run_requested.then(|| {
         "4h/72h 长压测必须走 operator supervisor，我不能从微信或 WebUI 启动；我可以帮你查看 EVT 就绪状态或生成脱敏证据包。"
             .to_string()
@@ -695,8 +787,11 @@ pub(super) fn general_message_plan_is_actionable_tool(kind: GeneralMessagePlanKi
     matches!(
         kind,
         GeneralMessagePlanKind::CameraReplayRecentClip
+            | GeneralMessagePlanKind::CameraLiveView
             | GeneralMessagePlanKind::CameraSnapshot
+            | GeneralMessagePlanKind::CameraSnapshotAndRecordClip
             | GeneralMessagePlanKind::CameraRecordClip
+            | GeneralMessagePlanKind::CatActivityQuery
             | GeneralMessagePlanKind::KnowledgeSearch
             | GeneralMessagePlanKind::RagAnswer
             | GeneralMessagePlanKind::HomeAssistantServiceAction
@@ -772,8 +867,11 @@ pub(super) fn general_message_plan_decision_label(plan: &GeneralMessagePlan) -> 
         GeneralMessagePlanKind::Clarify => "clarify",
         GeneralMessagePlanKind::CapabilitySummary => "capability_summary",
         GeneralMessagePlanKind::CameraReplayRecentClip => "camera_replay_recent_clip",
+        GeneralMessagePlanKind::CameraLiveView => "camera_live_view",
         GeneralMessagePlanKind::CameraSnapshot => "camera_snapshot",
+        GeneralMessagePlanKind::CameraSnapshotAndRecordClip => "camera_snapshot_and_record_clip",
         GeneralMessagePlanKind::CameraRecordClip => "camera_record_clip",
+        GeneralMessagePlanKind::CatActivityQuery => "cat_activity_query",
         GeneralMessagePlanKind::KnowledgeSearch => "knowledge_search",
         GeneralMessagePlanKind::RagAnswer => "rag_answer",
         GeneralMessagePlanKind::HomeAssistantServiceAction => "ha_service_action",
@@ -811,7 +909,10 @@ pub(super) fn should_try_general_message_router_llm(
     signals: &GeneralMessageSignals,
     _pending_loop: Option<&PendingTaskGeneralMessageLoop>,
 ) -> bool {
-    !signals.normalized.is_empty()
+    let has_explicit_camera_route = signals.explicit_live_view
+        || (signals.explicit_snapshot && signals.explicit_clip)
+        || requests_cat_activity_today(&signals.normalized);
+    !signals.normalized.is_empty() && !has_explicit_camera_route
 }
 
 pub(super) fn build_general_message_router_system_prompt() -> String {
@@ -822,9 +923,13 @@ pub(super) fn build_general_message_router_system_prompt() -> String {
         "{\"decision\":\"...\",\"confidence\":0.95,\"canonical_phrase\":\"...\",",
         "\"camera_hint\":null,\"query\":null,\"event_id\":null,",
         "\"corrected_summary\":null,\"corrected_labels\":null,",
+        "\"cat_activity\":{\"time_scope\":\"inherit|today|morning|afternoon|evening|recent\",",
+        "\"selection\":\"batch|latest|remaining|resend_last\",\"limit\":3},",
         "\"home_assistant\":{\"domain\":null,\"service\":null,\"entity_hint\":null},",
         "\"conversation_act\":null,\"reply_text\":null,\"reason\":\"...\"}. ",
-        "Closed decisions: capability_summary, camera_snapshot, camera_record_clip, ",
+        "Closed decisions: capability_summary, camera_live_view, camera_snapshot, ",
+        "camera_snapshot_and_record_clip, camera_record_clip, cat_activity_query, ",
+        "cat_activity_today is accepted only as a legacy alias for cat_activity_query. ",
         "vision_event_summary, vision_event_notify_latest, vlm_describe_latest_event, ",
         "vlm_describe_event, family_memory_summary, ha_service_action, system_readiness, ",
         "evt_readiness, evt_preflight, evt_evidence_bundle, family_timeline_summary, ",
@@ -839,6 +944,12 @@ pub(super) fn build_general_message_router_system_prompt() -> String {
         "light/switch/input_boolean turn_on/turn_off/toggle and scene turn_on. ",
         "Never extract arbitrary service fields. Use confidence 0.75-0.99 for clear decisions; ",
         "do not copy 0.0 unless the request is genuinely unclear. Chinese semantic rules: ",
+        "asking about the user's cat, pet cat, or a named cat in recorded camera activity means ",
+        "cat_activity_query. For cat_activity_query, only fill the closed cat_activity slots: ",
+        "today is the default scope; 上午=morning, 下午=afternoon, 晚上=evening, 刚才=recent; ",
+        "最新一段=latest with limit 1; 还有吗=remaining; 再发一次=resend_last; otherwise batch. ",
+        "For a contextual follow-up, use recent session recap and time_scope=inherit when omitted. ",
+        "Never emit a path, URL, artifact ID, or publication decision. ",
         "asking what Harbor/K3 can do means capability_summary; asking status/diagnostics/health ",
         "of the home, WeChat entry, K3, HA, camera, or gateway means system_readiness; asking if ",
         "K3 is ready for EVT/stress-test entry means evt_readiness; asking to run an EVT/pre-stress ",
@@ -851,7 +962,9 @@ pub(super) fn build_general_message_router_system_prompt() -> String {
         "guardian_rule_proposal with guardian_rule trigger/action_plan slots; asking to enable this ",
         "rule means guardian_rule_enable; asking to pause/cancel this rule means guardian_rule_pause; ",
         "asking family guardian status means guardian_status; asking to ",
-        "look/check/see the door/front/current camera means camera_snapshot; asking for a short ",
+        "open/watch a camera live stream means camera_live_view; asking to capture both a photo ",
+        "and a video means camera_snapshot_and_record_clip; asking to look/check/see the ",
+        "door/front/current camera means camera_snapshot; asking for a short ",
         "recording/video/clip means camera_record_clip; asking what the camera recently saw means ",
         "vision_event_summary; asking to describe or understand the latest visual event means ",
         "vlm_describe_latest_event; asking what is worth noticing at home means ",
@@ -866,7 +979,9 @@ pub(super) fn build_general_message_router_system_prompt() -> String {
         "with safe slots only. Do not classify supported K3 camera/event/status/HA requests as ",
         "conversation_boundary just because the wording is natural. Choose conversation_boundary ",
         "for weather, news, stocks, internet realtime requests, locks, HVAC, valves, or unsafe ",
-        "actions. Examples: latest camera status to my default contact => ",
+        "actions. For conversation_* decisions, always fill reply_text with a direct, concise ",
+        "Chinese response. Greetings, casual conversation, and stable general knowledge may be ",
+        "answered conversationally without claiming a tool was used. Examples: latest camera status to my default contact => ",
         "{\"decision\":\"vision_event_notify_latest\",\"confidence\":0.95}; ",
         "run the home test scene => {\"decision\":\"ha_service_action\",\"confidence\":0.95,",
         "\"home_assistant\":{\"domain\":\"scene\",\"service\":\"turn_on\",\"entity_hint\":\"test\"}}; ",
@@ -874,6 +989,12 @@ pub(super) fn build_general_message_router_system_prompt() -> String {
         "帮我做一下EVT预检 => {\"decision\":\"evt_preflight\",\"confidence\":0.95}; ",
         "生成压测证据 => {\"decision\":\"evt_evidence_bundle\",\"confidence\":0.95}; ",
         "今天家里发生了什么 => {\"decision\":\"family_timeline_summary\",\"confidence\":0.95}; ",
+        "小咪今天有什么新鲜事 => {\"decision\":\"cat_activity_query\",\"confidence\":0.95,",
+        "\"cat_activity\":{\"time_scope\":\"today\",\"selection\":\"batch\",\"limit\":3}}; ",
+        "下午的呢 => {\"decision\":\"cat_activity_query\",\"confidence\":0.92,",
+        "\"cat_activity\":{\"time_scope\":\"afternoon\",\"selection\":\"batch\",\"limit\":3}}; ",
+        "还有吗 => {\"decision\":\"cat_activity_query\",\"confidence\":0.92,",
+        "\"cat_activity\":{\"time_scope\":\"inherit\",\"selection\":\"remaining\",\"limit\":3}}; ",
         "刚才门口发生了什么 => {\"decision\":\"vlm_describe_latest_event\",\"confidence\":0.95,\"camera_hint\":\"门口\"}; ",
         "今天家里有什么值得注意的 => {\"decision\":\"family_memory_summary\",\"confidence\":0.95}; ",
         "收藏这个 => {\"decision\":\"family_memory_favorite\",\"confidence\":0.95}; ",
@@ -952,8 +1073,17 @@ pub(super) fn parse_general_message_router_decision(
             "camera_snapshot" | "snapshot" => {
                 return Some((GeneralMessagePlanKind::CameraSnapshot, None))
             }
+            "camera_live_view" | "live_view" | "live" => {
+                return Some((GeneralMessagePlanKind::CameraLiveView, None))
+            }
+            "camera_snapshot_and_record_clip" | "snapshot_and_clip" => {
+                return Some((GeneralMessagePlanKind::CameraSnapshotAndRecordClip, None))
+            }
             "camera_record_clip" | "record_clip" | "clip" => {
                 return Some((GeneralMessagePlanKind::CameraRecordClip, None))
+            }
+            "cat_activity_today" | "cat_today" => {
+                return Some((GeneralMessagePlanKind::CatActivityQuery, None))
             }
             "knowledge_search" | "search" => {
                 return Some((GeneralMessagePlanKind::KnowledgeSearch, None))
@@ -1092,8 +1222,13 @@ pub(super) fn build_general_message_renderer_prompt(
             GeneralMessagePlanKind::Unsupported => "unsupported",
             GeneralMessagePlanKind::CapabilitySummary => "capability_summary",
             GeneralMessagePlanKind::CameraReplayRecentClip => "camera_replay_recent_clip",
+            GeneralMessagePlanKind::CameraLiveView => "camera_live_view",
             GeneralMessagePlanKind::CameraSnapshot => "camera_snapshot",
+            GeneralMessagePlanKind::CameraSnapshotAndRecordClip => {
+                "camera_snapshot_and_record_clip"
+            }
             GeneralMessagePlanKind::CameraRecordClip => "camera_record_clip",
+            GeneralMessagePlanKind::CatActivityQuery => "cat_activity_query",
             GeneralMessagePlanKind::KnowledgeSearch => "knowledge_search",
             GeneralMessagePlanKind::RagAnswer => "rag_answer",
             GeneralMessagePlanKind::HomeAssistantServiceAction => "ha_service_action",
@@ -1218,6 +1353,8 @@ pub(super) fn general_message_requests_local_first_architecture_summary(raw_text
 
 pub(super) fn general_message_supported_examples() -> Vec<String> {
     vec![
+        "今天猫干了什么".to_string(),
+        "只发最新一段猫活动视频".to_string(),
         "拍一张门口".to_string(),
         "录一段门口".to_string(),
         "最近事件".to_string(),
@@ -1249,7 +1386,7 @@ pub(super) fn general_message_support_summary_for_request(raw_text: &str) -> Str
 }
 
 pub(super) fn general_message_support_summary() -> String {
-    "我可以作为 K3 家庭入口：摄像头抓拍/短视频、最近事件、通知最新事件、按需 VLM 理解最新事件、家庭记忆摘要、家庭时间线、家庭守护规则草稿/启用/暂停、低风险家居动作、状态诊断、EVT 就绪/预检/脱敏证据包，也能搜索/问答已有知识库；守护规则只有你明确启用后才会自动执行，遇到多个家居实体时我会先让你选择，不会猜着执行，VLM 只走本地按需/低频抽样，4h/72h 长压测必须走 operator supervisor。".to_string()
+    "我可以作为 K3 家庭入口：查询已复核发布的猫活动视频、摄像头抓拍/短视频、最近事件、通知最新事件、按需 VLM 理解最新事件、家庭记忆摘要、家庭时间线、家庭守护规则草稿/启用/暂停、低风险家居动作、状态诊断、EVT 就绪/预检/脱敏证据包，也能搜索/问答已有知识库；守护规则只有你明确启用后才会自动执行，遇到多个家居实体时我会先让你选择，不会猜着执行，VLM 只走本地按需/低频抽样，4h/72h 长压测必须走 operator supervisor。".to_string()
 }
 
 pub(super) fn general_message_unsupported_summary() -> String {
@@ -1362,8 +1499,15 @@ pub(super) fn parse_general_message_plan(text: &str) -> Option<GeneralMessagePla
             (GeneralMessagePlanKind::CapabilitySummary, None)
         }
         "camera_snapshot" | "snapshot" => (GeneralMessagePlanKind::CameraSnapshot, None),
+        "camera_live_view" | "live_view" | "live" => (GeneralMessagePlanKind::CameraLiveView, None),
+        "camera_snapshot_and_record_clip" | "snapshot_and_clip" => {
+            (GeneralMessagePlanKind::CameraSnapshotAndRecordClip, None)
+        }
         "camera_record_clip" | "record_clip" | "clip" => {
             (GeneralMessagePlanKind::CameraRecordClip, None)
+        }
+        "cat_activity_query" | "cat_activity_today" | "cat_today" => {
+            (GeneralMessagePlanKind::CatActivityQuery, None)
         }
         "knowledge_search" | "search" => (GeneralMessagePlanKind::KnowledgeSearch, None),
         "rag_answer" | "rag.answer" | "answer" => (GeneralMessagePlanKind::RagAnswer, None),
@@ -1460,6 +1604,7 @@ pub(super) fn parse_general_message_plan(text: &str) -> Option<GeneralMessagePla
     } else {
         None
     };
+    let cat_activity = cat_activity_query_options_from_payload(&payload);
     Some(GeneralMessagePlan {
         kind,
         conversation_act,
@@ -1467,6 +1612,7 @@ pub(super) fn parse_general_message_plan(text: &str) -> Option<GeneralMessagePla
         canonical_phrase: normalize_optional_general_message_plan_field(payload.canonical_phrase),
         camera_hint: normalize_optional_general_message_plan_field(payload.camera_hint),
         query: normalize_optional_general_message_plan_field(payload.query),
+        cat_activity,
         home_assistant_action,
         guardian_rule: payload.guardian_rule,
         event_id: normalize_optional_general_message_plan_field(payload.event_id),
@@ -1476,6 +1622,94 @@ pub(super) fn parse_general_message_plan(text: &str) -> Option<GeneralMessagePla
         recent_clip: None,
         reason: normalize_optional_general_message_plan_field(payload.reason),
     })
+}
+
+fn cat_activity_query_options_from_payload(
+    payload: &GeneralMessagePlanPayload,
+) -> CatActivityQueryOptions {
+    let Some(cat_activity) = payload.cat_activity.as_ref() else {
+        return CatActivityQueryOptions::default();
+    };
+    let time_scope = cat_activity
+        .time_scope
+        .as_deref()
+        .and_then(CatActivityTimeScope::parse)
+        .unwrap_or_default();
+    let selection = cat_activity
+        .selection
+        .as_deref()
+        .and_then(CatActivitySelection::parse)
+        .unwrap_or_default();
+    let limit = if selection == CatActivitySelection::Latest {
+        1
+    } else {
+        cat_activity
+            .limit
+            .as_ref()
+            .and_then(cat_activity_limit_from_value)
+            .unwrap_or(CAT_ACTIVITY_DEFAULT_BATCH_LIMIT)
+            .clamp(1, CAT_ACTIVITY_MAX_BATCH_LIMIT)
+    };
+    CatActivityQueryOptions {
+        time_scope,
+        selection,
+        limit,
+    }
+}
+
+fn cat_activity_limit_from_value(value: &Value) -> Option<usize> {
+    value
+        .as_u64()
+        .and_then(|limit| usize::try_from(limit).ok())
+        .or_else(|| value.as_str()?.trim().parse::<usize>().ok())
+}
+
+pub(super) fn infer_cat_activity_query_options(raw_text: &str) -> CatActivityQueryOptions {
+    let normalized = normalize_command_text(raw_text);
+    let selection = if matches_any(&normalized, &["再发一次", "重发", "再发一遍", "刚才那段"])
+    {
+        CatActivitySelection::ResendLast
+    } else if matches_any(
+        &normalized,
+        &["还有吗", "还有呢", "还有没有", "别的呢", "其他的呢"],
+    ) {
+        CatActivitySelection::Remaining
+    } else if matches_any(
+        &normalized,
+        &["最新一段", "最近一段", "只发一段", "最后一段"],
+    ) {
+        CatActivitySelection::Latest
+    } else {
+        CatActivitySelection::Batch
+    };
+    let time_scope = if matches_any(&normalized, &["上午", "早上", "清晨"]) {
+        CatActivityTimeScope::Morning
+    } else if normalized.contains("下午") {
+        CatActivityTimeScope::Afternoon
+    } else if matches_any(&normalized, &["晚上", "今晚", "夜里"]) {
+        CatActivityTimeScope::Evening
+    } else if selection == CatActivitySelection::Remaining
+        || selection == CatActivitySelection::ResendLast
+    {
+        CatActivityTimeScope::Inherit
+    } else if matches_any(&normalized, &["刚才", "最近"]) {
+        CatActivityTimeScope::Recent
+    } else if selection == CatActivitySelection::Latest
+        && !matches_any(&normalized, &["今天", "今日"])
+    {
+        CatActivityTimeScope::Inherit
+    } else {
+        CatActivityTimeScope::Today
+    };
+    CatActivityQueryOptions {
+        time_scope,
+        selection,
+        limit: if selection == CatActivitySelection::Latest {
+            1
+        } else {
+            CAT_ACTIVITY_DEFAULT_BATCH_LIMIT
+        },
+    }
 }
 
 pub(super) fn normalize_general_message_nsp_confidence(value: Option<&Value>) -> Option<u8> {
@@ -1574,6 +1808,7 @@ pub(super) fn fallback_general_message_plan(
             canonical_phrase: Some("长压测启动拒绝".to_string()),
             camera_hint: None,
             query: None,
+            cat_activity: CatActivityQueryOptions::default(),
             home_assistant_action: None,
             guardian_rule: None,
             event_id: None,
@@ -1593,6 +1828,7 @@ pub(super) fn fallback_general_message_plan(
             canonical_phrase: None,
             camera_hint: None,
             query: None,
+            cat_activity: CatActivityQueryOptions::default(),
             home_assistant_action: None,
             guardian_rule: None,
             event_id: None,
@@ -1612,6 +1848,7 @@ pub(super) fn fallback_general_message_plan(
             canonical_phrase: None,
             camera_hint: None,
             query: None,
+            cat_activity: CatActivityQueryOptions::default(),
             home_assistant_action: None,
             guardian_rule: None,
             event_id: None,
@@ -1630,6 +1867,7 @@ pub(super) fn fallback_general_message_plan(
             canonical_phrase: None,
             camera_hint: None,
             query: None,
+            cat_activity: CatActivityQueryOptions::default(),
             home_assistant_action: None,
             guardian_rule: None,
             event_id: None,
@@ -1648,6 +1886,7 @@ pub(super) fn fallback_general_message_plan(
             canonical_phrase: None,
             camera_hint: None,
             query: None,
+            cat_activity: CatActivityQueryOptions::default(),
             home_assistant_action: None,
             guardian_rule: None,
             event_id: None,
@@ -1666,6 +1905,7 @@ pub(super) fn fallback_general_message_plan(
             canonical_phrase: None,
             camera_hint: None,
             query: None,
+            cat_activity: CatActivityQueryOptions::default(),
             home_assistant_action: None,
             guardian_rule: None,
             event_id: None,
@@ -1677,12 +1917,95 @@ pub(super) fn fallback_general_message_plan(
         });
     }
 
-    if !looks_like_video_search_request(&normalized)
+    if requests_cat_activity_today(&normalized) {
+        return Some(GeneralMessagePlan {
+            kind: GeneralMessagePlanKind::CatActivityQuery,
+            conversation_act: None,
+            reply_text: None,
+            canonical_phrase: None,
+            camera_hint: default_camera_hint.map(str::to_string),
+            query: None,
+            cat_activity: infer_cat_activity_query_options(raw_text),
+            home_assistant_action: None,
+            guardian_rule: None,
+            event_id: None,
+            corrected_summary: None,
+            corrected_labels: None,
+            confidence: None,
+            recent_clip: None,
+            reason: Some("fallback rule inferred today's cat activity query".to_string()),
+        });
+    }
+
+    let explicit_snapshot = matches_any(
+        &normalized,
+        &["抓拍", "拍照", "拍一张", "来一张", "快照", "截图", "截一张"],
+    );
+    let explicit_clip = !looks_like_video_search_request(&normalized)
         && matches_any(
             &normalized,
-            &["录一段", "录视频", "拍视频", "录个视频", "录像"],
-        )
-    {
+            &[
+                "录一段",
+                "录一下",
+                "录个",
+                "录像",
+                "录视频",
+                "拍视频",
+                "短视频",
+                "一段视频",
+            ],
+        );
+    if explicit_snapshot && explicit_clip {
+        return Some(GeneralMessagePlan {
+            kind: GeneralMessagePlanKind::CameraSnapshotAndRecordClip,
+            conversation_act: None,
+            reply_text: None,
+            canonical_phrase: None,
+            camera_hint: default_camera_hint.map(str::to_string),
+            query: None,
+            cat_activity: CatActivityQueryOptions::default(),
+            home_assistant_action: None,
+            guardian_rule: None,
+            event_id: None,
+            corrected_summary: None,
+            corrected_labels: None,
+            confidence: None,
+            recent_clip: None,
+            reason: Some("fallback rule inferred a snapshot and clip request".to_string()),
+        });
+    }
+    if matches_any(
+        &normalized,
+        &[
+            "实时直播",
+            "实时画面",
+            "实时视频",
+            "打开直播",
+            "查看直播",
+            "liveview",
+            "livestream",
+        ],
+    ) {
+        return Some(GeneralMessagePlan {
+            kind: GeneralMessagePlanKind::CameraLiveView,
+            conversation_act: None,
+            reply_text: None,
+            canonical_phrase: None,
+            camera_hint: default_camera_hint.map(str::to_string),
+            query: None,
+            cat_activity: CatActivityQueryOptions::default(),
+            home_assistant_action: None,
+            guardian_rule: None,
+            event_id: None,
+            corrected_summary: None,
+            corrected_labels: None,
+            confidence: None,
+            recent_clip: None,
+            reason: Some("fallback rule inferred a live camera request".to_string()),
+        });
+    }
+
+    if explicit_clip {
         return Some(GeneralMessagePlan {
             kind: GeneralMessagePlanKind::CameraRecordClip,
             conversation_act: None,
@@ -1690,6 +2013,7 @@ pub(super) fn fallback_general_message_plan(
             canonical_phrase: None,
             camera_hint: default_camera_hint.map(str::to_string),
             query: None,
+            cat_activity: CatActivityQueryOptions::default(),
             home_assistant_action: None,
             guardian_rule: None,
             event_id: None,
@@ -1700,7 +2024,7 @@ pub(super) fn fallback_general_message_plan(
             reason: Some("fallback rule inferred a short clip request".to_string()),
         });
     }
-    if matches_any(&normalized, &["抓拍", "拍照", "拍一张", "看一眼", "截一张"]) {
+    if explicit_snapshot || matches_any(&normalized, &["看一眼"]) {
         return Some(GeneralMessagePlan {
             kind: GeneralMessagePlanKind::CameraSnapshot,
             conversation_act: None,
@@ -1708,6 +2032,7 @@ pub(super) fn fallback_general_message_plan(
             canonical_phrase: None,
             camera_hint: default_camera_hint.map(str::to_string),
             query: None,
+            cat_activity: CatActivityQueryOptions::default(),
             home_assistant_action: None,
             guardian_rule: None,
             event_id: None,
@@ -1726,6 +2051,7 @@ pub(super) fn fallback_general_message_plan(
             canonical_phrase: None,
             camera_hint: None,
             query: infer_query_from_raw_text(raw_text),
+            cat_activity: CatActivityQueryOptions::default(),
             home_assistant_action: None,
             guardian_rule: None,
             event_id: None,
@@ -1760,6 +2086,7 @@ pub(super) fn fallback_general_message_plan(
             canonical_phrase: None,
             camera_hint: None,
             query: infer_query_from_raw_text(raw_text),
+            cat_activity: CatActivityQueryOptions::default(),
             home_assistant_action: None,
             guardian_rule: None,
             event_id: None,
@@ -1771,4 +2098,103 @@ pub(super) fn fallback_general_message_plan(
         });
     }
     None
+}
+
+#[cfg(test)]
+mod cat_activity_tests {
+    use super::{
+        parse_general_message_plan, requests_cat_activity_today,
+        should_try_general_message_router_llm,
+    };
+    use crate::runtime::task_api::{
+        CatActivitySelection, CatActivityTimeScope, GeneralMessagePlanKind, GeneralMessageSignals,
+    };
+
+    #[test]
+    fn recognizes_today_cat_activity_questions_without_matching_generic_cat_text() {
+        assert!(requests_cat_activity_today("我那只猫今天干了什么"));
+        assert!(requests_cat_activity_today("看看猫今天的活动视频"));
+        assert!(requests_cat_activity_today("今天猫出现过吗"));
+        assert!(requests_cat_activity_today("猫今天来过吗"));
+        assert!(requests_cat_activity_today("最近猫有什么视频"));
+        assert!(requests_cat_activity_today("我家猫今天怎么样"));
+        assert!(!requests_cat_activity_today("我家有一只猫"));
+        assert!(!requests_cat_activity_today("猫粮怎么选"));
+    }
+
+    #[test]
+    fn explicit_today_cat_activity_skips_the_general_message_nsp() {
+        let signals = GeneralMessageSignals {
+            normalized: "我那只猫今天干了什么".to_string(),
+            asks_capability: false,
+            explicit_clip_playback: false,
+            explicit_live_view: false,
+            explicit_snapshot: false,
+            explicit_clip: false,
+            explicit_search: false,
+            explicit_rag_answer: false,
+            explicit_ha_action: false,
+            explicit_event_summary: false,
+            explicit_event_notify: false,
+            explicit_system_readiness: false,
+            mentions_camera_context: false,
+            ambiguous_visual_request: false,
+            recent_camera_context: false,
+            recent_clip_available: false,
+            recent_search_context: false,
+        };
+
+        assert!(!should_try_general_message_router_llm(&signals, None));
+    }
+
+    #[test]
+    fn non_keyword_cat_alias_is_left_for_the_general_message_nsp() {
+        let signals = GeneralMessageSignals {
+            normalized: "小咪今天有什么新鲜事".to_string(),
+            asks_capability: false,
+            explicit_clip_playback: false,
+            explicit_live_view: false,
+            explicit_snapshot: false,
+            explicit_clip: false,
+            explicit_search: false,
+            explicit_rag_answer: false,
+            explicit_ha_action: false,
+            explicit_event_summary: false,
+            explicit_event_notify: false,
+            explicit_system_readiness: false,
+            mentions_camera_context: false,
+            ambiguous_visual_request: false,
+            recent_camera_context: false,
+            recent_clip_available: false,
+            recent_search_context: false,
+        };
+
+        assert!(should_try_general_message_router_llm(&signals, None));
+    }
+
+    #[test]
+    fn parses_bounded_cat_activity_query_slots() {
+        let plan = parse_general_message_plan(
+            r#"{
+                "decision":"cat_activity_query",
+                "confidence":0.96,
+                "camera_hint":"camera-252",
+                "cat_activity":{
+                    "time_scope":"afternoon",
+                    "selection":"latest",
+                    "limit":99
+                }
+            }"#,
+        )
+        .expect("cat activity query plan");
+
+        assert_eq!(plan.kind, GeneralMessagePlanKind::CatActivityQuery);
+        assert_eq!(plan.confidence, Some(96));
+        assert_eq!(
+            plan.cat_activity.time_scope,
+            CatActivityTimeScope::Afternoon
+        );
+        assert_eq!(plan.cat_activity.selection, CatActivitySelection::Latest);
+        assert_eq!(plan.cat_activity.limit, 1);
+    }
 }

@@ -50,7 +50,9 @@ def main() -> int:
         raise RuntimeError(f"failed to read image: {args.image}")
 
     pre_started = time.perf_counter()
-    tensor, letterbox = preprocess(image, input_h, input_w)
+    tensor, letterbox = preprocess(
+        image, input_h, input_w, letterbox_pad_value(len(output_names))
+    )
     preprocess_ms = elapsed_ms(pre_started)
 
     infer_started = time.perf_counter()
@@ -117,7 +119,11 @@ def input_hw(shape) -> tuple[int, int]:
     return int(shape[2]), int(shape[3])
 
 
-def preprocess(image, input_h: int, input_w: int):
+def letterbox_pad_value(output_count: int) -> int:
+    return 114 if output_count == 1 else 0
+
+
+def preprocess(image, input_h: int, input_w: int, pad_value: int = 0):
     original_h, original_w = image.shape[:2]
     ratio = min(input_h / original_h, input_w / original_w)
     resized_w = int(round(original_w * ratio))
@@ -131,7 +137,13 @@ def preprocess(image, input_h: int, input_w: int):
     left = int(round(dw - 0.1))
     right = int(round(dw + 0.1))
     padded = cv2.copyMakeBorder(
-        rgb, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(0, 0, 0)
+        rgb,
+        top,
+        bottom,
+        left,
+        right,
+        cv2.BORDER_CONSTANT,
+        value=(pad_value, pad_value, pad_value),
     )
     tensor = padded.astype(np.float32) / 255.0
     tensor = np.transpose(tensor, (2, 0, 1))[None, :, :, :]
@@ -139,41 +151,101 @@ def preprocess(image, input_h: int, input_w: int):
 
 
 def postprocess(outputs, labels, letterbox, original_shape, conf_threshold, iou_threshold, limit):
+    if len(outputs) == 1:
+        return postprocess_combined_output(
+            outputs[0],
+            labels,
+            letterbox,
+            original_shape,
+            conf_threshold,
+            iou_threshold,
+            limit,
+        )
     if len(outputs) % 3 != 0:
         raise RuntimeError(f"unexpected YOLOv8 output count: {len(outputs)}")
     pair_per_branch = len(outputs) // 3
-    boxes, class_scores, object_scores = [], [], []
+    boxes, class_scores = [], []
     input_h = letterbox["input_h"]
     input_w = letterbox["input_w"]
 
     for index in range(3):
         position = outputs[pair_per_branch * index]
         classes = outputs[pair_per_branch * index + 1]
-        score = outputs[pair_per_branch * index + 2]
         boxes.append(flatten_head(box_process(position, input_h, input_w)))
         class_scores.append(flatten_head(classes))
-        object_scores.append(flatten_head(score).reshape(-1))
 
     boxes = np.concatenate(boxes)
     class_scores = np.concatenate(class_scores)
-    object_scores = np.concatenate(object_scores)
     class_ids = np.argmax(class_scores, axis=-1)
-    class_conf = np.max(class_scores, axis=-1)
-    scores = class_conf * object_scores
+    scores = np.max(class_scores, axis=-1)
     keep = np.where(scores >= conf_threshold)[0]
     boxes = boxes[keep]
     class_ids = class_ids[keep]
     scores = scores[keep]
     if boxes.size == 0:
         return []
+    return format_detections(
+        boxes,
+        class_ids,
+        scores,
+        labels,
+        letterbox,
+        original_shape,
+        iou_threshold,
+        limit,
+    )
 
+
+def postprocess_combined_output(
+    output, labels, letterbox, original_shape, conf_threshold, iou_threshold, limit
+):
+    predictions = np.squeeze(output, axis=0)
+    expected_columns = 4 + len(labels)
+    if predictions.ndim == 2 and predictions.shape[0] == expected_columns:
+        predictions = predictions.transpose()
+    if predictions.ndim != 2 or predictions.shape[1] != expected_columns:
+        raise RuntimeError(f"unexpected combined YOLOv8 output shape: {output.shape}")
+
+    class_scores = predictions[:, 4:]
+    class_ids = np.argmax(class_scores, axis=-1)
+    scores = np.max(class_scores, axis=-1)
+    keep = np.where(scores >= conf_threshold)[0]
+    predictions = predictions[keep]
+    class_ids = class_ids[keep]
+    scores = scores[keep]
+    if predictions.size == 0:
+        return []
+
+    center_x, center_y, width, height = predictions[:, :4].transpose()
+    boxes = np.column_stack(
+        (
+            center_x - width / 2,
+            center_y - height / 2,
+            center_x + width / 2,
+            center_y + height / 2,
+        )
+    )
+    return format_detections(
+        boxes,
+        class_ids,
+        scores,
+        labels,
+        letterbox,
+        original_shape,
+        iou_threshold,
+        limit,
+    )
+
+
+def format_detections(
+    boxes, class_ids, scores, labels, letterbox, original_shape, iou_threshold, limit
+):
     boxes = scale_boxes_to_original(boxes, letterbox, original_shape)
     kept = []
     for class_id in sorted(set(class_ids.tolist())):
         indexes = np.where(class_ids == class_id)[0]
         for keep_index in nms(boxes[indexes], scores[indexes], iou_threshold):
-            source_index = indexes[keep_index]
-            kept.append(source_index)
+            kept.append(indexes[keep_index])
 
     kept = sorted(kept, key=lambda item: float(scores[item]), reverse=True)[:limit]
     detections = []

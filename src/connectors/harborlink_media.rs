@@ -7,7 +7,8 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
+use std::path::Path;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -95,12 +96,25 @@ struct StartLiveSessionRequest<'a> {
 struct StartDetectionLeaseRequest<'a> {
     stream_profile: &'a str,
     ttl_seconds: u64,
+    pre_roll_seconds: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct StartRecordingRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_profile: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StartEventRecordingRequest<'a> {
+    event_id: &'a str,
+    owner: &'a str,
+    labels: &'a [&'a str],
+    stream_profile: &'a str,
+    ttl_seconds: u64,
+    pre_roll_seconds: u32,
+    trigger_epoch_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -128,6 +142,10 @@ pub struct HarborLinkDetectionLease {
     pub started_at: String,
     pub updated_at: String,
     pub expires_at: String,
+    #[serde(default)]
+    pub pre_roll_seconds: u32,
+    #[serde(default)]
+    pub pre_roll_ready: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -144,10 +162,38 @@ pub struct HarborLinkRecordingStatus {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct HarborLinkEventRecordingLease {
+    pub camera_id: String,
+    pub lease_id: String,
+    pub event_id: String,
+    pub owner: String,
+    pub status: String,
+    pub stream_profile: String,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    pub started_at: String,
+    pub updated_at: String,
+    pub expires_at: String,
+    #[serde(default)]
+    pub pre_roll_seconds: u32,
+    #[serde(default)]
+    pub trigger_epoch_ms: u64,
+    #[serde(default)]
+    pub artifacts: Vec<HarborLinkRecordingArtifact>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HarborLinkClipCapture {
     pub camera_id: String,
+    #[serde(default)]
     pub clip_path: String,
+    #[serde(default)]
     pub keyframe_paths: Vec<String>,
+    #[serde(default)]
+    pub clip_artifact: Option<HarborLinkRecordingArtifact>,
+    #[serde(default)]
+    pub keyframe_artifacts: Vec<HarborLinkRecordingArtifact>,
     pub mime_type: String,
     pub byte_size: u64,
     pub captured_at_epoch_ms: u128,
@@ -161,6 +207,7 @@ pub struct HarborLinkClipCapture {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HarborLinkRecordingArtifact {
+    pub media_contract_version: String,
     pub artifact_id: String,
     pub camera_id: String,
     pub kind: String,
@@ -176,6 +223,12 @@ pub struct HarborLinkRecordingArtifact {
     pub stream_kind: String,
     pub modified_at_epoch_ms: u128,
     pub preview_url: String,
+    #[serde(default)]
+    pub event_id: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -411,6 +464,7 @@ impl HarborLinkMediaClient {
         camera_id: &str,
         stream_profile: &str,
         ttl_seconds: u64,
+        pre_roll_seconds: u32,
     ) -> Result<HarborLinkDetectionLease, String> {
         let response = self
             .request(
@@ -418,14 +472,21 @@ impl HarborLinkMediaClient {
                 self.detection_lease_collection_endpoint(camera_id),
                 true,
             )
-            .timeout(Duration::from_secs(4))
+            .timeout(Duration::from_secs(12))
             .json(&StartDetectionLeaseRequest {
                 stream_profile,
                 ttl_seconds,
+                pre_roll_seconds,
             })
             .send_harborlink()
             .map_err(unavailable_error)?;
-        decode_json_response(response, "detection lease")
+        let lease: HarborLinkDetectionLease = decode_json_response(response, "detection lease")?;
+        if pre_roll_seconds > 0
+            && (!lease.pre_roll_ready || lease.pre_roll_seconds < pre_roll_seconds)
+        {
+            return Err("HarborLink did not prepare the requested detection pre-roll".to_string());
+        }
+        Ok(lease)
     }
 
     pub fn detection_lease_status(
@@ -565,6 +626,116 @@ impl HarborLinkMediaClient {
         self.recording_request(camera_id, reqwest::Method::DELETE, None)
     }
 
+    pub fn start_event_recording(
+        &self,
+        camera_id: &str,
+        event_id: &str,
+        stream_profile: &str,
+        ttl_seconds: u64,
+        pre_roll_seconds: u32,
+        trigger_epoch_ms: u64,
+    ) -> Result<HarborLinkEventRecordingLease, String> {
+        let response = self
+            .request(
+                reqwest::Method::POST,
+                self.event_recording_endpoint(camera_id, "current"),
+                true,
+            )
+            .timeout(Duration::from_secs(10))
+            .json(&StartEventRecordingRequest {
+                event_id,
+                owner: "harborbeacon",
+                labels: &["cat"],
+                stream_profile,
+                ttl_seconds,
+                pre_roll_seconds,
+                trigger_epoch_ms,
+            })
+            .send_harborlink()
+            .map_err(unavailable_error)?;
+        let lease: HarborLinkEventRecordingLease =
+            decode_json_response(response, "event recording")?;
+        if pre_roll_seconds > 0
+            && (lease.pre_roll_seconds < pre_roll_seconds
+                || lease.trigger_epoch_ms != trigger_epoch_ms)
+        {
+            return Err("HarborLink did not honor the requested event pre-roll".to_string());
+        }
+        Ok(lease)
+    }
+
+    pub fn event_recording_status(
+        &self,
+        camera_id: &str,
+    ) -> Result<HarborLinkEventRecordingLease, String> {
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                self.event_recording_endpoint(camera_id, "current"),
+                false,
+            )
+            .timeout(Duration::from_secs(4))
+            .send_harborlink()
+            .map_err(unavailable_error)?;
+        decode_json_response(response, "event recording")
+    }
+
+    pub fn event_recording_lease_status(
+        &self,
+        camera_id: &str,
+        lease_id: &str,
+    ) -> Result<HarborLinkEventRecordingLease, String> {
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                self.event_recording_endpoint(camera_id, lease_id),
+                false,
+            )
+            .timeout(Duration::from_secs(4))
+            .send_harborlink()
+            .map_err(unavailable_error)?;
+        decode_json_response(response, "event recording")
+    }
+
+    pub fn renew_event_recording(
+        &self,
+        camera_id: &str,
+        lease_id: &str,
+        ttl_seconds: u64,
+    ) -> Result<HarborLinkEventRecordingLease, String> {
+        let response = self
+            .request(
+                reqwest::Method::POST,
+                format!(
+                    "{}/renew",
+                    self.event_recording_endpoint(camera_id, lease_id)
+                ),
+                true,
+            )
+            .timeout(Duration::from_secs(4))
+            .json(&json!({ "ttl_seconds": ttl_seconds }))
+            .send_harborlink()
+            .map_err(unavailable_error)?;
+        decode_json_response(response, "event recording")
+    }
+
+    pub fn stop_event_recording(
+        &self,
+        camera_id: &str,
+        lease_id: &str,
+    ) -> Result<HarborLinkEventRecordingLease, String> {
+        let response = self
+            .request(
+                reqwest::Method::DELETE,
+                self.event_recording_endpoint(camera_id, lease_id),
+                true,
+            )
+            .timeout(Duration::from_secs(10))
+            .send_harborlink()
+            .map_err(unavailable_error)?;
+        decode_json_response(response, "event recording")
+    }
+
     pub fn capture_clip(
         &self,
         camera_id: &str,
@@ -626,6 +797,15 @@ impl HarborLinkMediaClient {
             .map_err(|error| {
                 format!("HarborLink returned an invalid camera recording response: {error}")
             })
+    }
+
+    fn event_recording_endpoint(&self, camera_id: &str, lease_id: &str) -> String {
+        format!(
+            "{}/v1/cameras/{}/event-recordings/{}",
+            self.base_url,
+            encode_path_segment(camera_id),
+            encode_path_segment(lease_id)
+        )
     }
 
     pub fn credential_status(&self, camera_id: &str) -> Result<HarborLinkCredentialStatus, String> {
@@ -859,6 +1039,13 @@ impl HarborLinkMediaClient {
             .timeout(Duration::from_secs(10))
             .send_harborlink()
             .map_err(unavailable_error)?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(json!({
+                "artifactId": artifact_id,
+                "deleted": true,
+                "alreadyAbsent": true
+            }));
+        }
         decode_json_response(response, "DVR artifact deletion")
     }
 
@@ -887,6 +1074,65 @@ impl HarborLinkMediaClient {
         } else {
             Err(redacted_media_response_error(response, "DVR artifact"))
         }
+    }
+
+    pub fn download_dvr_artifact_to(
+        &self,
+        artifact_id: &str,
+        destination: &Path,
+        max_bytes: u64,
+    ) -> Result<u64, String> {
+        if max_bytes == 0 {
+            return Err("DVR artifact download limit must be greater than zero".to_string());
+        }
+        let response = self.open_dvr_artifact(artifact_id, None)?;
+        if response
+            .content_length()
+            .is_some_and(|content_length| content_length > max_bytes)
+        {
+            return Err(format!(
+                "DVR artifact exceeds the validation download limit of {max_bytes} bytes"
+            ));
+        }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "failed to create DVR artifact download directory {}: {error}",
+                    parent.display()
+                )
+            })?;
+        }
+        let temp_path =
+            destination.with_extension(format!("download-{}.part", Uuid::new_v4().simple()));
+        let result = (|| {
+            let mut output = fs::File::create(&temp_path).map_err(|error| {
+                format!(
+                    "failed to create DVR artifact download {}: {error}",
+                    temp_path.display()
+                )
+            })?;
+            let copied = io::copy(&mut response.take(max_bytes.saturating_add(1)), &mut output)
+                .map_err(|error| format!("failed to download DVR artifact: {error}"))?;
+            if copied > max_bytes {
+                return Err(format!(
+                    "DVR artifact exceeds the validation download limit of {max_bytes} bytes"
+                ));
+            }
+            output
+                .sync_data()
+                .map_err(|error| format!("failed to persist DVR artifact download: {error}"))?;
+            fs::rename(&temp_path, destination).map_err(|error| {
+                format!(
+                    "failed to finalize DVR artifact download {}: {error}",
+                    destination.display()
+                )
+            })?;
+            Ok(copied)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp_path);
+        }
+        result
     }
 
     pub fn upsert_camera(&self, camera_id: &str, camera: &Value) -> Result<Value, String> {
@@ -1244,8 +1490,8 @@ fn encode_path_segment(value: &str) -> String {
 mod tests {
     use super::{
         encode_path_segment, harborlink_request_scope, HarborLinkContractError,
-        HarborLinkMediaClient, StartDetectionLeaseRequest, StartLiveSessionRequest,
-        StartRecordingRequest,
+        HarborLinkMediaClient, StartDetectionLeaseRequest, StartEventRecordingRequest,
+        StartLiveSessionRequest, StartRecordingRequest,
     };
 
     #[test]
@@ -1282,12 +1528,14 @@ mod tests {
         let body = serde_json::to_value(StartDetectionLeaseRequest {
             stream_profile: "sub",
             ttl_seconds: 60,
+            pre_roll_seconds: 3,
         })
         .expect("serialize request");
 
         assert_eq!(body["stream_profile"], "sub");
         assert_eq!(body["ttl_seconds"], 60);
-        assert_eq!(body.as_object().map(|value| value.len()), Some(2));
+        assert_eq!(body["pre_roll_seconds"], 3);
+        assert_eq!(body.as_object().map(|value| value.len()), Some(3));
         assert_eq!(
             client.detection_lease_endpoint("camera 1/left", "detect/lease"),
             "http://127.0.0.1:8790/v1/cameras/camera%201%2Fleft/detection-leases/detect%2Flease"
@@ -1313,6 +1561,28 @@ mod tests {
         .expect("serialize request");
 
         assert!(body.get("stream_profile").is_none());
+    }
+
+    #[test]
+    fn event_recording_request_uses_selected_stream_profile() {
+        for stream_profile in ["main", "sub"] {
+            let body = serde_json::to_value(StartEventRecordingRequest {
+                event_id: "cat-activity-test",
+                owner: "harborbeacon",
+                labels: &["cat"],
+                stream_profile,
+                ttl_seconds: 45,
+                pre_roll_seconds: 3,
+                trigger_epoch_ms: 1_786_060_800_123,
+            })
+            .expect("serialize request");
+
+            assert_eq!(body["streamProfile"], stream_profile);
+            assert_eq!(body["eventId"], "cat-activity-test");
+            assert_eq!(body["owner"], "harborbeacon");
+            assert_eq!(body["preRollSeconds"], 3);
+            assert_eq!(body["triggerEpochMs"], 1_786_060_800_123_u64);
+        }
     }
 
     #[test]

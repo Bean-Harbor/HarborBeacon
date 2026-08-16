@@ -166,7 +166,9 @@ impl VisionExecutor {
             notification_channel: "im_bridge".to_string(),
             notification_format: "lark_card".to_string(),
             notification_card,
-        })
+            delivery_hints: Vec::new(),
+        }
+        .with_delivery_contract())
     }
 
     fn find_device(&self, device_id: &str) -> Result<ResolvedCameraTarget, String> {

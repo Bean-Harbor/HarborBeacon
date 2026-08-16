@@ -1,7 +1,8 @@
 //! Vision domain actions for detection and image understanding.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::connectors::storage::StorageObjectRef;
 use crate::runtime::media::DeviceArtifactMetadata;
@@ -101,6 +102,47 @@ pub struct VisionAnalyzeCameraPayload {
     pub notification_format: String,
     #[serde(default, alias = "feishu_card")]
     pub notification_card: Value,
+    #[serde(default)]
+    pub delivery_hints: Vec<Value>,
+}
+
+impl VisionAnalyzeCameraPayload {
+    pub fn with_delivery_contract(mut self) -> Self {
+        let mut hints = vec![vision_image_delivery_hint(
+            "analysis_snapshot",
+            &self.snapshot.image_path,
+        )];
+        if let Some(path) = self
+            .snapshot
+            .annotated_image_path
+            .as_deref()
+            .filter(|path| !path.trim().is_empty())
+        {
+            hints.push(vision_image_delivery_hint("analysis_annotation", path));
+        }
+        self.delivery_hints = hints;
+        self
+    }
+}
+
+pub fn stable_vision_image_artifact_id(artifact_role: &str, path: &str) -> String {
+    let digest = Sha256::digest(format!("{artifact_role}\0{}", path.trim()).as_bytes());
+    let suffix = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("vision-image-{suffix}")
+}
+
+fn vision_image_delivery_hint(artifact_role: &str, path: &str) -> Value {
+    json!({
+        "kind": "native_image",
+        "artifact_id": stable_vision_image_artifact_id(artifact_role, path),
+        "fallback": "file",
+        "metadata": {
+            "artifact_role": artifact_role,
+        },
+    })
 }
 
 fn default_detect_label() -> String {
@@ -194,6 +236,7 @@ mod tests {
 
         assert_eq!(payload.notification_channel, "im_bridge");
         assert_eq!(payload.notification_format, "lark_card");
+        assert!(payload.delivery_hints.is_empty());
         assert_eq!(payload.camera_target.device_id, "cam-1");
         assert_eq!(payload.snapshot.source_storage, None);
         assert_eq!(payload.snapshot.byte_size, None);

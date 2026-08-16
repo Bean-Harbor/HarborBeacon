@@ -104,6 +104,7 @@ qrcodegen = "1.8"
 if-addrs = "0.13"
 quick-xml = "0.38"
 markitdown = "0.1.11"
+libc = "0.2"
 memmap2 = "0.9"
 fast-hnsw = "1.0.1"
 candle = { package = "candle-core", version = "0.10.2", optional = true }
@@ -113,6 +114,14 @@ hf-hub = { version = "0.4.1", default-features = false, features = ["ureq"] }
 tokenizers = { version = "0.22.0", default-features = false, features = ["fancy-regex"] }
 tantivy = "0.22"
 time = { version = "0.3.41", features = ["parsing"] }
+atomicwrites = "=0.4.4"
+fs2 = "0.4"
+cap-primitives = "=4.0.2"
+cap-std = "=4.0.2"
+cap-fs-ext = "=4.0.2"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "=1.1.4", features = ["fs"] }
 
 [features]
 default = ["embedded-model-runtime"]
