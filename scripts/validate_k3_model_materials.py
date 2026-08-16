@@ -173,7 +173,9 @@ def validate_manifest(payload: object, bundle_root: Path | None, stage: Path | N
     return errors
 
 
-def verify_approved_license_evidence(payload: dict[str, object]) -> list[str]:
+def verify_approved_license_evidence(
+    payload: dict[str, object], evidence_root: Path | None = None
+) -> list[str]:
     errors = []
     for material in payload["materials"]:
         review = material["license"]
@@ -187,6 +189,18 @@ def verify_approved_license_evidence(payload: dict[str, object]) -> list[str]:
             errors.append(
                 f"{material_id} license evidence is not bound to its HTTPS revision"
             )
+            continue
+        if evidence_root is not None:
+            evidence_file = evidence_root / evidence["sha256"]
+            if (
+                not evidence_file.is_file()
+                or evidence_file.is_symlink()
+                or evidence_file.stat().st_size > MAX_LICENSE_EVIDENCE_BYTES
+            ):
+                errors.append(f"{material_id} local license evidence is missing or unsafe")
+                continue
+            if sha256(evidence_file) != evidence["sha256"]:
+                errors.append(f"{material_id} local license evidence SHA256 changed")
             continue
         request = urllib.request.Request(
             source, headers={"User-Agent": "HarborOS-Qualification-License-Audit/1"}
@@ -217,13 +231,23 @@ def main() -> int:
     parser.add_argument("--stage", type=Path)
     parser.add_argument("--expect-blocked", action="store_true")
     parser.add_argument("--verify-license-evidence", action="store_true")
+    parser.add_argument("--license-evidence-root", type=Path)
     args = parser.parse_args()
     if args.stage is not None and args.bundle_root is None:
         parser.error("--stage requires --bundle-root")
+    if args.license_evidence_root is not None and not args.verify_license_evidence:
+        parser.error("--license-evidence-root requires --verify-license-evidence")
+    if args.license_evidence_root is not None and (
+        not args.license_evidence_root.is_dir()
+        or args.license_evidence_root.is_symlink()
+    ):
+        parser.error("--license-evidence-root must be a safe directory")
     payload = json.loads(args.manifest.read_text(encoding="utf-8"))
     errors = validate_manifest(payload, args.bundle_root, args.stage)
     if args.verify_license_evidence and not errors:
-        errors.extend(verify_approved_license_evidence(payload))
+        errors.extend(
+            verify_approved_license_evidence(payload, args.license_evidence_root)
+        )
     if args.expect_blocked:
         if not errors:
             print("error: model manifest unexpectedly became release-ready", file=sys.stderr)

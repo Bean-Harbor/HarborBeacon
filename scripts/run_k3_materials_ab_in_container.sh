@@ -4,6 +4,7 @@ set -euo pipefail
 : "${EVIDENCE_ROOT:?EVIDENCE_ROOT is required}"
 : "${HARBOROS_VALIDATOR_ROOT:?HARBOROS_VALIDATOR_ROOT is required}"
 : "${MODEL_BUNDLE_ROOT:?MODEL_BUNDLE_ROOT is required}"
+: "${MODEL_LICENSE_EVIDENCE_ROOT:?MODEL_LICENSE_EVIDENCE_ROOT is required}"
 : "${SOURCE_COMMIT:?SOURCE_COMMIT is required}"
 : "${SOURCE_DATE_EPOCH:?SOURCE_DATE_EPOCH is required}"
 : "${DEBIAN_VERSION:?DEBIAN_VERSION is required}"
@@ -30,6 +31,7 @@ for path in \
   "$EVIDENCE_ROOT" \
   "$HARBOROS_VALIDATOR_ROOT" \
   "$MODEL_BUNDLE_ROOT" \
+  "$MODEL_LICENSE_EVIDENCE_ROOT" \
   "$source_root_a" \
   "$source_root_b"
 do
@@ -89,6 +91,7 @@ python3 scripts/validate_k3_model_materials.py \
   --manifest models/k3-evt1-model-materials.json \
   --bundle-root "$MODEL_BUNDLE_ROOT" \
   --verify-license-evidence \
+  --license-evidence-root "$MODEL_LICENSE_EVIDENCE_ROOT" \
   | tee "$inspection/model-material-validation.txt"
 
 for run in root-a root-b; do
@@ -202,7 +205,7 @@ printf 'PASS packaging-materials; model-runtime release_eligible=false\n' \
   > "$EVIDENCE_ROOT/status.txt"
 (
   cd "$EVIDENCE_ROOT"
-  find artifacts inspection -type f -print0 \
+  find artifacts inputs inspection -type f -print0 \
     | sort -z \
     | xargs -0 sha256sum
   sha256sum status.txt

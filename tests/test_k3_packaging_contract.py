@@ -554,6 +554,7 @@ class K3PackagingContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("inspect_harbor_package_materials", driver)
         self.assertIn("--verify-license-evidence", driver)
+        self.assertIn("--license-evidence-root", driver)
         self.assertIn("diff --no-dereference --recursive", driver)
         self.assertIn("root-a", driver)
         self.assertIn("root-b", driver)
