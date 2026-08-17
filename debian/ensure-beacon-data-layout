@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+if [ "${1:-}" != "/data/harborbeacon" ]; then
+  echo "error: Beacon data root must be /data/harborbeacon" >&2
+  exit 2
+fi
+
+install -d -o harborbeacon -g harborbeacon -m 0750 \
+  /data/harborbeacon \
+  /data/harborbeacon/events \
+  /data/harborbeacon/cat-activity

@@ -1,0 +1,118 @@
+name: k3-evt-package
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/k3-evt-package.yml
+      - Cargo.lock
+      - Cargo.toml
+      - debian/**
+      - models/**
+      - scripts/**
+      - src/**
+  workflow_dispatch:
+    inputs:
+      debian_version:
+        description: Exact Debian version for the qualification package
+        required: true
+        default: 0.1.0+harbornavi.k3.evt1.riscv64
+
+permissions:
+  contents: read
+
+env:
+  BUILD_CONTAINER_DIGEST: sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663
+  DEBIAN_SNAPSHOT: 20260801T000000Z
+  DEBIAN_VERSION: ${{ inputs.debian_version || '0.1.0+harbornavi.k3.evt1.riscv64' }}
+
+jobs:
+  beacon-riscv64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    container:
+      image: rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Trust the checked-out container workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Install fixed packaging toolchain
+        env:
+          HARBORBEACON_DEBIAN_SNAPSHOT: ${{ env.DEBIAN_SNAPSHOT }}
+        run: |
+          bash scripts/configure_debian_snapshot.sh
+          apt-get update
+          apt-get install --yes --no-install-recommends \
+            dpkg-dev \
+            gcc-riscv64-linux-gnu \
+            libc6-dev-riscv64-cross \
+            python3 \
+            xz-utils
+          rustup target add riscv64gc-unknown-linux-gnu
+      - name: Verify the immutable model material lock
+        run: |
+          python3 scripts/validate_k3_model_materials.py \
+            --manifest models/k3-evt1-model-materials.json
+      - name: Verify reproducible Beacon package without embedded Candle
+        env:
+          DEB_ARCH: riscv64
+          RUST_TARGET: riscv64gc-unknown-linux-gnu
+          HARBORBEACON_BUILD_CONTAINER_DIGEST: ${{ env.BUILD_CONTAINER_DIGEST }}
+          HARBORBEACON_DEBIAN_SNAPSHOT: ${{ env.DEBIAN_SNAPSHOT }}
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          bash scripts/verify_k3_reproducible.sh beacon
+          bash scripts/build_harbornavi_k3_deb.sh
+          dpkg-deb --info dist/harbornavi-k3-debs/harboros-beacon_*.deb
+          dpkg-deb --contents dist/harbornavi-k3-debs/harboros-beacon_*.deb
+          (cd dist/harbornavi-k3-debs && sha256sum --check ./*.sha256)
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: harboros-beacon-riscv64
+          path: dist/harbornavi-k3-debs/harboros-beacon_*
+
+  model-runtime-lock:
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify model runtime scripts and transactional lifecycle
+        run: |
+          python3 -m unittest \
+            tests.test_k3_packaging_contract \
+            tests.test_model_runtime_rights_v2
+          bash scripts/build_model_runtime_lifecycle_fixture.sh /tmp/harbor-model-runtime-lifecycle.deb
+          HARBOR_MODEL_LIFECYCLE_DISPOSABLE=1 \
+            bash scripts/test_model_runtime_deb_lifecycle.sh /tmp/harbor-model-runtime-lifecycle.deb
+          bash scripts/build_cat_vision_runtime_lifecycle_fixture.sh /tmp/harbor-cat-vision-runtime-lifecycle.deb
+          HARBOR_CAT_VISION_LIFECYCLE_DISPOSABLE=1 \
+            bash scripts/test_cat_vision_runtime_deb_lifecycle.sh /tmp/harbor-cat-vision-runtime-lifecycle.deb
+          HARBOR_GENERATION_LIFECYCLE_DISPOSABLE=1 \
+            bash scripts/test_k3_generation_upgrade_order.sh
+      - name: Verify the immutable model material lock
+        run: |
+          python3 scripts/validate_k3_model_materials.py \
+            --manifest models/k3-evt1-model-materials.json
+          python3 scripts/validate_k3_model_materials.py \
+            --manifest models/k3-evt1-cat-vision-materials.json
+
+  model-runtime-riscv64:
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    # The controlled Linux builder supplies the immutable model bundle. Public
+    # CI verifies the lock but never downloads or republishes model materials.
+    steps:
+      - run: echo "model runtime packages require the controlled immutable bundle"
+
+  cat-vision-runtime-riscv64:
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    # The qualification builder supplies licensed, checksum-locked model bytes
+    # and APT provenance. Public CI must not publish the blocked vision package.
+    steps:
+      - run: echo "cat vision runtime requires controlled evidence and model bytes"

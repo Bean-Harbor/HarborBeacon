@@ -1,5 +1,6 @@
 use harborbeacon_local_agent::runtime::cat_recording_classifier::{
-    aggregate_cat_recording_predictions, CatRecordingFramePrediction,
+    aggregate_cat_recording_predictions, parse_classifier_probe_output, parse_validator_backend,
+    CatRecordingClassifierConfig, CatRecordingFramePrediction, CatRecordingValidatorBackend,
     CAT_RECORDING_CLASSIFIER_MIN_POSITIVE_FRAMES,
 };
 use std::fs;
@@ -10,6 +11,56 @@ fn prediction(frame_index: u8, probability_ppm: u32) -> CatRecordingFramePredict
         frame_index,
         cat_probability_ppm: probability_ppm,
         inference_ms: 6,
+    }
+}
+
+#[test]
+fn evt_validator_defaults_to_mobilenet_and_rejects_vlm_or_unknown_backends() {
+    assert_eq!(
+        parse_validator_backend(None).expect("default backend"),
+        CatRecordingValidatorBackend::MobileNetV2Int8
+    );
+    assert!(parse_validator_backend(Some("vlm")).is_err());
+    assert!(parse_validator_backend(Some("custom")).is_err());
+}
+
+#[test]
+fn readiness_probe_requires_exact_provider_model_and_sha() {
+    let config = CatRecordingClassifierConfig {
+        python_bin: "python3".to_string(),
+        classifier_bin: PathBuf::from("classifier.py"),
+        model_path: PathBuf::from("model.onnx"),
+        expected_model_sha256: "d0c1bdcf973ca7f6efc6e62af764ff59300e0d27abbc75c20c7f86515769d825"
+            .to_string(),
+        threshold_ppm: 620_000,
+        ai_threads: 4,
+        affinity: "12;13;14;15".to_string(),
+    };
+    let valid = serde_json::json!({
+        "schema_version": "1.0",
+        "status": "ok",
+        "provider": "SpaceMITExecutionProvider",
+        "model_name": "mobilenetv2-cat-binary-v2-int8",
+        "model_sha256": config.expected_model_sha256.clone(),
+    });
+    assert!(parse_classifier_probe_output(
+        &serde_json::to_vec(&valid).expect("probe JSON"),
+        &config
+    )
+    .is_ok());
+
+    for (field, value) in [
+        ("provider", serde_json::json!("CPUExecutionProvider")),
+        ("model_sha256", serde_json::json!("00")),
+        ("model_name", serde_json::json!("unexpected")),
+    ] {
+        let mut invalid = valid.clone();
+        invalid[field] = value;
+        assert!(parse_classifier_probe_output(
+            &serde_json::to_vec(&invalid).expect("invalid probe JSON"),
+            &config
+        )
+        .is_err());
     }
 }
 

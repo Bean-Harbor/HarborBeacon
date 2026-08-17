@@ -1406,7 +1406,7 @@ mod tests {
             local_smoke_bin: "harbornavi-k3-local-vision-smoke".to_string(),
             capture: CaptureSettings::default(),
             vlm_enrich: true,
-            vlm_api_base: Some("http://127.0.0.1:8080/v1".to_string()),
+            vlm_api_base: Some("https://external-vlm.example.invalid/v1".to_string()),
             vlm_model: Some("local-vlm".to_string()),
             vlm_api_key: None,
             vlm_sample_every: Some(360),
@@ -1442,7 +1442,11 @@ mod tests {
             .expect("args");
 
         assert!(args.contains(&"--vlm-enrich".to_string()));
-        assert_arg_value(&args, "--vlm-api-base", "http://127.0.0.1:8080/v1");
+        assert_arg_value(
+            &args,
+            "--vlm-api-base",
+            "https://external-vlm.example.invalid/v1",
+        );
         assert_arg_value(&args, "--vlm-model", "local-vlm");
         assert_arg_value(&args, "--vlm-sample-every", "120");
         assert_arg_value(&args, "--vlm-max-samples", "2");

@@ -30,8 +30,8 @@ from harbornavi_k3_yolov8_analyzer import (
 )
 
 
-DEFAULT_MODEL = "/var/lib/harboros-beacon/models/yolov8n_192x320.q.onnx"
-DEFAULT_LABELS = "/var/lib/harboros-beacon/models/label.txt"
+DEFAULT_MODEL = "/data/vision-models/current/detection/yolov8n_192x320.q.onnx"
+DEFAULT_LABELS = "/data/vision-models/current/detection/label.txt"
 DEFAULT_TARGET_LABEL = "cat"
 CONFIDENCE_OVERRIDE_ENV = "HARBOR_K3_YOLO_CONFIDENCE_OVERRIDE"
 STOP_REQUESTED = threading.Event()
@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--labels", default=DEFAULT_LABELS)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--target-label", default=DEFAULT_TARGET_LABEL)
-    parser.add_argument("--provider", choices=["cpu", "spacemit"], default="cpu")
+    parser.add_argument("--provider", choices=["cpu"], default="cpu")
     parser.add_argument("--max-fps", type=float, default=25.0)
     parser.add_argument("--conf-threshold", type=float, default=0.35)
     parser.add_argument("--iou-threshold", type=float, default=0.45)
@@ -262,39 +262,14 @@ def build_session(args: argparse.Namespace) -> tuple[ort.InferenceSession, int, 
     labels = load_labels(args.labels)
     if args.target_label.strip().lower() not in {label.lower() for label in labels}:
         raise ValueError("target label is not present in the label file")
-    providers = provider_list(args.provider)
+    if args.provider != "cpu":
+        raise ValueError("EVT.1 YOLO provider must be cpu")
+    providers = provider_list("cpu")
     options = ort.SessionOptions()
-    if args.provider == "spacemit":
-        ai_threads = int(os.environ.get("HARBOR_K3_YOLO_AI_THREADS", "4"))
-        if ai_threads <= 0:
-            raise ValueError("HARBOR_K3_YOLO_AI_THREADS must be positive")
-        affinity = os.environ.get(
-            "HARBOR_K3_YOLO_AI_AFFINITY", "8;9;10;11"
-        )
-        core_ids = [core_id.strip() for core_id in affinity.split(";")]
-        if len(core_ids) != ai_threads or any(
-            not core_id.isdigit() for core_id in core_ids
-        ):
-            raise ValueError(
-                "HARBOR_K3_YOLO_AI_AFFINITY "
-                f"must contain {ai_threads} core IDs"
-            )
-        options.intra_op_num_threads = 1
-        providers = [
-            (
-                providers[0],
-                {
-                    "SPACEMIT_EP_INTRA_THREAD_NUM": str(ai_threads),
-                    "SPACEMIT_EP_INTRA_THREAD_AFFINITY": affinity,
-                    "SPACEMIT_EP_INTER_THREAD_NUM": "1",
-                },
-            )
-        ]
-    else:
-        cpu_threads = int(os.environ.get("HARBOR_K3_YOLO_CPU_THREADS", "1"))
-        if cpu_threads <= 0:
-            raise ValueError("HARBOR_K3_YOLO_CPU_THREADS must be positive")
-        options.intra_op_num_threads = cpu_threads
+    cpu_threads = int(os.environ.get("HARBOR_K3_YOLO_CPU_THREADS", "1"))
+    if cpu_threads <= 0:
+        raise ValueError("HARBOR_K3_YOLO_CPU_THREADS must be positive")
+    options.intra_op_num_threads = cpu_threads
     session = ort.InferenceSession(args.model, sess_options=options, providers=providers)
     input_height, input_width = input_hw(session.get_inputs()[0].shape)
     provider = session.get_providers()[0] if session.get_providers() else providers[0]

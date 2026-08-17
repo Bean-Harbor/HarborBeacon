@@ -1,0 +1,19 @@
+{
+  "contracts": [
+    {
+      "capabilities": [
+        "candle-only",
+        "jina-embeddings-v2",
+        "lazy-model-loading",
+        "loopback-8792-only",
+        "qwen2.5-0.5b-instruct",
+        "signed-model-materials"
+      ],
+      "id": "harboros.k3.model-runtime",
+      "version": 1
+    }
+  ],
+  "package": "harboros-model-runtime",
+  "schema_version": 1,
+  "source_commit": "SOURCE_COMMIT_PLACEHOLDER"
+}

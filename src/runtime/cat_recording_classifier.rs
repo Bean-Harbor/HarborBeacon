@@ -26,7 +26,7 @@ pub const CAT_RECORDING_CLASSIFIER_MODEL_SHA256: &str =
 
 const DEFAULT_CLASSIFIER_BIN: &str =
     "/usr/lib/harboros-beacon/harbornavi_k3_cat_recording_classifier.py";
-const DEFAULT_CLASSIFIER_MODEL: &str = "/var/lib/harboros-beacon/vision-models/\
+const DEFAULT_CLASSIFIER_MODEL: &str = "/usr/share/harboros-beacon/vision-models/\
 mobilenetv2-cat-binary-v2-20260806/mobilenetv2_cat_binary_int8.onnx";
 const DEFAULT_THRESHOLD_PPM: u32 = 620_000;
 const DEFAULT_AI_THREADS: usize = 4;
@@ -35,7 +35,6 @@ const DEFAULT_AFFINITY: &str = "12;13;14;15";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatRecordingValidatorBackend {
     MobileNetV2Int8,
-    Vlm,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,19 +82,70 @@ pub struct CatRecordingClassifierOutput {
     pub elapsed_ms: u64,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct CatRecordingClassifierProbeOutput {
+    pub schema_version: String,
+    pub status: String,
+    pub provider: String,
+    pub model_name: String,
+    pub model_sha256: String,
+}
+
 pub fn validator_backend_from_env() -> Result<CatRecordingValidatorBackend, String> {
-    match env::var(CAT_RECORDING_VALIDATOR_ENV)
-        .unwrap_or_else(|_| "vlm".to_string())
+    let configured = env::var(CAT_RECORDING_VALIDATOR_ENV).ok();
+    parse_validator_backend(configured.as_deref())
+}
+
+pub fn parse_validator_backend(
+    configured: Option<&str>,
+) -> Result<CatRecordingValidatorBackend, String> {
+    match configured
+        .unwrap_or("mobilenet_v2_int8")
         .trim()
         .to_ascii_lowercase()
         .as_str()
     {
         "mobilenet_v2_int8" => Ok(CatRecordingValidatorBackend::MobileNetV2Int8),
-        "vlm" => Ok(CatRecordingValidatorBackend::Vlm),
         _ => Err(format!(
-            "{CAT_RECORDING_VALIDATOR_ENV} must be mobilenet_v2_int8 or vlm"
+            "{CAT_RECORDING_VALIDATOR_ENV} must be mobilenet_v2_int8"
         )),
     }
+}
+
+pub fn build_classifier_probe_command(config: &CatRecordingClassifierConfig) -> Command {
+    let mut command = Command::new(&config.python_bin);
+    command
+        .arg(&config.classifier_bin)
+        .arg("--model")
+        .arg(&config.model_path)
+        .arg("--expected-sha256")
+        .arg(&config.expected_model_sha256)
+        .arg("--ai-threads")
+        .arg(config.ai_threads.to_string())
+        .arg("--affinity")
+        .arg(&config.affinity)
+        .arg("--probe");
+    command
+}
+
+pub fn parse_classifier_probe_output(
+    stdout: &[u8],
+    config: &CatRecordingClassifierConfig,
+) -> Result<CatRecordingClassifierProbeOutput, String> {
+    let output = serde_json::from_slice::<CatRecordingClassifierProbeOutput>(stdout)
+        .map_err(|error| format!("cat_classifier_probe_invalid_json: {error}"))?;
+    if output.schema_version != "1.0" || output.status != "ok" {
+        return Err("cat_classifier_probe_invalid_status".to_string());
+    }
+    if output.provider != "SpaceMITExecutionProvider" {
+        return Err("cat_classifier_spacemit_provider_not_active".to_string());
+    }
+    if output.model_name != CAT_RECORDING_CLASSIFIER_MODEL_NAME
+        || output.model_sha256 != config.expected_model_sha256
+    {
+        return Err("cat_classifier_model_contract_mismatch".to_string());
+    }
+    Ok(output)
 }
 
 pub fn classifier_config_from_env() -> Result<CatRecordingClassifierConfig, String> {

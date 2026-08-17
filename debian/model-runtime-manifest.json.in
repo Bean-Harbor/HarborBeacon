@@ -1,0 +1,22 @@
+{
+  "bundled_runtime_dependencies": [],
+  "debian_control_dependencies": [
+    "libc6",
+    "ca-certificates",
+    "adduser",
+    "curl",
+    "init-system-helpers",
+    "harboros-system (>= 0.1.0~evt.1)",
+    "harboros-system (<< 0.2)"
+  ],
+  "package": "harboros-model-runtime",
+  "schema_version": 2,
+  "services": [
+    {
+      "bind": "127.0.0.1:8792",
+      "health": "http://127.0.0.1:8792/healthz",
+      "unit": "harboros-model-runtime.service"
+    }
+  ],
+  "source_commit": "SOURCE_COMMIT_PLACEHOLDER"
+}

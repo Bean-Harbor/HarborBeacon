@@ -1,0 +1,7 @@
+{
+  "architecture": "riscv64",
+  "packages": [],
+  "repository": "https://github.com/Bean-Harbor/HarborBeacon",
+  "schema_version": 1,
+  "suite": "source"
+}

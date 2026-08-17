@@ -27,14 +27,14 @@ pub const CAT_RECORDING_VALIDATION_STORE_PATH_ENV: &str =
 pub const CAT_RECORDING_VALIDATION_POLICY_VERSION: &str = "cat-recording-validation-v5";
 pub const CAT_RECORDING_MINIMUM_DURATION_MS: u64 = 5_000;
 
-const DEFAULT_STORE_PATH: &str = ".harborbeacon/cat-recording-validations.jsonl";
+const DEFAULT_STORE_PATH: &str = "/data/harborbeacon/cat-activity/validations.jsonl";
 const MAX_STORE_BYTES: u64 = 64 * 1024 * 1024;
 const COMPACTION_THRESHOLD_BYTES: u64 = 48 * 1024 * 1024;
 const MAX_RECORD_BYTES: usize = 64 * 1024;
 const MAX_TEXT_CHARS: usize = 500;
 const MAX_BEHAVIOR_TAGS: usize = 16;
 const MAX_CAT_DETECTION_EVIDENCE: usize = 256;
-const MAX_CAT_RECORDING_SAMPLE_FRAMES: usize = 10;
+const MAX_CAT_RECORDING_SAMPLE_FRAMES: usize = 9;
 const MAX_ARTIFACT_DISCARD_ATTEMPTS: u32 = 3;
 const DEFAULT_ARTIFACT_DISCARD_CLAIM_LEASE_MS: u64 = 120_000;
 
@@ -1452,7 +1452,7 @@ pub fn sanitize_decision(
         .sampled_frame_count
         .min(MAX_CAT_RECORDING_SAMPLE_FRAMES as u8);
     decision.sampling_strategy = sanitize_text(&decision.sampling_strategy);
-    decision.validation_rounds = decision.validation_rounds.min(2);
+    decision.validation_rounds = decision.validation_rounds.min(1);
     decision
         .sampled_offsets_ms
         .truncate(MAX_CAT_RECORDING_SAMPLE_FRAMES);

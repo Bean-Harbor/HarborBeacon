@@ -10,7 +10,17 @@
   "positive_class_index": 1,
   "frame_decision": "softmax(logits)[1] >= 0.620000",
   "video_decision": {
-    "sampling": "select up to 5 diverse YOLO evidence frames and fill up to 9 with uniform samples",
+    "sampling": {
+      "schema_version": 1,
+      "implementation": "/usr/lib/harboros-beacon/cat-sampling-plan",
+      "strategy_with_evidence": "yolo_guided_hybrid_9",
+      "defensive_strategy_without_evidence": "uniform_9",
+      "evidence_schema": "harbornavi.k3.yoloDetectionResult.v1",
+      "evidence_projection": "cat-recording-validation-v5",
+      "maximum_guided_frames": 5,
+      "frame_margin_ms": 100,
+      "uniform_percentages_in_order": [50, 10, 90, 30, 70, 20, 80, 40, 60]
+    },
     "maximum_frames": 9,
     "minimum_positive_frames": 3,
     "short_video_behavior": "evaluate every distinct decodable sample; require 3 positives"

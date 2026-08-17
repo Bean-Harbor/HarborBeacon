@@ -1658,10 +1658,10 @@ impl Cli {
                 .ok()
                 .or_else(default_analyzer_command),
             model_path: std::env::var("HARBOR_K3_YOLO_MODEL").unwrap_or_else(|_| {
-                "/var/lib/harboros-beacon/models/yolov8n_192x320.q.onnx".to_string()
+                "/data/vision-models/current/detection/yolov8n_192x320.q.onnx".to_string()
             }),
             label_path: std::env::var("HARBOR_K3_YOLO_LABELS")
-                .unwrap_or_else(|_| "/var/lib/harboros-beacon/models/label.txt".to_string()),
+                .unwrap_or_else(|_| "/data/vision-models/current/detection/label.txt".to_string()),
             provider: std::env::var("HARBOR_K3_YOLO_PROVIDER")
                 .unwrap_or_else(|_| "cpu".to_string()),
             redact_paths: false,
@@ -1669,10 +1669,8 @@ impl Cli {
                 .ok()
                 .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
                 .unwrap_or(false),
-            vlm_api_base: std::env::var("HARBORNAVI_VLM_API_BASE")
-                .unwrap_or_else(|_| "http://127.0.0.1:8080/v1".to_string()),
-            vlm_model: std::env::var("HARBORNAVI_VLM_MODEL")
-                .unwrap_or_else(|_| "qwen3_5vl_0.8b-text-q41.gguf".to_string()),
+            vlm_api_base: std::env::var("HARBORNAVI_VLM_API_BASE").unwrap_or_default(),
+            vlm_model: std::env::var("HARBORNAVI_VLM_MODEL").unwrap_or_default(),
             vlm_api_key: std::env::var("HARBORNAVI_VLM_API_KEY")
                 .unwrap_or_else(|_| "local".to_string()),
             vlm_prompt: std::env::var("HARBORNAVI_VLM_PROMPT").unwrap_or_else(|_| {
@@ -1805,6 +1803,10 @@ impl Cli {
         if cli.provider != "cpu" && cli.provider != "spacemit" {
             fail("--provider must be cpu or spacemit");
         }
+        if cli.vlm_enrich && (cli.vlm_api_base.trim().is_empty() || cli.vlm_model.trim().is_empty())
+        {
+            fail("--vlm-enrich requires an explicit external --vlm-api-base and --vlm-model");
+        }
         if cli.capture_mode == CaptureMode::PersistentFfmpeg && cli.decode_backend == "ffmpeg_sw" {
             cli.decode_backend = "ffmpeg_sw_persistent".to_string();
         }
@@ -1873,7 +1875,7 @@ mod tests {
             provider: "cpu".to_string(),
             redact_paths: true,
             vlm_enrich: true,
-            vlm_api_base: "http://127.0.0.1:8080/v1".to_string(),
+            vlm_api_base: "https://vlm.example.test/v1".to_string(),
             vlm_model: "test-vlm".to_string(),
             vlm_api_key: "local".to_string(),
             vlm_prompt: "describe".to_string(),

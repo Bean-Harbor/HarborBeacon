@@ -3,7 +3,7 @@
 ## Status
 
 This document is the current HarborBeacon core architecture and Harbor
-collaboration contract as of 2026-06-12.
+collaboration contract as of 2026-08-17.
 
 It updates `HarborBeacon-Harbor-Collaboration-Contract-v2.md` for the current
 HarborBeacon shape, where Model Center, RAG, Privacy Gateway, workflow compiler
@@ -35,6 +35,12 @@ Current local-agent planning references:
 - `docs/HarborBeacon-LocalAgent-Roadmap.md`
 - `docs/HarborBeacon-LocalAgent-Plan.md`
 - `docs/local-model-backend-benchmark-gate.md`
+
+Current K3 cat-recording inference contract:
+
+- `config/harbornavi-k3/vision-models/mobilenetv2-cat-binary-v2-20260806/runtime-contract.json`
+- `src/runtime/cat_recording_classifier.rs`
+- `scripts/harbornavi_k3_cat_recording_classifier.py`
 
 ## Purpose
 
@@ -89,10 +95,10 @@ This contract exists to make two things explicit:
                   |                                                |                                                |
                   v                                                v                                                v
 +-------------------------------+              +-------------------------------+              +-------------------------------+
-| Model Runtime Layer           |              | HarborOS System Domain        |              | Home Device / AIoT Domain     |
-| - local-first runtime         |              | - system readiness            |              | - cameras / RTSP / ONVIF      |
-| - route policy                |              | - middleware / MidCLI         |              | - HA / LAN devices            |
-| - controlled cloud fallback   |              | - OS/system operations        |              | - home sensing/control        |
+| Model Execution Plane         |              | HarborOS System Domain        |              | Home Device / AIoT Domain     |
+| - Candle text / embedding     |              | - system readiness            |              | - cameras / RTSP / ONVIF      |
+| - bounded vision executors    |              | - middleware / MidCLI         |              | - HA / LAN devices            |
+| - governed external endpoints |              | - OS/system operations        |              | - home sensing/control        |
 +-------------------------------+              +-------------------------------+              +-------------------------------+
 ```
 
@@ -185,6 +191,8 @@ HarborBeacon remains the source of truth for:
 - model endpoint policy and runtime-readiness projections
 - RAG citations, answer semantics, and privacy-gateway evidence
 - Home Guardian / family memory state
+- vision-event business state, validation decisions, publication eligibility,
+  and audit evidence
 
 HarborGate remains the source of truth for:
 
@@ -271,6 +279,14 @@ These must not become mandatory per-turn dependencies:
 - evidence/report generation
 - document or research artifacts
 
+### Background Event Path
+
+Continuous vision detection, media recording, and post-recording validation are
+background event workflows. They must not become synchronous dependencies of a
+normal user turn. Their durable results may later enter conversation, timeline,
+automation, notification, and audit flows through HarborBeacon-owned business
+state.
+
 ### Performance Rules
 
 - Deterministic router must short-circuit when it has a confident route.
@@ -340,6 +356,9 @@ Rules:
 - Product default is local-first.
 - Harbor-managed Candle-first local runtime is the preferred default lane, but
   Candle is not the frozen API contract.
+- The logical model execution plane is not synonymous with the
+  `harboros-model-runtime` package or port `8792`; capability-specific local
+  executors may have separate process, package, and health contracts.
 - OpenAI-compatible endpoints are advanced/external endpoints governed through
   Model Center and route policy.
 - Cloud fallback is allowed only for explicitly enabled routes.
@@ -347,11 +366,143 @@ Rules:
 - `semantic.router` remains local-only.
 - HarborOS command execution, AIoT control, OCR, VLM, and embedding routes do
   not use cloud fallback by default.
+- Fixed-function vision detection and verification remain local-only and have
+  no cloud fallback.
 - Endpoint secrets must be persisted server-side and returned only in redacted
   form.
 - Fallback audit must record endpoint choice, attempted endpoints, fallback
   reason, and policy evidence without plaintext secrets or full sensitive
   prompts.
+
+## Fixed-Function Edge Vision Contract
+
+Fixed-function edge inference is a separate execution lane from the general
+LLM/embedding runtime and from a general-purpose VLM endpoint. A task-specific
+classifier must not be described as Candle inference merely because
+Harbor-managed Candle is the default text and embedding runtime.
+
+The current K3 cat-recording path is a two-stage, local-only vision pipeline:
+
+1. HarborLink owns camera discovery, RTSP/media transport, recording leases,
+   and recording artifact bytes.
+2. HarborBeacon runs a bounded YOLOv8 INT8 detection job for the `cat` label.
+   EVT.1 requires `CPUExecutionProvider`; SpaceMIT YOLO is rejected. Detection
+   evidence triggers the recording workflow and guides post-recording frame
+   selection.
+3. After recording, HarborBeacon applies media and evidence hard gates, selects
+   up to five diverse YOLO evidence frames, and fills the sample set uniformly
+   to at most nine distinct frames.
+4. HarborBeacon invokes the SHA-bound first-party MobileNetV2 binary INT8 ONNX
+   classifier through `SpaceMITExecutionProvider`. Inputs are normalized RGB
+   `1x3x224x224` tensors. A frame is positive at probability `>= 0.62`, and a
+   recording is accepted only when at least three sampled frames are positive.
+   CPU fallback for this verifier is not an accepted K3 qualification path.
+5. HarborBeacon owns the validation decision, publication eligibility,
+   rejection/discard workflow, audit record, and user-facing query semantics.
+
+The product capability identifier for this workflow is
+`cat_activity_recording`. It must not be conflated with `cat_multi_video`:
+HarborBeacon owns detection orchestration, validation, publication, and query
+state; HarborLink owns recording leases and media artifacts; HarborGate owns
+per-artifact delivery and delivery recovery only.
+
+The deployed EVT backend is selected with
+`HARBOR_K3_CAT_RECORDING_VALIDATOR=mobilenet_v2_int8`; this is also the default
+and the only accepted EVT.1 value. `vlm`, unknown backends, a model digest
+mismatch, Python import failure, or an unavailable/non-primary
+`SpaceMITExecutionProvider` fail closed. No cat-validation path may fall back to
+a VLM endpoint, CPU provider, or port `8080`.
+
+`HARBOR_K3_CAT_AUTO_RECORD_ENABLED=true` is the packaged product default. At
+startup HarborBeacon immediately reconciles the registry returned by HarborLink
+`GET /v1/cameras`, then repeats every 10 seconds with bounded exponential
+backoff when Link is unavailable. Every `enabled=true` and
+`streamConfigured=true` registry camera is armed unless the global mode is
+`off` or its exact HarborLink `cameraId` is opted out. Detection leases request
+the `sub` stream. A `main` fallback is allowed only after Link explicitly
+reports that `sub` is unavailable and a resource gate admits it; the current
+Link projection cannot express this distinction, so timeout, generic 5xx, or
+ambiguous errors remain degraded and fail closed.
+
+The owner/admin-only management surface is:
+
+- `GET /api/vision/cat-activity/settings`
+- `PUT /api/vision/cat-activity/settings`
+
+`PUT` accepts only
+`{"schema_version":1,"mode":"all_enabled|off","disabled_camera_ids":[]}`.
+`GET` returns the same policy plus `cameras`, whose entries use the exact
+`camera_id`, `status=armed|unarmed|degraded`, optional reason, and optional
+update timestamp fields. Operator access and unknown request fields are
+rejected. The policy is atomically stored at
+`/data/harborbeacon/cat-activity/policy.json`, and every admitted change writes
+metadata-only audit evidence before the atomic replacement.
+
+Runtime and packaging rules:
+
+- Port `8792` and the Candle runtime serve general text and embedding
+  capabilities; they do not execute the cat-recording classifier.
+- The MobileNetV2 model, classifier command, expected model digest, sampling
+  policy, and aggregation threshold are one versioned contract and must remain
+  mechanically consistent.
+- Removing the general VLM service, port `8080`, its VLM model archive, and
+  `llama.cpp-tools-spacemit` does not remove this fixed-function vision lane.
+- A release that removes the VLM lane must also remove Beacon's service ordering
+  dependency on `harboros-vlm-runtime.service` and its `8080` endpoint setting;
+  retaining those settings would make the declared runtime topology false.
+- Removing `python3-spacemit-ort` or any `spacemit-onnxruntime` / `spacemit-tcm`
+  dependency required by `SpaceMITExecutionProvider` would break the qualified
+  MobileNetV2 verifier. Such a change requires a separately packaged and
+  benchmarked replacement provider plus updated model, resource, and release
+  evidence.
+- `harboros-model-runtime` contains only the Candle service on loopback `8792`
+  and the signed Qwen2.5-0.5B/Jina release rooted at `/data/models`. It contains
+  no VLM unit, port `8080`, YOLO material, SpaceMIT ONNX/TCM dependency, or
+  `llama.cpp-tools-spacemit` dependency.
+- `harboros-cat-vision-runtime` is a separate, fixed-function package. It owns
+  the YOLO model and labels, has no Harbor daemon or network listener, depends
+  on exact versions of `python3-spacemit-ort`, `spacemit-onnxruntime`, and
+  `spacemit-tcm`, and publishes an atomic release under
+  `/data/vision-models/releases/<version>` with `/data/vision-models/current`
+  as the active pointer.
+- The MobileNetV2 validator remains first-party Beacon material at
+  `/usr/share/harboros-beacon/vision-models/...`; the production classifier and
+  fixed quality runner are installed under `/usr/lib/harboros-beacon`. Production
+  validation and the holdout runner both execute the byte-bound
+  `/usr/lib/harboros-beacon/cat-sampling-plan`; the signed dataset supplies the
+  original YOLO evidence fields and detector identity, so quality qualification
+  cannot substitute a separate percentile-only sampler.
+- Vision runtime evidence binds the installed YOLO/label bytes, source archive,
+  rights record, exact runtime deb identities, APT provenance, licenses,
+  copyright, SPDX/CDX, and package contract. Missing rights or runtime evidence
+  keeps the package `blocked` and `release_eligible=false` even when a test deb
+  can be built.
+- Validation and reconciliation state live under
+  `/data/harborbeacon/cat-activity/`. Legacy
+  `/var/lib/harboros-beacon/cat-recording-*` data may be migrated once through a
+  transactional regular-file-only migration. A symlink, non-regular file, or
+  content on both sides aborts the upgrade instead of choosing one copy.
+- YOLO detection, cat verification, and LLM/embedding work must remain separate
+  resource-scheduler workloads so one lane cannot silently starve another.
+
+The three packages share one exact release generation. `Depends` and `Breaks`
+must reject a partial upgrade. The upgrade order is: stop Beacon; install and
+verify cat vision runtime; install slim model runtime; install Beacon; disable
+and remove the legacy VLM unit; run `daemon-reload`; start and verify `8792`;
+start Beacon; verify that no listener remains on `8080`. Rollback restores the
+prior Beacon, model runtime, vision generation, and both model release pointers;
+mixed generations are not a supported rollback state.
+
+Every Beacon start runs the package-owned generation verifier before the daemon.
+It requires all three packages to be fully installed at the exact same version,
+requires `/data/models/current` and `/data/vision-models/current` to select that
+version's real release directories, and re-runs the model, vision, and evidence
+manifest verifiers. This persistent boot gate is independent of the `/run`
+active-intent marker and therefore rejects an interrupted upgrade after reboot.
+
+This lane does not change the frozen HarborGate v2.0 HTTP contract. IM callers
+receive only HarborBeacon-owned business replies, artifacts, and delivery
+hints; they do not select inference providers or interpret validation policy.
 
 ## Privacy Gateway Contract
 
@@ -444,6 +595,12 @@ Belongs here:
 - RTSP / ONVIF / device discovery
 - HA / LAN device control
 - media/control separation
+
+HarborLink owns camera credentials, RTSP access, media leases, pre-recording,
+recording, physical artifact bytes, retention, and deletion. A detection lease
+is a bounded media-access lease; it does not transfer ownership of model
+selection, `cat_present`, validation, publication, automation, or audit
+semantics out of HarborBeacon.
 - vendor/device protocol adapters
 
 Shared framework must coordinate the handoff, but must not hide the domain
@@ -600,6 +757,39 @@ A release touching HarborBeacon core architecture is allowed only when:
 - `retrieval.answer` cloud fallback passes Privacy Gateway
 - audit/readiness evidence is metadata-only where sensitive sources are involved
 - workflow compiler shadow mode cannot alter execution semantics
+- the K3 cat-recording gate proves the pinned model digest, provider, frame
+  sampling, threshold, minimum-positive-frame policy, and resource isolation
+- the product inventory represents this workflow as Beacon-owned
+  `cat_activity_recording`, with Link-owned recording and Gate-owned delivery,
+  rather than as a standalone Gate-owned classifier package
+- an unavailable or failed cat verifier fails closed: the recording is not
+  published, does not trigger automation, and is not reported as a verified cat
+  event solely from YOLO trigger evidence
+- removing the VLM/8080 lane does not remove or mislabel the fixed-function cat
+  classifier, and the resulting package graph still contains its qualified
+  execution provider and model materials
+- HarborLink remains the owner of media bytes while HarborBeacon remains the
+  owner of cat validation, publication, discard, and audit decisions
+- signed holdout evidence covers at least 1,000 event-level clips; each of four
+  cameras contributes at least 100 cat and 100 non-cat samples; at least 25%
+  are night/low-light; every signed clip binds `low_light` and the canonical
+  nullable hard-negative annotation `person|shadow|other-animal`, positive
+  clips reject non-null hard-negative annotations, and the dataset covers all
+  three hard-negative classes; overall and per-camera precision is `>=97%`
+  and recall is `>=90%` at the fixed `0.62` and `3/9` policy
+- a four-camera K3 soak runs for at least 72 hours while Qwen and Jina are both
+  exercised through loopback `8792`; sampling coverage is `>=95%`, success is
+  `>=99%`, detection P95 is `<5s`, artifact-to-validation P95 is `<60s`, and
+  99% of events reach a terminal state within five minutes, with no OOM, panic,
+  service restart, boot change, thermal, memory, disk, or sustained-frequency
+  gate violation
+- exact package generations pass reproducible A/B builds and real dpkg
+  install, reinstall, upgrade, removal, rollback, partial-upgrade rejection,
+  material validation, legacy unit removal, and `8080`-absent checks
+- missing license/redistribution evidence, failed quality or soak gates, or a
+  failed A/B/lifecycle gate prevents a qualification distribution; the final
+  install artifact is a signed K3 raw GPT `.img.zst` plus checksums and install
+  documentation, not an ISO
 - relevant eval CLI and regression tests are run for touched areas
 
 ## Working Principle
@@ -611,6 +801,7 @@ The core stays stable by separating:
 - transport from business truth
 - candidate planning from execution admission
 - model runtime from business domain
+- general model services from bounded fixed-function edge inference
 - RAG cloud fallback from raw source content
 - HarborOS system control from Home Device / AIoT control
 - hot path from readiness/evaluation/control plane

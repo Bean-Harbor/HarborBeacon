@@ -15,10 +15,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hf_hub::{
     api::{sync::ApiBuilder as HfApiBuilder, Progress as HfProgress},
     Cache as HfCache, Repo, RepoType,
 };
+use hmac::{Hmac, Mac};
 use reqwest::blocking::Client;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -29,9 +31,9 @@ use tiny_http::{Header, Method, Request, Response, ResponseBox, Server, StatusCo
 use uuid::Uuid;
 
 use harborbeacon_local_agent::connectors::harborlink_media::{
-    harborlink_request_scope, HarborLinkCredentialStatus, HarborLinkEventRecordingLease,
-    HarborLinkHomeAssistantStatus, HarborLinkLiveSession, HarborLinkMediaClient,
-    HarborLinkRecordingArtifact, HarborLinkRecordingStatus,
+    harborlink_request_scope, HarborLinkCameraProjection, HarborLinkCredentialStatus,
+    HarborLinkEventRecordingLease, HarborLinkHomeAssistantStatus, HarborLinkLiveSession,
+    HarborLinkMediaClient, HarborLinkRecordingArtifact, HarborLinkRecordingStatus,
 };
 #[cfg(test)]
 use harborbeacon_local_agent::connectors::home_assistant::validate_home_assistant_service_fields as validate_home_assistant_service_fields_shared;
@@ -96,15 +98,21 @@ use harborbeacon_local_agent::runtime::ai_resource_scheduler::{
     acquire_ai_resource_lease, ai_resource_scheduler_snapshot, AiLeaseErrorKind,
     AiLeaseQuarantineReason, AiResourceLease, AiWorkload, AI_RESOURCE_QUEUE_MODE,
 };
+use harborbeacon_local_agent::runtime::cat_activity_policy::{
+    CatActivityMode, CatActivityPolicy, CatActivityPolicyStore,
+};
 use harborbeacon_local_agent::runtime::cat_recording_classifier::{
-    aggregate_cat_recording_predictions, build_classifier_command, classifier_config_from_env,
-    parse_classifier_output, validator_backend_from_env, CatRecordingClassifierConfig,
-    CatRecordingClassifierOutput, CatRecordingValidatorBackend,
-    CAT_RECORDING_CLASSIFIER_MIN_POSITIVE_FRAMES,
+    aggregate_cat_recording_predictions, build_classifier_command, build_classifier_probe_command,
+    classifier_config_from_env, parse_classifier_output, parse_classifier_probe_output,
+    validator_backend_from_env, CatRecordingClassifierConfig, CatRecordingClassifierOutput,
+    CAT_RECORDING_CLASSIFIER_MAX_FRAMES, CAT_RECORDING_CLASSIFIER_MIN_POSITIVE_FRAMES,
 };
 use harborbeacon_local_agent::runtime::cat_recording_reconciliation::{
     CatRecordingReconciliationPhase, CatRecordingReconciliationState,
     CatRecordingReconciliationStore,
+};
+use harborbeacon_local_agent::runtime::cat_recording_sampling::{
+    build_cat_recording_sampling_plan, CatRecordingSamplingEvidence, CatRecordingSamplingRequest,
 };
 use harborbeacon_local_agent::runtime::cat_recording_validation::{
     cat_recording_hard_gate_reason, sanitize_decision, validation_mode_from_env,
@@ -151,10 +159,9 @@ use harborbeacon_local_agent::runtime::knowledge_index::{
     KnowledgeIndexManifest, KnowledgeIndexService, KnowledgeIndexSnapshot, KnowledgeModality,
 };
 use harborbeacon_local_agent::runtime::model_center::{
-    load_model_center_state, redact_model_endpoint, run_cat_recording_validation,
-    run_vlm_summary_with_state, test_model_endpoint, vlm_endpoint_readiness,
-    vlm_execution_runtime_snapshot, CatRecordingVlmExecution, ModelEndpointTestResult,
-    ADMIN_STATE_PATH_ENV,
+    load_model_center_state, redact_model_endpoint, run_vlm_summary_with_state,
+    test_model_endpoint, vlm_endpoint_readiness, vlm_execution_runtime_snapshot,
+    ModelEndpointTestResult, ADMIN_STATE_PATH_ENV,
 };
 use harborbeacon_local_agent::runtime::privacy_gateway::PRIVACY_GATEWAY_POLICY_VERSION;
 use harborbeacon_local_agent::runtime::registry::{
@@ -176,6 +183,19 @@ use harborbeacon_local_agent::runtime::vision_event::{
 
 const DEFAULT_HF_ENDPOINT: &str = "https://hf-mirror.com";
 const HARBORBEACON_WEB_API_TOKEN_ENV: &str = "HARBORBEACON_WEB_API_TOKEN";
+const HARBOR_EDGE_ASSERTION_KEY_FILE_ENV: &str = "HARBOR_EDGE_ASSERTION_KEY_FILE";
+const EDGE_ASSERTION_VERSION: &str = "v1";
+const EDGE_ASSERTION_MAX_CLOCK_SKEW_SECONDS: u64 = 30;
+const EDGE_ASSERTION_REPLAY_CAPACITY: usize = 4096;
+const EDGE_ASSERTION_MAX_URI_BYTES: usize = 4096;
+const EDGE_ASSERTION_MAX_PRINCIPAL_BYTES: usize = 256;
+const EDGE_ASSERTION_HEADER: &str = "X-Harbor-Edge-Assertion";
+const EDGE_PRINCIPAL_ID_HEADER: &str = "X-Harbor-Principal-Id";
+const EDGE_PRINCIPAL_NAME_HEADER: &str = "X-Harbor-Principal-Name";
+const EDGE_PRINCIPAL_ROLE_HEADER: &str = "X-Harbor-Principal-Role";
+const EDGE_ORIGINAL_METHOD_HEADER: &str = "X-Harbor-Original-Method";
+const EDGE_ORIGINAL_URI_HEADER: &str = "X-Harbor-Original-URI";
+const EDGE_AUTH_SUBREQUEST_HEADER: &str = "X-Harbor-Auth-Subrequest";
 const KNOWLEDGE_EMBEDDING_WARMUP_TIMEOUT_MS_ENV: &str =
     "HARBORBEACON_KNOWLEDGE_EMBEDDING_WARMUP_TIMEOUT_MS";
 const DEFAULT_KNOWLEDGE_EMBEDDING_WARMUP_TIMEOUT_MS: u64 = 120_000;
@@ -207,10 +227,6 @@ const CAT_RECORDING_VALIDATION_TEMP_ROOT_ENV: &str = "HARBOR_K3_CAT_RECORDING_VA
 const CAT_RECORDING_VALIDATION_MAX_ATTEMPTS: u32 = 4;
 const CAT_RECORDING_VALIDATION_RETRY_DELAYS_SECONDS: [u64; 3] = [10, 30, 120];
 const CAT_RECORDING_AI_RESOURCE_RETRY_DELAY: Duration = Duration::from_secs(5);
-const CAT_RECORDING_VALIDATION_FRAMES_PER_ROUND: usize = 5;
-const CAT_RECORDING_VALIDATION_MAX_FRAMES: usize = 10;
-const CAT_RECORDING_VALIDATION_FRAME_MARGIN_MS: u64 = 100;
-const CAT_RECORDING_VALIDATION_FOLLOWUP_OFFSETS_MS: [u64; 3] = [250, 500, 1_000];
 const HOME_GUARDIAN_ACTIVITY_LIMIT: usize = 500;
 const MAX_FAMILY_MEMORY_FEEDBACK_JSON_BYTES: usize = 32 * 1024;
 const DEFAULT_DETECTION_JOB_TTL_SECONDS: u64 = 60;
@@ -225,8 +241,9 @@ const MAX_DETECTION_MAX_FPS: f64 = 25.0;
 const DEFAULT_DETECTION_CONFIDENCE: f64 = 0.35;
 const DEFAULT_DETECTION_WORKER: &str =
     "/usr/lib/harboros-beacon/harbornavi_k3_yolo_stream_worker.py";
-const DEFAULT_DETECTION_MODEL: &str = "/var/lib/harboros-beacon/models/yolov8n_192x320.q.onnx";
-const DEFAULT_DETECTION_LABELS: &str = "/var/lib/harboros-beacon/models/label.txt";
+const DEFAULT_DETECTION_MODEL: &str =
+    "/data/vision-models/current/detection/yolov8n_192x320.q.onnx";
+const DEFAULT_DETECTION_LABELS: &str = "/data/vision-models/current/detection/label.txt";
 const DEFAULT_DETECTION_OUTPUT_ROOT: &str = "/run/harboros-beacon/detection-jobs";
 const CAT_AUTO_RECORD_ENABLED_ENV: &str = "HARBOR_K3_CAT_AUTO_RECORD_ENABLED";
 const CAT_AUTO_RECORD_START_FRAMES_ENV: &str = "HARBOR_K3_CAT_AUTO_RECORD_START_CONSECUTIVE_FRAMES";
@@ -246,6 +263,9 @@ const DEFAULT_CAT_AUTO_RECORD_STOP_CONSECUTIVE_FRAMES: u64 = 15;
 const DEFAULT_CAT_AUTO_RECORD_STOP_DURATION_MS: u64 = 3_000;
 const LIVE_MANAGED_DETECTION_TTL_SECONDS: u64 = 300;
 const CAT_AUTO_DETECTION_RENEW_WINDOW_SECONDS: i64 = 60;
+const CAT_ACTIVITY_RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
+const CAT_ACTIVITY_RECONCILE_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const CAT_VALIDATION_READINESS_CACHE_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CatRecordingFrameSeekStrategy {
@@ -256,15 +276,11 @@ enum CatRecordingFrameSeekStrategy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CatRecordingFrameProfile {
     Classifier,
-    Vlm,
 }
 
 impl CatRecordingFrameProfile {
     fn max_frames(self) -> usize {
-        match self {
-            Self::Classifier => 9,
-            Self::Vlm => CAT_RECORDING_VALIDATION_FRAMES_PER_ROUND,
-        }
+        9
     }
 }
 
@@ -342,6 +358,244 @@ impl GateAuthenticatedPrincipal {
 struct GatePrincipalAuthError {
     status: StatusCode,
     message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EdgeAuthenticatedIdentity {
+    principal_id: String,
+    principal_name: String,
+    role_kind: RoleKind,
+}
+
+#[derive(Debug, Default)]
+struct EdgeAssertionReplayCache {
+    expirations_by_nonce: HashMap<String, u64>,
+}
+
+#[derive(Clone)]
+pub(crate) struct EdgeAssertionVerifier {
+    key: [u8; 32],
+    replay_cache: Arc<Mutex<EdgeAssertionReplayCache>>,
+}
+
+impl EdgeAssertionVerifier {
+    pub(crate) fn from_credential_env() -> Result<Self, String> {
+        let path = env::var_os(HARBOR_EDGE_ASSERTION_KEY_FILE_ENV)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| format!("{HARBOR_EDGE_ASSERTION_KEY_FILE_ENV} is required"))?;
+        if !path.is_absolute() {
+            return Err(format!(
+                "{HARBOR_EDGE_ASSERTION_KEY_FILE_ENV} must name an absolute credential path"
+            ));
+        }
+        let metadata = fs::metadata(&path)
+            .map_err(|_| "edge assertion credential is missing or unreadable".to_string())?;
+        if !metadata.is_file() {
+            return Err("edge assertion credential must resolve to a regular file".to_string());
+        }
+        let encoded = fs::read_to_string(&path)
+            .map_err(|_| "edge assertion credential is not valid ASCII text".to_string())?;
+        let encoded = encoded.strip_suffix('\n').unwrap_or(encoded.as_str());
+        let encoded = encoded.strip_suffix('\r').unwrap_or(encoded);
+        if encoded.len() != 64
+            || !encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(
+                "edge assertion credential must contain exactly 32 lowercase-hex bytes".to_string(),
+            );
+        }
+        let mut key = [0_u8; 32];
+        for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+            let pair = std::str::from_utf8(pair)
+                .map_err(|_| "edge assertion credential is not valid ASCII text".to_string())?;
+            key[index] = u8::from_str_radix(pair, 16)
+                .map_err(|_| "edge assertion credential is not valid lowercase hex".to_string())?;
+        }
+        Ok(Self::new(key))
+    }
+
+    fn new(key: [u8; 32]) -> Self {
+        Self {
+            key,
+            replay_cache: Arc::new(Mutex::new(EdgeAssertionReplayCache::default())),
+        }
+    }
+
+    fn verify_presented(
+        &self,
+        method: &Method,
+        original_uri: &str,
+        headers: &[Header],
+    ) -> Result<Option<EdgeAuthenticatedIdentity>, GatePrincipalAuthError> {
+        self.verify_presented_at(method, original_uri, headers, edge_assertion_now())
+    }
+
+    fn verify_presented_at(
+        &self,
+        method: &Method,
+        original_uri: &str,
+        headers: &[Header],
+        now: u64,
+    ) -> Result<Option<EdgeAuthenticatedIdentity>, GatePrincipalAuthError> {
+        if !edge_assertion_headers_present(headers) {
+            return Ok(None);
+        }
+        if request_has_header(headers, EDGE_AUTH_SUBREQUEST_HEADER) {
+            return Err(GatePrincipalAuthError::new(
+                StatusCode(400),
+                "edge auth-subrequest marker is not accepted by Beacon",
+            ));
+        }
+
+        let principal_id = required_unique_edge_header(headers, EDGE_PRINCIPAL_ID_HEADER)?;
+        let principal_name = required_unique_edge_header(headers, EDGE_PRINCIPAL_NAME_HEADER)?;
+        let role = required_unique_edge_header(headers, EDGE_PRINCIPAL_ROLE_HEADER)?;
+        let assertion = required_unique_edge_header(headers, EDGE_ASSERTION_HEADER)?;
+        let asserted_method = required_unique_edge_header(headers, EDGE_ORIGINAL_METHOD_HEADER)?;
+        let asserted_uri = required_unique_edge_header(headers, EDGE_ORIGINAL_URI_HEADER)?;
+
+        validate_edge_printable(
+            &principal_id,
+            EDGE_PRINCIPAL_ID_HEADER,
+            EDGE_ASSERTION_MAX_PRINCIPAL_BYTES,
+        )?;
+        validate_edge_printable(
+            &principal_name,
+            EDGE_PRINCIPAL_NAME_HEADER,
+            EDGE_ASSERTION_MAX_PRINCIPAL_BYTES,
+        )?;
+        validate_edge_printable(&role, EDGE_PRINCIPAL_ROLE_HEADER, 32)?;
+        validate_edge_printable(&assertion, EDGE_ASSERTION_HEADER, 256)?;
+        validate_edge_printable(&asserted_method, EDGE_ORIGINAL_METHOD_HEADER, 16)?;
+        validate_edge_printable(
+            &asserted_uri,
+            EDGE_ORIGINAL_URI_HEADER,
+            EDGE_ASSERTION_MAX_URI_BYTES,
+        )?;
+        if asserted_method != method.as_str() {
+            return Err(GatePrincipalAuthError::new(
+                StatusCode(401),
+                "edge assertion method does not match the request",
+            ));
+        }
+        if asserted_uri != original_uri {
+            return Err(GatePrincipalAuthError::new(
+                StatusCode(401),
+                "edge assertion URI does not match the request",
+            ));
+        }
+        let role_kind = match role.as_str() {
+            "FULL_ADMIN" => RoleKind::Admin,
+            "TRUSTED_LAN" => RoleKind::Member,
+            _ => {
+                return Err(GatePrincipalAuthError::new(
+                    StatusCode(403),
+                    "edge principal role is not allowed",
+                ))
+            }
+        };
+
+        let mut assertion_parts = assertion.split('.');
+        let version = assertion_parts.next().unwrap_or_default();
+        let timestamp_text = assertion_parts.next().unwrap_or_default();
+        let nonce = assertion_parts.next().unwrap_or_default();
+        let signature_text = assertion_parts.next().unwrap_or_default();
+        if assertion_parts.next().is_some()
+            || version != EDGE_ASSERTION_VERSION
+            || timestamp_text.is_empty()
+            || nonce.is_empty()
+            || signature_text.is_empty()
+        {
+            return Err(GatePrincipalAuthError::new(
+                StatusCode(401),
+                "edge assertion is malformed",
+            ));
+        }
+        let timestamp = timestamp_text.parse::<u64>().map_err(|_| {
+            GatePrincipalAuthError::new(StatusCode(401), "edge assertion timestamp is malformed")
+        })?;
+        if timestamp.to_string() != timestamp_text {
+            return Err(GatePrincipalAuthError::new(
+                StatusCode(401),
+                "edge assertion timestamp is not canonical",
+            ));
+        }
+        if now.saturating_sub(timestamp) > EDGE_ASSERTION_MAX_CLOCK_SKEW_SECONDS
+            || timestamp.saturating_sub(now) > EDGE_ASSERTION_MAX_CLOCK_SKEW_SECONDS
+        {
+            return Err(GatePrincipalAuthError::new(
+                StatusCode(401),
+                "edge assertion is outside the allowed time window",
+            ));
+        }
+        let nonce_bytes = decode_canonical_base64url(nonce, "edge assertion nonce")?;
+        if nonce_bytes.len() != 12 {
+            return Err(GatePrincipalAuthError::new(
+                StatusCode(401),
+                "edge assertion nonce must contain 12 bytes",
+            ));
+        }
+        let signature = decode_canonical_base64url(signature_text, "edge assertion signature")?;
+        if signature.len() != 32 {
+            return Err(GatePrincipalAuthError::new(
+                StatusCode(401),
+                "edge assertion signature must contain 32 bytes",
+            ));
+        }
+
+        let canonical = [
+            version,
+            timestamp_text,
+            nonce,
+            asserted_method.as_str(),
+            asserted_uri.as_str(),
+            principal_id.as_str(),
+            principal_name.as_str(),
+            role.as_str(),
+        ]
+        .join("\n");
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.key)
+            .expect("HMAC-SHA256 accepts a 32-byte key");
+        mac.update(canonical.as_bytes());
+        mac.verify_slice(&signature).map_err(|_| {
+            GatePrincipalAuthError::new(StatusCode(401), "edge assertion signature is invalid")
+        })?;
+
+        let mut replay_cache = self.replay_cache.lock().map_err(|_| {
+            GatePrincipalAuthError::new(
+                StatusCode(503),
+                "edge assertion replay cache is unavailable",
+            )
+        })?;
+        replay_cache
+            .expirations_by_nonce
+            .retain(|_, expiration| *expiration > now);
+        if replay_cache.expirations_by_nonce.contains_key(nonce) {
+            return Err(GatePrincipalAuthError::new(
+                StatusCode(401),
+                "edge assertion nonce was already used",
+            ));
+        }
+        if replay_cache.expirations_by_nonce.len() >= EDGE_ASSERTION_REPLAY_CAPACITY {
+            return Err(GatePrincipalAuthError::new(
+                StatusCode(503),
+                "edge assertion replay cache is full",
+            ));
+        }
+        replay_cache.expirations_by_nonce.insert(
+            nonce.to_string(),
+            timestamp.saturating_add(EDGE_ASSERTION_MAX_CLOCK_SKEW_SECONDS),
+        );
+
+        Ok(Some(EdgeAuthenticatedIdentity {
+            principal_id,
+            principal_name,
+            role_kind,
+        }))
+    }
 }
 
 impl GatePrincipalAuthError {
@@ -472,6 +726,7 @@ pub struct AdminApi {
     harborlink_media: HarborLinkMediaClient,
     harbor_assistant_dist: PathBuf,
     public_origin: String,
+    edge_assertion_verifier: Option<EdgeAssertionVerifier>,
     model_runtime_activation: Option<ModelRuntimeActivationHandler>,
     last_event_notification_attempt: Arc<Mutex<Option<Value>>>,
     last_home_assistant_service_action: Arc<Mutex<Option<Value>>>,
@@ -490,6 +745,9 @@ pub struct AdminApi {
     detection_job_lifecycle_lock: Arc<Mutex<()>>,
     detection_jobs: Arc<Mutex<HashMap<String, DetectionJobRuntime>>>,
     cat_auto_recording: Arc<Mutex<HashMap<String, CatAutoRecordingState>>>,
+    cat_activity_policy_store: CatActivityPolicyStore,
+    cat_activity_camera_statuses: Arc<Mutex<BTreeMap<String, CatActivityCameraStatus>>>,
+    cat_validation_readiness: Arc<Mutex<CatValidationReadinessCache>>,
     cat_recording_reconciliation_store: CatRecordingReconciliationStore,
     cat_recording_validation_mode: CatRecordingValidationMode,
     cat_recording_validation_store: CatRecordingValidationStore,
@@ -2038,6 +2296,49 @@ struct DetectionJobStartRequest {
     stream_profile: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatActivitySettingsUpdate {
+    schema_version: u8,
+    mode: CatActivityMode,
+    #[serde(default)]
+    disabled_camera_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CatActivityCameraState {
+    Armed,
+    Unarmed,
+    Degraded,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct CatActivityCameraStatus {
+    camera_id: String,
+    status: CatActivityCameraState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated_at: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct CatValidationReadinessCache {
+    checked_at: Option<Instant>,
+    ready: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct CatActivitySettingsResponse {
+    schema_version: u8,
+    mode: CatActivityMode,
+    disabled_camera_ids: Vec<String>,
+    cameras: Vec<CatActivityCameraStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated_at: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct DetectionJobRenewRequest {
     ttl_seconds: Option<u64>,
@@ -2163,6 +2464,48 @@ type ScanRequest = HubScanRequest;
 type ScanResponse = HubScanSummary;
 type ManualAddResponse = HubManualAddSummary;
 
+#[cfg(test)]
+fn unique_test_cat_activity_store_path(file_name: &str) -> PathBuf {
+    static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(0);
+    let store_id = NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed);
+    env::temp_dir()
+        .join(format!(
+            "harborbeacon-admin-api-cat-{}-{store_id}",
+            std::process::id()
+        ))
+        .join(file_name)
+}
+
+#[cfg(test)]
+fn constructor_cat_activity_policy_store() -> CatActivityPolicyStore {
+    CatActivityPolicyStore::new(unique_test_cat_activity_store_path("policy.json"))
+}
+
+#[cfg(not(test))]
+fn constructor_cat_activity_policy_store() -> CatActivityPolicyStore {
+    CatActivityPolicyStore::default()
+}
+
+#[cfg(test)]
+fn constructor_cat_recording_reconciliation_store() -> CatRecordingReconciliationStore {
+    CatRecordingReconciliationStore::new(unique_test_cat_activity_store_path("reconciliation.json"))
+}
+
+#[cfg(not(test))]
+fn constructor_cat_recording_reconciliation_store() -> CatRecordingReconciliationStore {
+    CatRecordingReconciliationStore::default()
+}
+
+#[cfg(test)]
+fn constructor_cat_recording_validation_store() -> CatRecordingValidationStore {
+    CatRecordingValidationStore::new(unique_test_cat_activity_store_path("validation.jsonl"))
+}
+
+#[cfg(not(test))]
+fn constructor_cat_recording_validation_store() -> CatRecordingValidationStore {
+    CatRecordingValidationStore::default()
+}
+
 impl AdminApi {
     pub fn new(
         admin_store: AdminConsoleStore,
@@ -2175,8 +2518,8 @@ impl AdminApi {
             task_service,
             harbor_assistant_dist,
             public_origin,
-            CatRecordingReconciliationStore::default(),
-            CatRecordingValidationStore::default(),
+            constructor_cat_recording_reconciliation_store(),
+            constructor_cat_recording_validation_store(),
         )
     }
 
@@ -2199,6 +2542,7 @@ impl AdminApi {
             public_origin,
             harborlink_media,
             cat_recording_validation_mode,
+            constructor_cat_activity_policy_store(),
             cat_recording_reconciliation_store,
             cat_recording_validation_store,
         )
@@ -2211,6 +2555,7 @@ impl AdminApi {
         public_origin: String,
         harborlink_media: HarborLinkMediaClient,
         cat_recording_validation_mode: CatRecordingValidationMode,
+        cat_activity_policy_store: CatActivityPolicyStore,
         cat_recording_reconciliation_store: CatRecordingReconciliationStore,
         cat_recording_validation_store: CatRecordingValidationStore,
     ) -> Self {
@@ -2227,6 +2572,7 @@ impl AdminApi {
             harborlink_media,
             harbor_assistant_dist,
             public_origin,
+            edge_assertion_verifier: None,
             model_runtime_activation: None,
             last_event_notification_attempt: Arc::new(Mutex::new(None)),
             last_home_assistant_service_action: Arc::new(Mutex::new(None)),
@@ -2245,6 +2591,9 @@ impl AdminApi {
             detection_job_lifecycle_lock: Arc::new(Mutex::new(())),
             detection_jobs: Arc::new(Mutex::new(HashMap::new())),
             cat_auto_recording: Arc::new(Mutex::new(cat_auto_recording)),
+            cat_activity_policy_store,
+            cat_activity_camera_statuses: Arc::new(Mutex::new(BTreeMap::new())),
+            cat_validation_readiness: Arc::new(Mutex::new(CatValidationReadinessCache::default())),
             cat_recording_reconciliation_store,
             cat_recording_validation_mode,
             cat_recording_validation_store,
@@ -2254,6 +2603,7 @@ impl AdminApi {
         api.refresh_home_guardian_rule_cache_best_effort();
         api.start_home_guardian_worker(guardian_receiver);
         api.start_detection_job_monitor();
+        api.start_cat_activity_supervisor();
         api.start_cat_auto_recording_worker();
         api.start_cat_recording_validation_worker();
         api
@@ -2274,8 +2624,9 @@ impl AdminApi {
             HarborLinkMediaClient::new("http://127.0.0.1:9")
                 .expect("fixed test HarborLink endpoint must be valid"),
             CatRecordingValidationMode::Off,
-            CatRecordingReconciliationStore::default(),
-            CatRecordingValidationStore::default(),
+            constructor_cat_activity_policy_store(),
+            constructor_cat_recording_reconciliation_store(),
+            constructor_cat_recording_validation_store(),
         )
     }
 
@@ -2287,9 +2638,20 @@ impl AdminApi {
         self
     }
 
+    pub(crate) fn with_edge_assertion_verifier(mut self, verifier: EdgeAssertionVerifier) -> Self {
+        self.edge_assertion_verifier = Some(verifier);
+        self
+    }
+
     #[cfg(test)]
     fn with_harborlink_media_client(mut self, client: HarborLinkMediaClient) -> Self {
         self.harborlink_media = client;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_cat_activity_policy_store(mut self, store: CatActivityPolicyStore) -> Self {
+        self.cat_activity_policy_store = store;
         self
     }
 
@@ -2318,6 +2680,215 @@ impl AdminApi {
             });
     }
 
+    fn start_cat_activity_supervisor(&self) {
+        if !cat_auto_recording_enabled() {
+            return;
+        }
+        let worker = self.clone();
+        thread::Builder::new()
+            .name("cat-activity-supervisor".to_string())
+            .spawn(move || {
+                let mut retry_delay = CAT_ACTIVITY_RECONCILE_BACKOFF_MIN;
+                loop {
+                    match worker.reconcile_cat_activity_policy() {
+                        Ok(()) => {
+                            retry_delay = CAT_ACTIVITY_RECONCILE_BACKOFF_MIN;
+                            thread::sleep(CAT_ACTIVITY_RECONCILE_INTERVAL);
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "HarborBeacon cat activity supervisor is degraded: {}",
+                                redact_admin_string(&error)
+                            );
+                            worker.mark_cat_activity_dependency_degraded();
+                            thread::sleep(retry_delay);
+                            retry_delay = retry_delay
+                                .saturating_mul(2)
+                                .min(CAT_ACTIVITY_RECONCILE_INTERVAL);
+                        }
+                    }
+                }
+            })
+            .unwrap_or_else(|error| {
+                panic!("failed to start required cat activity supervisor: {error}")
+            });
+    }
+
+    fn reconcile_cat_activity_policy(&self) -> Result<(), String> {
+        let policy = self.cat_activity_policy_store.load()?;
+        let previous_ids = self
+            .cat_activity_camera_statuses
+            .lock()
+            .map_err(|_| "cat activity status is unavailable".to_string())?
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let managed_camera_ids = self
+            .detection_jobs
+            .lock()
+            .map_err(|_| "detection job state is unavailable".to_string())?
+            .values()
+            .filter(|runtime| is_cat_activity_managed_detection_job(&runtime.projection))
+            .map(|runtime| runtime.projection.camera_id.clone())
+            .collect::<HashSet<_>>();
+        let mut local_ids = previous_ids
+            .union(&managed_camera_ids)
+            .cloned()
+            .collect::<Vec<_>>();
+        local_ids.sort();
+        for camera_id in &local_ids {
+            if let Some(reason) = cat_activity_policy_unarmed_reason(&policy, camera_id, None) {
+                let stop_result = self.stop_policy_managed_detection_job(camera_id);
+                let status = CatActivityCameraStatus {
+                    camera_id: camera_id.clone(),
+                    status: if stop_result.is_ok() {
+                        CatActivityCameraState::Unarmed
+                    } else {
+                        CatActivityCameraState::Degraded
+                    },
+                    reason: Some(if stop_result.is_ok() {
+                        reason.to_string()
+                    } else {
+                        "detection_stop_failed".to_string()
+                    }),
+                    updated_at: Some(current_rfc3339_timestamp()),
+                };
+                self.cat_activity_camera_statuses
+                    .lock()
+                    .map_err(|_| "cat activity status is unavailable".to_string())?
+                    .insert(camera_id.clone(), status);
+                stop_result?;
+            }
+        }
+
+        let cameras = self.harborlink_media.list_cameras()?;
+        let current_ids = cameras
+            .iter()
+            .map(|camera| camera.camera_id.clone())
+            .collect::<HashSet<_>>();
+        for camera_id in local_ids {
+            if !current_ids.contains(&camera_id) {
+                self.stop_policy_managed_detection_job(&camera_id)?;
+            }
+        }
+
+        let validation_ready = cameras.iter().any(|camera| {
+            cat_activity_policy_unarmed_reason(&policy, &camera.camera_id, Some(camera)).is_none()
+        }) && self.cat_validation_runtime_ready_cached();
+        let mut statuses = BTreeMap::new();
+        for camera in cameras {
+            let status = self.reconcile_cat_activity_camera(&policy, &camera, validation_ready);
+            statuses.insert(camera.camera_id, status);
+        }
+        *self
+            .cat_activity_camera_statuses
+            .lock()
+            .map_err(|_| "cat activity status is unavailable".to_string())? = statuses;
+        Ok(())
+    }
+
+    fn reconcile_cat_activity_camera(
+        &self,
+        policy: &CatActivityPolicy,
+        camera: &HarborLinkCameraProjection,
+        validation_ready: bool,
+    ) -> CatActivityCameraStatus {
+        let updated_at = Some(current_rfc3339_timestamp());
+        let unarmed_reason =
+            cat_activity_policy_unarmed_reason(policy, &camera.camera_id, Some(camera));
+        if let Some(reason) = unarmed_reason {
+            return match self.stop_policy_managed_detection_job(&camera.camera_id) {
+                Ok(()) => CatActivityCameraStatus {
+                    camera_id: camera.camera_id.clone(),
+                    status: CatActivityCameraState::Unarmed,
+                    reason: Some(reason.to_string()),
+                    updated_at,
+                },
+                Err(_) => CatActivityCameraStatus {
+                    camera_id: camera.camera_id.clone(),
+                    status: CatActivityCameraState::Degraded,
+                    reason: Some("detection_stop_failed".to_string()),
+                    updated_at,
+                },
+            };
+        }
+
+        match self.ensure_live_managed_detection_job(&camera.camera_id, "sub") {
+            Ok(()) => {
+                let (status, reason) = cat_activity_running_status(validation_ready);
+                CatActivityCameraStatus {
+                    camera_id: camera.camera_id.clone(),
+                    status,
+                    reason: reason.map(str::to_string),
+                    updated_at,
+                }
+            }
+            Err(_) => CatActivityCameraStatus {
+                camera_id: camera.camera_id.clone(),
+                status: CatActivityCameraState::Degraded,
+                reason: Some("sub_detection_unavailable".to_string()),
+                updated_at,
+            },
+        }
+    }
+
+    fn cat_validation_runtime_ready_cached(&self) -> bool {
+        let mut cache = match self.cat_validation_readiness.lock() {
+            Ok(cache) => cache,
+            Err(_) => {
+                eprintln!("HarborBeacon cat validation readiness cache is unavailable");
+                return false;
+            }
+        };
+        if cache
+            .checked_at
+            .is_some_and(|checked_at| checked_at.elapsed() < CAT_VALIDATION_READINESS_CACHE_TTL)
+        {
+            return cache.ready;
+        }
+        cache.ready = match cat_recording_validation_runtime_ready() {
+            Ok(ready) => ready,
+            Err(error) => {
+                eprintln!(
+                    "HarborBeacon cat validation readiness is degraded: {}",
+                    redact_admin_string(&error)
+                );
+                false
+            }
+        };
+        cache.checked_at = Some(Instant::now());
+        cache.ready
+    }
+
+    fn set_cat_validation_runtime_readiness(&self, ready: bool) {
+        match self.cat_validation_readiness.lock() {
+            Ok(mut cache) => {
+                cache.ready = ready;
+                cache.checked_at = Some(Instant::now());
+            }
+            Err(_) => {
+                eprintln!("HarborBeacon cat validation readiness cache is unavailable");
+            }
+        }
+    }
+
+    fn mark_cat_activity_dependency_degraded(&self) {
+        let updated_at = Some(current_rfc3339_timestamp());
+        let policy = self.cat_activity_policy_store.load().ok();
+        if let Ok(mut statuses) = self.cat_activity_camera_statuses.lock() {
+            for status in statuses.values_mut() {
+                if policy.as_ref().is_some_and(|policy| {
+                    cat_activity_policy_unarmed_reason(policy, &status.camera_id, None).is_some()
+                }) {
+                    continue;
+                }
+                status.status = CatActivityCameraState::Degraded;
+                status.reason = Some("harborlink_unavailable".to_string());
+                status.updated_at = updated_at.clone();
+            }
+        }
+    }
+
     fn start_cat_auto_recording_worker(&self) {
         let config = if cat_auto_recording_enabled() {
             match cat_auto_recording_config_from_env() {
@@ -2339,7 +2910,7 @@ impl AdminApi {
             return;
         }
         let worker = self.clone();
-        let _ = thread::Builder::new()
+        thread::Builder::new()
             .name("cat-auto-recording".to_string())
             .spawn(move || loop {
                 let result = match config {
@@ -2359,6 +2930,9 @@ impl AdminApi {
                     return;
                 }
                 thread::sleep(CAT_AUTO_RECORD_POLL_INTERVAL);
+            })
+            .unwrap_or_else(|error| {
+                panic!("failed to start required cat auto-recording worker: {error}")
             });
     }
 
@@ -2367,9 +2941,12 @@ impl AdminApi {
             return;
         }
         let worker = self.clone();
-        let _ = thread::Builder::new()
+        thread::Builder::new()
             .name("cat-recording-validation".to_string())
-            .spawn(move || worker.run_cat_recording_validation_worker());
+            .spawn(move || worker.run_cat_recording_validation_worker())
+            .unwrap_or_else(|error| {
+                panic!("failed to start required cat recording validation worker: {error}")
+            });
     }
 
     fn run_cat_recording_validation_worker(self) {
@@ -2384,22 +2961,32 @@ impl AdminApi {
         self.retry_pending_cat_recording_discards();
         loop {
             self.retry_pending_cat_recording_discards();
-            match cat_recording_validation_runtime_ready() {
-                Ok(true) => {}
-                Ok(false) => {
-                    thread::sleep(CAT_RECORDING_VALIDATION_RUNTIME_RETRY_INTERVAL);
-                    continue;
-                }
-                Err(error) => {
-                    eprintln!("HarborBeacon cat recording validation readiness failed: {error}");
-                    thread::sleep(CAT_RECORDING_VALIDATION_RUNTIME_RETRY_INTERVAL);
-                    continue;
-                }
-            }
             if let Err(error) = self.cat_recording_validation_store.recover_expired_claims() {
                 eprintln!("HarborBeacon cat recording validation recovery failed: {error}");
                 thread::sleep(CAT_RECORDING_VALIDATION_POLL_INTERVAL);
                 continue;
+            }
+            let has_pending = match self.cat_recording_validation_store.next_pending() {
+                Ok(pending) => pending.is_some(),
+                Err(error) => {
+                    eprintln!("HarborBeacon cat recording validation queue failed: {error}");
+                    thread::sleep(CAT_RECORDING_VALIDATION_POLL_INTERVAL);
+                    continue;
+                }
+            };
+            let runtime_ready = cat_validation_readiness_for_pending(has_pending, || {
+                self.cat_validation_runtime_ready_cached()
+            });
+            match runtime_ready {
+                None => {
+                    thread::sleep(CAT_RECORDING_VALIDATION_POLL_INTERVAL);
+                    continue;
+                }
+                Some(true) => {}
+                Some(false) => {
+                    thread::sleep(CAT_RECORDING_VALIDATION_RUNTIME_RETRY_INTERVAL);
+                    continue;
+                }
             }
             match self.cat_recording_validation_store.claim_next_pending(
                 &worker_owner,
@@ -2423,6 +3010,13 @@ impl AdminApi {
 
         let started = Instant::now();
         let result = self.evaluate_cat_recording_candidate(&claimed, started);
+        match &result {
+            Ok((_, Some(_), _)) => self.set_cat_validation_runtime_readiness(true),
+            Err(error) if cat_validation_error_invalidates_readiness(error) => {
+                self.set_cat_validation_runtime_readiness(false)
+            }
+            _ => {}
+        }
         let completion = match result {
             Ok((status, decision, error)) => self.cat_recording_validation_store.complete(
                 &claimed.artifact_id,
@@ -2649,108 +3243,41 @@ impl AdminApi {
             {
                 return Ok((status, None, Some(reason.to_string())));
             }
-            let backend = validator_backend_from_env()?;
-            let decision = match backend {
-                CatRecordingValidatorBackend::MobileNetV2Int8 => {
-                    let (sampling_strategy, sample_targets) =
-                        select_cat_recording_classifier_sample_targets(record, duration_seconds);
-                    let frames = build_cat_recording_sample_frames(
-                        &video_path,
-                        &work_dir,
-                        &sample_targets,
-                        Instant::now() + CAT_RECORDING_VALIDATION_MEDIA_TIMEOUT,
-                        CatRecordingFrameProfile::Classifier,
-                    )?;
-                    let config = classifier_config_from_env()?;
-                    let execution = run_cat_recording_classifier(&frames, &config)?;
-                    let aggregation = aggregate_cat_recording_predictions(
-                        &execution.predictions,
-                        config.threshold_ppm,
-                        CAT_RECORDING_CLASSIFIER_MIN_POSITIVE_FRAMES,
-                    )?;
-                    sanitize_decision(CatRecordingValidationDecision {
-                        cat_present: aggregation.cat_present,
-                        cat_frame_indices: aggregation.cat_frame_indices,
-                        behavior_tags: Vec::new(),
-                        summary: String::new(),
-                        reason_code: aggregation.reason_code,
-                        sampled_frame_count: execution.sampled_frame_count,
-                        sampling_strategy,
-                        validation_rounds: 1,
-                        sampled_offsets_ms: sample_targets
-                            .iter()
-                            .map(|target| target.offset_ms)
-                            .collect(),
-                        frame_predictions: aggregation.frame_predictions,
-                        model_endpoint_id: execution.provider,
-                        model_name: execution.model_name,
-                        elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-                    })
-                }
-                CatRecordingValidatorBackend::Vlm => {
-                    let media_deadline = Instant::now() + CAT_RECORDING_VALIDATION_MEDIA_TIMEOUT;
-                    let (sampling_strategy, mut sample_targets) =
-                        select_initial_cat_recording_vlm_sample_targets(record, duration_seconds);
-                    let initial_frames = build_cat_recording_sample_frames(
-                        &video_path,
-                        &work_dir,
-                        &sample_targets,
-                        media_deadline,
-                        CatRecordingFrameProfile::Vlm,
-                    )?;
-                    let initial_execution = run_cat_recording_validation(&initial_frames);
-                    if !initial_execution.available {
-                        return Err(format!("vlm_{}", initial_execution.status));
-                    }
-                    let mut executions = vec![initial_execution];
-                    if should_run_cat_recording_followup(&executions[0], record) {
-                        let positive_offsets = cat_recording_positive_offsets(
-                            &sample_targets,
-                            &executions[0].cat_frame_indices,
-                        );
-                        let followup_targets = select_followup_cat_recording_sample_targets(
-                            record,
-                            duration_seconds,
-                            &sample_targets,
-                            &positive_offsets,
-                        );
-                        if !followup_targets.is_empty() {
-                            let followup_frames = build_cat_recording_sample_frames(
-                                &video_path,
-                                &work_dir,
-                                &followup_targets,
-                                media_deadline,
-                                CatRecordingFrameProfile::Vlm,
-                            )?;
-                            let followup_execution = run_cat_recording_validation(&followup_frames);
-                            if !followup_execution.available {
-                                return Err(format!("vlm_{}", followup_execution.status));
-                            }
-                            sample_targets.extend(followup_targets);
-                            executions.push(followup_execution);
-                        }
-                    }
-                    let execution = merge_cat_recording_vlm_executions(&executions);
-                    sanitize_decision(CatRecordingValidationDecision {
-                        cat_present: execution.cat_present,
-                        cat_frame_indices: execution.cat_frame_indices,
-                        behavior_tags: execution.behavior_tags,
-                        summary: execution.summary,
-                        reason_code: execution.reason_code,
-                        sampled_frame_count: execution.sampled_frame_count,
-                        sampling_strategy,
-                        validation_rounds: u8::try_from(executions.len()).unwrap_or(u8::MAX),
-                        sampled_offsets_ms: sample_targets
-                            .iter()
-                            .map(|target| target.offset_ms)
-                            .collect(),
-                        frame_predictions: Vec::new(),
-                        model_endpoint_id: execution.model_endpoint_id.unwrap_or_default(),
-                        model_name: execution.model_name,
-                        elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-                    })
-                }
-            };
+            validator_backend_from_env()?;
+            let (sampling_strategy, sample_targets) =
+                select_cat_recording_classifier_sample_targets(record, duration_seconds)?;
+            let frames = build_cat_recording_sample_frames(
+                &video_path,
+                &work_dir,
+                &sample_targets,
+                Instant::now() + CAT_RECORDING_VALIDATION_MEDIA_TIMEOUT,
+                CatRecordingFrameProfile::Classifier,
+            )?;
+            let config = classifier_config_from_env()?;
+            let execution = run_cat_recording_classifier(&frames, &config)?;
+            let aggregation = aggregate_cat_recording_predictions(
+                &execution.predictions,
+                config.threshold_ppm,
+                CAT_RECORDING_CLASSIFIER_MIN_POSITIVE_FRAMES,
+            )?;
+            let decision = sanitize_decision(CatRecordingValidationDecision {
+                cat_present: aggregation.cat_present,
+                cat_frame_indices: aggregation.cat_frame_indices,
+                behavior_tags: Vec::new(),
+                summary: String::new(),
+                reason_code: aggregation.reason_code,
+                sampled_frame_count: execution.sampled_frame_count,
+                sampling_strategy,
+                validation_rounds: 1,
+                sampled_offsets_ms: sample_targets
+                    .iter()
+                    .map(|target| target.offset_ms)
+                    .collect(),
+                frame_predictions: aggregation.frame_predictions,
+                model_endpoint_id: execution.provider,
+                model_name: execution.model_name,
+                elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            });
             let status = cat_recording_validation_status_for_decision(&decision);
             Ok((status, Some(decision), None))
         })();
@@ -3699,27 +4226,70 @@ impl AdminApi {
             configured_token.as_deref(),
             raw_url,
             headers,
-            || {
-                let state = self.admin_store.load_state().map_err(|error| {
-                    GatePrincipalAuthError::new(
-                        StatusCode(503),
-                        format!("failed to load active workspace: {error}"),
-                    )
-                })?;
-                state
-                    .platform
-                    .workspaces
-                    .iter()
-                    .find(|workspace| workspace.status == WorkspaceStatus::Active)
-                    .map(|workspace| workspace.workspace_id.clone())
-                    .ok_or_else(|| {
-                        GatePrincipalAuthError::new(
-                            StatusCode(503),
-                            "active workspace is not configured",
-                        )
-                    })
-            },
+            || self.load_active_workspace_id(),
         )
+    }
+
+    fn load_active_workspace_id(&self) -> Result<String, GatePrincipalAuthError> {
+        let state = self.admin_store.load_state().map_err(|error| {
+            GatePrincipalAuthError::new(
+                StatusCode(503),
+                format!("failed to load active workspace: {error}"),
+            )
+        })?;
+        state
+            .platform
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.status == WorkspaceStatus::Active)
+            .map(|workspace| workspace.workspace_id.clone())
+            .ok_or_else(|| {
+                GatePrincipalAuthError::new(StatusCode(503), "active workspace is not configured")
+            })
+    }
+
+    fn verify_edge_assertion(
+        &self,
+        method: &Method,
+        original_uri: &str,
+        headers: &[Header],
+    ) -> Result<Option<EdgeAuthenticatedIdentity>, GatePrincipalAuthError> {
+        match &self.edge_assertion_verifier {
+            Some(verifier) => verifier.verify_presented(method, original_uri, headers),
+            None if edge_assertion_headers_present(headers) => Err(GatePrincipalAuthError::new(
+                StatusCode(503),
+                "edge assertion verification is not configured",
+            )),
+            None => Ok(None),
+        }
+    }
+
+    fn edge_identity_principal(
+        &self,
+        identity: EdgeAuthenticatedIdentity,
+    ) -> Result<GateAuthenticatedPrincipal, GatePrincipalAuthError> {
+        Ok(GateAuthenticatedPrincipal(AccessPrincipal {
+            workspace_id: self.load_active_workspace_id()?,
+            user_id: identity.principal_id,
+            display_name: identity.principal_name,
+            role_kind: identity.role_kind,
+        }))
+    }
+
+    pub(crate) fn reject_presented_edge_headers(
+        &self,
+        _method: &Method,
+        _original_uri: &str,
+        headers: &[Header],
+    ) -> Result<(), ResponseBox> {
+        if edge_assertion_headers_present(headers) {
+            return Err(error_json(
+                StatusCode(400),
+                "edge assertion headers are not accepted on this endpoint",
+            )
+            .boxed());
+        }
+        Ok(())
     }
 
     fn authorize_camera_action(
@@ -3784,7 +4354,8 @@ impl AdminApi {
 
     pub fn handle(&self, mut request: Request) {
         let method = request.method().clone();
-        let raw_url = normalize_unified_admin_url(&request.url().to_string());
+        let original_uri = request.url().to_string();
+        let raw_url = normalize_unified_admin_url(&original_uri);
         let path = raw_url.split('?').next().unwrap_or("/").to_string();
         let remote_addr = request.remote_addr().copied();
         let headers = request.headers().to_vec();
@@ -3798,6 +4369,14 @@ impl AdminApi {
             .or_else(|| header_value(&headers, "Idempotency-Key"));
         let _harborlink_request_scope = harborlink_request_scope(business_request_id.as_deref());
 
+        let edge_identity = match self.verify_edge_assertion(&method, &original_uri, &headers) {
+            Ok(identity) => identity,
+            Err(error) => {
+                let _ = request.respond(error_json(error.status, &error.message).boxed());
+                return;
+            }
+        };
+
         if is_admin_surface_path(path.as_str()) || is_harbor_assistant_surface_path(path.as_str()) {
             if let Err(error) = ensure_local_admin_access(remote_addr, &headers) {
                 let _ = request.respond(error_json(StatusCode(403), &error).boxed());
@@ -3806,7 +4385,11 @@ impl AdminApi {
         }
 
         let gate_principal = if requires_gate_principal {
-            match self.authenticate_gate_principal(&raw_url, &headers) {
+            let authenticated = match edge_identity {
+                Some(identity) => self.edge_identity_principal(identity),
+                None => self.authenticate_gate_principal(&raw_url, &headers),
+            };
+            match authenticated {
                 Ok(principal) => Some(principal),
                 Err(error) => {
                     let _ = request.respond(error_json(error.status, &error.message).boxed());
@@ -4040,6 +4623,12 @@ impl AdminApi {
             Method::Get if path == "/api/feature-availability" => {
                 self.handle_feature_availability(&identity_hints).boxed()
             }
+            Method::Get if path == "/api/vision/cat-activity/settings" => {
+                self.handle_cat_activity_settings(&identity_hints).boxed()
+            }
+            Method::Put if path == "/api/vision/cat-activity/settings" => self
+                .handle_save_cat_activity_settings(&mut request, &identity_hints)
+                .boxed(),
             Method::Get if is_cat_detection_observation_path(&path) => self
                 .handle_cat_detection_observation(
                     &path,
@@ -7022,6 +7611,99 @@ impl AdminApi {
         }
     }
 
+    fn handle_cat_activity_settings(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        match self.cat_activity_settings_response() {
+            Ok(response) => ok_json(&response),
+            Err(error) => error_json(StatusCode(500), &redact_admin_string(&error)),
+        }
+    }
+
+    fn handle_save_cat_activity_settings(
+        &self,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
+        let update = match read_json_body_limited::<CatActivitySettingsUpdate>(request, 16 * 1024) {
+            Ok(update) => update,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let policy = CatActivityPolicy {
+            schema_version: update.schema_version,
+            mode: update.mode,
+            disabled_camera_ids: update.disabled_camera_ids,
+            updated_at: Some(current_rfc3339_timestamp()),
+        };
+        if let Err(error) = persist_cat_activity_policy_with_audit(
+            &self.admin_store,
+            &self.cat_activity_policy_store,
+            &principal,
+            policy,
+        ) {
+            return error_json(StatusCode(422), &redact_admin_string(&error));
+        }
+        if cat_auto_recording_enabled() {
+            let worker = self.clone();
+            let spawn_result = thread::Builder::new()
+                .name("cat-activity-policy-apply".to_string())
+                .spawn(move || {
+                    if let Err(error) = worker.reconcile_cat_activity_policy() {
+                        eprintln!(
+                            "HarborBeacon cat activity policy apply is degraded: {}",
+                            redact_admin_string(&error)
+                        );
+                        worker.mark_cat_activity_dependency_degraded();
+                    }
+                });
+            if let Err(error) = spawn_result {
+                self.mark_cat_activity_dependency_degraded();
+                self.record_admin_audit(
+                    &principal,
+                    "cat_activity_policy",
+                    "default",
+                    "cat_activity_policy.apply",
+                    json!({"status": "spawn_failed"}),
+                    json!({
+                        "status": "degraded",
+                        "reason": "supervisor_unavailable",
+                        "error": redact_admin_string(&error.to_string()),
+                    }),
+                );
+            }
+        }
+        match self.cat_activity_settings_response() {
+            Ok(response) => ok_json(&response),
+            Err(error) => error_json(StatusCode(500), &redact_admin_string(&error)),
+        }
+    }
+
+    fn cat_activity_settings_response(&self) -> Result<CatActivitySettingsResponse, String> {
+        let policy = self.cat_activity_policy_store.load()?;
+        let cameras = self
+            .cat_activity_camera_statuses
+            .lock()
+            .map_err(|_| "cat activity status is unavailable".to_string())?
+            .values()
+            .cloned()
+            .collect();
+        Ok(CatActivitySettingsResponse {
+            schema_version: policy.schema_version,
+            mode: policy.mode,
+            disabled_camera_ids: policy.disabled_camera_ids,
+            cameras,
+            updated_at: policy.updated_at,
+        })
+    }
+
     fn handle_start_detection_job(
         &self,
         request: &mut Request,
@@ -7298,7 +7980,13 @@ impl AdminApi {
                 self.refresh_detection_job(runtime);
             }
             let Some(runtime) = jobs.values_mut().find(|runtime| {
-                runtime.projection.camera_id == camera_id && runtime.projection.status == "running"
+                runtime.projection.camera_id == camera_id
+                    && runtime.projection.status == "running"
+                    && runtime
+                        .projection
+                        .target_labels
+                        .iter()
+                        .any(|label| label.eq_ignore_ascii_case("cat"))
             }) else {
                 drop(jobs);
                 return self.start_live_managed_detection_profile_locked(camera_id, stream_profile);
@@ -7445,6 +8133,69 @@ impl AdminApi {
             refresh_detection_job_outputs(runtime);
         }
         Ok(())
+    }
+
+    fn stop_policy_managed_detection_job(&self, camera_id: &str) -> Result<(), String> {
+        let _lifecycle = self
+            .detection_job_lifecycle_lock
+            .lock()
+            .map_err(|_| "detection job lifecycle is unavailable".to_string())?;
+        let mut jobs = self
+            .detection_jobs
+            .lock()
+            .map_err(|_| "detection job state is unavailable".to_string())?;
+        let mut cleanup_failed = false;
+        for runtime in jobs.values_mut().filter(|runtime| {
+            runtime.projection.camera_id == camera_id
+                && is_cat_activity_managed_detection_job(&runtime.projection)
+        }) {
+            self.refresh_detection_job(runtime);
+            if runtime.projection.status != "running" {
+                match self
+                    .harborlink_media
+                    .stop_detection_lease(camera_id, &runtime.projection.lease_id)
+                {
+                    Ok(_) => {
+                        runtime.projection.managed_by_live = false;
+                        runtime.projection.message = None;
+                    }
+                    Err(_) => {
+                        cleanup_failed = true;
+                        runtime.projection.message =
+                            Some("detection lease cleanup was incomplete".to_string());
+                    }
+                }
+                refresh_detection_job_outputs(runtime);
+                continue;
+            }
+            let stop_result = stop_detection_child(runtime);
+            let worker_stop_note = complete_detection_job_stop(runtime, "stopped", stop_result)?;
+            let lease_stop_note = match self
+                .harborlink_media
+                .stop_detection_lease(camera_id, &runtime.projection.lease_id)
+            {
+                Ok(_) => {
+                    runtime.projection.managed_by_live = false;
+                    None
+                }
+                Err(_) => {
+                    cleanup_failed = true;
+                    Some("detection lease cleanup was incomplete".to_string())
+                }
+            };
+            runtime.projection.message = match (worker_stop_note, lease_stop_note) {
+                (Some(worker), Some(lease)) => Some(format!("{worker}; {lease}")),
+                (Some(worker), None) => Some(worker),
+                (None, Some(lease)) => Some(lease),
+                (None, None) => None,
+            };
+            refresh_detection_job_outputs(runtime);
+        }
+        if cleanup_failed {
+            Err("detection lease cleanup was incomplete".to_string())
+        } else {
+            Ok(())
+        }
     }
 
     fn handle_get_detection_job(
@@ -12255,6 +13006,97 @@ fn request_has_header(headers: &[Header], name: &str) -> bool {
         .any(|header| header.field.as_str().to_string().eq_ignore_ascii_case(name))
 }
 
+fn edge_assertion_headers_present(headers: &[Header]) -> bool {
+    let edge_specific_header_present = [
+        EDGE_ASSERTION_HEADER,
+        EDGE_PRINCIPAL_NAME_HEADER,
+        EDGE_PRINCIPAL_ROLE_HEADER,
+        EDGE_ORIGINAL_METHOD_HEADER,
+        EDGE_ORIGINAL_URI_HEADER,
+        EDGE_AUTH_SUBREQUEST_HEADER,
+    ]
+    .iter()
+    .any(|name| request_has_header(headers, name));
+    let complete_gate_v2_identity = [
+        "X-Harbor-Principal-Source",
+        "X-Harbor-Principal-Roles",
+        "X-Harbor-Workspace-Id",
+    ]
+    .iter()
+    .all(|name| request_has_header(headers, name));
+    edge_specific_header_present
+        || (request_has_header(headers, EDGE_PRINCIPAL_ID_HEADER) && !complete_gate_v2_identity)
+}
+
+fn required_unique_edge_header(
+    headers: &[Header],
+    name: &str,
+) -> Result<String, GatePrincipalAuthError> {
+    let mut values = headers
+        .iter()
+        .filter(|header| header.field.as_str().to_string().eq_ignore_ascii_case(name))
+        .map(|header| header.value.as_str());
+    let value = values.next().ok_or_else(|| {
+        GatePrincipalAuthError::new(
+            StatusCode(400),
+            format!("missing required edge header {name}"),
+        )
+    })?;
+    if values.next().is_some() {
+        return Err(GatePrincipalAuthError::new(
+            StatusCode(400),
+            format!("duplicate edge header {name}"),
+        ));
+    }
+    if value.is_empty() || value != value.trim() {
+        return Err(GatePrincipalAuthError::new(
+            StatusCode(400),
+            format!("edge header {name} is empty or has surrounding whitespace"),
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn validate_edge_printable(
+    value: &str,
+    field: &str,
+    max_bytes: usize,
+) -> Result<(), GatePrincipalAuthError> {
+    if value.len() > max_bytes || !value.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
+        return Err(GatePrincipalAuthError::new(
+            StatusCode(400),
+            format!("edge header {field} is not safe printable ASCII"),
+        ));
+    }
+    Ok(())
+}
+
+fn decode_canonical_base64url(value: &str, field: &str) -> Result<Vec<u8>, GatePrincipalAuthError> {
+    if value.len() > 128 || value.contains('=') {
+        return Err(GatePrincipalAuthError::new(
+            StatusCode(401),
+            format!("{field} is not canonical base64url"),
+        ));
+    }
+    let decoded = URL_SAFE_NO_PAD.decode(value).map_err(|_| {
+        GatePrincipalAuthError::new(StatusCode(401), format!("{field} is not valid base64url"))
+    })?;
+    if URL_SAFE_NO_PAD.encode(&decoded) != value {
+        return Err(GatePrincipalAuthError::new(
+            StatusCode(401),
+            format!("{field} is not canonical base64url"),
+        ));
+    }
+    Ok(decoded)
+}
+
+fn edge_assertion_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn query_has_parameter(url: &str, key: &str) -> bool {
     url.split_once('?')
         .map(|(_, query)| {
@@ -12395,22 +13237,101 @@ fn normalize_detection_job_start(
 
 fn normalize_detection_provider(value: Option<&str>) -> Result<String, String> {
     let provider = value.unwrap_or("cpu").trim().to_ascii_lowercase();
-    if matches!(provider.as_str(), "cpu" | "spacemit") {
+    if provider == "cpu" {
         return Ok(provider);
     }
-    Err("HARBOR_K3_YOLO_PROVIDER must be cpu or spacemit".to_string())
+    Err("HARBOR_K3_YOLO_PROVIDER must be cpu for EVT.1".to_string())
 }
 
 fn cat_auto_recording_enabled() -> bool {
-    env::var(CAT_AUTO_RECORD_ENABLED_ENV)
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    match env::var(CAT_AUTO_RECORD_ENABLED_ENV) {
+        Ok(value) => parse_cat_auto_recording_enabled(&value).unwrap_or_else(|error| {
+            panic!("invalid cat activity supervisor configuration: {error}")
+        }),
+        Err(env::VarError::NotPresent) => true,
+        Err(env::VarError::NotUnicode(_)) => {
+            panic!("{CAT_AUTO_RECORD_ENABLED_ENV} must be valid Unicode")
+        }
+    }
+}
+
+fn parse_cat_auto_recording_enabled(value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(format!(
+            "{CAT_AUTO_RECORD_ENABLED_ENV} must be true/false, 1/0, yes/no, or on/off"
+        )),
+    }
+}
+
+fn cat_activity_policy_unarmed_reason(
+    policy: &CatActivityPolicy,
+    camera_id: &str,
+    camera: Option<&HarborLinkCameraProjection>,
+) -> Option<&'static str> {
+    if policy.mode == CatActivityMode::Off {
+        return Some("policy_off");
+    }
+    if policy.camera_disabled(camera_id) {
+        return Some("camera_opted_out");
+    }
+    let camera = camera?;
+    if !camera.enabled {
+        return Some("camera_disabled");
+    }
+    if !camera.stream_configured {
+        return Some("stream_not_configured");
+    }
+    None
+}
+
+fn cat_activity_running_status(
+    validation_ready: bool,
+) -> (CatActivityCameraState, Option<&'static str>) {
+    if validation_ready {
+        (CatActivityCameraState::Armed, None)
+    } else {
+        (
+            CatActivityCameraState::Degraded,
+            Some("validator_unavailable"),
+        )
+    }
+}
+
+fn persist_cat_activity_policy_with_audit(
+    admin_store: &AdminConsoleStore,
+    policy_store: &CatActivityPolicyStore,
+    principal: &AccessPrincipal,
+    policy: CatActivityPolicy,
+) -> Result<CatActivityPolicy, String> {
+    let policy = policy.normalize()?;
+    let actor_kind = if principal.user_id == "system" {
+        AuditActorKind::System
+    } else {
+        AuditActorKind::User
+    };
+    let audit_record = build_metadata_audit_record(
+        principal.workspace_id.clone(),
+        "cat_activity_policy",
+        "default",
+        "cat_activity_policy.update",
+        actor_kind,
+        principal.user_id.clone(),
+        json!({
+            "schema_version": policy.schema_version,
+            "mode": policy.mode,
+            "disabled_camera_ids": policy.disabled_camera_ids.clone(),
+        }),
+        json!({
+            "status": "write_authorized",
+            "updated_at": policy.updated_at.clone(),
+        }),
+    );
+    admin_store
+        .append_audit_record(audit_record)
+        .map_err(|error| format!("failed to record cat activity policy audit: {error}"))?;
+    policy_store.save(policy)
 }
 
 fn cat_auto_recording_config_from_env() -> Result<CatAutoRecordingConfig, String> {
@@ -12485,29 +13406,63 @@ fn cat_recording_validation_temp_root() -> PathBuf {
 }
 
 fn cat_recording_validation_runtime_ready() -> Result<bool, String> {
-    let backend = validator_backend_from_env()?;
-    Ok(cat_recording_validation_runtime_ready_for(backend, || {
-        vlm_endpoint_readiness(&load_model_center_state())
-            .get("endpoint_ready")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-    }))
+    validator_backend_from_env()?;
+    let config = classifier_config_from_env()?;
+    let command = build_classifier_probe_command(&config);
+    let lease = acquire_ai_resource_lease(AiWorkload::CatRecordingVerifier)
+        .map_err(|error| format!("cat_classifier_probe_{}", error.code()))?;
+    let output = match run_bounded_media_command_with_graceful_stop(
+        command,
+        CAT_RECORDING_CLASSIFIER_TIMEOUT,
+        CAT_RECORDING_CLASSIFIER_STOP_GRACE_PERIOD,
+    ) {
+        Ok(output) => output,
+        Err(error) if media_error_requires_ai_lease_quarantine(&error) => {
+            quarantine_ai_resource_lease(lease);
+            return Err(format!(
+                "cat_classifier_probe_runner_error={error}; exit_unconfirmed=true; ai_resource_lease_quarantined=true; board_reboot_required=true"
+            ));
+        }
+        Err(error) => return Err(format!("cat_classifier_probe_runner_error={error}")),
+    };
+    if let Some(reason) =
+        classifier_ai_quarantine_reason(output.timed_out, output.status.success(), &output.stderr)
+    {
+        lease.quarantine(reason);
+        return Err(format!(
+            "cat_classifier_probe_failed {}; ai_resource_lease_quarantined=true",
+            summarize_media_tool_stderr(&output.stderr, &[])
+        ));
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "cat_classifier_probe_failed {}",
+            summarize_media_tool_stderr(&output.stderr, &[])
+        ));
+    }
+    parse_classifier_probe_output(&output.stdout, &config)?;
+    Ok(true)
 }
 
-fn cat_recording_validation_runtime_ready_for(
-    backend: CatRecordingValidatorBackend,
-    vlm_ready: impl FnOnce() -> bool,
-) -> bool {
-    match backend {
-        CatRecordingValidatorBackend::MobileNetV2Int8 => true,
-        CatRecordingValidatorBackend::Vlm => vlm_ready(),
-    }
+fn cat_validation_readiness_for_pending<F>(has_pending: bool, probe: F) -> Option<bool>
+where
+    F: FnOnce() -> bool,
+{
+    has_pending.then(probe)
+}
+
+fn cat_validation_error_invalidates_readiness(error: &str) -> bool {
+    error.starts_with("cat_classifier_")
+        || error.contains("HARBOR_K3_CAT_RECORDING_VALIDATOR")
+        || error.contains("HARBOR_K3_CAT_RECORDING_CLASSIFIER_")
 }
 
 fn cat_recording_validation_status_for_decision(
     decision: &CatRecordingValidationDecision,
 ) -> CatRecordingValidationStatus {
-    if decision.cat_present && decision.cat_frame_indices.len() >= 2 {
+    if decision.cat_present
+        && decision.cat_frame_indices.len() >= CAT_RECORDING_CLASSIFIER_MIN_POSITIVE_FRAMES
+    {
         CatRecordingValidationStatus::Accepted
     } else if !decision.cat_present
         && decision.cat_frame_indices.is_empty()
@@ -12630,342 +13585,36 @@ fn run_cat_recording_classifier(
 fn select_cat_recording_classifier_sample_targets(
     record: &CatRecordingValidationRecord,
     duration_seconds: f64,
-) -> (String, Vec<CatRecordingSampleTarget>) {
+) -> Result<(String, Vec<CatRecordingSampleTarget>), String> {
     let duration_ms = cat_recording_duration_ms(duration_seconds);
-    let evidence = cat_recording_evidence_offsets(record, duration_ms);
-    let mut offsets = select_diverse_cat_recording_offsets(&evidence, 5);
-    let strategy = if evidence.is_empty() {
-        "uniform_9"
-    } else {
-        "yolo_guided_hybrid_9"
-    };
-    for candidate in uniform_cat_recording_classifier_offsets(duration_ms) {
-        if offsets.len() >= 9 {
-            break;
-        }
-        if offsets
+    let request = CatRecordingSamplingRequest {
+        schema_version: 1,
+        duration_ms,
+        recording_started_at_epoch_ms: u64::try_from(record.started_at_epoch_ms)
+            .map_err(|_| "recording start time exceeds sampler bounds".to_string())?,
+        recording_ended_at_epoch_ms: u64::try_from(record.ended_at_epoch_ms)
+            .map_err(|_| "recording end time exceeds sampler bounds".to_string())?,
+        detection_evidence: record
+            .detection_evidence
             .iter()
-            .all(|offset| offset.abs_diff(candidate) >= CAT_RECORDING_VALIDATION_FRAME_MARGIN_MS)
-        {
-            offsets.push(candidate);
-        }
-    }
-    offsets.truncate(9);
-    (
-        strategy.to_string(),
-        cat_recording_targets_from_offsets(&offsets, 1),
-    )
-}
-
-fn select_initial_cat_recording_vlm_sample_targets(
-    record: &CatRecordingValidationRecord,
-    duration_seconds: f64,
-) -> (String, Vec<CatRecordingSampleTarget>) {
-    let duration_ms = cat_recording_duration_ms(duration_seconds);
-    let evidence = cat_recording_evidence_offsets(record, duration_ms);
-    let (strategy, offsets) = if evidence.is_empty() {
-        (
-            "uniform_fallback".to_string(),
-            uniform_cat_recording_sample_offsets(duration_ms),
-        )
-    } else {
-        (
-            "yolo_guided_adaptive".to_string(),
-            select_diverse_cat_recording_offsets(
-                &evidence,
-                CAT_RECORDING_VALIDATION_FRAMES_PER_ROUND,
-            ),
-        )
+            .map(|evidence| CatRecordingSamplingEvidence {
+                sequence: evidence.sequence,
+                frame_epoch_ms: evidence.frame_epoch_ms,
+                confidence_ppm: evidence.confidence_ppm,
+            })
+            .collect(),
     };
-    (strategy, cat_recording_targets_from_offsets(&offsets, 1))
-}
-
-fn select_followup_cat_recording_sample_targets(
-    record: &CatRecordingValidationRecord,
-    duration_seconds: f64,
-    initial_targets: &[CatRecordingSampleTarget],
-    positive_offsets: &[u64],
-) -> Vec<CatRecordingSampleTarget> {
-    let duration_ms = cat_recording_duration_ms(duration_seconds);
-    let evidence = cat_recording_evidence_offsets(record, duration_ms);
-    let seed_offsets = if positive_offsets.is_empty() {
-        if evidence.is_empty() {
-            initial_targets
-                .iter()
-                .map(|target| target.offset_ms)
-                .collect::<Vec<_>>()
-        } else {
-            evidence.iter().map(|(offset, _)| *offset).collect()
-        }
-    } else {
-        positive_offsets.to_vec()
-    };
-    let has_positive_seed = !positive_offsets.is_empty();
-
-    let mut candidates = BTreeMap::<u64, u32>::new();
-    for (offset, confidence_ppm) in &evidence {
-        insert_cat_recording_followup_candidate(
-            &mut candidates,
-            initial_targets,
-            duration_ms,
-            *offset,
-            confidence_ppm.saturating_add(if has_positive_seed { 0 } else { 1_000_000 }),
-        );
-    }
-    let neighbor_priority = if has_positive_seed {
-        2_000_000_u32
-    } else {
-        1_000_000_u32
-    };
-    for seed in seed_offsets {
-        for delta in CAT_RECORDING_VALIDATION_FOLLOWUP_OFFSETS_MS {
-            insert_cat_recording_followup_candidate(
-                &mut candidates,
-                initial_targets,
-                duration_ms,
-                seed.saturating_sub(delta),
-                neighbor_priority.saturating_sub(u32::try_from(delta).unwrap_or(u32::MAX)),
-            );
-            insert_cat_recording_followup_candidate(
-                &mut candidates,
-                initial_targets,
-                duration_ms,
-                seed.saturating_add(delta),
-                neighbor_priority.saturating_sub(u32::try_from(delta).unwrap_or(u32::MAX)),
-            );
-        }
-    }
-
-    let available_slots = CAT_RECORDING_VALIDATION_MAX_FRAMES.saturating_sub(initial_targets.len());
-    let offsets = select_diverse_cat_recording_offsets(
-        &candidates.into_iter().collect::<Vec<_>>(),
-        available_slots.min(CAT_RECORDING_VALIDATION_FRAMES_PER_ROUND),
-    );
-    let start_index = u8::try_from(initial_targets.len() + 1).unwrap_or(u8::MAX);
-    cat_recording_targets_from_offsets(&offsets, start_index)
-}
-
-fn should_run_cat_recording_followup(
-    execution: &CatRecordingVlmExecution,
-    record: &CatRecordingValidationRecord,
-) -> bool {
-    execution.cat_frame_indices.len() == 1
-        || execution.reason_code == "uncertain"
-        || (execution.cat_frame_indices.is_empty() && !record.detection_evidence.is_empty())
-}
-
-fn cat_recording_positive_offsets(
-    targets: &[CatRecordingSampleTarget],
-    positive_frame_indices: &[u8],
-) -> Vec<u64> {
-    targets
-        .iter()
-        .filter(|target| positive_frame_indices.contains(&target.frame_index))
-        .map(|target| target.offset_ms)
-        .collect()
-}
-
-fn merge_cat_recording_vlm_executions(
-    executions: &[CatRecordingVlmExecution],
-) -> CatRecordingVlmExecution {
-    let mut merged = executions.first().cloned().unwrap_or_default();
-    merged.available = executions.iter().all(|execution| execution.available);
-    merged.cat_frame_indices = executions
-        .iter()
-        .flat_map(|execution| execution.cat_frame_indices.iter().copied())
-        .collect();
-    merged.cat_frame_indices.sort_unstable();
-    merged.cat_frame_indices.dedup();
-    merged.behavior_tags.clear();
-    for tag in executions
-        .iter()
-        .flat_map(|execution| execution.behavior_tags.iter())
-    {
-        if !merged.behavior_tags.contains(tag) {
-            merged.behavior_tags.push(tag.clone());
-        }
-    }
-    merged.sampled_frame_count = executions.iter().fold(0_u8, |count, execution| {
-        count.saturating_add(execution.sampled_frame_count)
-    });
-    merged.cat_present = !merged.cat_frame_indices.is_empty();
-    let has_uncertain = executions
-        .iter()
-        .any(|execution| execution.reason_code == "uncertain");
-    merged.reason_code = if merged.cat_frame_indices.len() >= 2 {
-        "cat_visible".to_string()
-    } else if merged.cat_frame_indices.len() == 1 || has_uncertain {
-        "uncertain".to_string()
-    } else {
-        "no_cat_visible".to_string()
-    };
-    merged.summary = match merged.cat_frame_indices.len() {
-        count if count >= 2 => format!(
-            "共抽样 {} 帧，其中 {count} 个不同时间点确认出现猫。",
-            merged.sampled_frame_count
-        ),
-        1 => format!(
-            "共抽样 {} 帧，仅一个时间点确认出现猫，需要复核。",
-            merged.sampled_frame_count
-        ),
-        _ if has_uncertain => format!(
-            "共抽样 {} 帧仍未形成明确结论，需要复核。",
-            merged.sampled_frame_count
-        ),
-        _ => format!("共抽样 {} 帧均未看见猫。", merged.sampled_frame_count),
-    };
-    merged
+    let plan = build_cat_recording_sampling_plan(&request)?;
+    Ok((
+        plan.strategy,
+        cat_recording_targets_from_offsets(&plan.sample_offsets_ms, 1),
+    ))
 }
 
 fn cat_recording_duration_ms(duration_seconds: f64) -> u64 {
     (duration_seconds.max(0.0) * 1_000.0)
         .round()
         .min(u64::MAX as f64) as u64
-}
-
-fn cat_recording_evidence_offsets(
-    record: &CatRecordingValidationRecord,
-    duration_ms: u64,
-) -> Vec<(u64, u32)> {
-    if record.started_at_epoch_ms == 0 || duration_ms == 0 {
-        return Vec::new();
-    }
-    let lower_bound = record.started_at_epoch_ms.saturating_sub(2_000);
-    let upper_bound = record
-        .ended_at_epoch_ms
-        .max(
-            record
-                .started_at_epoch_ms
-                .saturating_add(u128::from(duration_ms)),
-        )
-        .saturating_add(1_000);
-    let mut offsets = BTreeMap::<u64, u32>::new();
-    for evidence in &record.detection_evidence {
-        let frame_epoch_ms = u128::from(evidence.frame_epoch_ms);
-        if frame_epoch_ms < lower_bound || frame_epoch_ms > upper_bound {
-            continue;
-        }
-        let raw_offset = frame_epoch_ms.saturating_sub(record.started_at_epoch_ms);
-        let offset = bounded_cat_recording_sample_offset(
-            u64::try_from(raw_offset).unwrap_or(u64::MAX),
-            duration_ms,
-        );
-        offsets
-            .entry(offset)
-            .and_modify(|confidence| *confidence = (*confidence).max(evidence.confidence_ppm))
-            .or_insert(evidence.confidence_ppm);
-    }
-    offsets.into_iter().collect()
-}
-
-fn uniform_cat_recording_sample_offsets(duration_ms: u64) -> Vec<u64> {
-    [50_u64, 30, 70, 10, 90]
-        .into_iter()
-        .map(|percent| {
-            bounded_cat_recording_sample_offset(
-                duration_ms.saturating_mul(percent) / 100,
-                duration_ms,
-            )
-        })
-        .fold(Vec::new(), |mut offsets, offset| {
-            if !offsets.contains(&offset) {
-                offsets.push(offset);
-            }
-            offsets
-        })
-}
-
-fn uniform_cat_recording_classifier_offsets(duration_ms: u64) -> Vec<u64> {
-    [50_u64, 10, 90, 30, 70, 20, 80, 40, 60]
-        .into_iter()
-        .map(|percent| {
-            bounded_cat_recording_sample_offset(
-                duration_ms.saturating_mul(percent) / 100,
-                duration_ms,
-            )
-        })
-        .fold(Vec::new(), |mut offsets, offset| {
-            if !offsets.contains(&offset) {
-                offsets.push(offset);
-            }
-            offsets
-        })
-}
-
-fn bounded_cat_recording_sample_offset(offset_ms: u64, duration_ms: u64) -> u64 {
-    if duration_ms <= CAT_RECORDING_VALIDATION_FRAME_MARGIN_MS.saturating_mul(2) {
-        return duration_ms / 2;
-    }
-    offset_ms.clamp(
-        CAT_RECORDING_VALIDATION_FRAME_MARGIN_MS,
-        duration_ms - CAT_RECORDING_VALIDATION_FRAME_MARGIN_MS,
-    )
-}
-
-fn select_diverse_cat_recording_offsets(candidates: &[(u64, u32)], limit: usize) -> Vec<u64> {
-    if candidates.is_empty() || limit == 0 {
-        return Vec::new();
-    }
-    let mut selected = Vec::<usize>::new();
-    let peak_index = candidates
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, (_, confidence))| *confidence)
-        .map(|(index, _)| index)
-        .unwrap_or(0);
-    selected.push(peak_index);
-    for index in [0, candidates.len() - 1] {
-        if selected.len() >= limit {
-            break;
-        }
-        if !selected.contains(&index) {
-            selected.push(index);
-        }
-    }
-    while selected.len() < limit && selected.len() < candidates.len() {
-        let next = candidates
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| !selected.contains(index))
-            .map(|(index, (offset, confidence))| {
-                let minimum_distance = selected
-                    .iter()
-                    .map(|selected_index| offset.abs_diff(candidates[*selected_index].0))
-                    .min()
-                    .unwrap_or_default();
-                (index, minimum_distance, *confidence)
-            })
-            .max_by_key(|(_, distance, confidence)| (*distance, *confidence))
-            .map(|(index, _, _)| index);
-        let Some(next) = next else {
-            break;
-        };
-        selected.push(next);
-    }
-    selected
-        .into_iter()
-        .map(|index| candidates[index].0)
-        .collect()
-}
-
-fn insert_cat_recording_followup_candidate(
-    candidates: &mut BTreeMap<u64, u32>,
-    initial_targets: &[CatRecordingSampleTarget],
-    duration_ms: u64,
-    raw_offset_ms: u64,
-    priority: u32,
-) {
-    let offset = bounded_cat_recording_sample_offset(raw_offset_ms, duration_ms);
-    if initial_targets
-        .iter()
-        .any(|target| target.offset_ms.abs_diff(offset) < CAT_RECORDING_VALIDATION_FRAME_MARGIN_MS)
-    {
-        return;
-    }
-    candidates
-        .entry(offset)
-        .and_modify(|existing| *existing = (*existing).max(priority))
-        .or_insert(priority);
 }
 
 fn cat_recording_targets_from_offsets(
@@ -12977,7 +13626,7 @@ fn cat_recording_targets_from_offsets(
         .enumerate()
         .filter_map(|(offset_index, offset_ms)| {
             let frame_index = start_index.checked_add(u8::try_from(offset_index).ok()?)?;
-            (usize::from(frame_index) <= CAT_RECORDING_VALIDATION_MAX_FRAMES).then_some(
+            (usize::from(frame_index) <= CAT_RECORDING_CLASSIFIER_MAX_FRAMES).then_some(
                 CatRecordingSampleTarget {
                     frame_index,
                     offset_ms: *offset_ms,
@@ -13176,7 +13825,7 @@ fn build_cat_recording_sample_frame_command(
     output_path: &Path,
     timestamp_seconds: f64,
     strategy: CatRecordingFrameSeekStrategy,
-    profile: CatRecordingFrameProfile,
+    _profile: CatRecordingFrameProfile,
 ) -> Command {
     let timestamp = format!("{timestamp_seconds:.3}");
     let mut command = Command::new(ffmpeg);
@@ -13189,12 +13838,6 @@ fn build_cat_recording_sample_frame_command(
         command.args(["-ss", timestamp.as_str()]);
     }
     command.args(["-map", "0:v:0", "-frames:v", "1", "-an", "-sn", "-dn"]);
-    if profile == CatRecordingFrameProfile::Vlm {
-        command.arg("-vf").arg(
-            "scale=384:384:force_original_aspect_ratio=decrease,\
-             pad=384:384:(ow-iw)/2:(oh-ih)/2:black",
-        );
-    }
     command.args(["-q:v", "3"]).arg(output_path);
     command
 }
@@ -13974,6 +14617,14 @@ fn detection_job_matches_stream_profile(
     stream_profile: &str,
 ) -> bool {
     projection.stream_profile == stream_profile
+}
+
+fn is_cat_activity_managed_detection_job(projection: &DetectionJobProjection) -> bool {
+    projection.managed_by_live
+        && projection
+            .target_labels
+            .iter()
+            .any(|label| label.eq_ignore_ascii_case("cat"))
 }
 
 fn detection_job_reference_conflict(
@@ -25074,8 +25725,10 @@ mod tests {
         build_local_vision_event_notification_blocked_response, build_model_capabilities_response,
         build_outreach_delivery_notification_request, build_rag_readiness_response,
         build_redacted_diagnostics_bundle, build_release_readiness_response,
-        build_rtsp_url_from_patch, cat_auto_recording_epoch_ms, cat_auto_recording_transition,
+        build_rtsp_url_from_patch, cat_activity_policy_unarmed_reason, cat_activity_running_status,
+        cat_auto_recording_epoch_ms, cat_auto_recording_transition,
         cat_recording_validation_retry_delay, cat_recording_validation_status_for_decision,
+        cat_validation_error_invalidates_readiness, cat_validation_readiness_for_pending,
         cleanup_detection_job_output_dir, current_epoch_secs, default_model_download_target_path,
         default_model_download_target_path_in_root, default_model_endpoints,
         detection_job_matches_stream_profile, dvr_timeline_segment_from_harborlink,
@@ -25083,12 +25736,12 @@ mod tests {
         harbor_assistant_build_missing_response, harbor_assistant_search_session_id,
         hardware_class_for_probe, has_forwarding_headers,
         huggingface_download_should_fallback_to_plain_http, huggingface_resolve_url,
-        identity_query_suffix, is_admin_surface_path, is_gate_principal_endpoint,
-        is_gate_principal_knowledge_endpoint, is_harbor_assistant_client_route,
-        is_harbor_assistant_surface_path, is_new_cat_detection_sequence,
-        knowledge_preview_mime_supported, latest_model_download_jobs,
-        live_bridge_provider_from_setup_status, local_model_catalog_item,
-        local_model_catalog_specs, merge_cat_recording_vlm_executions, mime_type_for_path,
+        identity_query_suffix, is_admin_surface_path, is_cat_activity_managed_detection_job,
+        is_gate_principal_endpoint, is_gate_principal_knowledge_endpoint,
+        is_harbor_assistant_client_route, is_harbor_assistant_surface_path,
+        is_new_cat_detection_sequence, knowledge_preview_mime_supported,
+        latest_model_download_jobs, live_bridge_provider_from_setup_status,
+        local_model_catalog_item, local_model_catalog_specs, mime_type_for_path,
         model_download_huggingface_endpoint, model_download_huggingface_endpoints,
         model_download_jobs_status, model_endpoint_uses_external_runtime,
         model_hardware_recommendation, model_snapshot_file_allowed, normalize_detection_job_start,
@@ -25101,10 +25754,10 @@ mod tests {
         parse_camera_hls_live_stop_path, parse_camera_live_page_path,
         parse_camera_live_stream_path, parse_camera_recording_start_path,
         parse_camera_recording_stop_path, parse_camera_share_link_path, parse_camera_snapshot_path,
-        parse_camera_task_snapshot_path, parse_cat_detection_streak_sample,
-        parse_detection_job_path, parse_device_credential_status_path,
-        parse_device_credentials_path, parse_device_evidence_path,
-        parse_device_metadata_patch_path, parse_device_rtsp_check_path,
+        parse_camera_task_snapshot_path, parse_cat_auto_recording_enabled,
+        parse_cat_detection_streak_sample, parse_detection_job_path,
+        parse_device_credential_status_path, parse_device_credentials_path,
+        parse_device_evidence_path, parse_device_metadata_patch_path, parse_device_rtsp_check_path,
         parse_device_validation_run_path, parse_harbor_app_lifecycle_path, parse_harbor_app_path,
         parse_harbor_assistant_conversation_path, parse_json_body_limited,
         parse_knowledge_index_job_cancel_path, parse_local_vision_event_notify_path,
@@ -25114,9 +25767,9 @@ mod tests {
         parse_notification_target_delete_path, parse_optional_unix_seconds,
         parse_share_link_revoke_path, parse_shared_camera_live_page_path,
         parse_shared_camera_live_stream_path, parse_static_byte_range, percent_decode_path_segment,
-        preview_static_file_response, probe_local_model_runtime,
-        probe_local_openai_compatible_serving_model, prune_detection_job_history,
-        read_media_pipe_tail, reconcile_stale_knowledge_index_jobs,
+        persist_cat_activity_policy_with_audit, preview_static_file_response,
+        probe_local_model_runtime, probe_local_openai_compatible_serving_model,
+        prune_detection_job_history, read_media_pipe_tail, reconcile_stale_knowledge_index_jobs,
         reconciliation_terminal_artifacts, redact_account_management_snapshot, redact_admin_string,
         redact_bridge_provider_config, redact_camera_device_projection,
         redact_model_endpoint_response, redact_state_snapshot, redact_stream_url_credentials,
@@ -25127,14 +25780,16 @@ mod tests {
         reusable_detection_job_projection, run_knowledge_index_jobs, run_model_download_job,
         run_model_download_transfer, sanitize_cat_recording_validation_error,
         sanitized_outreach_delivery_request_audit, select_cat_recording_classifier_sample_targets,
-        select_followup_cat_recording_sample_targets, service_overloaded_response,
-        snapshot_artifact_from_task_response, summarize_media_tool_stderr, url_encode_path_segment,
+        service_overloaded_response, snapshot_artifact_from_task_response,
+        summarize_media_tool_stderr, url_encode_path_segment,
         validate_home_assistant_service_fields, validate_home_assistant_service_smoke,
         validate_outreach_delivery_request, AdminApi, CameraLiveSessionProjection,
-        CameraStreamProfile, CatAutoRecordingConfig, CatAutoRecordingTransition,
-        CatDetectionStreakSample, CatRecordingFrameProfile, CatRecordingFrameSeekStrategy,
-        CatRecordingSampleTarget, DetectionJobProjection, DetectionJobRuntime,
-        DetectionJobStartRequest, GateAuthenticatedPrincipal, HarborLinkEventRecordingLease,
+        CameraStreamProfile, CatActivityCameraState, CatActivityCameraStatus,
+        CatActivityPolicyStore, CatActivitySettingsResponse, CatActivitySettingsUpdate,
+        CatAutoRecordingConfig, CatAutoRecordingTransition, CatDetectionStreakSample,
+        CatRecordingFrameProfile, CatRecordingFrameSeekStrategy, DetectionJobProjection,
+        DetectionJobRuntime, DetectionJobStartRequest, EdgeAssertionVerifier,
+        GateAuthenticatedPrincipal, HarborLinkCameraProjection, HarborLinkEventRecordingLease,
         HarborLinkHomeAssistantStatus, HarborLinkLiveSession, HarborLinkMediaClient,
         HarborLinkRecordingArtifact, HarborLinkRecordingStatus, HomeAssistantServiceSmokeRequest,
         HomeGuardianEvaluationQueue, KnowledgeSearchApiRequest, LocalModelRuntimeProjection,
@@ -25144,6 +25799,7 @@ mod tests {
         HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS, HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS,
         MAX_DETECTION_JOB_HISTORY, MAX_VISION_EVENT_INGEST_INFLIGHT, PRIVACY_GATEWAY_AUDIT_ACTION,
     };
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use harborbeacon_local_agent::connectors::notifications::{
         NotificationDeliveryError, NotificationDestinationKind, NotificationRecipientIdType,
         SharedHttpErrorDetail, SharedHttpErrorEnvelope,
@@ -25171,6 +25827,9 @@ mod tests {
         KnowledgeSettings, KnowledgeSourceRoot, ModelDownloadJobRecord, NotificationTargetRecord,
         RagResourceProfile, RemoteViewConfig,
     };
+    use harborbeacon_local_agent::runtime::cat_activity_policy::{
+        CatActivityMode, CatActivityPolicy,
+    };
     use harborbeacon_local_agent::runtime::cat_recording_reconciliation::{
         CatRecordingReconciliationPhase, CatRecordingReconciliationState,
         CatRecordingReconciliationStore,
@@ -25186,7 +25845,6 @@ mod tests {
         KnowledgeFileSignature, KnowledgeIndexChunk, KnowledgeIndexConfig, KnowledgeIndexEntry,
         KnowledgeIndexService, KnowledgeIndexTextSource, KnowledgeModality,
     };
-    use harborbeacon_local_agent::runtime::model_center::CatRecordingVlmExecution;
     use harborbeacon_local_agent::runtime::privacy_gateway::PRIVACY_GATEWAY_POLICY_VERSION;
     use harborbeacon_local_agent::runtime::registry::{CameraDevice, DeviceRegistryStore};
     use harborbeacon_local_agent::runtime::remote_view;
@@ -25196,8 +25854,10 @@ mod tests {
         ingest_local_vision_event, LocalVisionEvent, SnapshotArtifact, StoredLocalVisionEvent,
         VISION_EVENT_STORE_PATH_ENV,
     };
+    use hmac::{Hmac, Mac};
     use reqwest::blocking::Client;
     use serde_json::{json, Value};
+    use sha2::Sha256;
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::ffi::OsStr;
     use std::fs;
@@ -25228,6 +25888,381 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
     use tiny_http::{Header, Method, Server, StatusCode};
+
+    const EDGE_TEST_KEY: [u8; 32] = [0x2a; 32];
+
+    fn edge_headers(
+        method: &str,
+        uri: &str,
+        timestamp: u64,
+        nonce_bytes: [u8; 12],
+        principal_id: &str,
+        principal_name: &str,
+        role: &str,
+    ) -> Vec<Header> {
+        let nonce = URL_SAFE_NO_PAD.encode(nonce_bytes);
+        let timestamp = timestamp.to_string();
+        let canonical = [
+            "v1",
+            timestamp.as_str(),
+            nonce.as_str(),
+            method,
+            uri,
+            principal_id,
+            principal_name,
+            role,
+        ]
+        .join("\n");
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&EDGE_TEST_KEY).expect("test key");
+        mac.update(canonical.as_bytes());
+        let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        let assertion = format!("v1.{timestamp}.{nonce}.{signature}");
+        [
+            ("X-Harbor-Principal-Id", principal_id),
+            ("X-Harbor-Principal-Name", principal_name),
+            ("X-Harbor-Principal-Role", role),
+            ("X-Harbor-Edge-Assertion", assertion.as_str()),
+            ("X-Harbor-Original-Method", method),
+            ("X-Harbor-Original-URI", uri),
+        ]
+        .into_iter()
+        .map(|(name, value)| Header::from_bytes(name, value).expect("edge test header"))
+        .collect()
+    }
+
+    #[test]
+    fn edge_assertion_accepts_both_product_roles() {
+        for (index, (role, expected_role)) in [
+            ("FULL_ADMIN", RoleKind::Admin),
+            ("TRUSTED_LAN", RoleKind::Member),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let verifier = EdgeAssertionVerifier::new(EDGE_TEST_KEY);
+            let headers = edge_headers(
+                "POST",
+                "/api/harbor-beacon/knowledge/search?limit=10",
+                1_000,
+                [index as u8 + 1; 12],
+                "harboros:uid:1000",
+                "owner",
+                role,
+            );
+            let identity = verifier
+                .verify_presented_at(
+                    &Method::Post,
+                    "/api/harbor-beacon/knowledge/search?limit=10",
+                    &headers,
+                    1_000,
+                )
+                .expect("valid edge assertion")
+                .expect("edge identity");
+            assert_eq!(identity.principal_id, "harboros:uid:1000");
+            assert_eq!(identity.principal_name, "owner");
+            assert_eq!(identity.role_kind, expected_role);
+        }
+    }
+
+    #[test]
+    fn edge_assertion_rejects_tamper_stale_future_and_replay() {
+        let verifier = EdgeAssertionVerifier::new(EDGE_TEST_KEY);
+        let valid = edge_headers(
+            "POST",
+            "/api/knowledge/search?limit=10",
+            1_000,
+            [7; 12],
+            "harboros:uid:1000",
+            "owner",
+            "FULL_ADMIN",
+        );
+        assert!(verifier
+            .verify_presented_at(
+                &Method::Post,
+                "/api/knowledge/search?limit=10",
+                &valid,
+                1_000,
+            )
+            .expect("first assertion")
+            .is_some());
+        let replay = verifier
+            .verify_presented_at(
+                &Method::Post,
+                "/api/knowledge/search?limit=10",
+                &valid,
+                1_000,
+            )
+            .expect_err("replay");
+        assert_eq!(replay.status, StatusCode(401));
+
+        let mut tampered = edge_headers(
+            "POST",
+            "/api/knowledge/search?limit=10",
+            1_000,
+            [8; 12],
+            "harboros:uid:1000",
+            "owner",
+            "FULL_ADMIN",
+        );
+        tampered.retain(|header| !header.field.equiv("X-Harbor-Principal-Name"));
+        tampered.push(Header::from_bytes("X-Harbor-Principal-Name", "attacker").unwrap());
+        assert_eq!(
+            verifier
+                .verify_presented_at(
+                    &Method::Post,
+                    "/api/knowledge/search?limit=10",
+                    &tampered,
+                    1_000,
+                )
+                .expect_err("tamper")
+                .status,
+            StatusCode(401)
+        );
+
+        for (timestamp, nonce) in [(969, [9; 12]), (1_031, [10; 12])] {
+            let headers = edge_headers(
+                "POST",
+                "/api/knowledge/search",
+                timestamp,
+                nonce,
+                "harboros:uid:1000",
+                "owner",
+                "FULL_ADMIN",
+            );
+            assert_eq!(
+                verifier
+                    .verify_presented_at(&Method::Post, "/api/knowledge/search", &headers, 1_000,)
+                    .expect_err("time window")
+                    .status,
+                StatusCode(401)
+            );
+        }
+    }
+
+    #[test]
+    fn edge_assertion_rejects_partial_duplicate_method_uri_and_role() {
+        let verifier = EdgeAssertionVerifier::new(EDGE_TEST_KEY);
+        let partial = vec![Header::from_bytes("X-Harbor-Edge-Assertion", "v1.1.a.b").unwrap()];
+        assert_eq!(
+            verifier
+                .verify_presented_at(&Method::Get, "/healthz", &partial, 1)
+                .expect_err("partial")
+                .status,
+            StatusCode(400)
+        );
+
+        let base = edge_headers(
+            "POST",
+            "/api/knowledge/search?limit=10",
+            1_000,
+            [11; 12],
+            "harboros:uid:1000",
+            "owner",
+            "FULL_ADMIN",
+        );
+        let mut duplicate = base.clone();
+        duplicate.push(Header::from_bytes("X-Harbor-Principal-Role", "FULL_ADMIN").unwrap());
+        assert_eq!(
+            verifier
+                .verify_presented_at(
+                    &Method::Post,
+                    "/api/knowledge/search?limit=10",
+                    &duplicate,
+                    1_000,
+                )
+                .expect_err("duplicate")
+                .status,
+            StatusCode(400)
+        );
+        assert_eq!(
+            verifier
+                .verify_presented_at(&Method::Get, "/api/knowledge/search?limit=10", &base, 1_000,)
+                .expect_err("method mismatch")
+                .status,
+            StatusCode(401)
+        );
+        assert_eq!(
+            verifier
+                .verify_presented_at(
+                    &Method::Post,
+                    "/api/knowledge/search?limit=11",
+                    &base,
+                    1_000,
+                )
+                .expect_err("URI mismatch")
+                .status,
+            StatusCode(401)
+        );
+
+        let bad_role = edge_headers(
+            "POST",
+            "/api/knowledge/search",
+            1_000,
+            [12; 12],
+            "harboros:uid:1000",
+            "owner",
+            "READ_ONLY",
+        );
+        assert_eq!(
+            verifier
+                .verify_presented_at(&Method::Post, "/api/knowledge/search", &bad_role, 1_000,)
+                .expect_err("role")
+                .status,
+            StatusCode(403)
+        );
+    }
+
+    #[test]
+    fn edge_assertion_clones_share_replay_state() {
+        let verifier = EdgeAssertionVerifier::new(EDGE_TEST_KEY);
+        let worker_clone = verifier.clone();
+        let headers = edge_headers(
+            "POST",
+            "/api/knowledge/search",
+            1_000,
+            [13; 12],
+            "harboros:uid:1000",
+            "owner",
+            "FULL_ADMIN",
+        );
+        verifier
+            .verify_presented_at(&Method::Post, "/api/knowledge/search", &headers, 1_000)
+            .expect("first worker accepts assertion");
+        assert_eq!(
+            worker_clone
+                .verify_presented_at(&Method::Post, "/api/knowledge/search", &headers, 1_000)
+                .expect_err("second worker rejects replay")
+                .status,
+            StatusCode(401)
+        );
+    }
+
+    #[test]
+    fn edge_assertion_replay_cache_prunes_expired_nonces() {
+        let verifier = EdgeAssertionVerifier::new(EDGE_TEST_KEY);
+        let old_headers = edge_headers(
+            "POST",
+            "/api/knowledge/search",
+            1_000,
+            [14; 12],
+            "harboros:uid:1000",
+            "owner",
+            "FULL_ADMIN",
+        );
+        verifier
+            .verify_presented_at(&Method::Post, "/api/knowledge/search", &old_headers, 1_000)
+            .expect("old assertion");
+        let current_headers = edge_headers(
+            "POST",
+            "/api/knowledge/search",
+            1_031,
+            [15; 12],
+            "harboros:uid:1000",
+            "owner",
+            "FULL_ADMIN",
+        );
+        verifier
+            .verify_presented_at(
+                &Method::Post,
+                "/api/knowledge/search",
+                &current_headers,
+                1_031,
+            )
+            .expect("current assertion");
+        assert_eq!(
+            verifier
+                .replay_cache
+                .lock()
+                .expect("replay cache")
+                .expirations_by_nonce
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn edge_assertion_replay_cache_fails_closed_at_capacity() {
+        let verifier = EdgeAssertionVerifier::new(EDGE_TEST_KEY);
+        {
+            let mut cache = verifier.replay_cache.lock().expect("replay cache");
+            for index in 0..super::EDGE_ASSERTION_REPLAY_CAPACITY {
+                cache
+                    .expirations_by_nonce
+                    .insert(format!("reserved-{index}"), 1_030);
+            }
+        }
+        let headers = edge_headers(
+            "POST",
+            "/api/knowledge/search",
+            1_000,
+            [17; 12],
+            "harboros:uid:1000",
+            "owner",
+            "FULL_ADMIN",
+        );
+        assert_eq!(
+            verifier
+                .verify_presented_at(&Method::Post, "/api/knowledge/search", &headers, 1_000)
+                .expect_err("full cache")
+                .status,
+            StatusCode(503)
+        );
+    }
+
+    #[test]
+    fn edge_assertion_accepts_exact_thirty_second_boundaries() {
+        let verifier = EdgeAssertionVerifier::new(EDGE_TEST_KEY);
+        for (timestamp, nonce) in [(970, [18; 12]), (1_030, [19; 12])] {
+            let headers = edge_headers(
+                "POST",
+                "/api/knowledge/search",
+                timestamp,
+                nonce,
+                "harboros:uid:1000",
+                "owner",
+                "FULL_ADMIN",
+            );
+            assert!(verifier
+                .verify_presented_at(&Method::Post, "/api/knowledge/search", &headers, 1_000)
+                .expect("boundary assertion")
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn edge_assertion_credential_loader_requires_file_indirection() {
+        let _guard = hf_endpoint_env_lock().lock().expect("env lock");
+        let key_path = unique_store_path("edge-assertion-key");
+        fs::write(&key_path, format!("{}\n", "2a".repeat(32))).expect("write key");
+        let previous = std::env::var_os(super::HARBOR_EDGE_ASSERTION_KEY_FILE_ENV);
+        std::env::set_var(super::HARBOR_EDGE_ASSERTION_KEY_FILE_ENV, &key_path);
+        assert!(EdgeAssertionVerifier::from_credential_env().is_ok());
+        fs::write(&key_path, "2A".repeat(32)).expect("write invalid key");
+        assert!(EdgeAssertionVerifier::from_credential_env().is_err());
+        match previous {
+            Some(value) => std::env::set_var(super::HARBOR_EDGE_ASSERTION_KEY_FILE_ENV, value),
+            None => std::env::remove_var(super::HARBOR_EDGE_ASSERTION_KEY_FILE_ENV),
+        }
+        let _ = fs::remove_file(key_path);
+    }
+
+    #[test]
+    fn edge_headers_do_not_bypass_gate_v2_when_assertion_is_absent() {
+        let headers = trusted_gate_headers();
+        let verifier = EdgeAssertionVerifier::new(EDGE_TEST_KEY);
+        assert!(verifier
+            .verify_presented_at(&Method::Post, "/api/knowledge/search", &headers, 1_000)
+            .expect("Gate v2 headers are not an edge assertion")
+            .is_none());
+        let principal = authenticate_gate_principal_headers(
+            Some("service-token"),
+            "/api/knowledge/search",
+            &headers,
+            "home-1",
+        )
+        .expect("Gate v2 bearer fallback");
+        assert_eq!(principal.0.role_kind, RoleKind::Admin);
+    }
 
     #[test]
     fn parse_json_body_limited_blocks_oversized_payload() {
@@ -25377,6 +26412,9 @@ mod tests {
                 let Some(mut stream) = accepted else {
                     return;
                 };
+                stream
+                    .set_nonblocking(false)
+                    .expect("blocking HarborLink test stream");
                 stream
                     .set_read_timeout(Some(Duration::from_secs(1)))
                     .expect("HarborLink read timeout");
@@ -26823,6 +27861,7 @@ mod tests {
         let _env_lock = cat_auto_recording_env_lock()
             .lock()
             .expect("detection env lock");
+        let _auto_recording = EnvGuard::set(super::CAT_AUTO_RECORD_ENABLED_ENV, "false");
         let job_id = "yolo-unreferenced-delete";
         let lease_id = format!("detect-{job_id}");
         let (base_url, stop_count, server) =
@@ -26929,7 +27968,311 @@ mod tests {
     }
 
     #[test]
-    fn cat_recording_validation_requires_two_confirmed_frames() {
+    fn cat_activity_settings_wire_shape_is_strict_and_stable() {
+        let update = serde_json::from_value::<CatActivitySettingsUpdate>(json!({
+            "schema_version": 1,
+            "mode": "all_enabled",
+            "disabled_camera_ids": ["camera-2"]
+        }))
+        .expect("valid policy update");
+        assert_eq!(update.schema_version, 1);
+        assert_eq!(update.mode, CatActivityMode::AllEnabled);
+        assert!(serde_json::from_value::<CatActivitySettingsUpdate>(json!({
+            "schema_version": 1,
+            "mode": "off",
+            "disabled_camera_ids": [],
+            "unexpected": true
+        }))
+        .is_err());
+
+        let response = CatActivitySettingsResponse {
+            schema_version: 1,
+            mode: CatActivityMode::AllEnabled,
+            disabled_camera_ids: vec!["camera-2".to_string()],
+            cameras: vec![CatActivityCameraStatus {
+                camera_id: "camera-1".to_string(),
+                status: CatActivityCameraState::Armed,
+                reason: None,
+                updated_at: Some("2026-08-17T00:00:00Z".to_string()),
+            }],
+            updated_at: Some("2026-08-17T00:00:00Z".to_string()),
+        };
+        assert_eq!(
+            serde_json::to_value(response).expect("settings JSON"),
+            json!({
+                "schema_version": 1,
+                "mode": "all_enabled",
+                "disabled_camera_ids": ["camera-2"],
+                "cameras": [{
+                    "camera_id": "camera-1",
+                    "status": "armed",
+                    "updated_at": "2026-08-17T00:00:00Z"
+                }],
+                "updated_at": "2026-08-17T00:00:00Z"
+            })
+        );
+    }
+
+    #[test]
+    fn cat_activity_supervisor_enablement_rejects_ambiguous_configuration() {
+        for enabled in ["1", "true", "YES", " on "] {
+            assert_eq!(parse_cat_auto_recording_enabled(enabled), Ok(true));
+        }
+        for disabled in ["0", "false", "NO", " off "] {
+            assert_eq!(parse_cat_auto_recording_enabled(disabled), Ok(false));
+        }
+        assert!(parse_cat_auto_recording_enabled("enable-ish").is_err());
+        assert!(parse_cat_auto_recording_enabled("").is_err());
+    }
+
+    #[test]
+    fn cat_activity_status_requires_validation_runtime_readiness() {
+        assert_eq!(
+            cat_activity_running_status(true),
+            (CatActivityCameraState::Armed, None)
+        );
+        assert_eq!(
+            cat_activity_running_status(false),
+            (
+                CatActivityCameraState::Degraded,
+                Some("validator_unavailable")
+            )
+        );
+    }
+
+    #[test]
+    fn empty_validation_queue_does_not_execute_the_runtime_probe() {
+        let probes = AtomicUsize::new(0);
+        let result = cat_validation_readiness_for_pending(false, || {
+            probes.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+
+        assert_eq!(result, None);
+        assert_eq!(probes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            cat_validation_readiness_for_pending(true, || {
+                probes.fetch_add(1, Ordering::SeqCst);
+                true
+            }),
+            Some(true)
+        );
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn only_classifier_contract_failures_invalidate_cached_readiness() {
+        assert!(cat_validation_error_invalidates_readiness(
+            "cat_classifier_spacemit_provider_not_active"
+        ));
+        assert!(cat_validation_error_invalidates_readiness(
+            "HARBOR_K3_CAT_RECORDING_VALIDATOR must be mobilenet_v2_int8"
+        ));
+        assert!(!cat_validation_error_invalidates_readiness(
+            "failed_to_download_recording"
+        ));
+    }
+
+    #[test]
+    fn cat_activity_policy_stops_locally_before_registry_details_are_needed() {
+        let mut policy = CatActivityPolicy::default();
+        policy.mode = CatActivityMode::Off;
+        assert_eq!(
+            cat_activity_policy_unarmed_reason(&policy, "camera-1", None),
+            Some("policy_off")
+        );
+
+        policy.mode = CatActivityMode::AllEnabled;
+        policy.disabled_camera_ids = vec!["camera-1".to_string()];
+        assert_eq!(
+            cat_activity_policy_unarmed_reason(&policy, "camera-1", None),
+            Some("camera_opted_out")
+        );
+
+        policy.disabled_camera_ids.clear();
+        let mut camera = HarborLinkCameraProjection {
+            camera_id: "camera-1".to_string(),
+            enabled: false,
+            status: "disabled".to_string(),
+            stream_configured: true,
+        };
+        assert_eq!(
+            cat_activity_policy_unarmed_reason(&policy, "camera-1", Some(&camera)),
+            Some("camera_disabled")
+        );
+        camera.enabled = true;
+        camera.stream_configured = false;
+        assert_eq!(
+            cat_activity_policy_unarmed_reason(&policy, "camera-1", Some(&camera)),
+            Some("stream_not_configured")
+        );
+        camera.stream_configured = true;
+        assert_eq!(
+            cat_activity_policy_unarmed_reason(&policy, "camera-1", Some(&camera)),
+            None
+        );
+    }
+
+    #[test]
+    fn cat_activity_ownership_never_claims_non_cat_detection_jobs() {
+        let cat = sample_running_detection_job("cat-job", "camera-1", true, None);
+        assert!(is_cat_activity_managed_detection_job(&cat.projection));
+
+        let mut person = sample_running_detection_job("person-job", "camera-1", true, None);
+        person.projection.target_labels = vec!["person".to_string()];
+        assert!(!is_cat_activity_managed_detection_job(&person.projection));
+        person.projection.managed_by_live = false;
+        person.projection.target_labels = vec!["cat".to_string()];
+        assert!(!is_cat_activity_managed_detection_job(&person.projection));
+    }
+
+    #[test]
+    fn cat_activity_off_stops_locally_and_retries_remote_cleanup_before_link_list() {
+        let job_id = "cat-policy-cleanup-retry";
+        let camera_id = "camera.252";
+        let lease_id = format!("detect-{job_id}");
+        let policy_path = unique_store_path("cat-policy-cleanup-retry");
+        let policy_store = CatActivityPolicyStore::new(policy_path.clone());
+        policy_store
+            .save(CatActivityPolicy {
+                schema_version: 1,
+                mode: CatActivityMode::Off,
+                disabled_camera_ids: Vec::new(),
+                updated_at: Some("2026-08-17T00:00:00Z".to_string()),
+            })
+            .expect("save off policy");
+        let (mut api, paths) = build_test_admin_api("cat-policy-cleanup-retry");
+        api.cat_activity_policy_store = policy_store;
+        api.harborlink_media = HarborLinkMediaClient::new("http://127.0.0.1:9")
+            .expect("unavailable HarborLink client");
+        api.detection_jobs.lock().expect("detection jobs").insert(
+            job_id.to_string(),
+            sample_running_detection_job(
+                job_id,
+                camera_id,
+                true,
+                Some(spawn_sleeping_detection_child()),
+            ),
+        );
+
+        let first_error = api
+            .reconcile_cat_activity_policy()
+            .expect_err("unavailable lease cleanup must degrade");
+        assert!(first_error.contains("cleanup"));
+        {
+            let jobs = api.detection_jobs.lock().expect("detection jobs");
+            let runtime = jobs.get(job_id).expect("managed cat job");
+            assert_eq!(runtime.projection.status, "stopped");
+            assert!(runtime.child.is_none());
+            assert!(runtime.projection.managed_by_live);
+        }
+        {
+            let statuses = api
+                .cat_activity_camera_statuses
+                .lock()
+                .expect("cat activity statuses");
+            let status = statuses.get(camera_id).expect("degraded camera status");
+            assert_eq!(status.status, CatActivityCameraState::Degraded);
+            assert_eq!(status.reason.as_deref(), Some("detection_stop_failed"));
+        }
+
+        let (base_url, requests, server) = spawn_detection_lease_sequence_server(vec![
+            DetectionLeaseServerStep {
+                method: "DELETE",
+                path: format!("/v1/cameras/{camera_id}/detection-leases/{lease_id}"),
+                request_profile: None,
+                status: "200 OK",
+                response: detection_lease_response(camera_id, &lease_id, "stopped", "sub"),
+            },
+            DetectionLeaseServerStep {
+                method: "GET",
+                path: "/v1/cameras".to_string(),
+                request_profile: None,
+                status: "503 Service Unavailable",
+                response: json!({
+                    "error": {
+                        "code": "HARBORLINK_UNAVAILABLE",
+                        "message": "camera registry is unavailable",
+                        "retryable": true,
+                        "dependency": "harborlink"
+                    }
+                }),
+            },
+        ]);
+        api.harborlink_media = HarborLinkMediaClient::new(base_url).expect("HarborLink client");
+        api.reconcile_cat_activity_policy()
+            .expect_err("registry list remains unavailable after cleanup retry");
+        server.join().expect("HarborLink sequence server");
+
+        assert_eq!(requests.lock().expect("requests").len(), 2);
+        let jobs = api.detection_jobs.lock().expect("detection jobs");
+        let runtime = jobs.get(job_id).expect("managed cat job");
+        assert!(!runtime.projection.managed_by_live);
+        drop(jobs);
+        let statuses = api
+            .cat_activity_camera_statuses
+            .lock()
+            .expect("cat activity statuses");
+        let status = statuses.get(camera_id).expect("unarmed camera status");
+        assert_eq!(status.status, CatActivityCameraState::Unarmed);
+        assert_eq!(status.reason.as_deref(), Some("policy_off"));
+        drop(statuses);
+
+        cleanup_detection_children(&api);
+        cleanup_test_paths(&paths);
+        let _ = fs::remove_file(&policy_path);
+        let _ = fs::remove_file(policy_path.with_extension("lock"));
+    }
+
+    #[test]
+    fn cat_activity_policy_persistence_is_atomic_and_audited() {
+        let admin_path = unique_store_path("cat-activity-audit-state");
+        let registry_path = unique_store_path("cat-activity-audit-registry");
+        let policy_path = unique_store_path("cat-activity-policy");
+        let registry_store = DeviceRegistryStore::new(registry_path.clone());
+        let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store);
+        let policy_store = CatActivityPolicyStore::new(policy_path.clone());
+        let principal = AccessPrincipal {
+            workspace_id: "home-1".to_string(),
+            user_id: "owner-1".to_string(),
+            display_name: "Owner".to_string(),
+            role_kind: RoleKind::Owner,
+        };
+
+        let saved = persist_cat_activity_policy_with_audit(
+            &admin_store,
+            &policy_store,
+            &principal,
+            CatActivityPolicy {
+                schema_version: 1,
+                mode: CatActivityMode::AllEnabled,
+                disabled_camera_ids: vec!["camera-2".to_string(), "camera-1".to_string()],
+                updated_at: Some("2026-08-17T00:00:00Z".to_string()),
+            },
+        )
+        .expect("persist audited cat activity policy");
+
+        assert_eq!(policy_store.load().expect("load policy"), saved);
+        assert_eq!(
+            saved.disabled_camera_ids,
+            vec!["camera-1".to_string(), "camera-2".to_string()]
+        );
+        let audits = admin_store.audit_records().expect("load audit records");
+        let audit = audits.last().expect("cat activity audit record");
+        assert_eq!(audit.entity_kind, "cat_activity_policy");
+        assert_eq!(audit.action, "cat_activity_policy.update");
+        assert_eq!(audit.actor_id, "owner-1");
+        assert_eq!(audit.request_snapshot["mode"], json!("all_enabled"));
+        assert_eq!(audit.result_snapshot["status"], json!("write_authorized"));
+
+        for path in [admin_path, registry_path, policy_path] {
+            let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(path.with_extension("lock"));
+        }
+    }
+
+    #[test]
+    fn cat_recording_validation_requires_three_confirmed_frames() {
         let mut decision = CatRecordingValidationDecision {
             cat_present: true,
             cat_frame_indices: vec![2],
@@ -26952,6 +28295,11 @@ mod tests {
         decision.cat_frame_indices.push(4);
         assert_eq!(
             cat_recording_validation_status_for_decision(&decision),
+            CatRecordingValidationStatus::ReviewRequired
+        );
+        decision.cat_frame_indices.push(6);
+        assert_eq!(
+            cat_recording_validation_status_for_decision(&decision),
             CatRecordingValidationStatus::Accepted
         );
         decision.cat_present = false;
@@ -26966,25 +28314,6 @@ mod tests {
             cat_recording_validation_status_for_decision(&decision),
             CatRecordingValidationStatus::ReviewRequired
         );
-    }
-
-    #[test]
-    fn mobilenet_recording_validation_does_not_depend_on_vlm_readiness() {
-        let mut vlm_probed = false;
-        let mobilenet_ready = super::cat_recording_validation_runtime_ready_for(
-            super::CatRecordingValidatorBackend::MobileNetV2Int8,
-            || {
-                vlm_probed = true;
-                false
-            },
-        );
-
-        assert!(mobilenet_ready);
-        assert!(!vlm_probed);
-        assert!(!super::cat_recording_validation_runtime_ready_for(
-            super::CatRecordingValidatorBackend::Vlm,
-            || false,
-        ));
     }
 
     fn cat_validation_record_with_evidence(
@@ -27051,7 +28380,8 @@ mod tests {
             },
         ]);
 
-        let (strategy, targets) = select_cat_recording_classifier_sample_targets(&record, 10.0);
+        let (strategy, targets) =
+            select_cat_recording_classifier_sample_targets(&record, 10.0).unwrap();
 
         assert_eq!(strategy, "yolo_guided_hybrid_9");
         assert_eq!(targets[0].offset_ms, 5_000);
@@ -27066,61 +28396,6 @@ mod tests {
                 .len(),
             9
         );
-    }
-
-    #[test]
-    fn cat_recording_followup_samples_near_a_positive_frame() {
-        let record = cat_validation_record_with_evidence(vec![CatDetectionEvidence {
-            sequence: 1,
-            frame_epoch_ms: 105_000,
-            confidence_ppm: 950_000,
-        }]);
-        let initial = vec![CatRecordingSampleTarget {
-            frame_index: 1,
-            offset_ms: 5_000,
-        }];
-
-        let targets =
-            select_followup_cat_recording_sample_targets(&record, 10.0, &initial, &[5_000]);
-
-        assert!(!targets.is_empty());
-        assert!(targets.len() <= 5);
-        assert_eq!(targets[0].frame_index, 2);
-        assert!(targets
-            .iter()
-            .any(|target| target.offset_ms.abs_diff(5_000) <= 1_000));
-        assert!(targets
-            .iter()
-            .all(|target| target.offset_ms.abs_diff(5_000) >= 100));
-    }
-
-    #[test]
-    fn cat_recording_vlm_rounds_accept_two_distinct_positive_frames() {
-        let first = CatRecordingVlmExecution {
-            available: true,
-            status: "active".to_string(),
-            cat_present: true,
-            cat_frame_indices: vec![2],
-            reason_code: "uncertain".to_string(),
-            sampled_frame_count: 5,
-            ..Default::default()
-        };
-        let second = CatRecordingVlmExecution {
-            available: true,
-            status: "active".to_string(),
-            cat_present: true,
-            cat_frame_indices: vec![6],
-            reason_code: "uncertain".to_string(),
-            sampled_frame_count: 3,
-            ..Default::default()
-        };
-
-        let merged = merge_cat_recording_vlm_executions(&[first, second]);
-
-        assert!(merged.cat_present);
-        assert_eq!(merged.cat_frame_indices, vec![2, 6]);
-        assert_eq!(merged.reason_code, "cat_visible");
-        assert_eq!(merged.sampled_frame_count, 8);
     }
 
     #[test]
@@ -27218,7 +28493,7 @@ mod tests {
             output_path,
             12.3456,
             CatRecordingFrameSeekStrategy::Fast,
-            CatRecordingFrameProfile::Vlm,
+            CatRecordingFrameProfile::Classifier,
         );
         let accurate = build_cat_recording_sample_frame_command(
             OsStr::new("ffmpeg"),
@@ -27226,7 +28501,7 @@ mod tests {
             output_path,
             12.3456,
             CatRecordingFrameSeekStrategy::Accurate,
-            CatRecordingFrameProfile::Vlm,
+            CatRecordingFrameProfile::Classifier,
         );
         let fast_args = fast
             .get_args()
@@ -29178,15 +30453,16 @@ mod tests {
     }
 
     #[test]
-    fn detection_provider_defaults_to_cpu_and_allows_explicit_spacemit() {
+    fn detection_provider_is_cpu_only_for_evt1() {
         assert_eq!(
             normalize_detection_provider(None).expect("default provider"),
             "cpu"
         );
         assert_eq!(
-            normalize_detection_provider(Some(" spacemit ")).expect("explicit NPU provider"),
-            "spacemit"
+            normalize_detection_provider(Some(" CPU ")).expect("explicit CPU provider"),
+            "cpu"
         );
+        assert!(normalize_detection_provider(Some("spacemit")).is_err());
         assert!(normalize_detection_provider(Some("cuda")).is_err());
     }
 
@@ -33533,14 +34809,11 @@ mod tests {
     }
 
     #[test]
-    fn runtime_overlay_promotes_live_local_llm_and_embedder_rows() {
+    fn runtime_overlay_promotes_llm_and_embedder_without_recreating_builtin_vlm() {
         let mut endpoints =
             harborbeacon_local_agent::runtime::admin_console::default_model_endpoints();
         for endpoint in &mut endpoints {
-            if matches!(
-                endpoint.model_kind,
-                ModelKind::Llm | ModelKind::Embedder | ModelKind::Vlm
-            ) {
+            if matches!(endpoint.model_kind, ModelKind::Llm | ModelKind::Embedder) {
                 endpoint.status = ModelEndpointStatus::Disabled;
                 endpoint.metadata = json!({
                     "builtin": true,
@@ -33580,11 +34853,9 @@ mod tests {
         assert_eq!(embedder.status, ModelEndpointStatus::Active);
         assert_eq!(embedder.metadata["api_key_configured"], json!(true));
 
-        let vlm = overlayed
+        assert!(!overlayed
             .iter()
-            .find(|endpoint| endpoint.model_endpoint_id == "vlm-local-openai-compatible")
-            .expect("vlm endpoint");
-        assert_eq!(vlm.status, ModelEndpointStatus::Disabled);
+            .any(|endpoint| endpoint.model_endpoint_id == "vlm-local-openai-compatible"));
     }
 
     #[test]

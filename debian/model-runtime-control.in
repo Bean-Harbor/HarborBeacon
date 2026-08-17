@@ -1,0 +1,12 @@
+Package: harboros-model-runtime
+Version: VERSION_PLACEHOLDER
+Section: utils
+Priority: optional
+Architecture: ARCH_PLACEHOLDER
+Depends: libc6, ca-certificates, adduser, curl, init-system-helpers, harboros-system (>= 0.1.0~evt.1), harboros-system (<< 0.2)
+Breaks: harboros-beacon (<< VERSION_PLACEHOLDER), harboros-beacon (>> VERSION_PLACEHOLDER)
+Conflicts: llama.cpp-tools-spacemit
+Maintainer: Harborinno Ltd.
+Description: HarborOS K3 Candle model runtime and pinned text model materials
+ Provides the loopback-only Candle service on port 8792 together with the exact
+ Qwen2.5-0.5B and Jina embedding materials selected for HarborNavi EVT.1.

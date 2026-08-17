@@ -1,0 +1,37 @@
+#!/bin/sh
+set -eu
+
+state_dir="/run/harboros-model-runtime"
+upgrade_state="$state_dir/upgrade-active"
+state_tmp=""
+
+cleanup() {
+  [ -z "$state_tmp" ] || rm -f -- "$state_tmp"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+case "${1:-}" in
+  remove|upgrade|deconfigure)
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+      if [ "$1" = upgrade ]; then
+        install -d -o root -g root -m 0755 "$state_dir"
+        state_tmp="$(mktemp "$state_dir/.upgrade-active.XXXXXXXX")"
+        chmod 0600 "$state_tmp"
+        if systemctl is-active --quiet harboros-model-runtime.service; then
+          printf '%s\n' harboros-model-runtime.service >> "$state_tmp"
+        fi
+        chown root:root "$state_tmp"
+        mv -f -- "$state_tmp" "$upgrade_state"
+        state_tmp=""
+        chmod 0600 "$upgrade_state"
+      else
+        rm -f -- "$upgrade_state"
+      fi
+      systemctl stop harboros-model-runtime.service
+    fi
+    ;;
+esac
+
+trap - EXIT HUP INT TERM
+exit 0

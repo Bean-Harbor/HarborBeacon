@@ -22,6 +22,11 @@ class K3DebPackagingTests(unittest.TestCase):
         runtime_contract = json.loads(
             (model_directory / "runtime-contract.json").read_text(encoding="utf-8")
         )
+        first_party_provenance = json.loads(
+            (model_directory / "first-party-provenance.json").read_text(
+                encoding="utf-8"
+            )
+        )
         actual_sha256 = hashlib.sha256(model_path.read_bytes()).hexdigest()
         rust_runtime = (
             REPOSITORY_ROOT / "src" / "runtime" / "cat_recording_classifier.rs"
@@ -44,9 +49,31 @@ class K3DebPackagingTests(unittest.TestCase):
             systemd_unit,
         )
         self.assertIn(f"cat_recording_classifier_sha256={expected_sha256}", build_script)
-        self.assertIn(str(model_path.relative_to(REPOSITORY_ROOT)), build_script)
+        self.assertIn(model_directory.relative_to(REPOSITORY_ROOT).as_posix(), build_script)
+        self.assertIn(model_path.name, build_script)
+        self.assertEqual(first_party_provenance["artifact"], model_path.name)
+        self.assertEqual(first_party_provenance["artifact_sha256"], expected_sha256)
+        self.assertEqual(first_party_provenance["rights_holder"], "Harbor Innovations")
+        self.assertEqual(
+            first_party_provenance["declared_license"],
+            "LicenseRef-Harbor-Innovations-Proprietary",
+        )
+        self.assertIn("first-party-provenance.json", build_script)
         self.assertEqual(runtime_contract["video_decision"]["maximum_frames"], 9)
         self.assertEqual(runtime_contract["video_decision"]["minimum_positive_frames"], 3)
+        self.assertEqual(
+            runtime_contract["video_decision"]["sampling"]["implementation"],
+            "/usr/lib/harboros-beacon/cat-sampling-plan",
+        )
+        self.assertEqual(
+            runtime_contract["video_decision"]["sampling"]["maximum_guided_frames"],
+            5,
+        )
+        self.assertIn("--bin cat-sampling-plan", build_script)
+        self.assertIn(
+            '"$pkg_dir/usr/lib/harboros-beacon/cat-sampling-plan"', build_script
+        )
+        self.assertIn("ffmpeg", build_script)
         self.assertIn("CAT_RECORDING_CLASSIFIER_MAX_FRAMES: usize = 9", rust_runtime)
         self.assertIn("CAT_RECORDING_CLASSIFIER_MIN_POSITIVE_FRAMES: usize = 3", rust_runtime)
         self.assertIn("HARBOR_K3_CAT_RECORDING_CLASSIFIER_THRESHOLD=0.62", systemd_unit)
@@ -60,26 +87,50 @@ class K3DebPackagingTests(unittest.TestCase):
         )
         self.assertIn(
             "Environment=HARBOR_K3_CAT_RECORDING_RECONCILIATION_PATH="
-            "/var/lib/harboros-beacon/cat-recording-reconciliation.json",
+            "/data/harborbeacon/cat-activity/reconciliation.json",
             unit,
         )
 
-    def test_all_systemd_units_are_packaged_read_only(self):
+    def test_beacon_systemd_unit_is_packaged_read_only(self):
         script = BUILD_SCRIPT.read_text(encoding="utf-8")
-        unit_copy_start = script.index(
-            "sed 's/\\r$//' debian/harboros-beacon.service"
+        self.assertIn(
+            "install -m 0644 debian/harboros-beacon.service \\\n"
+            '  "$pkg_dir/usr/lib/systemd/system/harboros-beacon.service"',
+            script,
         )
-        control_start = script.index("\nsed \\", unit_copy_start)
-        unit_section = script[unit_copy_start:control_start]
-        mode_block = unit_section[unit_section.index("chmod 0644") :]
-        for unit_name in (
-            "harboros-beacon.service",
-            "semantic-router.service",
+        self.assertNotIn("$pkg_dir/etc/systemd/system", script)
+        self.assertNotIn("semantic-router.service", script)
+
+    def test_beacon_boot_verifies_exact_package_and_pointer_generation(self):
+        script = BUILD_SCRIPT.read_text(encoding="utf-8")
+        unit = (REPOSITORY_ROOT / "debian" / "harboros-beacon.service").read_text(
+            encoding="utf-8"
+        )
+        verifier = (
+            REPOSITORY_ROOT / "debian" / "verify-beacon-k3-generation"
+        ).read_text(encoding="utf-8")
+        control = (REPOSITORY_ROOT / "debian" / "control").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "ExecStartPre=+/usr/lib/harborbeacon/verify-k3-generation", unit
+        )
+        self.assertIn("debian/verify-beacon-k3-generation", script)
+        self.assertIn("ffmpeg", control)
+        self.assertIn("ffmpeg", script)
+        for package in (
+            "harboros-beacon",
+            "harboros-model-runtime",
+            "harboros-cat-vision-runtime",
         ):
-            self.assertIn(
-                f'"$pkg_dir/etc/systemd/system/{unit_name}"',
-                mode_block,
-            )
+            self.assertIn(package, verifier)
+        self.assertIn('version="$(package_identity "$package")"', verifier)
+        self.assertIn("verify_pointer /data/models", verifier)
+        self.assertIn("verify_pointer /data/vision-models", verifier)
+        self.assertIn("/usr/lib/harboros-model-runtime/verify-release", verifier)
+        self.assertIn("/usr/lib/harboros-cat-vision-runtime/verify-release", verifier)
+        self.assertIn("/usr/lib/harboros-cat-vision-runtime/verify-evidence", verifier)
 
 
 if __name__ == "__main__":

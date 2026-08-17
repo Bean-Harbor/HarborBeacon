@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "release_id": "harboros-navi-k3-0.1.0-evt.1",
+  "materials": [
+    {
+      "id": "detection-yolov8n-192x320",
+      "role": "detection",
+      "state": "locked",
+      "source": "https://gitee.com/bianbu/spacemit-demo.git",
+      "revision": "dc4477d3ea712598bb675f730642a43fe280c569",
+      "license": {
+        "blocking_reason": "The pinned spacemit-demo revision has no repository license declaration or explicit redistribution authorization for the YOLO model.",
+        "concluded_license": "NOASSERTION",
+        "declared_license": "NOASSERTION",
+        "evidence": null,
+        "review_status": "blocked"
+      },
+      "files": [
+        {
+          "source_path": "detection/yolov8n_192x320.q.onnx",
+          "package_path": "detection/yolov8n_192x320.q.onnx",
+          "size": 1925676,
+          "sha256": "d4bf61db2a0925a0126052212479ff5044b621b12c6793420e085d36ae6b5438"
+        }
+      ]
+    },
+    {
+      "id": "detection-coco-labels",
+      "role": "detection-labels",
+      "state": "locked",
+      "source": "https://gitee.com/bianbu/spacemit-demo.git",
+      "revision": "dc4477d3ea712598bb675f730642a43fe280c569",
+      "license": {
+        "blocking_reason": "The pinned spacemit-demo revision has no repository license declaration or explicit redistribution authorization for the labels.",
+        "concluded_license": "NOASSERTION",
+        "declared_license": "NOASSERTION",
+        "evidence": null,
+        "review_status": "blocked"
+      },
+      "files": [
+        {
+          "source_path": "detection/label.txt",
+          "package_path": "detection/label.txt",
+          "size": 621,
+          "sha256": "bd17f1ee35d5f3c862a4894605855abbb9dda4b0621fdb0ac4c2c8c7bb7e730a"
+        }
+      ]
+    }
+  ]
+}

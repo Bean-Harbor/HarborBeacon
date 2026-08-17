@@ -1,0 +1,82 @@
+#!/bin/sh
+set -eu
+
+fail() {
+  echo "error: HarborBeacon K3 generation verification failed: $*" >&2
+  exit 1
+}
+
+package_identity() {
+  package="$1"
+  identity="$(dpkg-query -W -f='${Status}|${Version}' "$package" 2>/dev/null || true)"
+  case "$identity" in
+    "install ok installed|"*) printf '%s\n' "${identity#install ok installed|}" ;;
+    *) fail "$package is not fully installed" ;;
+  esac
+}
+
+verify_pointer() {
+  root="$1"
+  version="$2"
+  label="$3"
+  current="$root/current"
+  release="$root/releases/$version"
+
+  [ ! -e "$root/current.new" ] && [ ! -L "$root/current.new" ] \
+    || fail "$label current.new exists"
+  [ -L "$current" ] || fail "$label current is not a managed symlink"
+  [ "$(stat -c %u "$current")" = 0 ] || fail "$label current is not root-owned"
+  [ "$(readlink "$current")" = "releases/$version" ] \
+    || fail "$label current does not select releases/$version"
+  [ ! -L "$release" ] && [ -d "$release" ] \
+    || fail "$label release is not a real directory"
+  [ "$(stat -c %u "$release")" = 0 ] || fail "$label release is not root-owned"
+}
+
+beacon_version="$(package_identity harboros-beacon)"
+case "$beacon_version" in
+  ""|*/*|.|..) fail "Beacon package version is unsafe" ;;
+esac
+for package in harboros-model-runtime harboros-cat-vision-runtime; do
+  version="$(package_identity "$package")"
+  [ "$version" = "$beacon_version" ] \
+    || fail "$package generation $version differs from Beacon $beacon_version"
+done
+
+verify_pointer /data/models "$beacon_version" model
+verify_pointer /data/vision-models "$beacon_version" vision
+
+model_verify=/usr/lib/harboros-model-runtime/verify-release
+model_manifest=/usr/share/harboros-model-runtime/model-materials.json
+vision_verify=/usr/lib/harboros-cat-vision-runtime/verify-release
+vision_manifest=/usr/share/harboros-cat-vision-runtime/cat-vision-materials.json
+vision_evidence_verify=/usr/lib/harboros-cat-vision-runtime/verify-evidence
+vision_evidence=/usr/share/doc/harboros-cat-vision-runtime/vision-runtime-evidence.json
+for path in \
+  "$model_verify" \
+  "$model_manifest" \
+  "$vision_verify" \
+  "$vision_manifest" \
+  "$vision_evidence_verify" \
+  "$vision_evidence"; do
+  [ ! -L "$path" ] && [ -f "$path" ] || fail "unsafe verifier input: $path"
+done
+
+"$model_verify" \
+  --manifest "$model_manifest" \
+  --root "/data/models/releases/$beacon_version" \
+  || fail "model release bytes do not match the installed manifest"
+"$vision_verify" \
+  --manifest "$vision_manifest" \
+  --root "/data/vision-models/releases/$beacon_version" \
+  || fail "vision release bytes do not match the installed manifest"
+architecture="$(dpkg --print-architecture 2>/dev/null || true)"
+[ -n "$architecture" ] || fail "unable to determine installed architecture"
+"$vision_evidence_verify" \
+  --architecture "$architecture" \
+  --evidence "$vision_evidence" \
+  --model-root "/data/vision-models/releases/$beacon_version" \
+  --package-version "$beacon_version" \
+  || fail "vision runtime evidence does not bind the installed release"
+
+exit 0

@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+if [ "${1:-}" != "/data/vision-models" ]; then
+  echo "error: cat vision runtime data root must be /data/vision-models" >&2
+  exit 2
+fi
+
+install -d -o root -g root -m 0755 \
+  /data/vision-models \
+  /data/vision-models/releases

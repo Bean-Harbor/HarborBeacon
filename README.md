@@ -2,6 +2,25 @@
 
 This repository contains the completed planning deliverables for a HarborBeacon local-first AI agent project, including architecture, roadmap, quick reference, meeting guide, launch checklist, and document index.
 
+## HarborNavi K3 Package Lane
+
+HarborNavi K3 uses separate riscv64 packages for the business core and the
+model runtime. `harboros-beacon` is built with `external-model-runtime`, so its
+4174 inference compatibility route only proxies to the loopback 8792 sidecar
+and does not link Candle. `harboros-model-runtime` owns `harbor-model-api` and
+the exact release model files.
+
+The model package is deliberately fail-closed until every EVT.1 LLM,
+embedding, detection, and VLM material has an immutable revision, exact byte
+size, and SHA256 in `models/k3-evt1-model-materials.json`. Public CI never
+downloads floating model revisions and never publishes qualification packages
+to a public release or APT channel.
+
+K3 state is partitioned by owner: Beacon writes `/data/harborbeacon`, the model
+package writes `/data/models/cache` and installs immutable sets under
+`/data/models/releases`, with `/data/models/current` selecting the active set.
+Camera, Home Assistant, media, and DVR remain owned by HarborLink.
+
 ## Current IM Contract Control Pack
 
 The active HarborBeacon <-> HarborGate seam is the v2.0 upgrade control pack.

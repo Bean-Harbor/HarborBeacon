@@ -1,0 +1,32 @@
+#!/bin/sh
+set -eu
+
+url="${1:?usage: wait-model-runtime-health URL DEADLINE_SECONDS}"
+deadline_seconds="${2:?usage: wait-model-runtime-health URL DEADLINE_SECONDS}"
+case "$deadline_seconds" in
+  *[!0-9]*|"") echo "error: deadline must be a positive integer" >&2; exit 2 ;;
+esac
+[ "$deadline_seconds" -gt 0 ] || { echo "error: deadline must be positive" >&2; exit 2; }
+
+curl_command="${HARBOR_MODEL_HEALTH_CURL:-/usr/bin/curl}"
+date_command="${HARBOR_MODEL_HEALTH_DATE:-/usr/bin/date}"
+sleep_command="${HARBOR_MODEL_HEALTH_SLEEP:-/usr/bin/sleep}"
+
+deadline=$(( $("$date_command" +%s) + deadline_seconds ))
+attempt=1
+while [ "$("$date_command" +%s)" -le "$deadline" ]; do
+  if "$curl_command" --fail --silent --show-error --max-time 2 "$url" >/dev/null 2>&1; then
+    exit 0
+  fi
+  [ "$("$date_command" +%s)" -lt "$deadline" ] || break
+  sleep_seconds=$((attempt / 10 + 1))
+  [ "$sleep_seconds" -le 5 ] || sleep_seconds=5
+  remaining=$((deadline - $("$date_command" +%s)))
+  [ "$sleep_seconds" -le "$remaining" ] || sleep_seconds="$remaining"
+  [ "$sleep_seconds" -gt 0 ] || break
+  "$sleep_command" "$sleep_seconds"
+  attempt=$((attempt + 1))
+done
+
+echo "error: model runtime did not become healthy within ${deadline_seconds}s: $url" >&2
+exit 1

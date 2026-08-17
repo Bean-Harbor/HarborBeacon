@@ -1,0 +1,215 @@
+#!/bin/sh
+set -eu
+
+if ! getent group harbormodel >/dev/null 2>&1; then
+  addgroup --system harbormodel
+fi
+if ! id harbormodel >/dev/null 2>&1; then
+  adduser --system --ingroup harbormodel --home /data/models --no-create-home harbormodel
+fi
+
+release_root="/data/models/releases/VERSION_PLACEHOLDER"
+source_root="/usr/share/harboros-model-runtime/models"
+manifest="/usr/share/harboros-model-runtime/model-materials.json"
+verify="/usr/lib/harboros-model-runtime/verify-release"
+staging_root=""
+backup_root=""
+previous_current=""
+had_current=0
+current_state_captured=0
+current_new_created=0
+current_switched=0
+release_installed=0
+transaction_committed=0
+systemd_live=0
+model_was_active=0
+upgrade_state="/run/harboros-model-runtime/upgrade-active"
+generation_state_dir="/run/harboros-k3-generation"
+beacon_active_state="$generation_state_dir/beacon-was-active"
+beacon_state_tmp=""
+
+validate_beacon_active_state() {
+  [ ! -L "$beacon_active_state" ] \
+    && [ -f "$beacon_active_state" ] \
+    && [ "$(stat -c %u "$beacon_active_state")" = 0 ] \
+    && [ "$(stat -c %a "$beacon_active_state")" = 600 ] \
+    && [ "$(stat -c %s "$beacon_active_state")" = 24 ] \
+    && [ "$(cat "$beacon_active_state")" = harboros-beacon.service ] || {
+    echo "error: unsafe Beacon generation active state: $beacon_active_state" >&2
+    exit 1
+  }
+}
+
+stop_beacon_for_generation_change() {
+  if [ -e "$generation_state_dir" ] || [ -L "$generation_state_dir" ]; then
+    [ ! -L "$generation_state_dir" ] \
+      && [ -d "$generation_state_dir" ] \
+      && [ "$(stat -c %u "$generation_state_dir")" = 0 ] \
+      && [ "$(stat -c %a "$generation_state_dir")" = 700 ] || {
+      echo "error: unsafe Beacon generation state directory" >&2
+      exit 1
+    }
+  else
+    install -d -o root -g root -m 0700 "$generation_state_dir"
+  fi
+  if [ -e "$beacon_active_state" ] || [ -L "$beacon_active_state" ]; then
+    validate_beacon_active_state
+  elif systemctl is-active --quiet harboros-beacon.service; then
+    beacon_state_tmp="$(mktemp "$generation_state_dir/.beacon-was-active.XXXXXXXX")"
+    printf '%s\n' harboros-beacon.service > "$beacon_state_tmp"
+    chown root:root "$beacon_state_tmp"
+    chmod 0600 "$beacon_state_tmp"
+    mv -f -- "$beacon_state_tmp" "$beacon_active_state"
+    beacon_state_tmp=""
+  fi
+  systemctl stop harboros-beacon.service >/dev/null 2>&1 || true
+  if systemctl is-active --quiet harboros-beacon.service; then
+    echo "error: Beacon must stop before model generation changes" >&2
+    exit 1
+  fi
+}
+
+cleanup() {
+  if [ "$transaction_committed" -ne 1 ]; then
+    if [ "$systemd_live" -eq 1 ]; then
+      systemctl stop harboros-model-runtime.service >/dev/null 2>&1 || true
+    fi
+    if [ "$release_installed" -eq 1 ]; then
+      rm -rf -- "$release_root"
+    fi
+    if [ -n "$backup_root" ] && [ -d "$backup_root" ]; then
+      mv -- "$backup_root" "$release_root"
+      backup_root=""
+    fi
+    if [ "$current_new_created" -eq 1 ]; then
+      rm -f -- /data/models/current.new
+    fi
+    if [ "$current_state_captured" -eq 1 ] && [ "$current_switched" -eq 1 ]; then
+      if [ "$had_current" -eq 1 ]; then
+        ln -s "$previous_current" /data/models/current.new
+        chown -h root:root /data/models/current.new
+        mv -Tf /data/models/current.new /data/models/current
+      else
+        rm -f -- /data/models/current /data/models/current.new
+      fi
+    fi
+    if [ "$systemd_live" -eq 1 ]; then
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      if [ "$model_was_active" -eq 1 ]; then
+        systemctl restart harboros-model-runtime.service >/dev/null 2>&1 || true
+      fi
+    fi
+    rm -f -- "$upgrade_state"
+  elif [ -n "$backup_root" ] && [ -d "$backup_root" ]; then
+    rm -rf -- "$backup_root"
+  fi
+  [ -z "$staging_root" ] || rm -rf -- "$staging_root"
+  [ -z "$beacon_state_tmp" ] || rm -f -- "$beacon_state_tmp"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+  systemd_live=1
+  stop_beacon_for_generation_change
+  if systemctl is-active --quiet harboros-model-runtime.service; then
+    model_was_active=1
+  fi
+  if [ -e "$upgrade_state" ] || [ -L "$upgrade_state" ]; then
+    [ ! -L "$upgrade_state" ] && [ -f "$upgrade_state" ] \
+      && [ "$(stat -c %u "$upgrade_state")" = 0 ] \
+      && [ "$(stat -c %a "$upgrade_state")" = 600 ] || {
+      echo "error: unsafe model runtime upgrade state: $upgrade_state" >&2
+      exit 1
+    }
+    while IFS= read -r unit; do
+      case "$unit" in
+        harboros-model-runtime.service) model_was_active=1 ;;
+        "") ;;
+        *) echo "error: invalid unit in $upgrade_state: $unit" >&2; exit 1 ;;
+      esac
+    done < "$upgrade_state"
+  fi
+  systemctl stop harboros-model-runtime.service
+  # This package generation deliberately retires the former VLM unit.
+  systemctl disable --now harboros-vlm-runtime.service >/dev/null 2>&1 || true
+  if systemctl is-active --quiet harboros-vlm-runtime.service; then
+    echo "error: retired VLM unit is still active" >&2
+    exit 1
+  fi
+fi
+
+/usr/lib/harboros-model-runtime/ensure-data-layout /data/models
+if [ -e /data/models/current.new ] || [ -L /data/models/current.new ]; then
+  echo "error: stale or unsafe /data/models/current.new exists" >&2
+  exit 1
+fi
+if [ -e /data/models/current ] || [ -L /data/models/current ]; then
+  [ -L /data/models/current ] || {
+    echo "error: /data/models/current is not a managed symlink" >&2
+    exit 1
+  }
+  previous_current="$(readlink /data/models/current)"
+  case "$previous_current" in
+    releases/*)
+      previous_version="${previous_current#releases/}"
+      case "$previous_version" in
+        ""|*/*|.|..) echo "error: unsafe current model target: $previous_current" >&2; exit 1 ;;
+      esac
+      ;;
+    *) echo "error: unsafe current model target: $previous_current" >&2; exit 1 ;;
+  esac
+  had_current=1
+fi
+current_state_captured=1
+
+"$verify" --manifest "$manifest" --root "$source_root"
+staging_root="$(mktemp -d "/data/models/releases/.VERSION_PLACEHOLDER.install.XXXXXXXX")"
+chown root:root "$staging_root"
+chmod 0700 "$staging_root"
+cp -a --no-dereference "$source_root/." "$staging_root/"
+"$verify" --manifest "$manifest" --root "$staging_root"
+chown -R root:root "$staging_root"
+find "$staging_root" -type d -exec chmod 0755 {} +
+find "$staging_root" -type f -exec chmod 0444 {} +
+
+if [ -L "$release_root" ] || { [ -e "$release_root" ] && [ ! -d "$release_root" ]; }; then
+  echo "error: model release target is not a real directory: $release_root" >&2
+  exit 1
+fi
+if [ -d "$release_root" ]; then
+  backup_root="$(mktemp -d "/data/models/releases/.VERSION_PLACEHOLDER.previous.XXXXXXXX")"
+  rmdir "$backup_root"
+  mv -- "$release_root" "$backup_root"
+fi
+release_installed=1
+mv -- "$staging_root" "$release_root"
+staging_root=""
+"$verify" --manifest "$manifest" --root "$release_root"
+
+current_new_created=1
+ln -s "releases/VERSION_PLACEHOLDER" /data/models/current.new
+chown -h root:root /data/models/current.new
+current_switched=1
+mv -Tf /data/models/current.new /data/models/current
+chown root:root /data/models /data/models/releases
+chmod 0755 /data/models /data/models/releases
+
+if command -v deb-systemd-helper >/dev/null 2>&1; then
+  deb-systemd-helper unmask harboros-model-runtime.service >/dev/null || true
+  deb-systemd-helper enable harboros-model-runtime.service >/dev/null || true
+fi
+
+if [ "$systemd_live" -eq 1 ]; then
+  systemctl daemon-reload
+  systemctl restart harboros-model-runtime.service
+fi
+
+transaction_committed=1
+rm -f -- "$upgrade_state"
+if [ -n "$backup_root" ]; then
+  rm -rf -- "$backup_root"
+  backup_root=""
+fi
+trap - EXIT HUP INT TERM
+exit 0

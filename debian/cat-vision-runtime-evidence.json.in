@@ -1,0 +1,151 @@
+{
+  "decision": {
+    "blocking_reasons": [
+      "cat_labels_redistribution_authorization_missing",
+      "cat_yolo_redistribution_authorization_missing",
+      "python3_spacemit_ort_artifact_and_license_evidence_missing",
+      "spacemit_onnxruntime_payload_license_evidence_incomplete",
+      "spacemit_tcm_payload_license_evidence_incomplete"
+    ],
+    "release_eligible": false,
+    "status": "blocked"
+  },
+  "kind": "vision-runtime-evidence",
+  "model_release_root": "/data/vision-models",
+  "models": [
+    {
+      "concluded_license": "NOASSERTION",
+      "copyright": null,
+      "declared_license": "NOASSERTION",
+      "id": "detection-yolov8n-192x320",
+      "installed_path": "/usr/share/harboros-cat-vision-runtime/models/detection/yolov8n_192x320.q.onnx",
+      "redistribution_evidence": null,
+      "revision": {
+        "kind": "git-commit",
+        "value": "dc4477d3ea712598bb675f730642a43fe280c569"
+      },
+      "runtime_path": "/data/vision-models/current/detection/yolov8n_192x320.q.onnx",
+      "sha256": "d4bf61db2a0925a0126052212479ff5044b621b12c6793420e085d36ae6b5438",
+      "size": 1925676,
+      "source": {
+        "kind": "git",
+        "url": "https://gitee.com/bianbu/spacemit-demo.git"
+      },
+      "source_archive": null
+    },
+    {
+      "concluded_license": "NOASSERTION",
+      "copyright": null,
+      "declared_license": "NOASSERTION",
+      "id": "detection-coco-labels",
+      "installed_path": "/usr/share/harboros-cat-vision-runtime/models/detection/label.txt",
+      "redistribution_evidence": null,
+      "revision": {
+        "kind": "git-commit",
+        "value": "dc4477d3ea712598bb675f730642a43fe280c569"
+      },
+      "runtime_path": "/data/vision-models/current/detection/label.txt",
+      "sha256": "bd17f1ee35d5f3c862a4894605855abbb9dda4b0621fdb0ac4c2c8c7bb7e730a",
+      "size": 621,
+      "source": {
+        "kind": "git",
+        "url": "https://gitee.com/bianbu/spacemit-demo.git"
+      },
+      "source_archive": null
+    }
+  ],
+  "package": {
+    "architecture": "ARCH_PLACEHOLDER",
+    "name": "harboros-cat-vision-runtime",
+    "version": "VERSION_PLACEHOLDER"
+  },
+  "policy": "fail-closed",
+  "runtime_packages": [
+    {
+      "apt_provenance": {
+        "architecture": "riscv64",
+        "component": "main",
+        "index_path": null,
+        "index_sha256": null,
+        "release_sha256": null,
+        "repository": "https://ppa.launchpadcontent.net/spacemit/k3/ubuntu",
+        "signing_key_fingerprint": null,
+        "suite": "resolute"
+      },
+      "architecture": "riscv64",
+      "artifact": {
+        "filename": "python3-spacemit-ort_2.0.3+3_riscv64.deb",
+        "sha256": null,
+        "size": null,
+        "source_package": "python3-spacemit-ort",
+        "source_version": "2.0.3+3"
+      },
+      "concluded_license": "NOASSERTION",
+      "copyright": null,
+      "declared_license": "NOASSERTION",
+      "license_evidence": null,
+      "name": "python3-spacemit-ort",
+      "version": "2.0.3+3"
+    },
+    {
+      "apt_provenance": {
+        "architecture": "riscv64",
+        "component": "main",
+        "index_path": null,
+        "index_sha256": null,
+        "release_sha256": null,
+        "repository": "https://ppa.launchpadcontent.net/spacemit/k3/ubuntu",
+        "signing_key_fingerprint": null,
+        "suite": "resolute"
+      },
+      "architecture": "riscv64",
+      "artifact": {
+        "filename": "spacemit-onnxruntime_2.0.3+3_riscv64.deb",
+        "sha256": "b69cfc955af1ac15abf61f4915a8d5e68c50d20d38451d640d98b4b189da8472",
+        "size": null,
+        "source_package": "spacemit-onnxruntime",
+        "source_version": "2.0.3+3"
+      },
+      "concluded_license": "NOASSERTION",
+      "copyright": {
+        "installed_path": "/usr/share/doc/spacemit-onnxruntime/copyright",
+        "sha256": "de3e277514b725dd7ea8e481067338850276a662f59a5f88dfc61b65a2859a69"
+      },
+      "declared_license": "NOASSERTION",
+      "license_evidence": null,
+      "name": "spacemit-onnxruntime",
+      "version": "2.0.3+3"
+    },
+    {
+      "apt_provenance": {
+        "architecture": "riscv64",
+        "component": "main",
+        "index_path": null,
+        "index_sha256": null,
+        "release_sha256": null,
+        "repository": "https://ppa.launchpadcontent.net/spacemit/k3/ubuntu",
+        "signing_key_fingerprint": null,
+        "suite": "resolute"
+      },
+      "architecture": "riscv64",
+      "artifact": {
+        "filename": "spacemit-tcm_3.0.0+3_riscv64.deb",
+        "sha256": "2763b8946791f47fd20d4bda55e3680c3548e7a6893e605e30e1cbb4455f5fa5",
+        "size": null,
+        "source_package": "spacemit-tcm",
+        "source_version": "3.0.0+3"
+      },
+      "concluded_license": "NOASSERTION",
+      "copyright": {
+        "installed_path": "/usr/share/doc/spacemit-tcm/copyright",
+        "sha256": "c5ae5de0b80538d412001b735d05442650c78a1f44d4dfed61da530d5ffa5311"
+      },
+      "declared_license": "NOASSERTION",
+      "license_evidence": null,
+      "name": "spacemit-tcm",
+      "version": "3.0.0+3"
+    }
+  ],
+  "schema_version": 1,
+  "source_commit": "SOURCE_COMMIT_PLACEHOLDER"
+}

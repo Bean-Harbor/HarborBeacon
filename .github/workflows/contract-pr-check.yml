@@ -35,8 +35,8 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Verify HarborLink dependency and lifecycle metadata
         run: |
-          grep -Eq '^Depends:.*harborlink \(>= [0-9]+\.[0-9]+\.[0-9]+\)' debian/control
-          grep -F 'harborlink (>= 0.1.0)' scripts/build_harbornavi_k3_deb.sh
+          grep -F 'harborlink (>= 0.1.0~evt.1), harborlink (<< 0.2)' debian/control
+          grep -F 'harborlink (>= 0.1.0~evt.1), harborlink (<< 0.2)' scripts/build_harbornavi_k3_deb.sh
           bash -n scripts/build_harbornavi_k3_deb.sh
           grep -F 'User=harborbeacon' debian/harboros-beacon.service
           grep -F 'LoadCredential=harborlink-local-api-token:' debian/harboros-beacon.service

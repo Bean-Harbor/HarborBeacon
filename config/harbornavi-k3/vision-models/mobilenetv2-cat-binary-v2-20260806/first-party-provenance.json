@@ -1,0 +1,12 @@
+{
+  "approval_id": "harbornavi-qualification-first-party-rights-2026-08-16",
+  "artifact": "mobilenetv2_cat_binary_int8.onnx",
+  "artifact_sha256": "d0c1bdcf973ca7f6efc6e62af764ff59300e0d27abbc75c20c7f86515769d825",
+  "copyright": "Copyright (c) Harbor Innovations",
+  "declared_license": "LicenseRef-Harbor-Innovations-Proprietary",
+  "introduced_commit": "97cf7a451d45179931a627fa92e07a82b3701185",
+  "provenance_basis": "Harbor-developed model artifact committed to the canonical HarborBeacon source repository",
+  "rights_holder": "Harbor Innovations",
+  "schema_version": 1,
+  "source_repository": "https://github.com/Bean-Harbor/HarborBeacon"
+}

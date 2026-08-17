@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+# Model releases are persistent state. Package removal and upgrade never delete
+# a release or repoint /data/vision-models/current.
+exit 0

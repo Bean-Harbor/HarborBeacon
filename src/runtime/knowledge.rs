@@ -3117,6 +3117,10 @@ mod tests {
             ocr_response.reply_pack.citations[0].provenance.as_deref(),
             Some("ocr")
         );
+        assert!(!ocr_response
+            .supported_modalities
+            .iter()
+            .any(|item| item == "vlm"));
         assert!(ocr_response
             .pending_modalities
             .iter()
@@ -3132,7 +3136,7 @@ mod tests {
     }
 
     #[test]
-    fn search_surfaces_vlm_provenance_for_image_hits() {
+    fn search_does_not_auto_run_disabled_external_vlm() {
         let _guard = INDEX_TEST_LOCK.lock().expect("lock");
         let root = unique_dir("harborbeacon-knowledge-vlm");
         let index_root = unique_dir("harborbeacon-knowledge-index-store");
@@ -3167,17 +3171,14 @@ mod tests {
         .expect("vlm search");
         std::env::remove_var("HARBOR_ADMIN_STATE_PATH");
 
-        assert_eq!(response.images.len(), 1);
-        assert_eq!(response.images[0].provenance.as_deref(), Some("vlm"));
-        assert_eq!(
-            response.reply_pack.citations[0].provenance.as_deref(),
-            Some("vlm")
-        );
-        assert!(response
+        assert_eq!(response.images.len(), 0);
+        assert_eq!(response.total_matches, 0);
+        assert!(response.reply_pack.citations.is_empty());
+        assert!(!response
             .supported_modalities
             .iter()
             .any(|item| item == "vlm"));
-        assert!(!response.pending_modalities.iter().any(|item| item == "vlm"));
+        assert!(response.pending_modalities.iter().any(|item| item == "vlm"));
 
         cleanup_dir(&root);
         cleanup_dir(&index_root);
@@ -3240,7 +3241,7 @@ mod tests {
     }
 
     #[test]
-    fn image_search_matches_vlm_content_and_marks_content_provenance() {
+    fn image_search_does_not_index_disabled_external_vlm_content() {
         let _guard = INDEX_TEST_LOCK.lock().expect("lock");
         let root = unique_dir("harborbeacon-knowledge-image-content-match");
         let index_root = unique_dir("harborbeacon-knowledge-index-store");
@@ -3277,11 +3278,13 @@ mod tests {
         .expect("image search");
         std::env::remove_var("HARBOR_ADMIN_STATE_PATH");
 
-        assert_eq!(response.images.len(), 1);
-        assert_eq!(response.images[0].provenance.as_deref(), Some("vlm"));
-        assert_eq!(response.images[0].content_source_kinds, vec!["vlm"]);
-        assert!(response.images[0].content_indexed);
-        assert!(!response.images[0].filename_match_used);
+        assert_eq!(response.images.len(), 0);
+        assert_eq!(response.total_matches, 0);
+        assert!(!response
+            .supported_modalities
+            .iter()
+            .any(|item| item == "vlm"));
+        assert!(response.pending_modalities.iter().any(|item| item == "vlm"));
 
         cleanup_dir(&root);
         cleanup_dir(&index_root);
