@@ -305,9 +305,8 @@ class K3PackagingContractTests(unittest.TestCase):
                 module.verify(evidence_path, root, "1.0", "riscv64")
 
     def test_maintainer_and_runtime_shell_scripts_parse(self):
-        shell = shutil.which("sh")
-        if shell is None:
-            self.skipTest("POSIX sh is not available on this host")
+        posix_shell = shutil.which("sh")
+        bash = shutil.which("bash")
         for relative in (
             "debian/postinst",
             "debian/prerm",
@@ -324,8 +323,13 @@ class K3PackagingContractTests(unittest.TestCase):
             "scripts/test_k3_generation_upgrade_order.sh",
             "scripts/run_k3_materials_ab_in_container.sh",
         ):
+            script = ROOT / relative
+            shebang = script.read_text(encoding="utf-8").splitlines()[0]
+            shell = bash if "bash" in shebang else posix_shell
+            if shell is None:
+                self.skipTest(f"shell for {relative} is not available on this host")
             subprocess.run(
-                [shell, "-n", str(ROOT / relative)],
+                [shell, "-n", str(script)],
                 check=True,
                 capture_output=True,
                 text=True,
