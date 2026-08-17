@@ -35,7 +35,7 @@ const DEFAULT_CANDLE_CHAT_MODEL_ID: &str =
 const DEFAULT_CANDLE_EMBEDDING_MODEL_ID: &str = "jinaai/jina-embeddings-v2-base-zh";
 const DEFAULT_CANDLE_CACHE_DIR: &str =
     "/mnt/software/harborbeacon-agent-ci/model-store/runtimes/harbor-candle/cache";
-const DEFAULT_CANDLE_MAX_NEW_TOKENS: usize = 64;
+const DEFAULT_CANDLE_MAX_NEW_TOKENS: usize = 512;
 const DEFAULT_CANDLE_TEMPERATURE: f64 = 0.2;
 const DEFAULT_CANDLE_REPEAT_PENALTY: f32 = 1.1;
 const DEFAULT_CANDLE_REPEAT_LAST_N: usize = 64;
@@ -1234,6 +1234,15 @@ struct CandleChatCompletion {
     text: String,
     prompt_tokens: usize,
     completion_tokens: usize,
+    finish_reason: &'static str,
+}
+
+fn candle_finish_reason(stopped_on_eos: bool) -> &'static str {
+    if stopped_on_eos {
+        "stop"
+    } else {
+        "length"
+    }
 }
 
 #[derive(Debug)]
@@ -1385,7 +1394,7 @@ impl CandleBackend {
                             "role": "assistant",
                             "content": completion.text,
                         },
-                        "finish_reason": "stop",
+                        "finish_reason": completion.finish_reason,
                     }
                 ],
                 "usage": {
@@ -1626,6 +1635,7 @@ impl CandleBackend {
         let mut logits_processor =
             LogitsProcessor::new(self.config.seed, Some(request.temperature), None);
 
+        let mut stopped_on_eos = false;
         for index in 0..request.max_new_tokens.max(1) {
             let context_size = if index > 0 { 1 } else { tokens.len() };
             let start_pos = tokens.len().saturating_sub(context_size);
@@ -1659,6 +1669,7 @@ impl CandleBackend {
                 .sample(&logits)
                 .map_err(|error| format!("failed to sample next token: {error}"))?;
             if runtime.eos_tokens.contains(&next_token) {
+                stopped_on_eos = true;
                 break;
             }
             tokens.push(next_token);
@@ -1684,6 +1695,7 @@ impl CandleBackend {
             text: sanitized,
             prompt_tokens,
             completion_tokens: generated.len(),
+            finish_reason: candle_finish_reason(stopped_on_eos),
         })
     }
 
@@ -3102,6 +3114,13 @@ mod tests {
         );
         assert_eq!(config.candle.cache_dir, DEFAULT_CANDLE_CACHE_DIR);
         assert_eq!(config.candle.max_new_tokens, DEFAULT_CANDLE_MAX_NEW_TOKENS);
+        assert_eq!(config.candle.max_new_tokens, 512);
+    }
+
+    #[test]
+    fn candle_finish_reason_distinguishes_eos_from_token_limit() {
+        assert_eq!(candle_finish_reason(true), "stop");
+        assert_eq!(candle_finish_reason(false), "length");
     }
 
     #[test]

@@ -144,7 +144,6 @@ const RAG_ANSWER_CONTEXT_CHAR_BUDGET: usize = 4_800;
 const RAG_DOCUMENT_LIST_ABSOLUTE_MIN_SCORE: u32 = 350;
 const RAG_DOCUMENT_LIST_RELATIVE_MIN_SCORE: f32 = 0.20;
 const RAG_DOCUMENT_LIST_RERANK_MIN_SCORE: f32 = 0.10;
-const RAG_ANSWER_RELATIVE_MIN_SCORE: f32 = 0.50;
 const RAG_ANSWER_BUDGET_MS: u64 = 30_000;
 const RAG_ANSWER_MAX_TOKENS: u32 = 512;
 const RAG_ANSWER_SOFT_TARGET_TOKENS: u32 = 300;
@@ -7429,21 +7428,8 @@ fn rag_answer_candidate_citations(
     if document_list {
         filter_document_list_citations_by_confidence(citations)
     } else {
-        filter_answer_citations_by_confidence(citations)
+        citations
     }
-}
-
-fn filter_answer_citations_by_confidence(
-    citations: Vec<KnowledgeSearchCitation>,
-) -> Vec<KnowledgeSearchCitation> {
-    let Some(top_score) = citations.iter().map(|citation| citation.score).max() else {
-        return citations;
-    };
-    let minimum_score = (top_score as f32 * RAG_ANSWER_RELATIVE_MIN_SCORE).round() as u32;
-    citations
-        .into_iter()
-        .filter(|citation| citation.score >= minimum_score)
-        .collect()
 }
 
 fn append_rag_review_scope_instruction(
@@ -16451,23 +16437,6 @@ mod tests {
         assert_eq!(filtered[0].title, "最相关.md");
         assert_eq!(filtered[1].title, "语义相关.md");
         assert_eq!(filtered[2].title, "重排相关.md");
-    }
-
-    #[test]
-    fn rag_answer_filters_weak_candidates_relative_to_the_top_result() {
-        let mut strongest = rag_test_citation("空调.md", "/knowledge/空调.md");
-        strongest.score = 1_000;
-        let mut second_strong = rag_test_citation("空调补充.md", "/knowledge/空调补充.md");
-        second_strong.score = 700;
-        let mut weak = rag_test_citation("厨房.md", "/knowledge/厨房.md");
-        weak.score = 334;
-
-        let filtered =
-            super::filter_answer_citations_by_confidence(vec![strongest, second_strong, weak]);
-
-        assert_eq!(filtered.len(), 2);
-        assert_eq!(filtered[0].title, "空调.md");
-        assert_eq!(filtered[1].title, "空调补充.md");
     }
 
     #[test]
