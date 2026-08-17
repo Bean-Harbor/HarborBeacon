@@ -129,12 +129,12 @@ export HARBOR_TEST_EVENTS="$events"
 export HARBOR_TEST_GENERATION="0.1.0~evt.1+fixture"
 
 # An active Beacon is stopped by prerm and restarted only after exact runtimes.
-PATH="$mock_bin:$PATH" "$repo_root/debian/prerm" upgrade
+PATH="$mock_bin:$PATH" sh "$repo_root/debian/prerm" upgrade
 test "$(cat "$service_state")" = 0
 state=/run/harboros-k3-generation/beacon-was-active
 test "$(stat -c '%U:%G:%a:%s' "$state")" = root:root:600:24
 test "$(cat "$state")" = harboros-beacon.service
-PATH="$mock_bin:$PATH" "$repo_root/debian/postinst" configure
+PATH="$mock_bin:$PATH" sh "$repo_root/debian/postinst" configure
 test "$(cat "$service_state")" = 1
 test ! -e "$state"
 grep -Fx -- 'migrate-cat-activity-state' "$events" >/dev/null
@@ -147,17 +147,17 @@ test "$migrate_line" -lt "$restart_line"
 # A previously inactive Beacon remains inactive and is not spuriously restarted.
 printf '%s\n' 0 > "$service_state"
 restart_count="$(grep -Fc 'systemctl restart harboros-beacon.service' "$events")"
-PATH="$mock_bin:$PATH" "$repo_root/debian/prerm" upgrade
+PATH="$mock_bin:$PATH" sh "$repo_root/debian/prerm" upgrade
 test ! -e "$state"
-PATH="$mock_bin:$PATH" "$repo_root/debian/postinst" configure
+PATH="$mock_bin:$PATH" sh "$repo_root/debian/postinst" configure
 test "$(cat "$service_state")" = 0
 test "$(grep -Fc 'systemctl restart harboros-beacon.service' "$events")" = "$restart_count"
 
 # A mixed runtime generation cannot consume the active marker or restart Beacon.
 printf '%s\n' 1 > "$service_state"
-PATH="$mock_bin:$PATH" "$repo_root/debian/prerm" upgrade
+PATH="$mock_bin:$PATH" sh "$repo_root/debian/prerm" upgrade
 export HARBOR_TEST_VISION_GENERATION="0.1.0~evt.1+wrong"
-if PATH="$mock_bin:$PATH" "$repo_root/debian/postinst" configure; then
+if PATH="$mock_bin:$PATH" sh "$repo_root/debian/postinst" configure; then
   echo "error: Beacon postinst accepted a mixed runtime generation" >&2
   exit 1
 fi
@@ -167,7 +167,7 @@ test "$(grep -Fc 'systemctl restart harboros-beacon.service' "$events")" = "$res
 
 # Restoring the exact three-package generation completes rollback and consumes state.
 unset HARBOR_TEST_VISION_GENERATION
-PATH="$mock_bin:$PATH" "$repo_root/debian/postinst" configure
+PATH="$mock_bin:$PATH" sh "$repo_root/debian/postinst" configure
 test "$(cat "$service_state")" = 1
 test ! -e "$state"
 test "$(grep -Fc 'systemctl restart harboros-beacon.service' "$events")" = \
@@ -175,17 +175,17 @@ test "$(grep -Fc 'systemctl restart harboros-beacon.service' "$events")" = \
 
 # A migration failure is also fail closed and can be retried without losing intent.
 printf '%s\n' 1 > "$service_state"
-PATH="$mock_bin:$PATH" "$repo_root/debian/prerm" upgrade
+PATH="$mock_bin:$PATH" sh "$repo_root/debian/prerm" upgrade
 restart_count="$(grep -Fc 'systemctl restart harboros-beacon.service' "$events")"
 if HARBOR_TEST_MIGRATE_FAIL=1 PATH="$mock_bin:$PATH" \
-  "$repo_root/debian/postinst" configure; then
+  sh "$repo_root/debian/postinst" configure; then
   echo "error: Beacon postinst ignored a cat-activity migration failure" >&2
   exit 1
 fi
 test "$(cat "$service_state")" = 0
 test -f "$state"
 test "$(grep -Fc 'systemctl restart harboros-beacon.service' "$events")" = "$restart_count"
-PATH="$mock_bin:$PATH" "$repo_root/debian/postinst" configure
+PATH="$mock_bin:$PATH" sh "$repo_root/debian/postinst" configure
 test "$(cat "$service_state")" = 1
 test ! -e "$state"
 test "$(grep -Fc 'systemctl restart harboros-beacon.service' "$events")" = \
