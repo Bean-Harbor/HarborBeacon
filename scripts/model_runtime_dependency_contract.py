@@ -49,6 +49,7 @@ def read_regular_bytes(path: Path, *, max_bytes: int, label: str) -> bytes:
             os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0),
         )
         opened = os.fstat(descriptor)
+        path_after_open = os.lstat(path)
         identity = lambda value: (
             value.st_dev,
             value.st_ino,
@@ -56,9 +57,25 @@ def read_regular_bytes(path: Path, *, max_bytes: int, label: str) -> bytes:
             value.st_mtime_ns,
             value.st_ctime_ns,
         )
+        # Windows path and handle stat calls expose different ctime semantics.
+        # Compare path ctime across path snapshots there; POSIX requires the full
+        # path-before/opened tuple requested by the qualification contract.
+        path_handle_identity = lambda value: (
+            value.st_dev,
+            value.st_ino,
+            value.st_size,
+            value.st_mtime_ns,
+        )
+        path_matches_open = (
+            path_handle_identity(before) == path_handle_identity(opened)
+            if os.name == "nt"
+            else identity(before) == identity(opened)
+        )
         if (
             not stat.S_ISREG(opened.st_mode)
-            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or not stat.S_ISREG(path_after_open.st_mode)
+            or identity(path_after_open) != identity(before)
+            or not path_matches_open
             or opened.st_size < 1
             or opened.st_size > max_bytes
         ):
@@ -71,7 +88,12 @@ def read_regular_bytes(path: Path, *, max_bytes: int, label: str) -> bytes:
             if len(payload) > max_bytes:
                 raise ValueError(f"{label} exceeds its size limit: {path}")
         after = os.fstat(descriptor)
-        if identity(after) != identity(opened) or len(payload) != opened.st_size:
+        path_after_read = os.lstat(path)
+        if (
+            identity(after) != identity(opened)
+            or identity(path_after_read) != identity(before)
+            or len(payload) != opened.st_size
+        ):
             raise ValueError(f"{label} changed while being read: {path}")
     except OSError as exc:
         raise ValueError(f"unable to open or read {label}: {path}") from exc

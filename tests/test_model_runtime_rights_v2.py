@@ -3,6 +3,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import tarfile
 import tempfile
 import unittest
@@ -432,6 +433,31 @@ class ModelRuntimeRightsV2Tests(unittest.TestCase):
                 self.dependencies.os, "fstat", side_effect=changing_fstat
             ):
                 with self.assertRaisesRegex(ValueError, "changed while being read"):
+                    self.dependencies.read_regular_bytes(
+                        source,
+                        max_bytes=self.dependencies.MAX_CONTROL_BYTES,
+                        label="control",
+                    )
+
+            original = source.read_bytes()
+            original_stat = source.stat()
+            real_open = self.dependencies.os.open
+
+            def mutate_before_open(path, flags):
+                Path(path).write_bytes(b"X" + original[1:])
+                os.utime(
+                    path,
+                    ns=(
+                        original_stat.st_atime_ns,
+                        original_stat.st_mtime_ns + 1_000_000_000,
+                    ),
+                )
+                return real_open(path, flags)
+
+            with mock.patch.object(
+                self.dependencies.os, "open", side_effect=mutate_before_open
+            ):
+                with self.assertRaisesRegex(ValueError, "missing, unsafe"):
                     self.dependencies.read_regular_bytes(
                         source,
                         max_bytes=self.dependencies.MAX_CONTROL_BYTES,
