@@ -10310,7 +10310,7 @@ fn build_rag_answer_prompt(
             "这是文档筛选任务，不是正文摘要任务。先在内部判断每篇候选是否满足原问题和排除条件。".to_string(),
             "必须检查全部候选并列出所有符合项，不要只选择最相关的一篇。排除条件按文档主要主题判断；正文仅为比较而提到排除词，不代表文档主题违规。".to_string(),
             "最终只列出符合条件的文档标题；不得解释正文，不得列出被排除的标题。".to_string(),
-            "每行必须严格使用格式：- 《原始 title》 [n]。不要输出判断过程或其他文字。".to_string(),
+            "answer 中每行必须严格使用格式：- 《原始 title》。citation_ids 必须列出所有对应编号。不要输出判断过程或其他文字。".to_string(),
         ]);
     }
     if understanding
@@ -10318,7 +10318,7 @@ fn build_rag_answer_prompt(
     {
         lines.extend([
             "这是资料包整理任务。请按用户目标组织可直接使用的文字资料与视觉素材，不要把检索词逐条复述给用户。".to_string(),
-            "按内容方向或素材类型分组；每项说明它适合用于任务的哪一部分，并保留对应引用。".to_string(),
+            "按内容方向或素材类型分组；每项说明它适合用于任务的哪一部分，并在 citation_ids 中列出对应编号。".to_string(),
             "如果某种目标类型没有可靠证据，明确指出该类型缺失，不得用另一种类型冒充。".to_string(),
         ]);
     }
@@ -10413,6 +10413,11 @@ fn build_rag_answer_prompt(
         });
         lines.push(format!("evidence={evidence}"));
     }
+    lines.push(String::new());
+    lines.push(
+        "最终输出要求：只输出单个 JSON 对象，格式严格为 {\"answer\":\"完整回答\",\"citation_ids\":[1]}。不要输出 JSON 之外的任何文字。"
+            .to_string(),
+    );
     lines.join("\n")
 }
 
@@ -15740,7 +15745,8 @@ mod tests {
         assert!(prompt.contains("必须检查全部候选并列出所有符合项"));
         assert!(prompt.contains("排除条件按文档主要主题判断"));
         assert!(prompt.contains("不得列出被排除的标题"));
-        assert!(prompt.contains("- 《原始 title》 [n]"));
+        assert!(prompt.contains("answer 中每行必须严格使用格式：- 《原始 title》"));
+        assert!(prompt.contains("citation_ids 必须列出所有对应编号"));
     }
 
     #[test]
@@ -16477,6 +16483,7 @@ mod tests {
         assert!(prompt.contains("citation_ids 必须列出"));
         assert!(prompt.contains("\"citation_id\":1"));
         assert!(prompt.contains("\"title\":\"春日花园.md\""));
+        assert!(prompt.ends_with("不要输出 JSON 之外的任何文字。"));
         assert!(!prompt.contains("used_citation_ids"));
         assert!(!prompt.contains("unsupported_claims"));
 
