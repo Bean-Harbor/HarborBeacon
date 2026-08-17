@@ -144,7 +144,7 @@ const RAG_ANSWER_CONTEXT_CHAR_BUDGET: usize = 4_800;
 const RAG_DOCUMENT_LIST_ABSOLUTE_MIN_SCORE: u32 = 350;
 const RAG_DOCUMENT_LIST_RELATIVE_MIN_SCORE: f32 = 0.20;
 const RAG_DOCUMENT_LIST_RERANK_MIN_SCORE: f32 = 0.10;
-const RAG_ANSWER_BUDGET_MS: u64 = 6_000;
+const RAG_ANSWER_BUDGET_MS: u64 = 30_000;
 const RAG_ANSWER_MAX_TOKENS: u32 = 512;
 const RAG_ANSWER_SOFT_TARGET_TOKENS: u32 = 300;
 const RAG_QUERY_UNDERSTANDING_BUDGET_MS: u64 = 8_000;
@@ -10451,7 +10451,7 @@ fn build_budgeted_rag_answer_prompt_with_history(
 
 fn build_rag_answer_system_prompt() -> String {
     format!(
-        "You are HarborBeacon's evidence-grounded RAG answer composer. Answer once using only the supplied evidence objects. Obey the requested target modality and every negative constraint; never substitute another source type merely to produce an answer. Cite only evidence that positively supports the final answer. Every factual sentence and list item MUST end with one or more in-range citation markers such as [1] or [1][2]. If the evidence is insufficient, say so directly. Never invent or rewrite document titles. Keep the answer within about {RAG_ANSWER_SOFT_TARGET_TOKENS} output tokens, prioritize the conclusion, and finish every sentence before stopping. Do not enumerate filenames when result cards already carry the complete list; summarize the result and direct the user to those cards instead. Return only the user-facing answer, not JSON, a review, or the judging process."
+        "You are HarborBeacon's evidence-grounded RAG answer composer. Answer once using only the supplied evidence objects. Obey the requested target modality and every negative constraint; never substitute another source type merely to produce an answer. Cite only evidence that positively supports the final answer. Every factual sentence and list item MUST end with one or more in-range citation markers such as [1] or [1][2]. Required format example (syntax only, not evidence for the current question): \"按住重置按钮 5 秒。[1]\" Copy the literal square-bracket citation marker into the answer. If the evidence is insufficient, say so directly. Never invent or rewrite document titles. Keep the answer within about {RAG_ANSWER_SOFT_TARGET_TOKENS} output tokens, prioritize the conclusion, and finish every sentence before stopping. Do not enumerate filenames when result cards already carry the complete list; summarize the result and direct the user to those cards instead. Return only the user-facing answer, not JSON, a review, or the judging process."
     )
 }
 
@@ -16381,8 +16381,13 @@ mod tests {
     #[test]
     fn rag_answer_uses_single_pass_text_and_deterministic_citation_validation() {
         let citations = vec![rag_test_citation("春日花园.md", "/knowledge/春日花园.md")];
+        let system_prompt = super::build_rag_answer_system_prompt();
         let prompt = super::build_rag_answer_prompt("文章讲了什么？", &citations, None);
 
+        assert_eq!(super::RAG_ANSWER_BUDGET_MS, 30_000);
+        assert!(system_prompt.contains("Required format example"));
+        assert!(system_prompt.contains("按住重置按钮 5 秒。[1]"));
+        assert!(system_prompt.contains("literal square-bracket citation marker"));
         assert!(prompt.contains("每个句子或列表项末尾"));
         assert!(prompt.contains("\"citation_id\":1"));
         assert!(prompt.contains("\"title\":\"春日花园.md\""));
