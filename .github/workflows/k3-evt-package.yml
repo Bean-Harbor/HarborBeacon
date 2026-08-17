@@ -83,7 +83,9 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Verify model runtime scripts and transactional lifecycle
         run: |
-          python3 -m unittest tests.test_k3_packaging_contract
+          python3 -m unittest \
+            tests.test_k3_packaging_contract \
+            tests.test_model_runtime_rights_v2
           bash scripts/build_model_runtime_lifecycle_fixture.sh /tmp/harbor-model-runtime-lifecycle.deb
           HARBOR_MODEL_LIFECYCLE_DISPOSABLE=1 \
             bash scripts/test_model_runtime_deb_lifecycle.sh /tmp/harbor-model-runtime-lifecycle.deb

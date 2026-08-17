@@ -89,7 +89,9 @@ bash -n scripts/build_harbornavi_k3_deb.sh
 bash -n scripts/build_model_runtime_k3_deb.sh
 bash -n scripts/build_cat_vision_runtime_k3_deb.sh
 bash -n scripts/run_k3_materials_ab_in_container.sh
-python3 -m unittest tests.test_k3_packaging_contract
+python3 -m unittest \
+  tests.test_k3_packaging_contract \
+  tests.test_model_runtime_rights_v2
 python3 scripts/validate_k3_model_materials.py \
   --manifest models/k3-evt1-model-materials.json \
   --bundle-root "$MODEL_BUNDLE_ROOT" \
@@ -125,6 +127,7 @@ for run in root-a root-b; do
       HARBORBEACON_BUILD_CONTAINER_DIGEST="$HARBORBEACON_BUILD_CONTAINER_DIGEST" \
       HARBORBEACON_DEBIAN_SNAPSHOT="$HARBORBEACON_DEBIAN_SNAPSHOT" \
       MODEL_BUNDLE_ROOT="$MODEL_BUNDLE_ROOT" \
+      MODEL_LICENSE_EVIDENCE_ROOT="$MODEL_LICENSE_EVIDENCE_ROOT" \
       OUT_DIR="$artifact_root" \
       PACKAGE_WORK_ROOT="$work_root" \
       RUST_TARGET="$target" \
@@ -172,7 +175,7 @@ architecture = sys.argv[4]
 source_repo = "https://github.com/Bean-Harbor/HarborBeacon"
 packages = (
     ("beacon", "harboros-beacon", True),
-    ("model-runtime", "harboros-model-runtime", True),
+    ("model-runtime", "harboros-model-runtime", False),
     ("cat-vision-runtime", "harboros-cat-vision-runtime", False),
 )
 for run in ("root-a", "root-b"):
@@ -215,7 +218,7 @@ cp -a "$EVIDENCE_ROOT/root-a/artifacts/model-runtime/." \
   "$EVIDENCE_ROOT/artifacts/model-runtime/"
 cp -a "$EVIDENCE_ROOT/root-a/artifacts/cat-vision-runtime/." \
   "$EVIDENCE_ROOT/artifacts/cat-vision-runtime/"
-printf 'PASS packaging-materials; cat-vision-runtime release_eligible=false\n' \
+printf 'PASS packaging-materials; model-runtime and cat-vision-runtime release_eligible=false\n' \
   > "$EVIDENCE_ROOT/status.txt"
 (
   cd "$EVIDENCE_ROOT"

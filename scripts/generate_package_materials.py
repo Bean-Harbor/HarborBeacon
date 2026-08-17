@@ -7,8 +7,10 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 import re
 import shutil
+import stat
 import subprocess
 import tarfile
 import tomllib
@@ -29,6 +31,36 @@ LICENSE_FILE_RE = re.compile(
 )
 MAX_LICENSE_EVIDENCE_BYTES = 4 * 1024 * 1024
 MAX_THIRD_PARTY_LICENSE_BYTES = 64 * 1024 * 1024
+MODEL_LICENSE_EVIDENCE_FIELDS = {
+    "filename",
+    "id",
+    "installed_path",
+    "kind",
+    "purpose",
+    "revision",
+    "sha256",
+    "source",
+}
+MODEL_LICENSE_FIELDS = {
+    "blocking_reason",
+    "concluded_license",
+    "declared_license",
+    "distribution_license_present",
+    "evidence_files",
+    "evidence_verified",
+    "notice_review",
+    "notice_status",
+    "review_status",
+}
+MODEL_NOTICE_REVIEW_FIELDS = {
+    "kind",
+    "license_paths",
+    "notice_paths",
+    "review_status",
+    "revision",
+    "source",
+    "tree_sha256",
+}
 
 
 def sha256(path: Path) -> str:
@@ -47,8 +79,11 @@ def canonical_bytes(value: Any) -> bytes:
 
 def load_json(path: Path, label: str) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        payload = read_license_evidence_bytes(
+            path, label, max_bytes=MAX_THIRD_PARTY_LICENSE_BYTES
+        )
+        value = json.loads(payload.decode("utf-8"))
+    except (ValueError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"invalid {label}: {exc}") from exc
     if not isinstance(value, dict):
         raise ValueError(f"{label} must be a JSON object")
@@ -56,8 +91,16 @@ def load_json(path: Path, label: str) -> dict[str, Any]:
 
 
 def load_canonical_json(path: Path, label: str) -> dict[str, Any]:
-    value = load_json(path, label)
-    if path.read_bytes() != canonical_bytes(value):
+    try:
+        payload = read_license_evidence_bytes(
+            path, label, max_bytes=MAX_THIRD_PARTY_LICENSE_BYTES
+        )
+        value = json.loads(payload.decode("utf-8"))
+    except (ValueError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid {label}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    if payload != canonical_bytes(value):
         raise ValueError(f"{label} is not canonical JSON: {path}")
     return value
 
@@ -79,19 +122,42 @@ def read_utf8_bytes(path: Path, label: str) -> tuple[bytes, str]:
     return payload, text
 
 
-def read_license_evidence_bytes(path: Path, label: str) -> bytes:
-    if not path.is_file() or path.is_symlink():
-        raise ValueError(f"{label} is missing or unsafe: {path}")
+def read_license_evidence_bytes(
+    path: Path, label: str, *, max_bytes: int = MAX_LICENSE_EVIDENCE_BYTES
+) -> bytes:
     try:
-        size = path.stat().st_size
-        if size <= 0 or size > MAX_LICENSE_EVIDENCE_BYTES:
-            raise ValueError(f"{label} has an invalid size: {size}")
-        payload = path.read_bytes()
+        before = os.lstat(path)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"{label} is missing or unsafe: {path}")
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+    except OSError as exc:
+        raise ValueError(f"unable to open {label}: {path}") from exc
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_dev != before.st_dev
+        or opened.st_ino != before.st_ino
+        or opened.st_size <= 0
+        or opened.st_size > max_bytes
+    ):
+        os.close(descriptor)
+        raise ValueError(f"{label} is missing, unsafe, or has an invalid size: {path}")
+    payload = bytearray()
+    try:
+        while chunk := os.read(descriptor, min(1024 * 1024, max_bytes + 1)):
+            payload.extend(chunk)
+            if len(payload) > max_bytes:
+                raise ValueError(f"{label} exceeds its size limit: {path}")
     except OSError as exc:
         raise ValueError(f"unable to read {label}: {path}") from exc
-    if len(payload) != size:
+    finally:
+        os.close(descriptor)
+    if len(payload) != opened.st_size:
         raise ValueError(f"{label} changed while being read: {path}")
-    return payload
+    return bytes(payload)
 
 
 def local_license_refs(value: dict[str, Any]) -> set[str]:
@@ -574,27 +640,123 @@ def model_license_review(path: Path | None) -> dict[str, Any] | None:
     if path is None:
         return None
     payload = load_json(path, "model materials")
+    schema_version = payload.get("schema_version")
+    if schema_version not in {1, 2}:
+        raise ValueError("model materials schema is unsupported")
     entries = []
+    evidence_ids: set[str] = set()
+    evidence_paths: set[str] = set()
     for material in payload.get("materials", []):
         review = material.get("license")
         if not isinstance(review, dict):
             raise ValueError(f"model material has no license review: {material.get('id')}")
         declared = normalize_license_expression(review.get("declared_license"))
         concluded = normalize_license_expression(review.get("concluded_license"))
-        evidence = review.get("evidence")
-        approved = (
-            review.get("review_status") == "approved"
-            and valid_spdx_expression(declared)
-            and valid_spdx_expression(concluded)
-            and isinstance(evidence, dict)
-        )
+        if schema_version == 1:
+            if (
+                set(review)
+                != {
+                    "blocking_reason",
+                    "concluded_license",
+                    "declared_license",
+                    "evidence",
+                    "review_status",
+                }
+                or review.get("review_status") != "blocked"
+                or review.get("evidence") is not None
+            ):
+                raise ValueError("schema v1 model license pointers are not release evidence")
+            evidence_files: list[dict[str, Any]] = []
+            distribution_license_present = False
+            evidence_verified = False
+            notice_review = None
+            notice_status = "review-required"
+            approved = False
+        else:
+            if set(review) != MODEL_LICENSE_FIELDS:
+                raise ValueError("schema v2 model license review has an invalid field set")
+            evidence_files = review.get("evidence_files")
+            if not isinstance(evidence_files, list) or not evidence_files:
+                raise ValueError("schema v2 model license review omits evidence files")
+            distribution_license_present = review.get("distribution_license_present")
+            evidence_verified = review.get("evidence_verified")
+            if not isinstance(distribution_license_present, bool) or not isinstance(
+                evidence_verified, bool
+            ):
+                raise ValueError("schema v2 model license booleans are invalid")
+            has_distribution_license = False
+            for evidence in evidence_files:
+                if not isinstance(evidence, dict) or set(evidence) != MODEL_LICENSE_EVIDENCE_FIELDS:
+                    raise ValueError("schema v2 model license evidence has invalid fields")
+                evidence_id = evidence.get("id")
+                installed_path = evidence.get("installed_path")
+                if (
+                    not isinstance(evidence_id, str)
+                    or evidence_id != evidence.get("kind")
+                    or evidence_id in evidence_ids
+                    or not isinstance(installed_path, str)
+                    or not installed_path.startswith(
+                        "/usr/share/doc/harboros-model-runtime/model-licenses/"
+                    )
+                    or installed_path in evidence_paths
+                    or not re.fullmatch(r"[0-9a-f]{64}", str(evidence.get("sha256")))
+                    or not isinstance(evidence.get("source"), str)
+                    or not evidence["source"].startswith("https://")
+                    or not isinstance(evidence.get("revision"), str)
+                    or not evidence["revision"]
+                    or evidence.get("filename") != PurePosixPath(installed_path).name
+                    or evidence.get("purpose")
+                    not in {"distribution-license", "license-declaration"}
+                ):
+                    raise ValueError("schema v2 model license evidence identity is invalid")
+                evidence_ids.add(evidence_id)
+                evidence_paths.add(installed_path)
+                has_distribution_license |= evidence["purpose"] == "distribution-license"
+            if distribution_license_present is not has_distribution_license:
+                raise ValueError("model distribution license flag differs from evidence")
+            notice_review = review.get("notice_review")
+            if not isinstance(notice_review, dict) or set(notice_review) != (
+                MODEL_NOTICE_REVIEW_FIELDS
+            ):
+                raise ValueError("schema v2 model notice review has invalid fields")
+            notice_status = review.get("notice_status")
+            review_state = notice_review.get("review_status")
+            tree_sha = notice_review.get("tree_sha256")
+            if review_state == "verified":
+                if not isinstance(tree_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", tree_sha):
+                    raise ValueError("verified model notice review has no tree digest")
+            elif review_state == "blocked":
+                if tree_sha is not None or notice_status != "review-required":
+                    raise ValueError("blocked model notice review is inconsistent")
+            else:
+                raise ValueError("model notice review status is invalid")
+            approved = (
+                review.get("review_status") == "approved"
+                and valid_spdx_expression(declared)
+                and valid_spdx_expression(concluded)
+                and distribution_license_present
+                and evidence_verified
+                and review_state == "verified"
+                and notice_status == "not-required-with-reviewed-basis"
+                and review.get("blocking_reason") is None
+            )
+            if review.get("review_status") == "approved" and not approved:
+                raise ValueError("model license approval is not fully evidenced")
+            if review.get("review_status") == "blocked" and not isinstance(
+                review.get("blocking_reason"), str
+            ):
+                raise ValueError("blocked model license review omits its reason")
         entries.append(
             {
                 "blocking_reason": None if approved else review.get("blocking_reason"),
                 "concluded_license": concluded,
                 "declared_license": declared,
-                "evidence": evidence,
+                "distribution_license_present": distribution_license_present,
+                "evidence_files": evidence_files,
+                "evidence_verified": evidence_verified,
                 "id": material.get("id"),
+                "notice_review": notice_review,
+                "notice_status": notice_status,
                 "revision": material.get("revision"),
                 "review_status": "approved" if approved else "blocked",
                 "role": material.get("role"),
@@ -607,8 +769,205 @@ def model_license_review(path: Path | None) -> dict[str, Any] | None:
         "approved": approved_count,
         "blocked": len(entries) - approved_count,
         "materials": entries,
+        "schema_version": schema_version,
         "total": len(entries),
     }
+
+
+def frozen_model_license_evidence(
+    review: dict[str, Any] | None, package_root: Path | None
+) -> list[dict[str, Any]]:
+    if review is None or review.get("schema_version") != 2:
+        return []
+    if package_root is None:
+        raise ValueError("schema v2 model materials require --model-license-root")
+    try:
+        root = package_root.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("model license root is missing") from exc
+    if package_root.is_symlink() or not root.is_dir():
+        raise ValueError("model license root is unsafe")
+    frozen = []
+    for material in review["materials"]:
+        for evidence in material["evidence_files"]:
+            installed = PurePosixPath(evidence["installed_path"])
+            source = root.joinpath(*installed.relative_to("/").parts)
+            payload = read_license_evidence_bytes(
+                source, f"model license evidence {evidence['id']}"
+            )
+            digest = hashlib.sha256(payload).hexdigest()
+            if digest != evidence["sha256"]:
+                raise ValueError(f"model license evidence differs: {evidence['id']}")
+            frozen.append(
+                {
+                    **evidence,
+                    "concluded_license": material["concluded_license"],
+                    "declared_license": material["declared_license"],
+                    "payload": payload,
+                }
+            )
+    return frozen
+
+
+def verify_model_license_supply_chain(
+    *,
+    spdx: dict[str, Any],
+    cyclonedx: dict[str, Any],
+    provenance: dict[str, Any],
+    evidence_files: list[dict[str, Any]],
+    package: str,
+    version: str,
+    architecture: str,
+    sidecar_prefix: str,
+    installed_spdx_sha256: str,
+    installed_cyclonedx_sha256: str,
+    model_materials_sha256: str,
+) -> None:
+    root_packages = [
+        item
+        for item in spdx.get("packages", [])
+        if isinstance(item, dict)
+        and item.get("name") == package
+        and item.get("versionInfo") == version
+    ]
+    if len(root_packages) != 1 or not isinstance(root_packages[0].get("SPDXID"), str):
+        raise ValueError("SPDX SBOM has no unique model runtime root")
+    root_id = root_packages[0]["SPDXID"]
+    spdx_files = spdx.get("files")
+    relationships = spdx.get("relationships")
+    components = cyclonedx.get("components")
+    if not all(isinstance(value, list) for value in (spdx_files, relationships, components)):
+        raise ValueError("model runtime SBOM collections are invalid")
+    subjects = provenance.get("subject")
+    resolved = (
+        provenance.get("predicate", {})
+        .get("buildDefinition", {})
+        .get("resolvedDependencies")
+    )
+    if not isinstance(subjects, list) or not isinstance(resolved, list):
+        raise ValueError("build provenance omits subjects or dependencies")
+    expected_materials_dependency = {
+        "digest": {"sha256": model_materials_sha256},
+        "uri": f"{sidecar_prefix}.model-materials.json",
+    }
+    if sum(item == expected_materials_dependency for item in resolved) != 1:
+        raise ValueError("build provenance does not bind the model materials sidecar")
+
+    for evidence in evidence_files:
+        evidence_id = evidence["id"]
+        spdx_id_value = "SPDXRef-ModelLicenseEvidence-" + re.sub(
+            r"[^A-Za-z0-9.-]", "-", evidence_id
+        )
+        expected_spdx = {
+            "SPDXID": spdx_id_value,
+            "checksums": [
+                {"algorithm": "SHA256", "checksumValue": evidence["sha256"]}
+            ],
+            "copyrightText": "NOASSERTION",
+            "fileName": evidence["installed_path"],
+            "licenseConcluded": evidence["concluded_license"],
+            "licenseInfoInFiles": [evidence["declared_license"]],
+        }
+        if sum(item == expected_spdx for item in spdx_files) != 1:
+            raise ValueError(f"SPDX does not exactly bind model license evidence: {evidence_id}")
+        expected_relationship = {
+            "relatedSpdxElement": spdx_id_value,
+            "relationshipType": "CONTAINS",
+            "spdxElementId": root_id,
+        }
+        if sum(item == expected_relationship for item in relationships) != 1:
+            raise ValueError(f"SPDX does not contain model license evidence: {evidence_id}")
+        expected_component = {
+            "bom-ref": f"model-license-evidence:{evidence_id}@sha256:{evidence['sha256']}",
+            "hashes": [{"alg": "SHA-256", "content": evidence["sha256"]}],
+            "licenses": [{"expression": evidence["concluded_license"]}],
+            "name": evidence_id,
+            "properties": [
+                {"name": "harboros:installed-path", "value": evidence["installed_path"]},
+                {"name": "harboros:purpose", "value": evidence["purpose"]},
+                {"name": "harboros:revision", "value": evidence["revision"]},
+                {"name": "harboros:source", "value": evidence["source"]},
+            ],
+            "type": "file",
+        }
+        if sum(item == expected_component for item in components) != 1:
+            raise ValueError(
+                f"CycloneDX does not exactly bind model license evidence: {evidence_id}"
+            )
+        sidecar = f"{sidecar_prefix}.{evidence_id}.{evidence['filename']}"
+        expected_subject = {"digest": {"sha256": evidence["sha256"]}, "name": sidecar}
+        if sum(item == expected_subject for item in subjects) != 1:
+            raise ValueError(
+                f"build provenance does not subject-bind model license evidence: {evidence_id}"
+            )
+        for uri in (evidence["source"], sidecar):
+            dependency = {"digest": {"sha256": evidence["sha256"]}, "uri": uri}
+            if sum(item == dependency for item in resolved) != 1:
+                raise ValueError(
+                    f"build provenance does not dependency-bind {uri}: {evidence_id}"
+                )
+
+    expected_sbom_subjects = (
+        {
+            "digest": {"sha256": installed_spdx_sha256},
+            "name": f"/usr/share/doc/{package}/sbom.spdx.json",
+        },
+        {
+            "digest": {"sha256": installed_cyclonedx_sha256},
+            "name": f"/usr/share/doc/{package}/sbom.cdx.json",
+        },
+    )
+    for expected in expected_sbom_subjects:
+        if sum(item == expected for item in subjects) != 1:
+            raise ValueError("build provenance does not bind the installed SBOM bytes")
+    parameters = provenance.get("predicate", {}).get("buildDefinition", {}).get(
+        "externalParameters"
+    )
+    if not isinstance(parameters, dict) or (
+        parameters.get("version"), parameters.get("arch")
+    ) != (version, architecture):
+        raise ValueError("build provenance package identity changed")
+
+
+def verify_package_provenance(
+    *,
+    provenance: dict[str, Any],
+    artifact_name: str,
+    artifact_sha256: str,
+    build_provenance_name: str,
+    build_provenance_sha256: str,
+    package: str,
+    version: str,
+    architecture: str,
+    source_commit: str,
+) -> None:
+    expected_subject = {
+        "digest": {"sha256": artifact_sha256},
+        "name": artifact_name,
+    }
+    if provenance.get("subject") != [expected_subject]:
+        raise ValueError("package provenance does not bind the final deb")
+    definition = provenance.get("predicate", {}).get("buildDefinition", {})
+    parameters = definition.get("externalParameters")
+    if not isinstance(parameters, dict) or (
+        parameters.get("package"),
+        parameters.get("version"),
+        parameters.get("arch"),
+    ) != (package, version, architecture):
+        raise ValueError("package provenance identity changed")
+    dependencies = definition.get("resolvedDependencies")
+    expected_build = {
+        "digest": {"sha256": build_provenance_sha256},
+        "uri": build_provenance_name,
+    }
+    expected_source = {
+        "digest": {"gitCommit": source_commit},
+        "uri": f"git+{SOURCE_REPOSITORY}@{source_commit}",
+    }
+    if not isinstance(dependencies, list) or sum(
+        item == expected_build for item in dependencies
+    ) != 1 or sum(item == expected_source for item in dependencies) != 1:
+        raise ValueError("package provenance dependencies changed")
 
 
 def runtime_license_review(
@@ -979,7 +1338,7 @@ def verify_deb_identity(
 
 
 def verify_installed_evidence_tar(
-    payload: Any, entries: list[dict[str, str]]
+    payload: Any, entries: list[dict[str, str]], source_date_epoch: int | None = None
 ) -> None:
     expected = {entry["installed_path"].lstrip("/"): entry for entry in entries}
     if len(expected) != len(entries):
@@ -994,6 +1353,14 @@ def verify_installed_evidence_tar(
                 continue
             if name in found or not member.isfile():
                 raise ValueError(f"installed evidence is unsafe or duplicated: {name}")
+            if (
+                member.mode != 0o644
+                or member.uid != 0
+                or member.gid != 0
+                or member.pax_headers
+                or (source_date_epoch is not None and member.mtime != source_date_epoch)
+            ):
+                raise ValueError(f"installed evidence metadata is not canonical: {name}")
             if member.size < 0 or member.size > MAX_THIRD_PARTY_LICENSE_BYTES:
                 raise ValueError(f"installed evidence has an invalid size: {name}")
             stream = archive.extractfile(member)
@@ -1017,7 +1384,9 @@ def verify_installed_evidence_tar(
         raise ValueError("installed evidence is missing: " + ", ".join(missing))
 
 
-def verify_installed_evidence(artifact: Path, entries: list[dict[str, str]]) -> None:
+def verify_installed_evidence(
+    artifact: Path, entries: list[dict[str, str]], source_date_epoch: int | None = None
+) -> None:
     try:
         process = subprocess.Popen(
             ["dpkg-deb", "--fsys-tarfile", str(artifact)],
@@ -1028,7 +1397,7 @@ def verify_installed_evidence(artifact: Path, entries: list[dict[str, str]]) -> 
         raise ValueError("dpkg-deb is required to verify installed evidence") from exc
     assert process.stdout is not None
     try:
-        verify_installed_evidence_tar(process.stdout, entries)
+        verify_installed_evidence_tar(process.stdout, entries, source_date_epoch)
     finally:
         process.stdout.close()
     stderr = process.stderr.read().decode("utf-8", errors="replace") if process.stderr else ""
@@ -1092,6 +1461,8 @@ def generate(args: argparse.Namespace) -> dict[str, Path]:
         raise ValueError("component contract does not bind the package source")
 
     spdx = load_canonical_json(args.sbom_spdx, "base SPDX SBOM")
+    installed_spdx_bytes = canonical_bytes(spdx)
+    installed_spdx_sha256 = hashlib.sha256(installed_spdx_bytes).hexdigest()
     verify_spdx_extracted_licenses(
         spdx, root_license=ROOT_LICENSE, notice_bytes=notice_bytes
     )
@@ -1114,6 +1485,8 @@ def generate(args: argparse.Namespace) -> dict[str, Path]:
     )
 
     cyclonedx = load_canonical_json(args.sbom_cyclonedx, "base CycloneDX SBOM")
+    installed_cyclonedx_bytes = canonical_bytes(cyclonedx)
+    installed_cyclonedx_sha256 = hashlib.sha256(installed_cyclonedx_bytes).hexdigest()
     component = cyclonedx.get("metadata", {}).get("component")
     if not isinstance(component, dict) or (
         component.get("name"), component.get("version")
@@ -1149,6 +1522,53 @@ def generate(args: argparse.Namespace) -> dict[str, Path]:
         args.third_party_licenses, expected_third_party_licenses
     )
     models = model_license_review(args.model_materials)
+    model_evidence = frozen_model_license_evidence(models, args.model_license_root)
+    model_materials_sha256 = (
+        hashlib.sha256(
+            read_license_evidence_bytes(
+                args.model_materials,
+                "model materials",
+                max_bytes=MAX_THIRD_PARTY_LICENSE_BYTES,
+            )
+        ).hexdigest()
+        if args.model_materials is not None
+        else None
+    )
+    build_provenance = load_canonical_json(
+        args.build_provenance, "build provenance"
+    )
+    package_provenance = load_canonical_json(
+        args.package_provenance, "package provenance"
+    )
+    build_provenance_sha256 = hashlib.sha256(
+        canonical_bytes(build_provenance)
+    ).hexdigest()
+    verify_package_provenance(
+        provenance=package_provenance,
+        artifact_name=args.artifact.name,
+        artifact_sha256=artifact_digest,
+        build_provenance_name=args.build_provenance.name,
+        build_provenance_sha256=build_provenance_sha256,
+        package=args.package,
+        version=args.version,
+        architecture=args.architecture,
+        source_commit=args.source_commit,
+    )
+    if model_evidence:
+        assert model_materials_sha256 is not None
+        verify_model_license_supply_chain(
+            spdx=spdx,
+            cyclonedx=cyclonedx,
+            provenance=build_provenance,
+            evidence_files=model_evidence,
+            package=args.package,
+            version=args.version,
+            architecture=args.architecture,
+            sidecar_prefix=prefix,
+            installed_spdx_sha256=installed_spdx_sha256,
+            installed_cyclonedx_sha256=installed_cyclonedx_sha256,
+            model_materials_sha256=model_materials_sha256,
+        )
     runtime = runtime_license_review(
         args.runtime_manifest, args.runtime_license_evidence, args.architecture
     )
@@ -1225,20 +1645,14 @@ def generate(args: argparse.Namespace) -> dict[str, Path]:
             args.output_dir / f"{prefix}.third-party-licenses.json",
             canonical_json=True,
         ),
-        "build-provenance": export_copy(
-            args.build_provenance,
-            args.output_dir / f"{prefix}.build-provenance.json",
-            canonical_json=True,
-        ),
-        "provenance": export_copy(
-            args.package_provenance,
-            args.output_dir / f"{prefix}.package-provenance.json",
-            canonical_json=True,
-        ),
+        "build-provenance": args.output_dir / f"{prefix}.build-provenance.json",
+        "provenance": args.output_dir / f"{prefix}.package-provenance.json",
         "sbom-spdx": args.output_dir / f"{prefix}.sbom.spdx.json",
         "sbom-cyclonedx": args.output_dir / f"{prefix}.sbom.cdx.json",
         "license-review": args.output_dir / f"{prefix}.license-review.json",
     }
+    write_json(outputs["build-provenance"], build_provenance)
+    write_json(outputs["provenance"], package_provenance)
     write_json(outputs["sbom-spdx"], spdx)
     write_json(outputs["sbom-cyclonedx"], cyclonedx)
     write_json(outputs["license-review"], review)
@@ -1247,6 +1661,21 @@ def generate(args: argparse.Namespace) -> dict[str, Path]:
             args.model_materials,
             args.output_dir / f"{prefix}.model-materials.json",
         )
+    if model_evidence:
+        outputs["installed-sbom-spdx"] = (
+            args.output_dir / f"{prefix}.installed-sbom.spdx.json"
+        )
+        outputs["installed-sbom-cyclonedx"] = (
+            args.output_dir / f"{prefix}.installed-sbom.cdx.json"
+        )
+        outputs["installed-sbom-spdx"].write_bytes(installed_spdx_bytes)
+        outputs["installed-sbom-cyclonedx"].write_bytes(installed_cyclonedx_bytes)
+        for evidence in model_evidence:
+            output = args.output_dir / (
+                f"{prefix}.{evidence['id']}.{evidence['filename']}"
+            )
+            output.write_bytes(evidence["payload"])
+            outputs[evidence["id"]] = output
     if args.runtime_manifest is not None:
         outputs["runtime-manifest"] = export_copy(
             args.runtime_manifest,
@@ -1321,6 +1750,26 @@ def generate(args: argparse.Namespace) -> dict[str, Path]:
                 "installed_path": args.model_materials_installed_path,
             }
         )
+    if model_evidence:
+        installed.extend(
+            (
+                {
+                    **identities["installed-sbom-spdx"],
+                    "installed_path": f"/usr/share/doc/{args.package}/sbom.spdx.json",
+                },
+                {
+                    **identities["installed-sbom-cyclonedx"],
+                    "installed_path": f"/usr/share/doc/{args.package}/sbom.cdx.json",
+                },
+            )
+        )
+        installed.extend(
+            {
+                **identities[evidence["id"]],
+                "installed_path": evidence["installed_path"],
+            }
+            for evidence in model_evidence
+        )
     if "runtime-manifest" in identities:
         installed.append(
             {
@@ -1352,7 +1801,23 @@ def generate(args: argparse.Namespace) -> dict[str, Path]:
                     "installed_path": model["installed_path"],
                 }
             )
-    verify_installed_evidence(args.artifact, installed)
+    verify_installed_evidence(args.artifact, installed, args.source_date_epoch)
+
+    binding_kinds = [
+        "component-contract",
+        "license-review",
+        "provenance",
+        "sbom-cyclonedx",
+        "sbom-spdx",
+        "third-party-licenses",
+    ]
+    if "model-materials" in identities:
+        binding_kinds.append("model-materials")
+    if model_evidence:
+        binding_kinds.extend(("installed-sbom-cyclonedx", "installed-sbom-spdx"))
+        binding_kinds.extend(evidence["id"] for evidence in model_evidence)
+    if "vision-runtime-evidence" in identities:
+        binding_kinds.append("vision-runtime-evidence")
 
     descriptor = {
         "architecture": args.architecture,
@@ -1362,22 +1827,7 @@ def generate(args: argparse.Namespace) -> dict[str, Path]:
             "sha256": artifact_digest,
             "size": args.artifact.stat().st_size,
         },
-        "bindings": [
-            identities[kind]
-            for kind in (
-                "component-contract",
-                "license-review",
-                "provenance",
-                "sbom-cyclonedx",
-                "sbom-spdx",
-                "third-party-licenses",
-            )
-        ]
-        + (
-            [identities["vision-runtime-evidence"]]
-            if "vision-runtime-evidence" in identities
-            else []
-        ),
+        "bindings": [identities[kind] for kind in binding_kinds],
         "decision": decision,
         "installed_evidence": installed,
         "materials": [identities[kind] for kind in sorted(identities)],
@@ -1426,6 +1876,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--build-provenance", type=Path, required=True)
     parser.add_argument("--package-provenance", type=Path, required=True)
     parser.add_argument("--model-materials", type=Path)
+    parser.add_argument("--model-license-root", type=Path)
     parser.add_argument(
         "--model-materials-installed-path",
         default="/usr/share/harboros-model-runtime/model-materials.json",
@@ -1444,6 +1895,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--vision-runtime-evidence", type=Path)
     parser.add_argument("--vision-model-root", type=Path)
+    parser.add_argument("--source-date-epoch", type=int)
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser.parse_args()
 

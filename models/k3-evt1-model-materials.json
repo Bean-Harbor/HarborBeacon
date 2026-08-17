@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "release_id": "harboros-navi-k3-0.1.0-evt.1",
   "materials": [
     {
@@ -9,15 +9,36 @@
       "source": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct",
       "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
       "license": {
-        "blocking_reason": null,
+        "blocking_reason": "qwen_pinned_tree_notice_review_incomplete",
         "concluded_license": "Apache-2.0",
         "declared_license": "Apache-2.0",
-        "evidence": {
-          "kind": "upstream-license-file",
-          "sha256": "832dd9e00a68dd83b3c3fb9f5588dad7dcf337a0db50f7d9483f310cd292e92e",
-          "source": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/7ae557604adf67be50417f59c2c2f167def9a775/LICENSE"
+        "distribution_license_present": true,
+        "evidence_files": [
+          {
+            "id": "model-license-qwen2.5-0.5b-instruct",
+            "kind": "model-license-qwen2.5-0.5b-instruct",
+            "source": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/7ae557604adf67be50417f59c2c2f167def9a775/LICENSE",
+            "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+            "sha256": "832dd9e00a68dd83b3c3fb9f5588dad7dcf337a0db50f7d9483f310cd292e92e",
+            "filename": "LICENSE",
+            "installed_path": "/usr/share/doc/harboros-model-runtime/model-licenses/qwen2.5-0.5b-instruct/LICENSE",
+            "purpose": "distribution-license"
+          }
+        ],
+        "evidence_verified": true,
+        "notice_review": {
+          "kind": "pinned-source-tree-review",
+          "source": "https://huggingface.co/api/models/Qwen/Qwen2.5-0.5B-Instruct/tree/7ae557604adf67be50417f59c2c2f167def9a775?recursive=true&expand=false",
+          "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+          "tree_sha256": null,
+          "license_paths": [
+            "LICENSE"
+          ],
+          "notice_paths": [],
+          "review_status": "blocked"
         },
-        "review_status": "approved"
+        "notice_status": "review-required",
+        "review_status": "blocked"
       },
       "files": [
         {
@@ -47,15 +68,44 @@
       "source": "https://huggingface.co/jinaai/jina-embeddings-v2-base-zh",
       "revision": "998b9133910ffcb127a7bff233f41db6ed9be4d2",
       "license": {
-        "blocking_reason": null,
+        "blocking_reason": "jina_pinned_tree_notice_review_incomplete",
         "concluded_license": "Apache-2.0",
         "declared_license": "Apache-2.0",
-        "evidence": {
-          "kind": "upstream-model-card",
-          "sha256": "d94c902fe88c81437eb2a1877d21c829a967351c38bc720f4516c312632c1b33",
-          "source": "https://huggingface.co/jinaai/jina-embeddings-v2-base-zh/resolve/998b9133910ffcb127a7bff233f41db6ed9be4d2/README.md"
+        "distribution_license_present": true,
+        "evidence_files": [
+          {
+            "id": "model-license-declaration-jina-embeddings-v2-base-zh",
+            "kind": "model-license-declaration-jina-embeddings-v2-base-zh",
+            "source": "https://huggingface.co/jinaai/jina-embeddings-v2-base-zh/resolve/998b9133910ffcb127a7bff233f41db6ed9be4d2/README.md",
+            "revision": "998b9133910ffcb127a7bff233f41db6ed9be4d2",
+            "sha256": "d94c902fe88c81437eb2a1877d21c829a967351c38bc720f4516c312632c1b33",
+            "filename": "README.md",
+            "installed_path": "/usr/share/doc/harboros-model-runtime/model-licenses/jina-embeddings-v2-base-zh/README.md",
+            "purpose": "license-declaration"
+          },
+          {
+            "id": "model-distribution-license-jina-embeddings-v2-base-zh",
+            "kind": "model-distribution-license-jina-embeddings-v2-base-zh",
+            "source": "https://www.apache.org/licenses/LICENSE-2.0.txt",
+            "revision": "Apache-2.0",
+            "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+            "filename": "LICENSE",
+            "installed_path": "/usr/share/doc/harboros-model-runtime/model-licenses/jina-embeddings-v2-base-zh/LICENSE",
+            "purpose": "distribution-license"
+          }
+        ],
+        "evidence_verified": true,
+        "notice_review": {
+          "kind": "pinned-source-tree-review",
+          "source": "https://huggingface.co/api/models/jinaai/jina-embeddings-v2-base-zh/tree/998b9133910ffcb127a7bff233f41db6ed9be4d2?recursive=true&expand=false",
+          "revision": "998b9133910ffcb127a7bff233f41db6ed9be4d2",
+          "tree_sha256": null,
+          "license_paths": [],
+          "notice_paths": [],
+          "review_status": "blocked"
         },
-        "review_status": "approved"
+        "notice_status": "review-required",
+        "review_status": "blocked"
       },
       "files": [
         {

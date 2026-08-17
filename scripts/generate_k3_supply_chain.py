@@ -7,11 +7,13 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import os
 import re
+import stat
 import subprocess
 import tomllib
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 ROOT_LICENSE = "LicenseRef-Harbor-Innovations-Proprietary"
@@ -22,6 +24,18 @@ LICENSE_FILE_RE = re.compile(
     r"^(?:LICENSE|LICENCE|COPYING|NOTICE|UNLICENSE)(?:[._-].*)?$",
     re.IGNORECASE,
 )
+MODEL_LICENSE_EVIDENCE_FIELDS = {
+    "filename",
+    "id",
+    "installed_path",
+    "kind",
+    "purpose",
+    "revision",
+    "sha256",
+    "source",
+}
+MAX_MODEL_LICENSE_EVIDENCE_BYTES = 8 * 1024 * 1024
+MAX_MODEL_MANIFEST_BYTES = 4 * 1024 * 1024
 
 
 def sha256(path: Path) -> str:
@@ -30,6 +44,120 @@ def sha256(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def read_regular_bytes(path: Path, *, max_bytes: int, label: str) -> bytes:
+    try:
+        before = os.lstat(path)
+        if not stat.S_ISREG(before.st_mode):
+            raise RuntimeError(f"{label} is missing or unsafe: {path}")
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+    except OSError as exc:
+        raise RuntimeError(f"unable to open {label}: {path}") from exc
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_dev != before.st_dev
+        or opened.st_ino != before.st_ino
+        or opened.st_size < 1
+        or opened.st_size > max_bytes
+    ):
+        os.close(descriptor)
+        raise RuntimeError(f"{label} is missing, unsafe, or has an invalid size: {path}")
+    payload = bytearray()
+    try:
+        while chunk := os.read(descriptor, min(1024 * 1024, max_bytes + 1)):
+            payload.extend(chunk)
+            if len(payload) > max_bytes:
+                raise RuntimeError(f"{label} exceeds its size limit: {path}")
+    except OSError as exc:
+        raise RuntimeError(f"unable to read {label}: {path}") from exc
+    finally:
+        os.close(descriptor)
+    if len(payload) != opened.st_size:
+        raise RuntimeError(f"{label} changed while being read: {path}")
+    return bytes(payload)
+
+
+def model_license_evidence(
+    materials_payload: dict[str, object],
+    package_root: Path | None,
+    sidecar_prefix: str | None,
+) -> list[dict[str, object]]:
+    if materials_payload.get("schema_version") != 2:
+        return []
+    if package_root is None or sidecar_prefix is None:
+        raise RuntimeError("schema v2 model materials require the frozen model license root")
+    try:
+        root = package_root.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError("model license root is missing") from exc
+    if package_root.is_symlink() or not root.is_dir():
+        raise RuntimeError("model license root is unsafe")
+    result: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for material in materials_payload.get("materials", []):
+        if not isinstance(material, dict) or not isinstance(material.get("license"), dict):
+            raise RuntimeError("model material license evidence is malformed")
+        review = material["license"]
+        concluded = normalize_license_expression(review.get("concluded_license"))
+        declared = normalize_license_expression(review.get("declared_license"))
+        evidence_files = review.get("evidence_files")
+        if not isinstance(evidence_files, list) or not evidence_files:
+            raise RuntimeError("schema v2 model material omits license evidence files")
+        for evidence in evidence_files:
+            if not isinstance(evidence, dict) or set(evidence) != MODEL_LICENSE_EVIDENCE_FIELDS:
+                raise RuntimeError("model license evidence has an invalid field set")
+            evidence_id = evidence.get("id")
+            installed = evidence.get("installed_path")
+            expected_sha = evidence.get("sha256")
+            if (
+                not isinstance(evidence_id, str)
+                or not evidence_id
+                or evidence_id != evidence.get("kind")
+                or evidence_id in seen
+                or not isinstance(installed, str)
+                or not installed.startswith(
+                    "/usr/share/doc/harboros-model-runtime/model-licenses/"
+                )
+                or not isinstance(expected_sha, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", expected_sha)
+            ):
+                raise RuntimeError("model license evidence identity is invalid")
+            installed_parts = PurePosixPath(installed)
+            if not installed_parts.is_absolute() or any(
+                part in {".", ".."} for part in installed_parts.parts
+            ):
+                raise RuntimeError("model license installed path is unsafe")
+            source_path = root.joinpath(*installed_parts.relative_to("/").parts)
+            payload = read_regular_bytes(
+                source_path,
+                max_bytes=MAX_MODEL_LICENSE_EVIDENCE_BYTES,
+                label=f"model license evidence {evidence_id}",
+            )
+            actual_sha = hashlib.sha256(payload).hexdigest()
+            if actual_sha != expected_sha:
+                raise RuntimeError(f"model license evidence differs: {evidence_id}")
+            filename = evidence.get("filename")
+            if not isinstance(filename, str) or filename != installed_parts.name:
+                raise RuntimeError("model license evidence filename is invalid")
+            seen.add(evidence_id)
+            result.append(
+                {
+                    **evidence,
+                    "bom_ref": f"model-license-evidence:{evidence_id}@sha256:{actual_sha}",
+                    "concluded_license": concluded,
+                    "declared_license": declared,
+                    "payload": payload,
+                    "sidecar_filename": f"{sidecar_prefix}.{evidence_id}.{filename}",
+                    "spdx_id": "SPDXRef-ModelLicenseEvidence-"
+                    + re.sub(r"[^A-Za-z0-9.-]", "-", evidence_id),
+                }
+            )
+    return result
 
 
 def canonical_json_sha256(value: object) -> str:
@@ -246,6 +374,8 @@ def main() -> None:
     parser.add_argument("--no-cargo-dependencies", action="store_true")
     parser.add_argument("--first-party-notice", type=Path, required=True)
     parser.add_argument("--materials", type=Path)
+    parser.add_argument("--model-license-root", type=Path)
+    parser.add_argument("--model-license-sidecar-prefix")
     parser.add_argument("--input-file", type=Path, action="append", default=[])
     parser.add_argument("--model-root", type=Path)
     parser.add_argument(
@@ -262,6 +392,14 @@ def main() -> None:
     parser.add_argument("--debian-snapshot", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
+    if (args.model_license_root is None) != (args.model_license_sidecar_prefix is None):
+        parser.error(
+            "--model-license-root and --model-license-sidecar-prefix must be provided together"
+        )
+    if args.model_license_sidecar_prefix is not None and args.model_license_sidecar_prefix != (
+        f"{args.package}_{args.version}_{args.arch}"
+    ):
+        parser.error("model license sidecar prefix differs from the Debian artifact identity")
 
     try:
         notice_bytes = args.first_party_notice.read_bytes()
@@ -287,8 +425,30 @@ def main() -> None:
     )
     model_files = []
     model_license_by_path: dict[str, dict[str, object]] = {}
+    model_evidence: list[dict[str, object]] = []
+    materials_digest: str | None = None
+    materials_schema_version: int | None = None
     if args.materials is not None:
-        materials_payload = json.loads(args.materials.read_text(encoding="utf-8"))
+        try:
+            materials_bytes = read_regular_bytes(
+                args.materials,
+                max_bytes=MAX_MODEL_MANIFEST_BYTES,
+                label="model materials manifest",
+            )
+            materials_digest = hashlib.sha256(materials_bytes).hexdigest()
+            materials_payload = json.loads(
+                materials_bytes.decode("utf-8")
+            )
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("model materials manifest is invalid") from exc
+        if not isinstance(materials_payload, dict):
+            raise RuntimeError("model materials manifest must be an object")
+        materials_schema_version = materials_payload.get("schema_version")
+        model_evidence = model_license_evidence(
+            materials_payload,
+            args.model_license_root,
+            args.model_license_sidecar_prefix,
+        )
         for material in materials_payload.get("materials", []):
             license_review = material.get("license", {})
             for file_entry in material.get("files", []):
@@ -454,6 +614,48 @@ def main() -> None:
                 }
             )
 
+    for evidence in model_evidence:
+        spdx_files.append(
+            {
+                "fileName": evidence["installed_path"],
+                "SPDXID": evidence["spdx_id"],
+                "checksums": [
+                    {"algorithm": "SHA256", "checksumValue": evidence["sha256"]}
+                ],
+                "licenseConcluded": evidence["concluded_license"],
+                "licenseInfoInFiles": [evidence["declared_license"]],
+                "copyrightText": "NOASSERTION",
+            }
+        )
+        relationships.append(
+            {
+                "spdxElementId": root_id,
+                "relationshipType": "CONTAINS",
+                "relatedSpdxElement": evidence["spdx_id"],
+            }
+        )
+        model_subjects.append(
+            {
+                "name": evidence["sidecar_filename"],
+                "digest": {"sha256": evidence["sha256"]},
+            }
+        )
+        model_components.append(
+            {
+                "type": "file",
+                "name": evidence["id"],
+                "bom-ref": evidence["bom_ref"],
+                "hashes": [{"alg": "SHA-256", "content": evidence["sha256"]}],
+                "licenses": [{"expression": evidence["concluded_license"]}],
+                "properties": [
+                    {"name": "harboros:installed-path", "value": evidence["installed_path"]},
+                    {"name": "harboros:purpose", "value": evidence["purpose"]},
+                    {"name": "harboros:revision", "value": evidence["revision"]},
+                    {"name": "harboros:source", "value": evidence["source"]},
+                ],
+            }
+        )
+
     spdx = {
         "spdxVersion": "SPDX-2.3",
         "dataLicense": "CC0-1.0",
@@ -534,11 +736,30 @@ def main() -> None:
         },
     ]
     if args.materials is not None:
+        assert materials_digest is not None
+        materials_uri = (
+            f"{args.model_license_sidecar_prefix}.model-materials.json"
+            if materials_schema_version == 2
+            else args.materials.name
+        )
         resolved.append(
             {
-                "uri": args.materials.name,
-                "digest": {"sha256": sha256(args.materials)},
+                "uri": materials_uri,
+                "digest": {"sha256": materials_digest},
             }
+        )
+    for evidence in model_evidence:
+        resolved.extend(
+            (
+                {
+                    "uri": evidence["source"],
+                    "digest": {"sha256": evidence["sha256"]},
+                },
+                {
+                    "uri": evidence["sidecar_filename"],
+                    "digest": {"sha256": evidence["sha256"]},
+                },
+            )
         )
     for input_file in inputs:
         resolved.append(
@@ -613,15 +834,29 @@ def main() -> None:
     }
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    for name, payload in (
-        ("sbom.spdx.json", spdx),
-        ("sbom.cdx.json", cyclonedx),
-        ("build-provenance.json", provenance),
-    ):
+    for name, payload in (("sbom.spdx.json", spdx), ("sbom.cdx.json", cyclonedx)):
         (args.output_dir / name).write_text(
             json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+    provenance["subject"].extend(
+        (
+            {
+                "name": f"/usr/share/doc/{args.package}/sbom.spdx.json",
+                "digest": {
+                    "sha256": sha256(args.output_dir / "sbom.spdx.json")
+                },
+            },
+            {
+                "name": f"/usr/share/doc/{args.package}/sbom.cdx.json",
+                "digest": {"sha256": sha256(args.output_dir / "sbom.cdx.json")},
+            },
+        )
+    )
+    (args.output_dir / "build-provenance.json").write_text(
+        json.dumps(provenance, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 if __name__ == "__main__":

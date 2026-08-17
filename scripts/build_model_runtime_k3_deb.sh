@@ -15,6 +15,7 @@ deb_arch="${DEB_ARCH:-riscv64}"
 : "${HARBORBEACON_BUILD_CONTAINER_DIGEST:?HARBORBEACON_BUILD_CONTAINER_DIGEST is required}"
 : "${HARBORBEACON_DEBIAN_SNAPSHOT:?HARBORBEACON_DEBIAN_SNAPSHOT is required}"
 : "${MODEL_BUNDLE_ROOT:?MODEL_BUNDLE_ROOT is required}"
+: "${MODEL_LICENSE_EVIDENCE_ROOT:?MODEL_LICENSE_EVIDENCE_ROOT is required}"
 dpkg --validate-version "$DEBIAN_VERSION"
 [[ "$HARBORBEACON_BUILD_CONTAINER_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || {
   echo "error: HARBORBEACON_BUILD_CONTAINER_DIGEST must be a sha256 digest" >&2
@@ -40,6 +41,9 @@ export CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER="${CARGO_TARGET_RISCV64GC
 export CARGO_INCREMENTAL=0
 
 out_dir="${OUT_DIR:-${repo_root}/dist/harbornavi-k3-debs}"
+artifact="${out_dir}/harboros-model-runtime_${DEBIAN_VERSION}_${deb_arch}.deb"
+artifact_name="$(basename "$artifact")"
+material_prefix="${artifact_name%.deb}"
 work_parent="${PACKAGE_WORK_ROOT:-${TMPDIR:-/tmp}}"
 mkdir -p "$out_dir" "$work_parent"
 build_root="$(mktemp -d "${work_parent%/}/harbormodel-deb.XXXXXX")"
@@ -54,7 +58,11 @@ export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }--remap-path-prefix=${cargo_target_
 python3 scripts/validate_k3_model_materials.py \
   --manifest models/k3-evt1-model-materials.json \
   --bundle-root "$MODEL_BUNDLE_ROOT" \
-  --stage "$model_stage"
+  --stage "$model_stage" \
+  --verify-license-evidence \
+  --license-evidence-root "$MODEL_LICENSE_EVIDENCE_ROOT" \
+  --license-stage-root "$pkg_dir" \
+  --manifest-stage "$pkg_dir/usr/share/harboros-model-runtime/model-materials.json"
 cargo build --locked --release --target "$target" \
   --no-default-features --features embedded-model-runtime --bin harbor-model-api
 cargo metadata --locked --offline --format-version 1 \
@@ -92,8 +100,6 @@ sed "s/SOURCE_COMMIT_PLACEHOLDER/${source_commit}/g" \
 sed "s/SOURCE_COMMIT_PLACEHOLDER/${source_commit}/g" \
   debian/model-runtime-manifest.json.in \
   > "$pkg_dir/usr/share/doc/harboros-model-runtime/runtime-manifest.json"
-install -m 0644 models/k3-evt1-model-materials.json \
-  "$pkg_dir/usr/share/harboros-model-runtime/model-materials.json"
 install -m 0644 debian/first-party-rights.json \
   "$pkg_dir/usr/share/doc/harboros-model-runtime/first-party-rights.json"
 install -m 0644 debian/FIRST_PARTY_RIGHTS.txt \
@@ -113,7 +119,9 @@ python3 scripts/generate_k3_supply_chain.py \
   --cargo-lock "$repo_root/Cargo.lock" \
   --cargo-metadata "$build_root/cargo-metadata.json" \
   --first-party-notice "$repo_root/debian/FIRST_PARTY_RIGHTS.txt" \
-  --materials "$repo_root/models/k3-evt1-model-materials.json" \
+  --materials "$pkg_dir/usr/share/harboros-model-runtime/model-materials.json" \
+  --model-license-root "$pkg_dir" \
+  --model-license-sidecar-prefix "$material_prefix" \
   --input-file "$repo_root/debian/model-runtime-control.in" \
   --input-file "$repo_root/debian/model-runtime-postinst" \
   --input-file "$repo_root/debian/model-runtime-prerm" \
@@ -126,6 +134,7 @@ python3 scripts/generate_k3_supply_chain.py \
   --input-file "$repo_root/debian/first-party-rights.json" \
   --input-file "$repo_root/debian/FIRST_PARTY_RIGHTS.txt" \
   --input-file "$repo_root/scripts/verify_k3_model_release.py" \
+  --input-file "$repo_root/scripts/verify_model_runtime_output_set.py" \
   --model-root "$model_stage" \
   --binary "$pkg_dir/usr/bin/harbor-model-api" \
   --version "$DEBIAN_VERSION" \
@@ -138,9 +147,6 @@ python3 scripts/generate_k3_supply_chain.py \
   --output-dir "$pkg_dir/usr/share/doc/harboros-model-runtime"
 
 find "$pkg_dir" -print0 | xargs -0 touch --no-dereference --date="@${SOURCE_DATE_EPOCH}"
-artifact="${out_dir}/harboros-model-runtime_${DEBIAN_VERSION}_${deb_arch}.deb"
-artifact_name="$(basename "$artifact")"
-material_prefix="${artifact_name%.deb}"
 SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" dpkg-deb \
   --root-owner-group --build --uniform-compression -Zxz -z9 "$pkg_dir" "$artifact"
 python3 scripts/generate_package_provenance.py \
@@ -177,7 +183,14 @@ python3 scripts/generate_package_materials.py \
   --build-provenance "$pkg_dir/usr/share/doc/harboros-model-runtime/build-provenance.json" \
   --package-provenance "$out_dir/${material_prefix}.package-provenance.json" \
   --model-materials "$pkg_dir/usr/share/harboros-model-runtime/model-materials.json" \
+  --model-license-root "$pkg_dir" \
   --runtime-manifest "$pkg_dir/usr/share/doc/harboros-model-runtime/runtime-manifest.json" \
   --runtime-license-evidence "$pkg_dir/usr/share/doc/harboros-model-runtime/runtime-license-evidence.json" \
+  --source-date-epoch "$SOURCE_DATE_EPOCH" \
   --output-dir "$out_dir"
+python3 scripts/verify_model_runtime_output_set.py \
+  --manifest "$pkg_dir/usr/share/harboros-model-runtime/model-materials.json" \
+  --output-dir "$out_dir" \
+  --version "$DEBIAN_VERSION" \
+  --architecture "$deb_arch"
 printf '%s\n' "$artifact"

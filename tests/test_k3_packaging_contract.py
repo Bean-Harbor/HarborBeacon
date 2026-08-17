@@ -48,8 +48,8 @@ class K3PackagingContractTests(unittest.TestCase):
             ROOT / "models" / "k3-evt1-model-materials.json"
         )
         self.assertEqual(model_review["total"], 2)
-        self.assertEqual(model_review["approved"], 2)
-        self.assertEqual(model_review["blocked"], 0)
+        self.assertEqual(model_review["approved"], 0)
+        self.assertEqual(model_review["blocked"], 2)
         vision_review = module.model_license_review(
             ROOT / "models" / "k3-evt1-cat-vision-materials.json"
         )
@@ -912,7 +912,10 @@ class K3PackagingContractTests(unittest.TestCase):
         )
         self.assertIn('"vision-runtime-evidence"', materials)
         self.assertIn('f"vision-model-{model[\'id\']}"', materials)
-        self.assertIn("verify_installed_evidence(args.artifact, installed)", materials)
+        self.assertIn(
+            "verify_installed_evidence(args.artifact, installed, args.source_date_epoch)",
+            materials,
+        )
         postinst = (
             ROOT / "debian" / "cat-vision-runtime-postinst"
         ).read_text(encoding="utf-8")
