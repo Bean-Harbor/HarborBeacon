@@ -18913,12 +18913,25 @@ fn npu_probe_evidence() -> Vec<String> {
 
 fn command_available(command: &str) -> bool {
     Command::new(command)
-        .arg("--version")
+        .arg(command_version_argument(command))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+fn command_version_argument(command: &str) -> &'static str {
+    let file_name = Path::new(command)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(command)
+        .trim_end_matches(".exe");
+    if file_name.eq_ignore_ascii_case("ffmpeg") || file_name.eq_ignore_ascii_case("ffprobe") {
+        "-version"
+    } else {
+        "--version"
+    }
 }
 
 fn build_home_assistant_status_response(
@@ -25076,12 +25089,12 @@ mod tests {
         build_redacted_diagnostics_bundle, build_release_readiness_response,
         build_rtsp_url_from_patch, cat_auto_recording_epoch_ms, cat_auto_recording_transition,
         cat_recording_validation_retry_delay, cat_recording_validation_status_for_decision,
-        cleanup_detection_job_output_dir, current_epoch_secs, default_model_download_target_path,
-        default_model_download_target_path_in_root, default_model_endpoints,
-        detection_job_matches_stream_profile, dvr_timeline_segment_from_harborlink,
-        ensure_local_admin_access, ensure_local_camera_access,
-        harbor_assistant_build_missing_response, harbor_assistant_search_session_id,
-        hardware_class_for_probe, has_forwarding_headers,
+        cleanup_detection_job_output_dir, command_version_argument, current_epoch_secs,
+        default_model_download_target_path, default_model_download_target_path_in_root,
+        default_model_endpoints, detection_job_matches_stream_profile,
+        dvr_timeline_segment_from_harborlink, ensure_local_admin_access,
+        ensure_local_camera_access, harbor_assistant_build_missing_response,
+        harbor_assistant_search_session_id, hardware_class_for_probe, has_forwarding_headers,
         huggingface_download_should_fallback_to_plain_http, huggingface_resolve_url,
         identity_query_suffix, is_admin_surface_path, is_gate_principal_endpoint,
         is_gate_principal_knowledge_endpoint, is_harbor_assistant_client_route,
@@ -25144,6 +25157,14 @@ mod tests {
         HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS, HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS,
         MAX_DETECTION_JOB_HISTORY, MAX_VISION_EVENT_INGEST_INFLIGHT, PRIVACY_GATEWAY_AUDIT_ACTION,
     };
+
+    #[test]
+    fn command_version_argument_matches_media_cli_contracts() {
+        assert_eq!(command_version_argument("ffmpeg"), "-version");
+        assert_eq!(command_version_argument("/usr/bin/ffprobe"), "-version");
+        assert_eq!(command_version_argument("FFMPEG.exe"), "-version");
+        assert_eq!(command_version_argument("docker"), "--version");
+    }
     use harborbeacon_local_agent::connectors::notifications::{
         NotificationDeliveryError, NotificationDestinationKind, NotificationRecipientIdType,
         SharedHttpErrorDetail, SharedHttpErrorEnvelope,
