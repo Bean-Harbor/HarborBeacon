@@ -11,9 +11,16 @@ import os
 import re
 import stat
 import subprocess
+import sys
 import tomllib
 import uuid
 from pathlib import Path, PurePosixPath
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from model_runtime_dependency_contract import CONTROL_URI, load_dependency_contract
 
 
 ROOT_LICENSE = "LicenseRef-Harbor-Innovations-Proprietary"
@@ -377,6 +384,8 @@ def main() -> None:
     parser.add_argument("--model-license-root", type=Path)
     parser.add_argument("--model-license-sidecar-prefix")
     parser.add_argument("--input-file", type=Path, action="append", default=[])
+    parser.add_argument("--runtime-manifest", type=Path)
+    parser.add_argument("--debian-control", type=Path)
     parser.add_argument("--model-root", type=Path)
     parser.add_argument(
         "--model-installed-root",
@@ -400,6 +409,8 @@ def main() -> None:
         f"{args.package}_{args.version}_{args.arch}"
     ):
         parser.error("model license sidecar prefix differs from the Debian artifact identity")
+    if (args.runtime_manifest is None) != (args.debian_control is None):
+        parser.error("--runtime-manifest and --debian-control must be provided together")
 
     try:
         notice_bytes = args.first_party_notice.read_bytes()
@@ -423,6 +434,21 @@ def main() -> None:
         (runtime_dependency(value, args.arch) for value in args.runtime_dependency),
         key=lambda dependency: dependency["name"],
     )
+    dependency_contract = None
+    if args.runtime_manifest is not None:
+        dependency_contract = load_dependency_contract(
+            args.runtime_manifest,
+            args.debian_control,
+            source_commit=args.source_commit,
+        )
+        bundled = [
+            f"{dependency['name']}={dependency['version']}"
+            for dependency in runtime_dependencies
+        ]
+        if dependency_contract["bundled_runtime_dependencies"] != bundled:
+            raise RuntimeError(
+                "model runtime manifest differs from bundled runtime dependencies"
+            )
     model_files = []
     model_license_by_path: dict[str, dict[str, object]] = {}
     model_evidence: list[dict[str, object]] = []
@@ -768,6 +794,13 @@ def main() -> None:
                 "digest": {"sha256": sha256(input_file)},
             }
         )
+    if dependency_contract is not None:
+        resolved.append(
+            {
+                "uri": CONTROL_URI,
+                "digest": {"sha256": dependency_contract["control_sha256"]},
+            }
+        )
     for dependency in runtime_dependencies:
         resolved.append(
             {
@@ -782,6 +815,29 @@ def main() -> None:
             )
         }
     )
+    external_parameters = {
+        "target": args.target,
+        "arch": args.arch,
+        "version": args.version,
+        "source_date_epoch": args.source_date_epoch,
+        "debian_snapshot": args.debian_snapshot,
+    }
+    if dependency_contract is None:
+        external_parameters["runtime_dependencies"] = [
+            f"{dependency['name']}={dependency['version']}"
+            for dependency in runtime_dependencies
+        ]
+    else:
+        external_parameters.update(
+            {
+                "bundled_runtime_dependencies": dependency_contract[
+                    "bundled_runtime_dependencies"
+                ],
+                "debian_control_dependencies": dependency_contract[
+                    "debian_control_dependencies"
+                ],
+            }
+        )
     provenance = {
         "_type": "https://in-toto.io/Statement/v1",
         "subject": [
@@ -793,17 +849,7 @@ def main() -> None:
         "predicate": {
             "buildDefinition": {
                 "buildType": "https://harboros.ai/build-types/rust-deb/v1",
-                "externalParameters": {
-                    "target": args.target,
-                    "arch": args.arch,
-                    "version": args.version,
-                    "source_date_epoch": args.source_date_epoch,
-                    "debian_snapshot": args.debian_snapshot,
-                    "runtime_dependencies": [
-                        f"{dependency['name']}={dependency['version']}"
-                        for dependency in runtime_dependencies
-                    ],
-                },
+                "externalParameters": external_parameters,
                 "resolvedDependencies": resolved,
             },
             "runDetails": {

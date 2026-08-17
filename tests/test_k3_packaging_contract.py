@@ -60,9 +60,11 @@ class K3PackagingContractTests(unittest.TestCase):
             ROOT / "debian" / "model-runtime-manifest.json.in",
             ROOT / "debian" / "model-runtime-third-party.json",
             "riscv64",
+            ROOT / "debian" / "model-runtime-control.in",
         )
         self.assertEqual(runtime_review["approved"], 0)
         self.assertEqual(runtime_review["blocked"], 0)
+        self.assertEqual(runtime_review["bundled_runtime_dependencies"], [])
 
     def test_registry_license_declaration_is_bound_to_cargo_lock_checksum(self):
         script_path = ROOT / "scripts" / "generate_package_materials.py"
@@ -584,7 +586,21 @@ class K3PackagingContractTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual(runtime_manifest["runtime_dependencies"], [])
+        self.assertEqual(runtime_manifest["schema_version"], 2)
+        self.assertEqual(runtime_manifest["bundled_runtime_dependencies"], [])
+        self.assertNotIn("runtime_dependencies", runtime_manifest)
+        self.assertEqual(
+            runtime_manifest["debian_control_dependencies"],
+            [
+                "libc6",
+                "ca-certificates",
+                "adduser",
+                "curl",
+                "init-system-helpers",
+                "harboros-system (>= 0.1.0~evt.1)",
+                "harboros-system (<< 0.2)",
+            ],
+        )
         self.assertEqual(
             runtime_manifest["services"],
             [
@@ -609,6 +625,12 @@ class K3PackagingContractTests(unittest.TestCase):
             self.assertNotIn(forbidden, build)
         self.assertIn("Conflicts: llama.cpp-tools-spacemit", control)
         self.assertFalse((ROOT / "debian" / "harboros-vlm-runtime.service").exists())
+        for required in (
+            '--runtime-manifest "$pkg_dir/usr/share/doc/harboros-model-runtime/runtime-manifest.json"',
+            '--debian-control "$pkg_dir/DEBIAN/control"',
+            '--input-file "$repo_root/scripts/model_runtime_dependency_contract.py"',
+        ):
+            self.assertIn(required, build)
 
         exact_dependencies = (
             "python3-spacemit-ort (= 2.0.3+3)",

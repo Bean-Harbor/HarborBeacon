@@ -7,6 +7,7 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).parents[1]
@@ -27,8 +28,11 @@ class ModelRuntimeRightsV2Tests(unittest.TestCase):
         cls.validator = load_script("validate_k3_model_materials.py")
         cls.materials = load_script("generate_package_materials.py")
         cls.outputs = load_script("verify_model_runtime_output_set.py")
+        cls.dependencies = load_script("model_runtime_dependency_contract.py")
         cls.manifest_path = ROOT / "models" / "k3-evt1-model-materials.json"
         cls.manifest = json.loads(cls.manifest_path.read_text(encoding="utf-8"))
+        cls.runtime_manifest_path = ROOT / "debian" / "model-runtime-manifest.json.in"
+        cls.control_path = ROOT / "debian" / "model-runtime-control.in"
 
     def test_manifest_v2_has_exact_ordered_rights_shape(self):
         self.assertEqual(self.manifest["schema_version"], 2)
@@ -329,6 +333,207 @@ class ModelRuntimeRightsV2Tests(unittest.TestCase):
             for material in self.manifest["materials"]
         )
         self.assertEqual(len(expected), 18 + evidence_count)
+
+    def test_model_runtime_dependency_contract_rejects_drift(self):
+        expected_dependencies = [
+            "libc6",
+            "ca-certificates",
+            "adduser",
+            "curl",
+            "init-system-helpers",
+            "harboros-system (>= 0.1.0~evt.1)",
+            "harboros-system (<< 0.2)",
+        ]
+        contract = self.dependencies.load_dependency_contract(
+            self.runtime_manifest_path, self.control_path
+        )
+        self.assertEqual(contract["bundled_runtime_dependencies"], [])
+        self.assertEqual(contract["debian_control_dependencies"], expected_dependencies)
+
+        manifest = json.loads(self.runtime_manifest_path.read_text(encoding="utf-8"))
+        control = self.control_path.read_text(encoding="utf-8")
+        mutations = []
+
+        reordered = copy.deepcopy(manifest)
+        reordered["debian_control_dependencies"][0:2] = reversed(
+            reordered["debian_control_dependencies"][0:2]
+        )
+        mutations.append((reordered, control))
+
+        dropped = copy.deepcopy(manifest)
+        dropped["debian_control_dependencies"].pop()
+        mutations.append((dropped, control))
+
+        legacy = copy.deepcopy(manifest)
+        legacy["runtime_dependencies"] = legacy.pop("bundled_runtime_dependencies")
+        mutations.append((legacy, control))
+
+        injected = copy.deepcopy(manifest)
+        injected["debian_control_dependencies"].append("spacemit-tcm (= 3.0.0+3)")
+        injected_control = control.replace(
+            "harboros-system (<< 0.2)",
+            "harboros-system (<< 0.2), spacemit-tcm (= 3.0.0+3)",
+        )
+        mutations.append((injected, injected_control))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest_path = root / "runtime-manifest.json"
+            control_path = root / "control"
+            for changed_manifest, changed_control in mutations:
+                manifest_path.write_text(
+                    json.dumps(changed_manifest, ensure_ascii=True, indent=2, sort_keys=True)
+                    + "\n",
+                    encoding="utf-8",
+                )
+                control_path.write_text(changed_control, encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    self.dependencies.load_dependency_contract(
+                        manifest_path, control_path
+                    )
+
+    def test_dependency_inputs_reject_symlinks_and_in_place_mutation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "control"
+            source.write_bytes(self.control_path.read_bytes())
+            link = root / "control-link"
+            try:
+                link.symlink_to(source)
+            except OSError:
+                link = None
+            if link is not None:
+                with self.assertRaises(ValueError):
+                    self.dependencies.read_regular_bytes(
+                        link,
+                        max_bytes=self.dependencies.MAX_CONTROL_BYTES,
+                        label="control",
+                    )
+
+            real_fstat = self.dependencies.os.fstat
+            calls = 0
+
+            def changing_fstat(descriptor):
+                nonlocal calls
+                calls += 1
+                value = real_fstat(descriptor)
+                if calls == 2:
+                    changed = mock.Mock(wraps=value)
+                    changed.st_dev = value.st_dev
+                    changed.st_ino = value.st_ino
+                    changed.st_size = value.st_size
+                    changed.st_mode = value.st_mode
+                    changed.st_mtime_ns = value.st_mtime_ns + 1
+                    changed.st_ctime_ns = value.st_ctime_ns
+                    return changed
+                return value
+
+            with mock.patch.object(
+                self.dependencies.os, "fstat", side_effect=changing_fstat
+            ):
+                with self.assertRaisesRegex(ValueError, "changed while being read"):
+                    self.dependencies.read_regular_bytes(
+                        source,
+                        max_bytes=self.dependencies.MAX_CONTROL_BYTES,
+                        label="control",
+                    )
+
+    def test_model_runtime_dependency_provenance_fails_closed(self):
+        contract = self.dependencies.load_dependency_contract(
+            self.runtime_manifest_path, self.control_path
+        )
+        provenance = {
+            "predicate": {
+                "buildDefinition": {
+                    "externalParameters": {
+                        "bundled_runtime_dependencies": [],
+                        "debian_control_dependencies": contract[
+                            "debian_control_dependencies"
+                        ],
+                    },
+                    "resolvedDependencies": [
+                        {
+                            "digest": {"sha256": contract["control_sha256"]},
+                            "uri": self.dependencies.CONTROL_URI,
+                        }
+                    ],
+                }
+            }
+        }
+        self.materials.verify_model_runtime_dependency_provenance(
+            provenance, contract
+        )
+        mutations = (
+            lambda value: value["predicate"]["buildDefinition"][
+                "externalParameters"
+            ].update({"runtime_dependencies": []}),
+            lambda value: value["predicate"]["buildDefinition"][
+                "externalParameters"
+            ]["debian_control_dependencies"].reverse(),
+            lambda value: value["predicate"]["buildDefinition"][
+                "resolvedDependencies"
+            ][0]["digest"].update({"sha256": "0" * 64}),
+        )
+        for mutation in mutations:
+            changed = copy.deepcopy(provenance)
+            mutation(changed)
+            with self.assertRaises(ValueError):
+                self.materials.verify_model_runtime_dependency_provenance(
+                    changed, contract
+                )
+
+        control_bytes = self.control_path.read_bytes()
+        byte_tampered = control_bytes.replace(b"Depends: ", b"Depends:  ", 1)
+        tampered_contract = self.dependencies.load_dependency_contract_bytes(
+            self.runtime_manifest_path, byte_tampered
+        )
+        self.assertEqual(
+            tampered_contract["debian_control_dependencies"],
+            contract["debian_control_dependencies"],
+        )
+        self.assertNotEqual(
+            tampered_contract["control_sha256"], contract["control_sha256"]
+        )
+        with self.assertRaises(ValueError):
+            self.materials.verify_model_runtime_dependency_provenance(
+                provenance, tampered_contract
+            )
+
+    def test_actual_deb_control_member_is_unique_regular_and_exact(self):
+        control_bytes = self.control_path.read_bytes()
+
+        def archive_with(entries):
+            payload = io.BytesIO()
+            with tarfile.open(fileobj=payload, mode="w", format=tarfile.GNU_FORMAT) as archive:
+                for name, content, kind in entries:
+                    member = tarfile.TarInfo(name)
+                    member.type = kind
+                    member.mode = 0o644
+                    if kind == tarfile.REGTYPE:
+                        member.size = len(content)
+                        archive.addfile(member, io.BytesIO(content))
+                    else:
+                        member.linkname = "other"
+                        archive.addfile(member)
+            payload.seek(0)
+            return payload
+
+        valid = archive_with([("./control", control_bytes, tarfile.REGTYPE)])
+        self.assertEqual(self.materials.read_debian_control_tar(valid), control_bytes)
+
+        invalid_archives = (
+            archive_with([]),
+            archive_with(
+                [
+                    ("./control", control_bytes, tarfile.REGTYPE),
+                    ("control", control_bytes, tarfile.REGTYPE),
+                ]
+            ),
+            archive_with([("./control", b"", tarfile.SYMTYPE)]),
+        )
+        for archive in invalid_archives:
+            with self.assertRaises(ValueError):
+                self.materials.read_debian_control_tar(archive)
 
 
 if __name__ == "__main__":

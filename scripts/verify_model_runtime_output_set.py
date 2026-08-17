@@ -8,6 +8,12 @@ import json
 import sys
 from pathlib import Path
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from model_runtime_dependency_contract import load_dependency_contract
+
 
 def expected_names(manifest: dict[str, object], version: str, architecture: str) -> set[str]:
     if manifest.get("schema_version") != 2:
@@ -66,12 +72,15 @@ def expected_names(manifest: dict[str, object], version: str, architecture: str)
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--runtime-manifest", type=Path, required=True)
+    parser.add_argument("--debian-control", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--architecture", required=True)
     args = parser.parse_args()
     try:
         manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+        load_dependency_contract(args.runtime_manifest, args.debian_control)
         expected = expected_names(manifest, args.version, args.architecture)
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
         raise SystemExit(f"model runtime output verification failed: {exc}") from exc

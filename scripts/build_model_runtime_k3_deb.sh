@@ -122,6 +122,8 @@ python3 scripts/generate_k3_supply_chain.py \
   --materials "$pkg_dir/usr/share/harboros-model-runtime/model-materials.json" \
   --model-license-root "$pkg_dir" \
   --model-license-sidecar-prefix "$material_prefix" \
+  --runtime-manifest "$pkg_dir/usr/share/doc/harboros-model-runtime/runtime-manifest.json" \
+  --debian-control "$pkg_dir/DEBIAN/control" \
   --input-file "$repo_root/debian/model-runtime-control.in" \
   --input-file "$repo_root/debian/model-runtime-postinst" \
   --input-file "$repo_root/debian/model-runtime-prerm" \
@@ -135,6 +137,7 @@ python3 scripts/generate_k3_supply_chain.py \
   --input-file "$repo_root/debian/FIRST_PARTY_RIGHTS.txt" \
   --input-file "$repo_root/scripts/verify_k3_model_release.py" \
   --input-file "$repo_root/scripts/verify_model_runtime_output_set.py" \
+  --input-file "$repo_root/scripts/model_runtime_dependency_contract.py" \
   --model-root "$model_stage" \
   --binary "$pkg_dir/usr/bin/harbor-model-api" \
   --version "$DEBIAN_VERSION" \
@@ -195,6 +198,8 @@ python3 scripts/generate_package_materials.py \
   --output-dir "$out_dir"
 python3 scripts/verify_model_runtime_output_set.py \
   --manifest "$pkg_dir/usr/share/harboros-model-runtime/model-materials.json" \
+  --runtime-manifest "$pkg_dir/usr/share/doc/harboros-model-runtime/runtime-manifest.json" \
+  --debian-control "$pkg_dir/DEBIAN/control" \
   --output-dir "$out_dir" \
   --version "$DEBIAN_VERSION" \
   --architecture "$deb_arch"

@@ -12,10 +12,22 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import tomllib
 from pathlib import Path, PurePosixPath
 from typing import Any
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from model_runtime_dependency_contract import (
+    CONTROL_URI,
+    MAX_CONTROL_BYTES,
+    load_dependency_contract,
+    load_dependency_contract_bytes,
+)
 
 
 SOURCE_REPOSITORY = "https://github.com/Bean-Harbor/HarborBeacon"
@@ -971,13 +983,30 @@ def verify_package_provenance(
 
 
 def runtime_license_review(
-    path: Path | None, evidence_path: Path | None, architecture: str
+    path: Path | None,
+    evidence_path: Path | None,
+    architecture: str,
+    control_path: Path | None = None,
+    source_commit: str | None = None,
+    dependency_contract: dict[str, object] | None = None,
 ) -> dict[str, Any] | None:
-    if path is None and evidence_path is None:
+    if (
+        path is None
+        and evidence_path is None
+        and control_path is None
+        and dependency_contract is None
+    ):
         return None
-    if path is None or evidence_path is None:
-        raise ValueError("runtime manifest and license evidence must be provided together")
-    payload = load_canonical_json(path, "model runtime manifest")
+    if path is None or evidence_path is None or (
+        control_path is None and dependency_contract is None
+    ):
+        raise ValueError(
+            "runtime manifest, license evidence, and Debian control must be provided together"
+        )
+    if dependency_contract is None:
+        dependency_contract = load_dependency_contract(
+            path, control_path, source_commit=source_commit
+        )
     evidence_payload = load_canonical_json(
         evidence_path, "model runtime third-party evidence"
     )
@@ -991,7 +1020,7 @@ def runtime_license_review(
     ):
         raise ValueError("model runtime third-party evidence has invalid provenance")
     expected = {}
-    for value in payload.get("runtime_dependencies", []):
+    for value in dependency_contract["bundled_runtime_dependencies"]:
         if not isinstance(value, str) or "=" not in value:
             raise ValueError(f"invalid model runtime dependency: {value!r}")
         name, version = value.split("=", 1)
@@ -1065,7 +1094,87 @@ def runtime_license_review(
         "repository": evidence_payload["repository"],
         "suite": evidence_payload["suite"],
         "total": len(entries),
+        "bundled_runtime_dependencies": dependency_contract[
+            "bundled_runtime_dependencies"
+        ],
+        "debian_control_dependencies": dependency_contract[
+            "debian_control_dependencies"
+        ],
     }
+
+
+def verify_model_runtime_dependency_provenance(
+    provenance: dict[str, Any], dependency_contract: dict[str, object]
+) -> None:
+    definition = provenance.get("predicate", {}).get("buildDefinition", {})
+    parameters = definition.get("externalParameters")
+    if not isinstance(parameters, dict):
+        raise ValueError("model runtime build provenance has no external parameters")
+    if "runtime_dependencies" in parameters or (
+        parameters.get("bundled_runtime_dependencies")
+        != dependency_contract["bundled_runtime_dependencies"]
+        or parameters.get("debian_control_dependencies")
+        != dependency_contract["debian_control_dependencies"]
+    ):
+        raise ValueError("model runtime build provenance dependency contract changed")
+    expected_control = {
+        "digest": {"sha256": dependency_contract["control_sha256"]},
+        "uri": CONTROL_URI,
+    }
+    resolved = definition.get("resolvedDependencies")
+    if not isinstance(resolved, list) or sum(
+        item == expected_control for item in resolved
+    ) != 1:
+        raise ValueError("model runtime build provenance omits generated Debian control")
+
+
+def read_debian_control_tar(stream: Any) -> bytes:
+    control: bytes | None = None
+    try:
+        with tarfile.open(fileobj=stream, mode="r|*") as archive:
+            for member in archive:
+                if member.name not in {"control", "./control"}:
+                    continue
+                if control is not None or not member.isfile():
+                    raise ValueError("Debian control archive has an unsafe control member")
+                if member.size < 1 or member.size > MAX_CONTROL_BYTES:
+                    raise ValueError("Debian control member has an invalid size")
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    raise ValueError("Debian control member cannot be read")
+                control = extracted.read(MAX_CONTROL_BYTES + 1)
+                if len(control) != member.size:
+                    raise ValueError("Debian control member changed while being read")
+    except (OSError, tarfile.TarError) as exc:
+        raise ValueError("Debian control archive is invalid") from exc
+    if control is None:
+        raise ValueError("Debian control archive omits control")
+    return control
+
+
+def read_packaged_debian_control(artifact: Path) -> bytes:
+    try:
+        process = subprocess.Popen(
+            ["dpkg-deb", "--ctrl-tarfile", str(artifact)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        raise ValueError("dpkg-deb is required to verify packaged Debian control") from exc
+    assert process.stdout is not None
+    try:
+        control = read_debian_control_tar(process.stdout)
+    except Exception:
+        process.kill()
+        process.wait(timeout=30)
+        raise
+    finally:
+        process.stdout.close()
+    stderr = process.stderr.read().decode("utf-8", errors="replace") if process.stderr else ""
+    return_code = process.wait(timeout=300)
+    if return_code:
+        raise ValueError(f"dpkg-deb control inspection failed: {stderr.strip()}")
+    return control
 
 
 def vision_runtime_evidence_review(
@@ -1571,9 +1680,26 @@ def generate(args: argparse.Namespace) -> dict[str, Path]:
             installed_cyclonedx_sha256=installed_cyclonedx_sha256,
             model_materials_sha256=model_materials_sha256,
         )
+    dependency_contract = None
+    if args.runtime_manifest is not None:
+        packaged_control = read_packaged_debian_control(args.artifact)
+        dependency_contract = load_dependency_contract_bytes(
+            args.runtime_manifest,
+            packaged_control,
+            source_commit=args.source_commit,
+        )
     runtime = runtime_license_review(
-        args.runtime_manifest, args.runtime_license_evidence, args.architecture
+        args.runtime_manifest,
+        args.runtime_license_evidence,
+        args.architecture,
+        source_commit=args.source_commit,
+        dependency_contract=dependency_contract,
     )
+    if runtime is not None:
+        assert dependency_contract is not None
+        verify_model_runtime_dependency_provenance(
+            build_provenance, dependency_contract
+        )
     vision = vision_runtime_evidence_review(
         args.vision_runtime_evidence,
         args.vision_model_root,
