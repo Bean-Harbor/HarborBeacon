@@ -2496,6 +2496,16 @@ fn constructor_cat_recording_reconciliation_store() -> CatRecordingReconciliatio
     CatRecordingReconciliationStore::default()
 }
 
+#[cfg(test)]
+fn constructor_cat_recording_validation_store() -> CatRecordingValidationStore {
+    CatRecordingValidationStore::new(unique_test_cat_activity_store_path("validation.jsonl"))
+}
+
+#[cfg(not(test))]
+fn constructor_cat_recording_validation_store() -> CatRecordingValidationStore {
+    CatRecordingValidationStore::default()
+}
+
 impl AdminApi {
     pub fn new(
         admin_store: AdminConsoleStore,
@@ -2509,7 +2519,7 @@ impl AdminApi {
             harbor_assistant_dist,
             public_origin,
             constructor_cat_recording_reconciliation_store(),
-            CatRecordingValidationStore::default(),
+            constructor_cat_recording_validation_store(),
         )
     }
 
@@ -2616,7 +2626,7 @@ impl AdminApi {
             CatRecordingValidationMode::Off,
             constructor_cat_activity_policy_store(),
             constructor_cat_recording_reconciliation_store(),
-            CatRecordingValidationStore::default(),
+            constructor_cat_recording_validation_store(),
         )
     }
 
