@@ -2464,6 +2464,38 @@ type ScanRequest = HubScanRequest;
 type ScanResponse = HubScanSummary;
 type ManualAddResponse = HubManualAddSummary;
 
+#[cfg(test)]
+fn unique_test_cat_activity_store_path(file_name: &str) -> PathBuf {
+    static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(0);
+    let store_id = NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed);
+    env::temp_dir()
+        .join(format!(
+            "harborbeacon-admin-api-cat-{}-{store_id}",
+            std::process::id()
+        ))
+        .join(file_name)
+}
+
+#[cfg(test)]
+fn constructor_cat_activity_policy_store() -> CatActivityPolicyStore {
+    CatActivityPolicyStore::new(unique_test_cat_activity_store_path("policy.json"))
+}
+
+#[cfg(not(test))]
+fn constructor_cat_activity_policy_store() -> CatActivityPolicyStore {
+    CatActivityPolicyStore::default()
+}
+
+#[cfg(test)]
+fn constructor_cat_recording_reconciliation_store() -> CatRecordingReconciliationStore {
+    CatRecordingReconciliationStore::new(unique_test_cat_activity_store_path("reconciliation.json"))
+}
+
+#[cfg(not(test))]
+fn constructor_cat_recording_reconciliation_store() -> CatRecordingReconciliationStore {
+    CatRecordingReconciliationStore::default()
+}
+
 impl AdminApi {
     pub fn new(
         admin_store: AdminConsoleStore,
@@ -2476,7 +2508,7 @@ impl AdminApi {
             task_service,
             harbor_assistant_dist,
             public_origin,
-            CatRecordingReconciliationStore::default(),
+            constructor_cat_recording_reconciliation_store(),
             CatRecordingValidationStore::default(),
         )
     }
@@ -2500,6 +2532,7 @@ impl AdminApi {
             public_origin,
             harborlink_media,
             cat_recording_validation_mode,
+            constructor_cat_activity_policy_store(),
             cat_recording_reconciliation_store,
             cat_recording_validation_store,
         )
@@ -2512,6 +2545,7 @@ impl AdminApi {
         public_origin: String,
         harborlink_media: HarborLinkMediaClient,
         cat_recording_validation_mode: CatRecordingValidationMode,
+        cat_activity_policy_store: CatActivityPolicyStore,
         cat_recording_reconciliation_store: CatRecordingReconciliationStore,
         cat_recording_validation_store: CatRecordingValidationStore,
     ) -> Self {
@@ -2547,7 +2581,7 @@ impl AdminApi {
             detection_job_lifecycle_lock: Arc::new(Mutex::new(())),
             detection_jobs: Arc::new(Mutex::new(HashMap::new())),
             cat_auto_recording: Arc::new(Mutex::new(cat_auto_recording)),
-            cat_activity_policy_store: CatActivityPolicyStore::default(),
+            cat_activity_policy_store,
             cat_activity_camera_statuses: Arc::new(Mutex::new(BTreeMap::new())),
             cat_validation_readiness: Arc::new(Mutex::new(CatValidationReadinessCache::default())),
             cat_recording_reconciliation_store,
@@ -2580,7 +2614,8 @@ impl AdminApi {
             HarborLinkMediaClient::new("http://127.0.0.1:9")
                 .expect("fixed test HarborLink endpoint must be valid"),
             CatRecordingValidationMode::Off,
-            CatRecordingReconciliationStore::default(),
+            constructor_cat_activity_policy_store(),
+            constructor_cat_recording_reconciliation_store(),
             CatRecordingValidationStore::default(),
         )
     }
@@ -26368,6 +26403,9 @@ mod tests {
                     return;
                 };
                 stream
+                    .set_nonblocking(false)
+                    .expect("blocking HarborLink test stream");
+                stream
                     .set_read_timeout(Some(Duration::from_secs(1)))
                     .expect("HarborLink read timeout");
                 let request = read_test_http_request(&mut stream);
@@ -27813,6 +27851,7 @@ mod tests {
         let _env_lock = cat_auto_recording_env_lock()
             .lock()
             .expect("detection env lock");
+        let _auto_recording = EnvGuard::set(super::CAT_AUTO_RECORD_ENABLED_ENV, "false");
         let job_id = "yolo-unreferenced-delete";
         let lease_id = format!("detect-{job_id}");
         let (base_url, stop_count, server) =
@@ -34760,14 +34799,11 @@ mod tests {
     }
 
     #[test]
-    fn runtime_overlay_promotes_live_local_llm_and_embedder_rows() {
+    fn runtime_overlay_promotes_llm_and_embedder_without_recreating_builtin_vlm() {
         let mut endpoints =
             harborbeacon_local_agent::runtime::admin_console::default_model_endpoints();
         for endpoint in &mut endpoints {
-            if matches!(
-                endpoint.model_kind,
-                ModelKind::Llm | ModelKind::Embedder | ModelKind::Vlm
-            ) {
+            if matches!(endpoint.model_kind, ModelKind::Llm | ModelKind::Embedder) {
                 endpoint.status = ModelEndpointStatus::Disabled;
                 endpoint.metadata = json!({
                     "builtin": true,
@@ -34807,11 +34843,9 @@ mod tests {
         assert_eq!(embedder.status, ModelEndpointStatus::Active);
         assert_eq!(embedder.metadata["api_key_configured"], json!(true));
 
-        let vlm = overlayed
+        assert!(!overlayed
             .iter()
-            .find(|endpoint| endpoint.model_endpoint_id == "vlm-local-openai-compatible")
-            .expect("vlm endpoint");
-        assert_eq!(vlm.status, ModelEndpointStatus::Disabled);
+            .any(|endpoint| endpoint.model_endpoint_id == "vlm-local-openai-compatible"));
     }
 
     #[test]
