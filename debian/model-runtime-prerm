@@ -18,11 +18,9 @@ case "${1:-}" in
         install -d -o root -g root -m 0755 "$state_dir"
         state_tmp="$(mktemp "$state_dir/.upgrade-active.XXXXXXXX")"
         chmod 0600 "$state_tmp"
-        for unit in harboros-model-runtime.service harboros-vlm-runtime.service; do
-          if systemctl is-active --quiet "$unit"; then
-            printf '%s\n' "$unit" >> "$state_tmp"
-          fi
-        done
+        if systemctl is-active --quiet harboros-model-runtime.service; then
+          printf '%s\n' harboros-model-runtime.service >> "$state_tmp"
+        fi
         chown root:root "$state_tmp"
         mv -f -- "$state_tmp" "$upgrade_state"
         state_tmp=""
@@ -30,7 +28,7 @@ case "${1:-}" in
       else
         rm -f -- "$upgrade_state"
       fi
-      systemctl stop harboros-model-runtime.service harboros-vlm-runtime.service
+      systemctl stop harboros-model-runtime.service
     fi
     ;;
 esac

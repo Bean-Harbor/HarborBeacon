@@ -8,6 +8,7 @@ from pathlib import Path
 
 from generate_package_materials import (
     build_cargo_third_party_licenses,
+    build_empty_cargo_third_party_licenses,
     write_json,
 )
 
@@ -19,19 +20,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--root-manifest", type=Path, required=True)
     parser.add_argument("--cargo-lock", type=Path, required=True)
     parser.add_argument("--cargo-metadata", type=Path, required=True)
+    parser.add_argument("--no-dependencies", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    _review, sidecar = build_cargo_third_party_licenses(
-        args.cargo_metadata,
-        args.root_manifest,
-        args.cargo_lock,
-        package=args.package,
-        source_commit=args.source_commit,
-    )
+    if args.no_dependencies:
+        _review, sidecar = build_empty_cargo_third_party_licenses(
+            args.cargo_lock,
+            package=args.package,
+            source_commit=args.source_commit,
+        )
+    else:
+        _review, sidecar = build_cargo_third_party_licenses(
+            args.cargo_metadata,
+            args.root_manifest,
+            args.cargo_lock,
+            package=args.package,
+            source_commit=args.source_commit,
+        )
     if sidecar["unresolved"]:
         names = ", ".join(
             f"{item['name']}@{item['version']}" for item in sidecar["unresolved"]

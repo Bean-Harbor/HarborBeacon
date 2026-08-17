@@ -54,6 +54,7 @@ export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }--remap-path-prefix=${cargo_target_
 cargo build --locked --release --target "$target" \
   --no-default-features --features external-model-runtime \
   --bin harboros-beacon \
+  --bin cat-sampling-plan \
   --bin harbornavi-k3-local-vision-smoke \
   --bin harbornavi-k3-multi-vision-smoke \
   --bin harbornavi-ha-mqtt-event-contract-smoke
@@ -69,7 +70,7 @@ cargo metadata --locked --offline --format-version 1 \
   > "$build_root/cargo-metadata.json"
 
 model_source_dir="config/harbornavi-k3/vision-models/mobilenetv2-cat-binary-v2-20260806"
-model_install_dir="$pkg_dir/var/lib/harboros-beacon/vision-models/mobilenetv2-cat-binary-v2-20260806"
+model_install_dir="$pkg_dir/usr/share/harboros-beacon/vision-models/mobilenetv2-cat-binary-v2-20260806"
 install -d \
   "$pkg_dir/DEBIAN" \
   "$pkg_dir/usr/bin" \
@@ -92,8 +93,16 @@ install -m 0755 scripts/harbornavi_k3_yolo_stream_worker.py \
   "$pkg_dir/usr/lib/harboros-beacon/harbornavi_k3_yolo_stream_worker.py"
 install -m 0755 scripts/harbornavi_k3_cat_recording_classifier.py \
   "$pkg_dir/usr/lib/harboros-beacon/harbornavi_k3_cat_recording_classifier.py"
+install -m 0755 scripts/harbornavi_k3_cat_quality_runner.py \
+  "$pkg_dir/usr/lib/harboros-beacon/cat-quality-runner"
+install -m 0755 "$cargo_target_dir/$target/release/cat-sampling-plan" \
+  "$pkg_dir/usr/lib/harboros-beacon/cat-sampling-plan"
 install -m 0755 debian/ensure-beacon-data-layout \
   "$pkg_dir/usr/lib/harborbeacon/ensure-data-layout"
+install -m 0755 debian/migrate-cat-activity-state \
+  "$pkg_dir/usr/lib/harborbeacon/migrate-cat-activity-state"
+install -m 0755 debian/verify-beacon-k3-generation \
+  "$pkg_dir/usr/lib/harborbeacon/verify-k3-generation"
 install -m 0644 debian/harboros-beacon.service \
   "$pkg_dir/usr/lib/systemd/system/harboros-beacon.service"
 install -m 0644 \
@@ -114,7 +123,7 @@ python3 scripts/generate_cargo_license_sidecar.py \
   --output "$pkg_dir/usr/share/doc/harboros-beacon/third-party-licenses.json"
 sed -e "s/VERSION_PLACEHOLDER/${DEBIAN_VERSION}/g" \
   -e "s/ARCH_PLACEHOLDER/${deb_arch}/g" debian/control \
-  | sed 's/^Depends: .*/Depends: libc6, openssl, ca-certificates, adduser, init-system-helpers, harboros-system (>= 0.1.0~evt.1), harboros-system (<< 0.2), harborlink (>= 0.1.0~evt.1), harborlink (<< 0.2), harboros-model-runtime (>= 0.1.0~evt.1), harboros-model-runtime (<< 0.2), python3, python3-numpy, python3-pil, python3-opencv, python3-spacemit-ort/' \
+  | sed "s/^Depends: .*/Depends: libc6, openssl, ca-certificates, adduser, init-system-helpers, harboros-system (>= 0.1.0~evt.1), harboros-system (<< 0.2), harborlink (>= 0.1.0~evt.1), harborlink (<< 0.2), harboros-model-runtime (= ${DEBIAN_VERSION}), harboros-cat-vision-runtime (= ${DEBIAN_VERSION}), ffmpeg, python3, python3-numpy, python3-pil, python3-opencv/" \
   > "$pkg_dir/DEBIAN/control"
 sed 's/\r$//' debian/postinst > "$pkg_dir/DEBIAN/postinst"
 sed 's/\r$//' debian/prerm > "$pkg_dir/DEBIAN/prerm"
@@ -132,7 +141,9 @@ analyzer=/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py
 stream_worker=/usr/lib/harboros-beacon/harbornavi_k3_yolo_stream_worker.py
 cat_recording_validator=mobilenet_v2_int8
 cat_recording_classifier=/usr/lib/harboros-beacon/harbornavi_k3_cat_recording_classifier.py
-cat_recording_classifier_model=/var/lib/harboros-beacon/vision-models/mobilenetv2-cat-binary-v2-20260806/mobilenetv2_cat_binary_int8.onnx
+cat_quality_runner=/usr/lib/harboros-beacon/cat-quality-runner
+cat_sampling_plan=/usr/lib/harboros-beacon/cat-sampling-plan
+cat_recording_classifier_model=/usr/share/harboros-beacon/vision-models/mobilenetv2-cat-binary-v2-20260806/mobilenetv2_cat_binary_int8.onnx
 cat_recording_classifier_sha256=d0c1bdcf973ca7f6efc6e62af764ff59300e0d27abbc75c20c7f86515769d825
 cat_recording_classifier_policy=up_to_9_frames_at_least_3_positive
 single_runner=/usr/bin/harbornavi-k3-local-vision-smoke
@@ -140,8 +151,8 @@ multi_runner=/usr/bin/harbornavi-k3-multi-vision-smoke
 ha_mqtt_runner=/usr/bin/harbornavi-ha-mqtt-event-contract-smoke
 model_runtime_service=harboros-model-runtime.service
 model_api=http://127.0.0.1:8792/v1
-default_model=/data/models/current/detection/yolov8n_192x320.q.onnx
-default_labels=/data/models/current/detection/label.txt
+default_model=/data/vision-models/current/detection/yolov8n_192x320.q.onnx
+default_labels=/data/vision-models/current/detection/label.txt
 capture_modes=oneshot_ffmpeg,persistent_ffmpeg,local_restream
 fixed_rate_scheduler=enabled
 default_four_channel_phase_offsets=0ms,2500ms,5000ms,7500ms
@@ -155,11 +166,16 @@ python3 scripts/generate_k3_supply_chain.py \
   --first-party-notice "$repo_root/debian/FIRST_PARTY_RIGHTS.txt" \
   --input-file "$repo_root/debian/first-party-rights.json" \
   --input-file "$repo_root/debian/FIRST_PARTY_RIGHTS.txt" \
+  --input-file "$repo_root/debian/verify-beacon-k3-generation" \
   --input-file "$repo_root/scripts/harbornavi_k3_cat_recording_classifier.py" \
+  --input-file "$repo_root/scripts/harbornavi_k3_cat_quality_runner.py" \
+  --input-file "$repo_root/src/bin/cat_sampling_plan.rs" \
+  --input-file "$repo_root/src/runtime/cat_recording_sampling.rs" \
   --input-file "$repo_root/$model_source_dir/mobilenetv2_cat_binary_int8.onnx" \
   --input-file "$repo_root/$model_source_dir/runtime-contract.json" \
   --input-file "$repo_root/$model_source_dir/first-party-provenance.json" \
   --binary "$pkg_dir/usr/bin/harboros-beacon" \
+  --binary "$pkg_dir/usr/lib/harboros-beacon/cat-sampling-plan" \
   --version "$DEBIAN_VERSION" \
   --target "$target" \
   --arch "$deb_arch" \

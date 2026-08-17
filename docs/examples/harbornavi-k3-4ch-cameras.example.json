@@ -5,14 +5,9 @@
   "beaconUrl": "http://127.0.0.1:4174",
   "outputDir": "/tmp/harbornavi-p1/4ch-mixed-simulation",
   "analyzerCommand": "/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py",
-  "modelPath": "/data/models/current/detection/yolov8n_192x320.q.onnx",
-  "labelPath": "/var/lib/harboros-beacon/models/label.txt",
+  "modelPath": "/data/vision-models/current/detection/yolov8n_192x320.q.onnx",
+  "labelPath": "/data/vision-models/current/detection/label.txt",
   "provider": "cpu",
-  "vlmEnrich": false,
-  "vlmApiBase": "http://127.0.0.1:8080/v1",
-  "vlmModel": "qwen3_5vl_0.8b-text-q41.gguf",
-  "vlmSampleEvery": 30,
-  "vlmMaxSamples": 3,
   "capture": {
     "mode": "persistent_ffmpeg",
     "maxFrameAgeMs": 2500,
@@ -22,10 +17,7 @@
     {
       "cameraId": "cam-real-231",
       "kind": "real",
-      "sourceSecretRef": "env:CAM_REAL_231_RTSP",
-      "vlmEnrich": true,
-      "vlmSampleEvery": 30,
-      "vlmMaxSamples": 3
+      "sourceSecretRef": "env:CAM_REAL_231_RTSP"
     },
     {
       "cameraId": "cam-sim-1",

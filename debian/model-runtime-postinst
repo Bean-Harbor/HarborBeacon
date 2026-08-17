@@ -23,14 +23,56 @@ release_installed=0
 transaction_committed=0
 systemd_live=0
 model_was_active=0
-vlm_was_active=0
 upgrade_state="/run/harboros-model-runtime/upgrade-active"
+generation_state_dir="/run/harboros-k3-generation"
+beacon_active_state="$generation_state_dir/beacon-was-active"
+beacon_state_tmp=""
+
+validate_beacon_active_state() {
+  [ ! -L "$beacon_active_state" ] \
+    && [ -f "$beacon_active_state" ] \
+    && [ "$(stat -c %u "$beacon_active_state")" = 0 ] \
+    && [ "$(stat -c %a "$beacon_active_state")" = 600 ] \
+    && [ "$(stat -c %s "$beacon_active_state")" = 24 ] \
+    && [ "$(cat "$beacon_active_state")" = harboros-beacon.service ] || {
+    echo "error: unsafe Beacon generation active state: $beacon_active_state" >&2
+    exit 1
+  }
+}
+
+stop_beacon_for_generation_change() {
+  if [ -e "$generation_state_dir" ] || [ -L "$generation_state_dir" ]; then
+    [ ! -L "$generation_state_dir" ] \
+      && [ -d "$generation_state_dir" ] \
+      && [ "$(stat -c %u "$generation_state_dir")" = 0 ] \
+      && [ "$(stat -c %a "$generation_state_dir")" = 700 ] || {
+      echo "error: unsafe Beacon generation state directory" >&2
+      exit 1
+    }
+  else
+    install -d -o root -g root -m 0700 "$generation_state_dir"
+  fi
+  if [ -e "$beacon_active_state" ] || [ -L "$beacon_active_state" ]; then
+    validate_beacon_active_state
+  elif systemctl is-active --quiet harboros-beacon.service; then
+    beacon_state_tmp="$(mktemp "$generation_state_dir/.beacon-was-active.XXXXXXXX")"
+    printf '%s\n' harboros-beacon.service > "$beacon_state_tmp"
+    chown root:root "$beacon_state_tmp"
+    chmod 0600 "$beacon_state_tmp"
+    mv -f -- "$beacon_state_tmp" "$beacon_active_state"
+    beacon_state_tmp=""
+  fi
+  systemctl stop harboros-beacon.service >/dev/null 2>&1 || true
+  if systemctl is-active --quiet harboros-beacon.service; then
+    echo "error: Beacon must stop before model generation changes" >&2
+    exit 1
+  fi
+}
 
 cleanup() {
   if [ "$transaction_committed" -ne 1 ]; then
     if [ "$systemd_live" -eq 1 ]; then
-      systemctl stop harboros-model-runtime.service harboros-vlm-runtime.service \
-        >/dev/null 2>&1 || true
+      systemctl stop harboros-model-runtime.service >/dev/null 2>&1 || true
     fi
     if [ "$release_installed" -eq 1 ]; then
       rm -rf -- "$release_root"
@@ -56,26 +98,22 @@ cleanup() {
       if [ "$model_was_active" -eq 1 ]; then
         systemctl restart harboros-model-runtime.service >/dev/null 2>&1 || true
       fi
-      if [ "$vlm_was_active" -eq 1 ]; then
-        systemctl restart harboros-vlm-runtime.service >/dev/null 2>&1 || true
-      fi
     fi
     rm -f -- "$upgrade_state"
   elif [ -n "$backup_root" ] && [ -d "$backup_root" ]; then
     rm -rf -- "$backup_root"
   fi
   [ -z "$staging_root" ] || rm -rf -- "$staging_root"
+  [ -z "$beacon_state_tmp" ] || rm -f -- "$beacon_state_tmp"
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   systemd_live=1
+  stop_beacon_for_generation_change
   if systemctl is-active --quiet harboros-model-runtime.service; then
     model_was_active=1
-  fi
-  if systemctl is-active --quiet harboros-vlm-runtime.service; then
-    vlm_was_active=1
   fi
   if [ -e "$upgrade_state" ] || [ -L "$upgrade_state" ]; then
     [ ! -L "$upgrade_state" ] && [ -f "$upgrade_state" ] \
@@ -87,13 +125,18 @@ if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     while IFS= read -r unit; do
       case "$unit" in
         harboros-model-runtime.service) model_was_active=1 ;;
-        harboros-vlm-runtime.service) vlm_was_active=1 ;;
         "") ;;
         *) echo "error: invalid unit in $upgrade_state: $unit" >&2; exit 1 ;;
       esac
     done < "$upgrade_state"
   fi
-  systemctl stop harboros-model-runtime.service harboros-vlm-runtime.service
+  systemctl stop harboros-model-runtime.service
+  # This package generation deliberately retires the former VLM unit.
+  systemctl disable --now harboros-vlm-runtime.service >/dev/null 2>&1 || true
+  if systemctl is-active --quiet harboros-vlm-runtime.service; then
+    echo "error: retired VLM unit is still active" >&2
+    exit 1
+  fi
 fi
 
 /usr/lib/harboros-model-runtime/ensure-data-layout /data/models
@@ -153,16 +196,13 @@ chown root:root /data/models /data/models/releases
 chmod 0755 /data/models /data/models/releases
 
 if command -v deb-systemd-helper >/dev/null 2>&1; then
-  for unit in harboros-model-runtime.service harboros-vlm-runtime.service; do
-    deb-systemd-helper unmask "$unit" >/dev/null || true
-    deb-systemd-helper enable "$unit" >/dev/null || true
-  done
+  deb-systemd-helper unmask harboros-model-runtime.service >/dev/null || true
+  deb-systemd-helper enable harboros-model-runtime.service >/dev/null || true
 fi
 
 if [ "$systemd_live" -eq 1 ]; then
   systemctl daemon-reload
   systemctl restart harboros-model-runtime.service
-  systemctl restart harboros-vlm-runtime.service
 fi
 
 transaction_committed=1

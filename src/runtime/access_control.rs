@@ -225,7 +225,7 @@ mod tests {
         build_platform_state, AdminConsoleState, IdentityBindingRecord,
     };
 
-    use super::{authorize_access, AccessAction, AccessIdentityHints};
+    use super::{action_allowed, authorize_access, AccessAction, AccessIdentityHints};
 
     #[test]
     fn local_owner_fallback_can_manage_admin_surface() {
@@ -242,6 +242,30 @@ mod tests {
         .expect("principal");
 
         assert_eq!(principal.user_id, "local-owner");
+    }
+
+    #[test]
+    fn admin_manage_contract_allows_owner_and_admin_but_denies_operator() {
+        let mut state = AdminConsoleState::default();
+        state.platform = build_platform_state(&state);
+        let permissions = &state.platform.permission_bindings;
+
+        for role in ["owner", "admin"] {
+            assert!(action_allowed(
+                permissions,
+                "home-1",
+                role,
+                "workspace:home-1",
+                AccessAction::AdminManage.permission_key(),
+            ));
+        }
+        assert!(!action_allowed(
+            permissions,
+            "home-1",
+            "operator",
+            "workspace:home-1",
+            AccessAction::AdminManage.permission_key(),
+        ));
     }
 
     #[test]

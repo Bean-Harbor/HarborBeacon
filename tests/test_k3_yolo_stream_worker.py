@@ -45,11 +45,7 @@ def load_worker_module():
     analyzer.load_labels = lambda _path: ["cat"]
     analyzer.postprocess = lambda *_args, **_kwargs: []
     analyzer.preprocess = lambda *_args, **_kwargs: (None, None)
-    analyzer.provider_list = lambda provider: [
-        "SpaceMITExecutionProvider"
-        if provider == "spacemit"
-        else "CPUExecutionProvider"
-    ]
+    analyzer.provider_list = lambda _provider: ["CPUExecutionProvider"]
     modules = {
         "cv2": cv2,
         "numpy": numpy,
@@ -150,7 +146,7 @@ class K3YoloStreamWorkerTests(unittest.TestCase):
 
         self.assertEqual(worker.ort.last_session_options.intra_op_num_threads, 1)
 
-    def test_build_session_configures_spacemit_core_affinity(self):
+    def test_build_session_rejects_spacemit_provider(self):
         worker = load_worker_module()
         args = types.SimpleNamespace(
             labels="labels.txt",
@@ -159,47 +155,8 @@ class K3YoloStreamWorkerTests(unittest.TestCase):
             model="model.onnx",
         )
 
-        environment = {
-            "HARBOR_K3_YOLO_AI_THREADS": "4",
-            "HARBOR_K3_YOLO_AI_AFFINITY": "8;9;10;11",
-            "HARBOR_K3_YOLO_CPU_THREADS": "8",
-        }
-        with mock.patch.dict(os.environ, environment, clear=True):
-            session, _, _, _, provider = worker.build_session(args)
-
-        self.assertEqual(worker.ort.last_session_options.intra_op_num_threads, 1)
-        self.assertEqual(
-            worker.ort.last_providers,
-            [
-                (
-                    "SpaceMITExecutionProvider",
-                    {
-                        "SPACEMIT_EP_INTRA_THREAD_NUM": "4",
-                        "SPACEMIT_EP_INTRA_THREAD_AFFINITY": "8;9;10;11",
-                        "SPACEMIT_EP_INTER_THREAD_NUM": "1",
-                    },
-                )
-            ],
-        )
-        self.assertEqual(session.get_providers(), ["SpaceMITExecutionProvider"])
-        self.assertEqual(provider, "SpaceMITExecutionProvider")
-
-    def test_build_session_rejects_spacemit_affinity_count_mismatch(self):
-        worker = load_worker_module()
-        args = types.SimpleNamespace(
-            labels="labels.txt",
-            target_label="cat",
-            provider="spacemit",
-            model="model.onnx",
-        )
-
-        environment = {
-            "HARBOR_K3_YOLO_AI_THREADS": "4",
-            "HARBOR_K3_YOLO_AI_AFFINITY": "8;9",
-        }
-        with mock.patch.dict(os.environ, environment, clear=True):
-            with self.assertRaisesRegex(ValueError, "must contain 4 core IDs"):
-                worker.build_session(args)
+        with self.assertRaisesRegex(ValueError, "EVT.1 YOLO provider must be cpu"):
+            worker.build_session(args)
 
     def test_filter_target_detections_keeps_only_cat(self):
         worker = load_worker_module()
@@ -452,7 +409,7 @@ class K3YoloStreamWorkerTests(unittest.TestCase):
                         320,
                         320,
                         ["cat"],
-                        "SpaceMITExecutionProvider",
+                        "CPUExecutionProvider",
                     ),
                 ),
                 mock.patch.object(worker, "file_sha256", return_value="model-sha"),

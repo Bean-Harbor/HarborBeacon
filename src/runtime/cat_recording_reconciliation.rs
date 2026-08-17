@@ -14,7 +14,7 @@ use crate::runtime::secure_store_path::{SecureFileIdentity, SecureStorePath};
 
 pub const CAT_RECORDING_RECONCILIATION_PATH_ENV: &str =
     "HARBOR_K3_CAT_RECORDING_RECONCILIATION_PATH";
-const DEFAULT_RECONCILIATION_PATH: &str = ".harborbeacon/cat-recording-reconciliation.json";
+const DEFAULT_RECONCILIATION_PATH: &str = "/data/harborbeacon/cat-activity/reconciliation.json";
 const MAX_RECONCILIATION_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]

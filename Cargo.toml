@@ -41,6 +41,10 @@ name = "agent-hub-admin-api"
 path = "src/bin/agent_hub_admin_api.rs"
 
 [[bin]]
+name = "cat-sampling-plan"
+path = "src/bin/cat_sampling_plan.rs"
+
+[[bin]]
 name = "assistant-task-api"
 path = "src/bin/assistant_task_api.rs"
 

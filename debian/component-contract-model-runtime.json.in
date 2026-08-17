@@ -2,22 +2,14 @@
   "contracts": [
     {
       "capabilities": [
+        "candle-only",
+        "jina-embeddings-v2",
         "lazy-model-loading",
-        "loopback-only",
-        "pinned-model-materials",
+        "loopback-8792-only",
+        "qwen2.5-0.5b-instruct",
         "signed-model-materials"
       ],
       "id": "harboros.k3.model-runtime",
-      "version": 1
-    },
-    {
-      "capabilities": [
-        "event-vlm",
-        "loopback-only",
-        "qwen3.5-0.8b",
-        "smt-tcm-vision"
-      ],
-      "id": "harboros.k3.vlm-runtime",
       "version": 1
     }
   ],

@@ -1,0 +1,12 @@
+{
+  "model_release_root": "/data/vision-models",
+  "package": "harboros-cat-vision-runtime",
+  "runtime_dependencies": [
+    "python3-spacemit-ort=2.0.3+3",
+    "spacemit-onnxruntime=2.0.3+3",
+    "spacemit-tcm=3.0.0+3"
+  ],
+  "schema_version": 1,
+  "services": [],
+  "source_commit": "SOURCE_COMMIT_PLACEHOLDER"
+}

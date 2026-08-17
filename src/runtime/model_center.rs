@@ -860,8 +860,7 @@ fn endpoint_requires_a100_cluster_1(endpoint: &ModelEndpoint, workload: AiWorklo
                 .is_some_and(|runtime| runtime.eq_ignore_ascii_case("spacemit-llama-server"))
                 || endpoint_uses_loopback_port(endpoint, 8091)
         }
-        AiWorkload::Vlm => endpoint_uses_loopback_port(endpoint, 8080),
-        AiWorkload::Yolo | AiWorkload::CatRecordingVerifier => false,
+        AiWorkload::Vlm | AiWorkload::Yolo | AiWorkload::CatRecordingVerifier => false,
     }
 }
 
@@ -2731,11 +2730,12 @@ mod tests {
     use super::{
         aggregate_cat_frame_verifications, clear_local_runtime_projection_cache, connectivity_url,
         embedding_endpoint_identity_with_state, embedding_query_input,
-        endpoint_uses_openai_compatible_api, openai_compatible_config_from_endpoint,
-        redact_model_endpoint, run_cat_recording_validation_with_state, run_embedding_with_state,
-        run_llm_text_with_state, run_llm_text_with_state_and_options, run_rerank_with_state,
-        run_vlm_summary_with_state, semantic_router_local_only_model_state, test_model_endpoint,
-        vlm_endpoint_readiness, LlmTextOptions, RERANK_POLICY_ID,
+        endpoint_requires_a100_cluster_1, endpoint_uses_openai_compatible_api,
+        openai_compatible_config_from_endpoint, redact_model_endpoint,
+        run_cat_recording_validation_with_state, run_embedding_with_state, run_llm_text_with_state,
+        run_llm_text_with_state_and_options, run_rerank_with_state, run_vlm_summary_with_state,
+        semantic_router_local_only_model_state, test_model_endpoint, vlm_endpoint_readiness,
+        AiWorkload, LlmTextOptions, RERANK_POLICY_ID,
     };
     use crate::connectors::ai_provider::CatFrameVerificationResponse;
     use crate::control_plane::models::{
@@ -3150,6 +3150,33 @@ mod tests {
         };
 
         assert!(openai_compatible_config_from_endpoint(&endpoint).is_none());
+    }
+
+    #[test]
+    fn custom_vlm_port_never_recreates_the_retired_builtin_resource_binding() {
+        let mut endpoint = ModelEndpoint {
+            model_endpoint_id: "vlm-custom-loopback".to_string(),
+            workspace_id: Some("home-1".to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Vlm,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "openai_compatible".to_string(),
+            model_name: "custom-vlm".to_string(),
+            capability_tags: vec!["vision".to_string()],
+            cost_policy: json!({}),
+            status: ModelEndpointStatus::Disabled,
+            metadata: json!({
+                "base_url": "http://127.0.0.1:8080/v1",
+                "qualification_eligible": false,
+            }),
+        };
+
+        assert!(!endpoint_requires_a100_cluster_1(
+            &endpoint,
+            AiWorkload::Vlm
+        ));
+        endpoint.metadata["ai_resource_cluster"] = json!("a100_cluster_1");
+        assert!(endpoint_requires_a100_cluster_1(&endpoint, AiWorkload::Vlm));
     }
 
     #[test]

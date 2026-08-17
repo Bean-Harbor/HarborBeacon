@@ -87,6 +87,7 @@ rustup target add "$target"
 
 bash -n scripts/build_harbornavi_k3_deb.sh
 bash -n scripts/build_model_runtime_k3_deb.sh
+bash -n scripts/build_cat_vision_runtime_k3_deb.sh
 bash -n scripts/run_k3_materials_ab_in_container.sh
 python3 -m unittest tests.test_k3_packaging_contract
 python3 scripts/validate_k3_model_materials.py \
@@ -95,6 +96,10 @@ python3 scripts/validate_k3_model_materials.py \
   --verify-license-evidence \
   --license-evidence-root "$MODEL_LICENSE_EVIDENCE_ROOT" \
   | tee "$inspection/model-material-validation.txt"
+python3 scripts/validate_k3_model_materials.py \
+  --manifest models/k3-evt1-cat-vision-materials.json \
+  --bundle-root "$MODEL_BUNDLE_ROOT" \
+  | tee "$inspection/cat-vision-material-validation.txt"
 
 for run in root-a root-b; do
   case "$run" in
@@ -102,13 +107,14 @@ for run in root-a root-b; do
     root-b) source_root="$source_root_b" ;;
   esac
   target_root="$EVIDENCE_ROOT/$run/target"
-  for component in beacon model-runtime; do
+  for component in beacon model-runtime cat-vision-runtime; do
     artifact_root="$EVIDENCE_ROOT/$run/artifacts/$component"
     work_root="$EVIDENCE_ROOT/$run/work/$component"
     install -d "$artifact_root" "$target_root" "$work_root"
     case "$component" in
       beacon) build_script=scripts/build_harbornavi_k3_deb.sh ;;
       model-runtime) build_script=scripts/build_model_runtime_k3_deb.sh ;;
+      cat-vision-runtime) build_script=scripts/build_cat_vision_runtime_k3_deb.sh ;;
     esac
     cd "$source_root"
     env \
@@ -136,7 +142,7 @@ for run in root-a root-b; do
   done
 done
 
-for component in beacon model-runtime; do
+for component in beacon model-runtime cat-vision-runtime; do
   diff --no-dereference --recursive \
     "$EVIDENCE_ROOT/root-a/artifacts/$component" \
     "$EVIDENCE_ROOT/root-b/artifacts/$component" \
@@ -166,7 +172,8 @@ architecture = sys.argv[4]
 source_repo = "https://github.com/Bean-Harbor/HarborBeacon"
 packages = (
     ("beacon", "harboros-beacon", True),
-    ("model-runtime", "harboros-model-runtime", False),
+    ("model-runtime", "harboros-model-runtime", True),
+    ("cat-vision-runtime", "harboros-cat-vision-runtime", False),
 )
 for run in ("root-a", "root-b"):
     for component, package, expected_eligible in packages:
@@ -199,11 +206,16 @@ for run in ("root-a", "root-b"):
         )
 PY
 
-install -d "$EVIDENCE_ROOT/artifacts/beacon" "$EVIDENCE_ROOT/artifacts/model-runtime"
+install -d \
+  "$EVIDENCE_ROOT/artifacts/beacon" \
+  "$EVIDENCE_ROOT/artifacts/model-runtime" \
+  "$EVIDENCE_ROOT/artifacts/cat-vision-runtime"
 cp -a "$EVIDENCE_ROOT/root-a/artifacts/beacon/." "$EVIDENCE_ROOT/artifacts/beacon/"
 cp -a "$EVIDENCE_ROOT/root-a/artifacts/model-runtime/." \
   "$EVIDENCE_ROOT/artifacts/model-runtime/"
-printf 'PASS packaging-materials; model-runtime release_eligible=false\n' \
+cp -a "$EVIDENCE_ROOT/root-a/artifacts/cat-vision-runtime/." \
+  "$EVIDENCE_ROOT/artifacts/cat-vision-runtime/"
+printf 'PASS packaging-materials; cat-vision-runtime release_eligible=false\n' \
   > "$EVIDENCE_ROOT/status.txt"
 (
   cd "$EVIDENCE_ROOT"

@@ -3,50 +3,6 @@
   "release_id": "harboros-navi-k3-0.1.0-evt.1",
   "materials": [
     {
-      "id": "detection-yolov8n-192x320",
-      "role": "detection",
-      "state": "locked",
-      "source": "https://gitee.com/bianbu/spacemit-demo.git",
-      "revision": "dc4477d3ea712598bb675f730642a43fe280c569",
-      "license": {
-        "blocking_reason": "The pinned spacemit-demo revision has no repository license declaration.",
-        "concluded_license": "NOASSERTION",
-        "declared_license": "NOASSERTION",
-        "evidence": null,
-        "review_status": "blocked"
-      },
-      "files": [
-        {
-          "source_path": "detection/yolov8n_192x320.q.onnx",
-          "package_path": "detection/yolov8n_192x320.q.onnx",
-          "size": 1925676,
-          "sha256": "d4bf61db2a0925a0126052212479ff5044b621b12c6793420e085d36ae6b5438"
-        }
-      ]
-    },
-    {
-      "id": "detection-coco-labels",
-      "role": "detection-labels",
-      "state": "locked",
-      "source": "https://gitee.com/bianbu/spacemit-demo.git",
-      "revision": "dc4477d3ea712598bb675f730642a43fe280c569",
-      "license": {
-        "blocking_reason": "The pinned spacemit-demo revision has no repository license declaration for the labels.",
-        "concluded_license": "NOASSERTION",
-        "declared_license": "NOASSERTION",
-        "evidence": null,
-        "review_status": "blocked"
-      },
-      "files": [
-        {
-          "source_path": "detection/label.txt",
-          "package_path": "detection/label.txt",
-          "size": 621,
-          "sha256": "bd17f1ee35d5f3c862a4894605855abbb9dda4b0621fdb0ac4c2c8c7bb7e730a"
-        }
-      ]
-    },
-    {
       "id": "semantic-router-bootstrap-llm",
       "role": "semantic-router",
       "state": "locked",
@@ -119,40 +75,6 @@
           "package_path": "embedding/jina-embeddings-v2-base-zh/tokenizer.json",
           "size": 2030772,
           "sha256": "0046da43cc8c424b317f56b092b0512aaaa65c4f925d2f16af9d9eeb4d0ef902"
-        }
-      ]
-    },
-    {
-      "id": "event-vlm-qwen3.5-0.8b-384",
-      "role": "event-vlm",
-      "state": "locked",
-      "source": "https://archive.spacemit.com/spacemit-ai/model_zoo/vlm/Qwen3.5-0.8B.tar.gz",
-      "revision": "20a0fa9353a326f1751340dc469d6929fbd5ba95",
-      "license": {
-        "blocking_reason": "The pinned SpacemiT conversion archive does not provide license evidence for redistribution of the converted model files.",
-        "concluded_license": "NOASSERTION",
-        "declared_license": "NOASSERTION",
-        "evidence": null,
-        "review_status": "blocked"
-      },
-      "files": [
-        {
-          "source_path": "vlm/Qwen3.5-0.8B/qwen3_5vl_0.8b-vision-384-op23.f16.onnx",
-          "package_path": "vlm/Qwen3.5-0.8B/qwen3_5vl_0.8b-vision-384-op23.f16.onnx",
-          "size": 201460594,
-          "sha256": "51b71bdcbb47f0e325dbfde7e1ef54609864ec4f261ee422e5503d6757c6b364"
-        },
-        {
-          "source_path": "vlm/Qwen3.5-0.8B/qwen3_5vl_0.8b-text-q41.gguf",
-          "package_path": "vlm/Qwen3.5-0.8B/qwen3_5vl_0.8b-text-q41.gguf",
-          "size": 532553184,
-          "sha256": "143617d3e4a67206c2a23c331684496f595560d0d893dd291c642c97fe677e4a"
-        },
-        {
-          "source_path": "vlm/Qwen3.5-0.8B/config.json",
-          "package_path": "vlm/Qwen3.5-0.8B/config.json",
-          "size": 353,
-          "sha256": "26a1971ed1061e7bd0ad1365698c339e553f4d46cc5b8eca7830022375f96172"
         }
       ]
     }

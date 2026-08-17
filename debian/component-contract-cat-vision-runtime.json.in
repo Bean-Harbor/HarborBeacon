@@ -1,0 +1,18 @@
+{
+  "contracts": [
+    {
+      "capabilities": [
+        "bounded-fixed-function-inference",
+        "cat-yolov8-int8-materials",
+        "no-network-listener",
+        "signed-vision-materials",
+        "spacemit-mobilenet-provider"
+      ],
+      "id": "harboros.k3.cat-vision-runtime",
+      "version": 1
+    }
+  ],
+  "package": "harboros-cat-vision-runtime",
+  "schema_version": 1,
+  "source_commit": "SOURCE_COMMIT_PLACEHOLDER"
+}

@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import tarfile
 import tomllib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -537,6 +537,24 @@ def build_cargo_third_party_licenses(
     return review, sidecar
 
 
+def build_empty_cargo_third_party_licenses(
+    cargo_lock: Path, *, package: str, source_commit: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not re.fullmatch(r"[0-9a-f]{40}", source_commit):
+        raise ValueError("Cargo license sidecar source commit is invalid")
+    review = {"approved": 0, "blocked": 0, "dependencies": [], "total": 0}
+    sidecar = {
+        "cargo_lock": {"filename": cargo_lock.name, "sha256": sha256(cargo_lock)},
+        "dependencies": [],
+        "package": package,
+        "schema_version": 1,
+        "source_commit": source_commit,
+        "total": 0,
+        "unresolved": [],
+    }
+    return review, sidecar
+
+
 def verify_cargo_third_party_licenses(
     path: Path, expected: dict[str, Any]
 ) -> dict[str, Any]:
@@ -689,6 +707,256 @@ def runtime_license_review(
         "suite": evidence_payload["suite"],
         "total": len(entries),
     }
+
+
+def vision_runtime_evidence_review(
+    path: Path | None,
+    model_root: Path | None,
+    *,
+    package: str,
+    version: str,
+    architecture: str,
+    source_commit: str,
+) -> dict[str, Any] | None:
+    if path is None and model_root is None:
+        return None
+    if path is None or model_root is None:
+        raise ValueError(
+            "vision runtime evidence and vision model root must be provided together"
+        )
+    payload = load_canonical_json(path, "vision runtime evidence")
+    if set(payload) != {
+        "decision",
+        "kind",
+        "model_release_root",
+        "models",
+        "package",
+        "policy",
+        "runtime_packages",
+        "schema_version",
+        "source_commit",
+    }:
+        raise ValueError("vision runtime evidence has an invalid field set")
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("kind") != "vision-runtime-evidence"
+        or payload.get("policy") != "fail-closed"
+        or payload.get("model_release_root") != "/data/vision-models"
+        or payload.get("source_commit") != source_commit
+        or payload.get("package")
+        != {"architecture": architecture, "name": package, "version": version}
+    ):
+        raise ValueError("vision runtime evidence identity is invalid")
+    decision = payload.get("decision")
+    if not isinstance(decision, dict) or set(decision) != {
+        "blocking_reasons",
+        "release_eligible",
+        "status",
+    }:
+        raise ValueError("vision runtime decision has an invalid field set")
+    blockers = decision.get("blocking_reasons")
+    if (
+        decision.get("status") not in {"approved", "blocked"}
+        or decision.get("release_eligible")
+        is not (decision.get("status") == "approved")
+        or not isinstance(blockers, list)
+        or not all(isinstance(item, str) and item for item in blockers)
+        or (decision.get("status") == "approved" and blockers)
+        or (decision.get("status") == "blocked" and not blockers)
+    ):
+        raise ValueError("vision runtime decision is inconsistent")
+
+    model_fields = {
+        "concluded_license",
+        "copyright",
+        "declared_license",
+        "id",
+        "installed_path",
+        "redistribution_evidence",
+        "revision",
+        "runtime_path",
+        "sha256",
+        "size",
+        "source",
+        "source_archive",
+    }
+    models = payload.get("models")
+    if not isinstance(models, list) or len(models) != 2:
+        raise ValueError("vision runtime evidence must bind exactly two model files")
+    root = model_root.resolve(strict=True)
+    if model_root.is_symlink() or not root.is_dir():
+        raise ValueError("vision model root is missing or unsafe")
+    seen_ids: set[str] = set()
+    installed_prefix = "/usr/share/harboros-cat-vision-runtime/models/"
+    runtime_prefix = "/data/vision-models/current/"
+    expected_models = {
+        "detection-coco-labels": (
+            "detection/label.txt",
+            621,
+            "bd17f1ee35d5f3c862a4894605855abbb9dda4b0621fdb0ac4c2c8c7bb7e730a",
+        ),
+        "detection-yolov8n-192x320": (
+            "detection/yolov8n_192x320.q.onnx",
+            1925676,
+            "d4bf61db2a0925a0126052212479ff5044b621b12c6793420e085d36ae6b5438",
+        ),
+    }
+    for item in models:
+        if not isinstance(item, dict) or set(item) != model_fields:
+            raise ValueError("vision model evidence has an invalid field set")
+        model_id = item.get("id")
+        installed_path = item.get("installed_path")
+        runtime_path = item.get("runtime_path")
+        expected_model = expected_models.get(model_id)
+        if (
+            expected_model is None
+            or not isinstance(model_id, str)
+            or model_id in seen_ids
+            or not isinstance(installed_path, str)
+            or not installed_path.startswith(installed_prefix)
+            or not isinstance(runtime_path, str)
+            or not runtime_path.startswith(runtime_prefix)
+            or installed_path.removeprefix(installed_prefix)
+            != runtime_path.removeprefix(runtime_prefix)
+        ):
+            raise ValueError("vision model evidence has an invalid identity")
+        seen_ids.add(model_id)
+        relative = PurePosixPath(installed_path.removeprefix(installed_prefix))
+        if relative.is_absolute() or "." in relative.parts or ".." in relative.parts:
+            raise ValueError(f"vision model has an unsafe installed path: {model_id}")
+        model_file = root.joinpath(*relative.parts)
+        expected_size = item.get("size")
+        expected_sha = item.get("sha256")
+        if (
+            relative.as_posix() != expected_model[0]
+            or expected_size != expected_model[1]
+            or expected_sha != expected_model[2]
+            or item.get("source")
+            != {"kind": "git", "url": "https://gitee.com/bianbu/spacemit-demo.git"}
+            or item.get("revision")
+            != {
+                "kind": "git-commit",
+                "value": "dc4477d3ea712598bb675f730642a43fe280c569",
+            }
+            or model_file.is_symlink()
+            or not model_file.is_file()
+            or not isinstance(expected_size, int)
+            or expected_size < 1
+            or model_file.stat().st_size != expected_size
+            or not isinstance(expected_sha, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_sha)
+            or sha256(model_file) != expected_sha
+        ):
+            raise ValueError(f"vision model bytes differ from evidence: {model_id}")
+        if decision["status"] == "approved" and any(
+            item.get(field) is None
+            for field in ("copyright", "redistribution_evidence", "source_archive")
+        ):
+            raise ValueError(f"approved vision model evidence is incomplete: {model_id}")
+
+    runtime_fields = {
+        "apt_provenance",
+        "architecture",
+        "artifact",
+        "concluded_license",
+        "copyright",
+        "declared_license",
+        "license_evidence",
+        "name",
+        "version",
+    }
+    artifact_fields = {
+        "filename",
+        "sha256",
+        "size",
+        "source_package",
+        "source_version",
+    }
+    provenance_fields = {
+        "architecture",
+        "component",
+        "index_path",
+        "index_sha256",
+        "release_sha256",
+        "repository",
+        "signing_key_fingerprint",
+        "suite",
+    }
+    expected_runtime = {
+        "python3-spacemit-ort": (
+            "2.0.3+3",
+            "python3-spacemit-ort_2.0.3+3_riscv64.deb",
+            None,
+            None,
+        ),
+        "spacemit-onnxruntime": (
+            "2.0.3+3",
+            "spacemit-onnxruntime_2.0.3+3_riscv64.deb",
+            "b69cfc955af1ac15abf61f4915a8d5e68c50d20d38451d640d98b4b189da8472",
+            {
+                "installed_path": "/usr/share/doc/spacemit-onnxruntime/copyright",
+                "sha256": "de3e277514b725dd7ea8e481067338850276a662f59a5f88dfc61b65a2859a69",
+            },
+        ),
+        "spacemit-tcm": (
+            "3.0.0+3",
+            "spacemit-tcm_3.0.0+3_riscv64.deb",
+            "2763b8946791f47fd20d4bda55e3680c3548e7a6893e605e30e1cbb4455f5fa5",
+            {
+                "installed_path": "/usr/share/doc/spacemit-tcm/copyright",
+                "sha256": "c5ae5de0b80538d412001b735d05442650c78a1f44d4dfed61da530d5ffa5311",
+            },
+        ),
+    }
+    runtime_packages = payload.get("runtime_packages")
+    if not isinstance(runtime_packages, list) or len(runtime_packages) != 3:
+        raise ValueError("vision runtime evidence must bind exactly three packages")
+    seen_runtime: set[str] = set()
+    for item in runtime_packages:
+        if not isinstance(item, dict) or set(item) != runtime_fields:
+            raise ValueError("vision runtime package has an invalid field set")
+        name = item.get("name")
+        version_value = item.get("version")
+        artifact = item.get("artifact")
+        provenance = item.get("apt_provenance")
+        expected_package = expected_runtime.get(name)
+        if (
+            name in seen_runtime
+            or expected_package is None
+            or expected_package[0] != version_value
+            or item.get("architecture") != architecture
+            or not isinstance(artifact, dict)
+            or set(artifact) != artifact_fields
+            or artifact.get("source_package") != name
+            or artifact.get("source_version") != version_value
+            or artifact.get("filename") != expected_package[1]
+            or artifact.get("sha256") != expected_package[2]
+            or item.get("copyright") != expected_package[3]
+            or not isinstance(provenance, dict)
+            or set(provenance) != provenance_fields
+            or provenance.get("architecture") != architecture
+            or provenance.get("repository")
+            != "https://ppa.launchpadcontent.net/spacemit/k3/ubuntu"
+            or provenance.get("suite") != "resolute"
+            or provenance.get("component") != "main"
+        ):
+            raise ValueError(f"vision runtime package evidence differs: {name}")
+        seen_runtime.add(name)
+        if decision["status"] == "approved" and any(
+            value is None
+            for value in (
+                artifact.get("sha256"),
+                artifact.get("size"),
+                provenance.get("index_path"),
+                provenance.get("index_sha256"),
+                provenance.get("release_sha256"),
+                provenance.get("signing_key_fingerprint"),
+                item.get("copyright"),
+                item.get("license_evidence"),
+            )
+        ):
+            raise ValueError(f"approved vision runtime evidence is incomplete: {name}")
+    return payload
 
 
 def verify_deb_identity(
@@ -863,19 +1131,34 @@ def generate(args: argparse.Namespace) -> dict[str, Path]:
         }
     )
 
-    cargo, expected_third_party_licenses = build_cargo_third_party_licenses(
-        args.cargo_metadata,
-        args.root_manifest,
-        args.cargo_lock,
-        package=args.package,
-        source_commit=args.source_commit,
-    )
+    if args.no_cargo_dependencies:
+        cargo, expected_third_party_licenses = build_empty_cargo_third_party_licenses(
+            args.cargo_lock,
+            package=args.package,
+            source_commit=args.source_commit,
+        )
+    else:
+        cargo, expected_third_party_licenses = build_cargo_third_party_licenses(
+            args.cargo_metadata,
+            args.root_manifest,
+            args.cargo_lock,
+            package=args.package,
+            source_commit=args.source_commit,
+        )
     verify_cargo_third_party_licenses(
         args.third_party_licenses, expected_third_party_licenses
     )
     models = model_license_review(args.model_materials)
     runtime = runtime_license_review(
         args.runtime_manifest, args.runtime_license_evidence, args.architecture
+    )
+    vision = vision_runtime_evidence_review(
+        args.vision_runtime_evidence,
+        args.vision_model_root,
+        package=args.package,
+        version=args.version,
+        architecture=args.architecture,
+        source_commit=args.source_commit,
     )
     blockers = []
     if cargo["blocked"]:
@@ -884,6 +1167,8 @@ def generate(args: argparse.Namespace) -> dict[str, Path]:
         blockers.append("third_party_model_license_review_incomplete")
     if runtime is not None and runtime["blocked"]:
         blockers.append("third_party_runtime_license_review_incomplete")
+    if vision is not None and not vision["decision"]["release_eligible"]:
+        blockers.append("vision_runtime_evidence_incomplete")
     approved = not blockers
     decision = {
         "blocking_reasons": blockers,
@@ -915,6 +1200,7 @@ def generate(args: argparse.Namespace) -> dict[str, Path]:
             "model_materials": models,
             "policy": "Original upstream license only",
             "runtime_dependencies": runtime,
+            "vision_runtime": vision,
         },
         "version": args.version,
     }
@@ -973,6 +1259,24 @@ def generate(args: argparse.Namespace) -> dict[str, Path]:
             args.output_dir / f"{prefix}.runtime-license-evidence.json",
             canonical_json=True,
         )
+    if args.vision_runtime_evidence is not None:
+        outputs["vision-runtime-evidence"] = export_copy(
+            args.vision_runtime_evidence,
+            args.output_dir / f"{prefix}.vision-runtime-evidence.json",
+            canonical_json=True,
+        )
+        assert args.vision_model_root is not None
+        for model in vision["models"]:
+            installed_path = model["installed_path"]
+            relative = installed_path.removeprefix(
+                "/usr/share/harboros-cat-vision-runtime/models/"
+            )
+            source = args.vision_model_root.joinpath(*PurePosixPath(relative).parts)
+            outputs[f"vision-model-{model['id']}"] = export_copy(
+                source,
+                args.output_dir
+                / f"{prefix}.vision-model.{model['id']}.{source.name}",
+            )
 
     checksum = args.output_dir / f"{args.artifact.name}.sha256"
     expected_checksum = f"{artifact_digest}  {args.artifact.name}\n"
@@ -1014,26 +1318,40 @@ def generate(args: argparse.Namespace) -> dict[str, Path]:
         installed.append(
             {
                 **identities["model-materials"],
-                "installed_path": "/usr/share/harboros-model-runtime/model-materials.json",
+                "installed_path": args.model_materials_installed_path,
             }
         )
     if "runtime-manifest" in identities:
         installed.append(
             {
                 **identities["runtime-manifest"],
-                "installed_path": "/usr/share/doc/harboros-model-runtime/runtime-manifest.json",
+                "installed_path": args.runtime_manifest_installed_path,
             }
         )
     if "runtime-license-evidence" in identities:
         installed.append(
             {
                 **identities["runtime-license-evidence"],
+                "installed_path": args.runtime_license_evidence_installed_path,
+            }
+        )
+    if "vision-runtime-evidence" in identities:
+        installed.append(
+            {
+                **identities["vision-runtime-evidence"],
                 "installed_path": (
-                    "/usr/share/doc/harboros-model-runtime/"
-                    "runtime-license-evidence.json"
+                    "/usr/share/doc/harboros-cat-vision-runtime/"
+                    "vision-runtime-evidence.json"
                 ),
             }
         )
+        for model in vision["models"]:
+            installed.append(
+                {
+                    **identities[f"vision-model-{model['id']}"],
+                    "installed_path": model["installed_path"],
+                }
+            )
     verify_installed_evidence(args.artifact, installed)
 
     descriptor = {
@@ -1054,7 +1372,12 @@ def generate(args: argparse.Namespace) -> dict[str, Path]:
                 "sbom-spdx",
                 "third-party-licenses",
             )
-        ],
+        ]
+        + (
+            [identities["vision-runtime-evidence"]]
+            if "vision-runtime-evidence" in identities
+            else []
+        ),
         "decision": decision,
         "installed_evidence": installed,
         "materials": [identities[kind] for kind in sorted(identities)],
@@ -1092,6 +1415,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--root-manifest", type=Path, required=True)
     parser.add_argument("--cargo-lock", type=Path, required=True)
     parser.add_argument("--cargo-metadata", type=Path, required=True)
+    parser.add_argument("--no-cargo-dependencies", action="store_true")
     parser.add_argument("--component-contract", type=Path, required=True)
     parser.add_argument("--component-contract-installed-path", required=True)
     parser.add_argument("--first-party-rights", type=Path, required=True)
@@ -1102,8 +1426,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--build-provenance", type=Path, required=True)
     parser.add_argument("--package-provenance", type=Path, required=True)
     parser.add_argument("--model-materials", type=Path)
+    parser.add_argument(
+        "--model-materials-installed-path",
+        default="/usr/share/harboros-model-runtime/model-materials.json",
+    )
     parser.add_argument("--runtime-manifest", type=Path)
+    parser.add_argument(
+        "--runtime-manifest-installed-path",
+        default="/usr/share/doc/harboros-model-runtime/runtime-manifest.json",
+    )
     parser.add_argument("--runtime-license-evidence", type=Path)
+    parser.add_argument(
+        "--runtime-license-evidence-installed-path",
+        default=(
+            "/usr/share/doc/harboros-model-runtime/runtime-license-evidence.json"
+        ),
+    )
+    parser.add_argument("--vision-runtime-evidence", type=Path)
+    parser.add_argument("--vision-model-root", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser.parse_args()
 

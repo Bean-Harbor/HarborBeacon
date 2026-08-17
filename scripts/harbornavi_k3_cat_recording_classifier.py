@@ -45,7 +45,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threshold", type=float, default=0.62)
     parser.add_argument("--ai-threads", type=int, default=4)
     parser.add_argument("--affinity", default="12;13;14;15")
-    parser.add_argument("--frame", action="append", required=True)
+    parser.add_argument("--frame", action="append", default=[])
+    parser.add_argument("--probe", action="store_true")
     return parser.parse_args()
 
 
@@ -210,15 +211,42 @@ def softmax_cat(logits: Any) -> float:
     return positive_exp / (negative_exp + positive_exp)
 
 
-def run(args: argparse.Namespace) -> dict[str, Any]:
-    if not 0.0 <= args.threshold <= 1.0:
-        raise ValueError("threshold must be between 0.0 and 1.0")
+def prepare_model(args: argparse.Namespace) -> tuple[Path, str]:
     model_path = args.model.resolve(strict=True)
     if not model_path.is_file():
         raise ValueError("model path must be a regular file")
     model_sha256 = sha256(model_path)
     if model_sha256 != args.expected_sha256.strip().lower():
         raise ValueError("model SHA256 mismatch")
+    return model_path, model_sha256
+
+
+def run_probe(args: argparse.Namespace) -> dict[str, Any]:
+    model_path, model_sha256 = prepare_model(args)
+    session: Any | None = None
+    try:
+        raise_if_stop_requested()
+        session, details = create_session(model_path, args.ai_threads, args.affinity)
+        raise_if_stop_requested()
+        return {
+            "schema_version": "1.0",
+            "status": "ok",
+            "provider": "SpaceMITExecutionProvider",
+            "model_name": MODEL_NAME,
+            "model_sha256": model_sha256,
+            "session_creation_ms": details["session_creation_ms"],
+        }
+    finally:
+        session = None
+        gc.collect()
+
+
+def run(args: argparse.Namespace) -> dict[str, Any]:
+    if getattr(args, "probe", False):
+        return run_probe(args)
+    if not 0.0 <= args.threshold <= 1.0:
+        raise ValueError("threshold must be between 0.0 and 1.0")
+    model_path, model_sha256 = prepare_model(args)
     frames = parse_frame_specs(args.frame)
     for _, frame_path in frames:
         size = frame_path.stat().st_size

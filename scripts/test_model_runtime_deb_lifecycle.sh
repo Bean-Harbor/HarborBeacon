@@ -17,10 +17,9 @@ work_root="$(mktemp -d /tmp/harbor-model-lifecycle.XXXXXX)"
 cleanup() {
   rm -rf -- "$work_root" /data/models
   rm -rf -- /usr/share/harboros-model-runtime /usr/lib/harboros-model-runtime
-  rm -f -- \
-    /usr/lib/systemd/system/harboros-model-runtime.service \
-    /usr/lib/systemd/system/harboros-vlm-runtime.service
+  rm -f -- /usr/lib/systemd/system/harboros-model-runtime.service
   rm -rf -- /run/harboros-model-runtime
+  rm -rf -- /run/harboros-k3-generation
   rmdir /run/systemd/system 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -37,23 +36,18 @@ done
 python3 -m py_compile "$work_root/root/usr/lib/harboros-model-runtime/verify-release"
 
 control="$work_root/control/control"
-for dependency in \
-  'llama.cpp-tools-spacemit (= 0.1.1)' \
-  'spacemit-onnxruntime (= 2.0.3+3)' \
-  'spacemit-tcm (= 3.0.0+3)'; do
-  grep -F -- "$dependency" "$control" >/dev/null
+depends_line="$(grep '^Depends:' "$control")"
+for forbidden in llama.cpp-tools-spacemit spacemit-onnxruntime spacemit-tcm; do
+  [[ "$depends_line" != *"$forbidden"* ]]
 done
-for unit in harboros-model-runtime.service harboros-vlm-runtime.service; do
-  test -f "$work_root/root/usr/lib/systemd/system/$unit"
-  grep -F -- "$unit" "$work_root/control/postinst" >/dev/null
-  grep -F -- "$unit" "$work_root/control/prerm" >/dev/null
-  grep -F -- 'ReadOnlyPaths=/data/models' \
-    "$work_root/root/usr/lib/systemd/system/$unit" >/dev/null
-done
+grep -Fx -- 'Conflicts: llama.cpp-tools-spacemit' "$control" >/dev/null
+test -f "$work_root/root/usr/lib/systemd/system/harboros-model-runtime.service"
+test ! -e "$work_root/root/usr/lib/systemd/system/harboros-vlm-runtime.service"
+! grep -R -F -- '127.0.0.1:8080' "$work_root/root" >/dev/null
+grep -F -- 'ReadOnlyPaths=/data/models' \
+  "$work_root/root/usr/lib/systemd/system/harboros-model-runtime.service" >/dev/null
 grep -F -- 'TimeoutStartSec=75' \
   "$work_root/root/usr/lib/systemd/system/harboros-model-runtime.service" >/dev/null
-grep -F -- 'TimeoutStartSec=315' \
-  "$work_root/root/usr/lib/systemd/system/harboros-vlm-runtime.service" >/dev/null
 
 package_version="$(dpkg-deb --field "$artifact" Version)"
 release_root="/data/models/releases/$package_version"
@@ -63,10 +57,9 @@ install -d /usr/share/harboros-model-runtime /usr/lib/harboros-model-runtime /us
 cp -a "$work_root/root/usr/share/harboros-model-runtime/." /usr/share/harboros-model-runtime/
 cp -a "$work_root/root/usr/lib/harboros-model-runtime/." /usr/lib/harboros-model-runtime/
 cp -a "$work_root/root/usr/lib/systemd/system/harboros-model-runtime.service" \
-  "$work_root/root/usr/lib/systemd/system/harboros-vlm-runtime.service" \
   /usr/lib/systemd/system/
 
-# Chroot-style configure installs both core units without attempting to start them.
+# Chroot-style configure installs the Candle unit without attempting to start it.
 "$work_root/control/postinst" configure
 test "$(readlink /data/models/current)" = "releases/$package_version"
 "$verifier" --manifest "$manifest" --root "$release_root"
@@ -132,6 +125,9 @@ rm -f -- /data/models/current.new
 
 mock_bin="$work_root/mock-bin"
 systemctl_log="$work_root/systemctl.log"
+beacon_state="$work_root/beacon.active"
+printf '%s\n' 0 > "$beacon_state"
+export HARBOR_TEST_BEACON_STATE="$beacon_state"
 install -d "$mock_bin" /run/systemd/system
 cat > "$mock_bin/systemctl" <<'SH'
 #!/bin/sh
@@ -141,16 +137,24 @@ case "${1:-}" in
   is-active)
     case "${3:-}" in
       harboros-model-runtime.service) [ "${HARBOR_TEST_MODEL_ACTIVE:-0}" = 1 ] ;;
-      harboros-vlm-runtime.service) [ "${HARBOR_TEST_VLM_ACTIVE:-0}" = 1 ] ;;
+      harboros-beacon.service) [ "$(cat "$HARBOR_TEST_BEACON_STATE")" = 1 ] ;;
       *) exit 3 ;;
     esac
     ;;
+  stop)
+    if [ "${2:-}" = harboros-beacon.service ]; then
+      printf '%s\n' 0 > "$HARBOR_TEST_BEACON_STATE"
+    fi
+    ;;
   restart)
-    if [ "${2:-}" = harboros-vlm-runtime.service ] \
-      && [ -n "${HARBOR_TEST_FAIL_VLM_ONCE:-}" ] \
-      && [ ! -e "$HARBOR_TEST_FAIL_VLM_ONCE" ]; then
-      : > "$HARBOR_TEST_FAIL_VLM_ONCE"
+    if [ "${2:-}" = harboros-model-runtime.service ] \
+      && [ -n "${HARBOR_TEST_FAIL_MODEL_ONCE:-}" ] \
+      && [ ! -e "$HARBOR_TEST_FAIL_MODEL_ONCE" ]; then
+      : > "$HARBOR_TEST_FAIL_MODEL_ONCE"
       exit 1
+    fi
+    if [ "${2:-}" = harboros-beacon.service ]; then
+      printf '%s\n' 1 > "$HARBOR_TEST_BEACON_STATE"
     fi
     ;;
 esac
@@ -158,20 +162,15 @@ exit 0
 SH
 chmod 0755 "$mock_bin/systemctl"
 
-# The actual prerm upgrade path must synchronously stop both units.
+# The actual prerm upgrade path must synchronously stop the Candle unit.
 : > "$systemctl_log"
 PATH="$mock_bin:$PATH" HARBOR_TEST_SYSTEMCTL_LOG="$systemctl_log" \
-  HARBOR_TEST_MODEL_ACTIVE=1 HARBOR_TEST_VLM_ACTIVE=0 \
+  HARBOR_TEST_MODEL_ACTIVE=1 \
   "$work_root/control/prerm" upgrade
-grep -Fx -- 'stop harboros-model-runtime.service harboros-vlm-runtime.service' \
+grep -Fx -- 'stop harboros-model-runtime.service' \
   "$systemctl_log" >/dev/null
 grep -Fx -- 'harboros-model-runtime.service' \
   /run/harboros-model-runtime/upgrade-active >/dev/null
-if grep -Fx -- 'harboros-vlm-runtime.service' \
-  /run/harboros-model-runtime/upgrade-active >/dev/null; then
-  echo "error: prerm recorded an inactive unit as active" >&2
-  exit 1
-fi
 
 # Failed startup restores the previous release/current and only units active before upgrade.
 install -d /data/models/releases/predecessor
@@ -180,14 +179,15 @@ rm -f -- /data/models/current
 ln -s releases/predecessor /data/models/current
 printf '%s\n' old-release > "$release_root/rollback.marker"
 : > "$systemctl_log"
-fail_once="$work_root/fail-vlm-once"
+fail_once="$work_root/fail-model-once"
 PATH="$mock_bin:$PATH" HARBOR_TEST_SYSTEMCTL_LOG="$systemctl_log" \
-  HARBOR_TEST_MODEL_ACTIVE=1 HARBOR_TEST_VLM_ACTIVE=0 \
+  HARBOR_TEST_MODEL_ACTIVE=1 \
   "$work_root/control/prerm" upgrade
+printf '%s\n' 1 > "$beacon_state"
 if PATH="$mock_bin:$PATH" \
   HARBOR_TEST_SYSTEMCTL_LOG="$systemctl_log" \
-  HARBOR_TEST_MODEL_ACTIVE=0 HARBOR_TEST_VLM_ACTIVE=0 \
-  HARBOR_TEST_FAIL_VLM_ONCE="$fail_once" \
+  HARBOR_TEST_MODEL_ACTIVE=0 \
+  HARBOR_TEST_FAIL_MODEL_ONCE="$fail_once" \
   "$work_root/control/postinst" configure; then
   echo "error: postinst ignored a core unit startup failure" >&2
   exit 1
@@ -195,10 +195,15 @@ fi
 test "$(readlink /data/models/current)" = releases/predecessor
 test "$(cat "$release_root/rollback.marker")" = old-release
 test ! -e /run/harboros-model-runtime/upgrade-active
+test "$(cat "$beacon_state")" = 0
+test "$(stat -c '%U:%G:%a:%s' /run/harboros-k3-generation/beacon-was-active)" = \
+  root:root:600:24
+test "$(cat /run/harboros-k3-generation/beacon-was-active)" = harboros-beacon.service
+beacon_stop_line="$(grep -n -m1 '^stop harboros-beacon.service$' "$systemctl_log" | cut -d: -f1)"
+model_restart_line="$(grep -n -m1 '^restart harboros-model-runtime.service$' "$systemctl_log" | cut -d: -f1)"
+test "$beacon_stop_line" -lt "$model_restart_line"
 model_restart_count="$(grep -Fc 'restart harboros-model-runtime.service' "$systemctl_log" || true)"
-vlm_restart_count="$(grep -Fc 'restart harboros-vlm-runtime.service' "$systemctl_log" || true)"
 test "$model_restart_count" = 2
-test "$vlm_restart_count" = 1
 test "$(tail -n 1 "$systemctl_log")" = 'restart harboros-model-runtime.service'
 
 # A post-move verification failure and TERM both restore the sole previous tree.
@@ -206,7 +211,7 @@ rm -f -- "$release_root/rollback.marker"
 rm -f -- "$fail_once"
 rm -f -- /run/harboros-model-runtime/upgrade-active
 PATH="$mock_bin:$PATH" HARBOR_TEST_SYSTEMCTL_LOG="$systemctl_log" \
-  HARBOR_TEST_MODEL_ACTIVE=0 HARBOR_TEST_VLM_ACTIVE=0 \
+  HARBOR_TEST_MODEL_ACTIVE=0 \
   "$work_root/control/postinst" configure
 cp -a "$verifier" "${verifier}.real"
 cat > "$verifier" <<'SH'
@@ -234,7 +239,7 @@ for fault in fail term; do
   count_file="$work_root/verify-$fault.count"
   if PATH="$mock_bin:$PATH" \
     HARBOR_TEST_SYSTEMCTL_LOG="$systemctl_log" \
-    HARBOR_TEST_MODEL_ACTIVE=0 HARBOR_TEST_VLM_ACTIVE=0 \
+    HARBOR_TEST_MODEL_ACTIVE=0 \
     HARBOR_TEST_VERIFY_COUNT="$count_file" HARBOR_TEST_VERIFY_FAULT="$fault" \
     "$work_root/control/postinst" configure; then
     echo "error: postinst ignored verifier $fault injection" >&2
@@ -281,13 +286,13 @@ chmod 0755 "$mock_bin/curl-success" "$mock_bin/curl-fail" \
 HARBOR_MODEL_HEALTH_CURL="$mock_bin/curl-success" \
   HARBOR_MODEL_HEALTH_SLEEP="$mock_bin/no-sleep" \
   HARBOR_TEST_HEALTH_COUNT="$health_count" \
-  /usr/lib/harboros-model-runtime/wait-health http://127.0.0.1:8080/health 30
+  /usr/lib/harboros-model-runtime/wait-health http://127.0.0.1:8792/healthz 30
 test "$(cat "$health_count")" = 3
 if HARBOR_MODEL_HEALTH_CURL="$mock_bin/curl-fail" \
   HARBOR_MODEL_HEALTH_DATE="$mock_bin/date-deadline" \
   HARBOR_MODEL_HEALTH_SLEEP="$mock_bin/no-sleep" \
   HARBOR_TEST_DATE_COUNT="$work_root/date.count" \
-  /usr/lib/harboros-model-runtime/wait-health http://127.0.0.1:8080/health 5; then
+  /usr/lib/harboros-model-runtime/wait-health http://127.0.0.1:8792/healthz 5; then
   echo "error: health helper ignored its deadline" >&2
   exit 1
 fi

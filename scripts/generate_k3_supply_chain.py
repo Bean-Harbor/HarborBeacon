@@ -243,10 +243,15 @@ def main() -> None:
     parser.add_argument("--binary", type=Path, action="append", required=True)
     parser.add_argument("--cargo-lock", type=Path, required=True)
     parser.add_argument("--cargo-metadata", type=Path, required=True)
+    parser.add_argument("--no-cargo-dependencies", action="store_true")
     parser.add_argument("--first-party-notice", type=Path, required=True)
     parser.add_argument("--materials", type=Path)
     parser.add_argument("--input-file", type=Path, action="append", default=[])
     parser.add_argument("--model-root", type=Path)
+    parser.add_argument(
+        "--model-installed-root",
+        default="/usr/share/harboros-model-runtime/models",
+    )
     parser.add_argument("--runtime-dependency", action="append", default=[])
     parser.add_argument("--version", required=True)
     parser.add_argument("--target", required=True)
@@ -296,11 +301,13 @@ def main() -> None:
         )
     root_purl = f"pkg:deb/{args.package}@{args.version}?arch={args.arch}"
     root_id = spdx_id(args.package, args.version)
-    components = cargo_components(
-        args.cargo_metadata,
-        args.cargo_lock.parent / "Cargo.toml",
-        args.cargo_lock,
-    )
+    components = []
+    if not args.no_cargo_dependencies:
+        components = cargo_components(
+            args.cargo_metadata,
+            args.cargo_lock.parent / "Cargo.toml",
+            args.cargo_lock,
+        )
     packages = [
         {
             "name": args.package,
@@ -391,11 +398,17 @@ def main() -> None:
     model_subjects = []
     model_components = []
     if args.model_root is not None:
+        if not args.model_installed_root.startswith("/") or ".." in Path(
+            args.model_installed_root
+        ).parts:
+            raise RuntimeError("model installed root must be an absolute safe path")
         for model_file in model_files:
             relative_name = model_file.relative_to(model_root).as_posix()
             model_digest = sha256(model_file)
             model_id = file_spdx_id(relative_name, model_digest)
-            package_model_name = f"usr/share/harboros-model-runtime/models/{relative_name}"
+            package_model_name = (
+                f"{args.model_installed_root.strip('/')}/{relative_name}"
+            )
             license_review = model_license_by_path.get(relative_name, {})
             declared_license = normalize_license_expression(
                 license_review.get("declared_license")

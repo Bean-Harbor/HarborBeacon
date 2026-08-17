@@ -10,6 +10,17 @@
       ],
       "id": "harboros.k3.beacon-edge-assertion",
       "version": 1
+    },
+    {
+      "capabilities": [
+        "cat-detection-orchestration",
+        "cat-query-cursor",
+        "cat-validation-publish-gate",
+        "cpu-yolov8-int8-trigger",
+        "fail-closed-cat-validation"
+      ],
+      "id": "harboros.k3.beacon-cat-activity",
+      "version": 1
     }
   ],
   "package": "harboros-beacon",

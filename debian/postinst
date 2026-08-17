@@ -1,5 +1,31 @@
 #!/bin/sh
-set -e
+set -eu
+
+generation_state_dir="/run/harboros-k3-generation"
+beacon_active_state="$generation_state_dir/beacon-was-active"
+
+validate_generation_state_dir() {
+  [ ! -L "$generation_state_dir" ] \
+    && [ -d "$generation_state_dir" ] \
+    && [ "$(stat -c %u "$generation_state_dir")" = 0 ] \
+    && [ "$(stat -c %a "$generation_state_dir")" = 700 ] || {
+    echo "error: unsafe Beacon generation state directory" >&2
+    exit 1
+  }
+}
+
+validate_beacon_active_state() {
+  validate_generation_state_dir
+  [ ! -L "$beacon_active_state" ] \
+    && [ -f "$beacon_active_state" ] \
+    && [ "$(stat -c %u "$beacon_active_state")" = 0 ] \
+    && [ "$(stat -c %a "$beacon_active_state")" = 600 ] \
+    && [ "$(stat -c %s "$beacon_active_state")" = 24 ] \
+    && [ "$(cat "$beacon_active_state")" = harboros-beacon.service ] || {
+    echo "error: unsafe Beacon generation active state: $beacon_active_state" >&2
+    exit 1
+  }
+}
 
 if ! getent group harborbeacon >/dev/null 2>&1; then
   addgroup --system harborbeacon
@@ -9,6 +35,7 @@ if ! id harborbeacon >/dev/null 2>&1; then
 fi
 
 /usr/lib/harborbeacon/ensure-data-layout /data/harborbeacon
+/usr/lib/harborbeacon/migrate-cat-activity-state
 
 if command -v deb-systemd-helper >/dev/null 2>&1; then
   deb-systemd-helper unmask harboros-beacon.service >/dev/null || true
@@ -17,7 +44,31 @@ fi
 
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   systemctl daemon-reload
-  systemctl try-restart harboros-beacon.service || true
+  if [ -e "$beacon_active_state" ] || [ -L "$beacon_active_state" ]; then
+    validate_beacon_active_state
+    beacon_version="$(dpkg-query -W -f='${Version}' harboros-beacon 2>/dev/null || true)"
+    [ -n "$beacon_version" ] || {
+      echo "error: unable to resolve the configuring Beacon generation" >&2
+      exit 1
+    }
+    for package in harboros-model-runtime harboros-cat-vision-runtime; do
+      installed="$(dpkg-query -W -f='${Status} ${Version}' "$package" 2>/dev/null || true)"
+      [ "$installed" = "install ok installed $beacon_version" ] || {
+        echo "error: $package is not the configured Beacon generation $beacon_version" >&2
+        exit 1
+      }
+    done
+    systemctl restart harboros-beacon.service
+    systemctl is-active --quiet harboros-beacon.service || {
+      echo "error: Beacon did not become active after generation upgrade" >&2
+      exit 1
+    }
+    rm -f -- "$beacon_active_state"
+    rmdir "$generation_state_dir" 2>/dev/null || true
+  elif systemctl is-active --quiet harboros-beacon.service; then
+    echo "error: Beacon is active without a generation upgrade marker" >&2
+    exit 1
+  fi
 fi
 
 exit 0

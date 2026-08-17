@@ -1,21 +1,12 @@
 {
   "package": "harboros-model-runtime",
-  "runtime_dependencies": [
-    "llama.cpp-tools-spacemit=0.1.1",
-    "spacemit-onnxruntime=2.0.3+3",
-    "spacemit-tcm=3.0.0+3"
-  ],
+  "runtime_dependencies": [],
   "schema_version": 1,
   "services": [
     {
       "bind": "127.0.0.1:8792",
       "health": "http://127.0.0.1:8792/healthz",
       "unit": "harboros-model-runtime.service"
-    },
-    {
-      "bind": "127.0.0.1:8080",
-      "health": "http://127.0.0.1:8080/health",
-      "unit": "harboros-vlm-runtime.service"
     }
   ],
   "source_commit": "SOURCE_COMMIT_PLACEHOLDER"

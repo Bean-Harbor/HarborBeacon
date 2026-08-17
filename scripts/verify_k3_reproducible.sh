@@ -6,7 +6,8 @@ component="${1:-beacon}"
 case "$component" in
   beacon) build_script="$repo_root/scripts/build_harbornavi_k3_deb.sh" ;;
   model-runtime) build_script="$repo_root/scripts/build_model_runtime_k3_deb.sh" ;;
-  *) echo "usage: $0 beacon|model-runtime" >&2; exit 2 ;;
+  cat-vision-runtime) build_script="$repo_root/scripts/build_cat_vision_runtime_k3_deb.sh" ;;
+  *) echo "usage: $0 beacon|model-runtime|cat-vision-runtime" >&2; exit 2 ;;
 esac
 
 work_root="$(mktemp -d "${TMPDIR:-/tmp}/harborbeacon-repro.XXXXXX")"

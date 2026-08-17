@@ -8,4 +8,5 @@ fi
 
 install -d -o harborbeacon -g harborbeacon -m 0750 \
   /data/harborbeacon \
-  /data/harborbeacon/events
+  /data/harborbeacon/events \
+  /data/harborbeacon/cat-activity

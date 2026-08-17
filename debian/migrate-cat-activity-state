@@ -1,0 +1,115 @@
+#!/bin/sh
+set -eu
+
+if [ "${HARBORBEACON_MIGRATION_TEST_MODE:-0}" = 1 ]; then
+  : "${HARBORBEACON_MIGRATION_TEST_ROOT:?test root is required}"
+  legacy_root="$HARBORBEACON_MIGRATION_TEST_ROOT/legacy"
+  target_root="$HARBORBEACON_MIGRATION_TEST_ROOT/target"
+  install -d -m 0750 "$legacy_root" "$target_root"
+else
+  legacy_root=/var/lib/harboros-beacon
+  target_root=/data/harborbeacon/cat-activity
+  install -d -o harborbeacon -g harborbeacon -m 0750 "$target_root"
+fi
+marker="$target_root/.legacy-state-migrated-v1"
+
+legacy_reconciliation="$legacy_root/cat-recording-reconciliation.json"
+target_reconciliation="$target_root/reconciliation.json"
+legacy_validations="$legacy_root/cat-recording-validations.jsonl"
+target_validations="$target_root/validations.jsonl"
+
+require_regular_or_absent() {
+  path=$1
+  if [ -L "$path" ] || { [ -e "$path" ] && [ ! -f "$path" ]; }; then
+    echo "error: cat activity state path is not a regular file: $path" >&2
+    exit 1
+  fi
+}
+
+for state_path in \
+  "$marker" \
+  "$legacy_reconciliation" \
+  "$target_reconciliation" \
+  "$legacy_validations" \
+  "$target_validations"; do
+  require_regular_or_absent "$state_path"
+done
+
+if [ -e "$marker" ]; then
+  if [ -s "$legacy_reconciliation" ] || [ -s "$legacy_validations" ]; then
+    echo "error: legacy cat activity state reappeared after migration" >&2
+    exit 1
+  fi
+  exit 0
+fi
+
+check_pair() {
+  legacy=$1
+  target=$2
+  if [ ! -s "$legacy" ] || [ ! -s "$target" ]; then
+    return 0
+  fi
+  if ! cmp -s "$legacy" "$target"; then
+    echo "error: conflicting cat activity state: $legacy and $target" >&2
+    exit 1
+  fi
+}
+
+check_pair "$legacy_reconciliation" "$target_reconciliation"
+check_pair "$legacy_validations" "$target_validations"
+
+stage_root="$target_root/.migration-stage.$$"
+install -d -m 0700 "$stage_root"
+committed_reconciliation=0
+committed_validations=0
+
+rollback() {
+  if [ "$committed_reconciliation" -eq 1 ]; then
+    rm -f "$target_reconciliation"
+  fi
+  if [ "$committed_validations" -eq 1 ]; then
+    rm -f "$target_validations"
+  fi
+  rm -f "$stage_root/reconciliation.json" "$stage_root/validations.jsonl"
+  rmdir "$stage_root" 2>/dev/null || true
+}
+trap rollback EXIT HUP INT TERM
+
+stage_pair() {
+  legacy=$1
+  target=$2
+  staged=$3
+  if [ -s "$legacy" ] && [ ! -s "$target" ]; then
+    cp "$legacy" "$staged"
+    chmod 0600 "$staged"
+    if [ "${HARBORBEACON_MIGRATION_TEST_MODE:-0}" != 1 ]; then
+      chown harborbeacon:harborbeacon "$staged"
+    fi
+  fi
+}
+
+stage_pair "$legacy_reconciliation" "$target_reconciliation" "$stage_root/reconciliation.json"
+stage_pair "$legacy_validations" "$target_validations" "$stage_root/validations.jsonl"
+
+if [ -e "$stage_root/reconciliation.json" ]; then
+  mv "$stage_root/reconciliation.json" "$target_reconciliation"
+  committed_reconciliation=1
+fi
+if [ -e "$stage_root/validations.jsonl" ]; then
+  mv "$stage_root/validations.jsonl" "$target_validations"
+  committed_validations=1
+fi
+
+check_pair "$legacy_reconciliation" "$target_reconciliation"
+check_pair "$legacy_validations" "$target_validations"
+
+rm -f "$legacy_reconciliation" "$legacy_validations"
+if [ "${HARBORBEACON_MIGRATION_TEST_MODE:-0}" = 1 ]; then
+  install -m 0600 /dev/null "$marker"
+else
+  install -o harborbeacon -g harborbeacon -m 0600 /dev/null "$marker"
+fi
+rmdir "$stage_root"
+trap - EXIT HUP INT TERM
+
+exit 0

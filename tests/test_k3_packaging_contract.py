@@ -22,6 +22,9 @@ class K3PackagingContractTests(unittest.TestCase):
             "debian/component-contract-model-runtime.json.in",
             "debian/model-runtime-manifest.json.in",
             "debian/model-runtime-third-party.json",
+            "debian/component-contract-cat-vision-runtime.json.in",
+            "debian/cat-vision-runtime-manifest.json.in",
+            "debian/cat-vision-runtime-evidence.json.in",
         ):
             path = ROOT / relative
             value = json.loads(path.read_text(encoding="utf-8"))
@@ -44,16 +47,22 @@ class K3PackagingContractTests(unittest.TestCase):
         model_review = module.model_license_review(
             ROOT / "models" / "k3-evt1-model-materials.json"
         )
-        self.assertEqual(model_review["total"], 5)
+        self.assertEqual(model_review["total"], 2)
         self.assertEqual(model_review["approved"], 2)
-        self.assertEqual(model_review["blocked"], 3)
+        self.assertEqual(model_review["blocked"], 0)
+        vision_review = module.model_license_review(
+            ROOT / "models" / "k3-evt1-cat-vision-materials.json"
+        )
+        self.assertEqual(vision_review["total"], 2)
+        self.assertEqual(vision_review["approved"], 0)
+        self.assertEqual(vision_review["blocked"], 2)
         runtime_review = module.runtime_license_review(
             ROOT / "debian" / "model-runtime-manifest.json.in",
             ROOT / "debian" / "model-runtime-third-party.json",
             "riscv64",
         )
         self.assertEqual(runtime_review["approved"], 0)
-        self.assertEqual(runtime_review["blocked"], 3)
+        self.assertEqual(runtime_review["blocked"], 0)
 
     def test_registry_license_declaration_is_bound_to_cargo_lock_checksum(self):
         script_path = ROOT / "scripts" / "generate_package_materials.py"
@@ -254,15 +263,65 @@ class K3PackagingContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "installed evidence is missing"):
             module.verify_installed_evidence_tar(payload(), [identity])
 
+    def test_cat_vision_evidence_verifier_binds_model_bytes(self):
+        script_path = ROOT / "scripts" / "verify_cat_vision_runtime_evidence.py"
+        spec = importlib.util.spec_from_file_location("verify_cat_vision_evidence", script_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        evidence = json.loads(
+            (ROOT / "debian" / "cat-vision-runtime-evidence.json.in").read_text(
+                encoding="utf-8"
+            )
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            expected = {}
+            for index, model in enumerate(evidence["models"]):
+                relative = model["installed_path"].removeprefix(
+                    module.MODEL_INSTALL_PREFIX
+                )
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(f"fixture-{index}".encode("ascii"))
+                digest = hashlib.sha256(target.read_bytes()).hexdigest()
+                model["size"] = target.stat().st_size
+                model["sha256"] = digest
+                expected[model["id"]] = (relative, target.stat().st_size, digest)
+            module.EXPECTED_MODELS = expected
+            evidence["source_commit"] = "a" * 40
+            evidence["package"] = {
+                "architecture": "riscv64",
+                "name": "harboros-cat-vision-runtime",
+                "version": "1.0",
+            }
+            evidence_path = root / "evidence.json"
+            evidence_path.write_bytes(module.canonical_bytes(evidence))
+            module.verify(evidence_path, root, "1.0", "riscv64")
+            first = root / next(iter(expected.values()))[0]
+            first.write_bytes(b"tampered")
+            with self.assertRaisesRegex(ValueError, "bytes differ"):
+                module.verify(evidence_path, root, "1.0", "riscv64")
+
     def test_maintainer_and_runtime_shell_scripts_parse(self):
         shell = shutil.which("sh")
         if shell is None:
             self.skipTest("POSIX sh is not available on this host")
         for relative in (
+            "debian/postinst",
+            "debian/prerm",
             "debian/ensure-model-runtime-data-layout",
             "debian/model-runtime-postinst",
             "debian/model-runtime-prerm",
             "debian/wait-model-runtime-health",
+            "debian/ensure-cat-vision-runtime-data-layout",
+            "debian/cat-vision-runtime-postinst",
+            "debian/cat-vision-runtime-prerm",
+            "scripts/build_cat_vision_runtime_k3_deb.sh",
+            "scripts/build_cat_vision_runtime_lifecycle_fixture.sh",
+            "scripts/test_cat_vision_runtime_deb_lifecycle.sh",
+            "scripts/test_k3_generation_upgrade_order.sh",
             "scripts/run_k3_materials_ab_in_container.sh",
         ):
             subprocess.run(
@@ -281,7 +340,7 @@ class K3PackagingContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         for evidence in (
             '"$work_root/control/prerm" upgrade',
-            "HARBOR_TEST_FAIL_VLM_ONCE",
+            "HARBOR_TEST_FAIL_MODEL_ONCE",
             "HARBOR_TEST_VERIFY_FAULT",
             "kill -TERM \"$PPID\"",
             "runuser -u harbormodel",
@@ -290,6 +349,35 @@ class K3PackagingContractTests(unittest.TestCase):
         ):
             self.assertIn(evidence, lifecycle)
         self.assertIn("dpkg-deb --root-owner-group --build", fixture)
+        vision_lifecycle = (
+            ROOT / "scripts" / "test_cat_vision_runtime_deb_lifecycle.sh"
+        ).read_text(encoding="utf-8")
+        vision_fixture = (
+            ROOT / "scripts" / "build_cat_vision_runtime_lifecycle_fixture.sh"
+        ).read_text(encoding="utf-8")
+        for evidence in (
+            "/data/vision-models/current",
+            "/run/harboros-k3-generation/beacon-was-active",
+            "stop harboros-beacon.service",
+            "root:root:600:24",
+            "HARBOR_TEST_VERIFY_FAULT",
+            'kill -TERM "$PPID"',
+            "unexpected-empty-directory",
+        ):
+            self.assertIn(evidence, vision_lifecycle)
+        self.assertIn("dpkg-deb --root-owner-group --build", vision_fixture)
+        generation_lifecycle = (
+            ROOT / "scripts" / "test_k3_generation_upgrade_order.sh"
+        ).read_text(encoding="utf-8")
+        for evidence in (
+            "root:root:600:24",
+            "Beacon was active during cat-activity migration",
+            "HARBOR_TEST_VISION_GENERATION",
+            "HARBOR_TEST_MIGRATE_FAIL",
+            "Restoring the exact three-package generation",
+            "previously inactive Beacon remains inactive",
+        ):
+            self.assertIn(evidence, generation_lifecycle)
 
     def test_beacon_service_uses_system_owned_credentials_fail_closed(self):
         unit = (ROOT / "debian" / "harboros-beacon.service").read_text(
@@ -311,8 +399,18 @@ class K3PackagingContractTests(unittest.TestCase):
         )
         self.assertNotIn("/etc/harborlink/local-api.token", unit)
         postinst = (ROOT / "debian" / "postinst").read_text(encoding="utf-8")
+        prerm = (ROOT / "debian" / "prerm").read_text(encoding="utf-8")
         self.assertNotIn("/etc/default/harboros-beacon", postinst)
         self.assertNotIn("append_env_if_missing", postinst)
+        self.assertIn("/usr/lib/harborbeacon/migrate-cat-activity-state", postinst)
+        self.assertIn('generation_state_dir="/run/harboros-k3-generation"', postinst)
+        self.assertIn('beacon_active_state="$generation_state_dir/beacon-was-active"', postinst)
+        self.assertIn('dpkg-query -W -f=\'${Status} ${Version}\'', postinst)
+        self.assertIn("systemctl restart harboros-beacon.service", postinst)
+        self.assertIn("upgrade|deconfigure", prerm)
+        self.assertIn("install -d -o root -g root -m 0700", prerm)
+        self.assertIn("chmod 0600", prerm)
+        self.assertIn("systemctl stop harboros-beacon.service", prerm)
         self.assertIn(
             "LoadCredential=harbor-edge-assertion-key:/data/harboros/secrets/edge-assertion.key",
             unit,
@@ -331,10 +429,11 @@ class K3PackagingContractTests(unittest.TestCase):
         for package in (
             "harboros-system",
             "harborlink",
-            "harboros-model-runtime",
         ):
             self.assertIn(f"{package} (>= 0.1.0~evt.1)", build)
             self.assertIn(f"{package} (<< 0.2)", build)
+        for package in ("harboros-model-runtime", "harboros-cat-vision-runtime"):
+            self.assertIn(f"{package} (= ${{DEBIAN_VERSION}})", build)
 
     def test_component_contract_paths_do_not_collide(self):
         beacon_build = (ROOT / "scripts" / "build_harbornavi_k3_deb.sh").read_text(
@@ -343,6 +442,9 @@ class K3PackagingContractTests(unittest.TestCase):
         model_build = (ROOT / "scripts" / "build_model_runtime_k3_deb.sh").read_text(
             encoding="utf-8"
         )
+        vision_build = (
+            ROOT / "scripts" / "build_cat_vision_runtime_k3_deb.sh"
+        ).read_text(encoding="utf-8")
         beacon_contract = (
             ROOT / "debian" / "component-contract-beacon.json.in"
         ).read_text(encoding="utf-8")
@@ -354,6 +456,10 @@ class K3PackagingContractTests(unittest.TestCase):
         self.assertNotIn(
             '"$pkg_dir/usr/share/harboros/component-contract.json"', model_build
         )
+        self.assertIn(
+            "usr/share/harboros/component-contracts/harboros-cat-vision-runtime.json",
+            vision_build,
+        )
         model_contract = (
             ROOT / "debian" / "component-contract-model-runtime.json.in"
         ).read_text(encoding="utf-8")
@@ -362,13 +468,32 @@ class K3PackagingContractTests(unittest.TestCase):
             {"contracts", "package", "schema_version", "source_commit"},
         )
         for capability in (
+            "candle-only",
+            "jina-embeddings-v2",
             "lazy-model-loading",
-            "loopback-only",
+            "loopback-8792-only",
+            "qwen2.5-0.5b-instruct",
             "signed-model-materials",
         ):
             self.assertIn(capability, model_contract)
         self.assertNotIn('"lazy-model-load"', model_contract)
         self.assertNotIn('"signed-package-only"', model_contract)
+        vision_contract = json.loads(
+            (ROOT / "debian" / "component-contract-cat-vision-runtime.json.in").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(vision_contract["package"], "harboros-cat-vision-runtime")
+        self.assertEqual(
+            vision_contract["contracts"][0]["capabilities"],
+            [
+                "bounded-fixed-function-inference",
+                "cat-yolov8-int8-materials",
+                "no-network-listener",
+                "signed-vision-materials",
+                "spacemit-mobilenet-provider",
+            ],
+        )
         for capability in (
             "hmac-sha256",
             "loopback-only",
@@ -377,6 +502,35 @@ class K3PackagingContractTests(unittest.TestCase):
             "role-trusted-lan",
         ):
             self.assertIn(capability, beacon_contract)
+        beacon_contracts = {
+            contract["id"]: contract
+            for contract in json.loads(beacon_contract)["contracts"]
+        }
+        self.assertEqual(
+            beacon_contracts["harboros.k3.beacon-cat-activity"]["capabilities"],
+            [
+                "cat-detection-orchestration",
+                "cat-query-cursor",
+                "cat-validation-publish-gate",
+                "cpu-yolov8-int8-trigger",
+                "fail-closed-cat-validation",
+            ],
+        )
+
+    def test_evt1_yolo_trigger_is_cpu_only(self):
+        unit = (ROOT / "debian" / "harboros-beacon.service").read_text(
+            encoding="utf-8"
+        )
+        admin = (ROOT / "src" / "bin" / "agent_hub_admin_api.rs").read_text(
+            encoding="utf-8"
+        )
+        worker = (ROOT / "scripts" / "harbornavi_k3_yolo_stream_worker.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("Environment=HARBOR_K3_YOLO_PROVIDER=cpu", unit)
+        self.assertIn('if provider == "cpu"', admin)
+        self.assertIn('choices=["cpu"]', worker)
+        self.assertNotIn('args.provider == "spacemit"', worker)
 
     def test_external_profile_fails_startup_without_edge_key_file(self):
         service = (ROOT / "src" / "bin" / "harborbeacon_service.rs").read_text(
@@ -408,70 +562,67 @@ class K3PackagingContractTests(unittest.TestCase):
         self.assertIn("harboros-system (>= 0.1.0~evt.1)", control)
         self.assertIn("harboros-system (<< 0.2)", control)
 
-    def test_k3_event_vlm_is_loopback_only_and_fully_pinned(self):
-        vlm_unit = (ROOT / "debian" / "harboros-vlm-runtime.service").read_text(
-            encoding="utf-8"
-        )
-        beacon_unit = (ROOT / "debian" / "harboros-beacon.service").read_text(
-            encoding="utf-8"
-        )
+    def test_model_and_cat_vision_runtime_topology_is_split_and_pinned(self):
         control = (ROOT / "debian" / "model-runtime-control.in").read_text(
             encoding="utf-8"
         )
         build = (ROOT / "scripts" / "build_model_runtime_k3_deb.sh").read_text(
             encoding="utf-8"
         )
+        vision_control = (
+            ROOT / "debian" / "cat-vision-runtime-control.in"
+        ).read_text(encoding="utf-8")
+        vision_build = (
+            ROOT / "scripts" / "build_cat_vision_runtime_k3_deb.sh"
+        ).read_text(encoding="utf-8")
         runtime_manifest = json.loads(
             (ROOT / "debian" / "model-runtime-manifest.json.in").read_text(
                 encoding="utf-8"
             )
         )
-
-        self.assertIn("--host 127.0.0.1 --port 8080", vlm_unit)
-        self.assertIn("--vision-backend smt", vlm_unit)
-        self.assertIn("--ctx-size 4096 -t 8 -tb 8", vlm_unit)
-        self.assertIn("--no-warmup", vlm_unit)
-        self.assertIn("Environment=OMP_NUM_THREADS=8", vlm_unit)
-        self.assertIn("LimitNOFILE=1048576", vlm_unit)
-        self.assertNotIn("taskset", vlm_unit)
-        self.assertNotIn("--media-path", vlm_unit)
-        self.assertIn("ReadOnlyPaths=/data/models", vlm_unit)
-        self.assertIn(
-            "ExecStartPost=/usr/lib/harboros-model-runtime/wait-health "
-            "http://127.0.0.1:8080/health 300",
-            vlm_unit,
+        self.assertEqual(runtime_manifest["runtime_dependencies"], [])
+        self.assertEqual(
+            runtime_manifest["services"],
+            [
+                {
+                    "bind": "127.0.0.1:8792",
+                    "health": "http://127.0.0.1:8792/healthz",
+                    "unit": "harboros-model-runtime.service",
+                }
+            ],
         )
-        self.assertIn("TimeoutStartSec=315", vlm_unit)
-        self.assertNotIn("0.0.0.0", vlm_unit)
-        self.assertIn("HARBORNAVI_VLM_API_BASE=http://127.0.0.1:8080/v1", beacon_unit)
-        self.assertIn("harboros-vlm-runtime.service", beacon_unit)
+        for forbidden in (
+            "llama.cpp-tools-spacemit",
+            "spacemit-onnxruntime",
+            "spacemit-tcm",
+            "harboros-vlm-runtime.service",
+            "127.0.0.1:8080",
+        ):
+            self.assertNotIn(
+                forbidden,
+                next(line for line in control.splitlines() if line.startswith("Depends:")),
+            )
+            self.assertNotIn(forbidden, build)
+        self.assertIn("Conflicts: llama.cpp-tools-spacemit", control)
+        self.assertFalse((ROOT / "debian" / "harboros-vlm-runtime.service").exists())
 
         exact_dependencies = (
-            "llama.cpp-tools-spacemit (= 0.1.1)",
+            "python3-spacemit-ort (= 2.0.3+3)",
             "spacemit-onnxruntime (= 2.0.3+3)",
             "spacemit-tcm (= 3.0.0+3)",
         )
         build_dependencies = (
-            "llama.cpp-tools-spacemit=0.1.1",
+            "python3-spacemit-ort=2.0.3+3",
             "spacemit-onnxruntime=2.0.3+3",
             "spacemit-tcm=3.0.0+3",
         )
         for dependency in exact_dependencies:
-            self.assertIn(dependency, control)
+            self.assertIn(dependency, vision_control)
         for dependency in build_dependencies:
-            self.assertIn(dependency, build)
-
-        services = {
-            service["unit"]: service for service in runtime_manifest["services"]
-        }
-        self.assertEqual(
-            services["harboros-model-runtime.service"]["health"],
-            "http://127.0.0.1:8792/healthz",
-        )
-        self.assertEqual(
-            services["harboros-vlm-runtime.service"]["health"],
-            "http://127.0.0.1:8080/health",
-        )
+            self.assertIn(dependency, vision_build)
+        self.assertNotIn("llama.cpp-tools-spacemit", vision_control)
+        self.assertNotIn("systemd/system", vision_build)
+        self.assertNotIn("ExecStart=", vision_build)
 
     def test_model_release_install_is_root_owned_atomic_and_manifest_verified(self):
         postinst = (ROOT / "debian" / "model-runtime-postinst").read_text(
@@ -498,13 +649,12 @@ class K3PackagingContractTests(unittest.TestCase):
         self.assertIn("mv -Tf /data/models/current.new /data/models/current", postinst)
         self.assertNotIn("chown -R harbormodel", postinst)
         self.assertIn("systemctl restart harboros-model-runtime.service", postinst)
-        self.assertIn("systemctl restart harboros-vlm-runtime.service", postinst)
+        self.assertNotIn("systemctl restart harboros-vlm-runtime.service", postinst)
+        self.assertIn("systemctl disable --now harboros-vlm-runtime.service", postinst)
+        self.assertIn("retired VLM unit is still active", postinst)
         self.assertIn("remove|upgrade|deconfigure", prerm)
-        self.assertIn(
-            "systemctl stop harboros-model-runtime.service "
-            "harboros-vlm-runtime.service",
-            prerm,
-        )
+        self.assertIn("systemctl stop harboros-model-runtime.service", prerm)
+        self.assertNotIn("harboros-vlm-runtime.service", prerm)
         self.assertIn("install -d -o root -g root -m 0755", layout)
         self.assertIn("ReadOnlyPaths=/data/models", model_unit)
         self.assertIn("ReadWritePaths=/data/models/cache", model_unit)
@@ -515,14 +665,22 @@ class K3PackagingContractTests(unittest.TestCase):
         self.assertIn("/run/harboros-model-runtime/upgrade-active", postinst)
         self.assertIn("/run/harboros-model-runtime", prerm)
         self.assertIn("systemctl is-active --quiet harboros-model-runtime.service", postinst)
-        self.assertIn("systemctl is-active --quiet harboros-vlm-runtime.service", postinst)
+        self.assertIn('generation_state_dir="/run/harboros-k3-generation"', postinst)
+        self.assertIn('beacon_active_state="$generation_state_dir/beacon-was-active"', postinst)
+        self.assertLess(
+            postinst.index("  stop_beacon_for_generation_change\n"),
+            postinst.index(
+                "/usr/lib/harboros-model-runtime/ensure-data-layout /data/models"
+            ),
+        )
+        self.assertNotIn("vlm_was_active", postinst)
         self.assertIn('mv -- "$backup_root" "$release_root"', postinst)
         self.assertIn("os.lstat", verifier)
         self.assertIn("followlinks=False", verifier)
         self.assertIn("unexpected file:", verifier)
         self.assertIn("SHA256 mismatch:", verifier)
 
-    def test_model_manifest_locks_only_selected_vlm_resolution(self):
+    def test_model_and_cat_vision_manifests_have_disjoint_materials(self):
         manifest = json.loads(
             (ROOT / "models" / "k3-evt1-model-materials.json").read_text(
                 encoding="utf-8"
@@ -534,12 +692,8 @@ class K3PackagingContractTests(unittest.TestCase):
             for material in manifest["materials"]
             for file_entry in material["files"]
         ]
-        self.assertEqual(len(paths), 11)
-        self.assertIn(
-            "vlm/Qwen3.5-0.8B/qwen3_5vl_0.8b-vision-384-op23.f16.onnx",
-            paths,
-        )
-        self.assertFalse(any("vision-224" in path or "vision-768" in path for path in paths))
+        self.assertEqual(len(paths), 6)
+        self.assertFalse(any(path.startswith(("detection/", "vlm/")) for path in paths))
         self.assertTrue(
             all(
                 isinstance(file_entry["size"], int)
@@ -557,9 +711,44 @@ class K3PackagingContractTests(unittest.TestCase):
             reviews["rag-embedding-model"]["declared_license"],
             "Apache-2.0",
         )
+        vision_manifest = json.loads(
+            (ROOT / "models" / "k3-evt1-cat-vision-materials.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        vision_paths = [
+            file_entry["package_path"]
+            for material in vision_manifest["materials"]
+            for file_entry in material["files"]
+        ]
         self.assertEqual(
-            reviews["event-vlm-qwen3.5-0.8b-384"]["review_status"],
-            "blocked",
+            vision_paths,
+            ["detection/yolov8n_192x320.q.onnx", "detection/label.txt"],
+        )
+        self.assertTrue(
+            all(
+                material["license"]["review_status"] == "blocked"
+                for material in vision_manifest["materials"]
+            )
+        )
+        evidence = json.loads(
+            (ROOT / "debian" / "cat-vision-runtime-evidence.json.in").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(evidence["kind"], "vision-runtime-evidence")
+        self.assertEqual(evidence["model_release_root"], "/data/vision-models")
+        self.assertEqual(evidence["decision"]["status"], "blocked")
+        self.assertFalse(evidence["decision"]["release_eligible"])
+        self.assertEqual(len(evidence["models"]), 2)
+        self.assertTrue(all(model["source_archive"] is None for model in evidence["models"]))
+        self.assertEqual(
+            {item["name"]: item["version"] for item in evidence["runtime_packages"]},
+            {
+                "python3-spacemit-ort": "2.0.3+3",
+                "spacemit-onnxruntime": "2.0.3+3",
+                "spacemit-tcm": "3.0.0+3",
+            },
         )
 
         workflow = (ROOT / ".github" / "workflows" / "k3-evt-package.yml").read_text(
@@ -593,6 +782,12 @@ class K3PackagingContractTests(unittest.TestCase):
                 "usr/lib/harboros-model-runtime/ensure-data-layout",
                 "scripts/build_model_runtime_k3_deb.sh",
             ),
+            (
+                "debian/ensure-cat-vision-runtime-data-layout",
+                "/data/vision-models",
+                "usr/lib/harboros-cat-vision-runtime/ensure-data-layout",
+                "scripts/build_cat_vision_runtime_k3_deb.sh",
+            ),
         ]
         for helper_path, root, installed_path, build_path in cases:
             helper = (ROOT / helper_path).read_text(encoding="utf-8")
@@ -605,6 +800,7 @@ class K3PackagingContractTests(unittest.TestCase):
         for script_name in (
             "scripts/build_harbornavi_k3_deb.sh",
             "scripts/build_model_runtime_k3_deb.sh",
+            "scripts/build_cat_vision_runtime_k3_deb.sh",
         ):
             script = (ROOT / script_name).read_text(encoding="utf-8")
             self.assertIn("git status --porcelain --untracked-files=all", script)
@@ -628,9 +824,10 @@ class K3PackagingContractTests(unittest.TestCase):
             self.assertIn("release-materials", (
                 ROOT / "scripts" / "generate_package_materials.py"
             ).read_text(encoding="utf-8"))
-            self.assertIn(
-                "--remap-path-prefix=${cargo_target_dir}=./target", script
-            )
+            if "cat_vision" not in script_name:
+                self.assertIn(
+                    "--remap-path-prefix=${cargo_target_dir}=./target", script
+                )
 
         reproducible = (ROOT / "scripts" / "verify_k3_reproducible.sh").read_text(
             encoding="utf-8"
@@ -645,6 +842,7 @@ class K3PackagingContractTests(unittest.TestCase):
         self.assertIn('parser.add_argument("--debian-snapshot", required=True)', supply_chain)
         self.assertIn('parser.add_argument("--cargo-metadata", type=Path, required=True)', supply_chain)
         self.assertIn('parser.add_argument("--model-root", type=Path)', supply_chain)
+        self.assertIn('"--model-installed-root"', supply_chain)
         self.assertIn('parser.add_argument("--input-file", type=Path', supply_chain)
         self.assertIn('parser.add_argument("--runtime-dependency"', supply_chain)
         self.assertIn('"relationshipType": "CONTAINS"', supply_chain)
@@ -680,6 +878,54 @@ class K3PackagingContractTests(unittest.TestCase):
         self.assertIn("diff --no-dereference --recursive", driver)
         self.assertIn("root-a", driver)
         self.assertIn("root-b", driver)
+        self.assertIn("cat-vision-runtime", driver)
+
+    def test_partial_upgrade_and_vision_installed_evidence_are_fail_closed(self):
+        model_control = (ROOT / "debian" / "model-runtime-control.in").read_text(
+            encoding="utf-8"
+        )
+        vision_control = (
+            ROOT / "debian" / "cat-vision-runtime-control.in"
+        ).read_text(encoding="utf-8")
+        for control in (model_control, vision_control):
+            self.assertIn("harboros-beacon (<< VERSION_PLACEHOLDER)", control)
+            self.assertIn("harboros-beacon (>> VERSION_PLACEHOLDER)", control)
+        vision_build = (
+            ROOT / "scripts" / "build_cat_vision_runtime_k3_deb.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "/usr/share/doc/harboros-cat-vision-runtime/vision-runtime-evidence.json",
+            vision_build,
+        )
+        self.assertIn("--vision-runtime-evidence", vision_build)
+        self.assertIn("--vision-model-root", vision_build)
+        self.assertIn(
+            "--model-installed-root /usr/share/harboros-cat-vision-runtime/models",
+            vision_build,
+        )
+        materials = (ROOT / "scripts" / "generate_package_materials.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"vision-runtime-evidence"', materials)
+        self.assertIn('f"vision-model-{model[\'id\']}"', materials)
+        self.assertIn("verify_installed_evidence(args.artifact, installed)", materials)
+        postinst = (
+            ROOT / "debian" / "cat-vision-runtime-postinst"
+        ).read_text(encoding="utf-8")
+        self.assertIn("/data/vision-models/releases/VERSION_PLACEHOLDER", postinst)
+        self.assertIn("mv -Tf /data/vision-models/current.new", postinst)
+        self.assertIn('mv -- "$backup_root" "$release_root"', postinst)
+        self.assertIn('generation_state_dir="/run/harboros-k3-generation"', postinst)
+        self.assertIn('beacon_active_state="$generation_state_dir/beacon-was-active"', postinst)
+        self.assertIn("systemctl stop harboros-beacon.service", postinst)
+        self.assertNotIn("systemctl restart harboros-beacon.service", postinst)
+        self.assertLess(
+            postinst.index("  stop_beacon_for_generation_change\n"),
+            postinst.index(
+                "/usr/lib/harboros-cat-vision-runtime/ensure-data-layout "
+                "/data/vision-models"
+            ),
+        )
 
     def test_obsolete_public_release_path_is_fail_closed(self):
         workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(

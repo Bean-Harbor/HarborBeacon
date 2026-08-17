@@ -87,10 +87,17 @@ jobs:
           bash scripts/build_model_runtime_lifecycle_fixture.sh /tmp/harbor-model-runtime-lifecycle.deb
           HARBOR_MODEL_LIFECYCLE_DISPOSABLE=1 \
             bash scripts/test_model_runtime_deb_lifecycle.sh /tmp/harbor-model-runtime-lifecycle.deb
+          bash scripts/build_cat_vision_runtime_lifecycle_fixture.sh /tmp/harbor-cat-vision-runtime-lifecycle.deb
+          HARBOR_CAT_VISION_LIFECYCLE_DISPOSABLE=1 \
+            bash scripts/test_cat_vision_runtime_deb_lifecycle.sh /tmp/harbor-cat-vision-runtime-lifecycle.deb
+          HARBOR_GENERATION_LIFECYCLE_DISPOSABLE=1 \
+            bash scripts/test_k3_generation_upgrade_order.sh
       - name: Verify the immutable model material lock
         run: |
           python3 scripts/validate_k3_model_materials.py \
             --manifest models/k3-evt1-model-materials.json
+          python3 scripts/validate_k3_model_materials.py \
+            --manifest models/k3-evt1-cat-vision-materials.json
 
   model-runtime-riscv64:
     if: ${{ false }}
@@ -99,3 +106,11 @@ jobs:
     # CI verifies the lock but never downloads or republishes model materials.
     steps:
       - run: echo "model runtime packages require the controlled immutable bundle"
+
+  cat-vision-runtime-riscv64:
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    # The qualification builder supplies licensed, checksum-locked model bytes
+    # and APT provenance. Public CI must not publish the blocked vision package.
+    steps:
+      - run: echo "cat vision runtime requires controlled evidence and model bytes"

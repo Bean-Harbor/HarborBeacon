@@ -1,56 +1,7 @@
 {
   "architecture": "riscv64",
-  "packages": [
-    {
-      "artifact": {
-        "filename": "llama.cpp-tools-spacemit_0.1.1_riscv64.deb",
-        "sha256": "8baa099a7a6e8f1048622deef233305cd72b346df825506d0f76069105c51421"
-      },
-      "blocking_reason": "The package copyright file marks most payload files as __NO_COPYRIGHT_NOR_LICENSE__, skips the principal binaries and libraries, and retains placeholder upstream metadata.",
-      "concluded_license": "NOASSERTION",
-      "copyright_file": {
-        "installed_path": "/usr/share/doc/llama.cpp-tools-spacemit/copyright",
-        "sha256": "607ee89a467945300d9653e4d65b675d3548b2ac9e3f1f704427873126315b0a"
-      },
-      "declared_license": "NOASSERTION",
-      "name": "llama.cpp-tools-spacemit",
-      "review_status": "blocked",
-      "version": "0.1.1"
-    },
-    {
-      "artifact": {
-        "filename": "spacemit-onnxruntime_2.0.3+3_riscv64.deb",
-        "sha256": "b69cfc955af1ac15abf61f4915a8d5e68c50d20d38451d640d98b4b189da8472"
-      },
-      "blocking_reason": "The package copyright file covers only repository metadata, declares __NO_COPYRIGHT_NOR_LICENSE__, and retains placeholder upstream metadata rather than licensing the shipped runtime payload.",
-      "concluded_license": "NOASSERTION",
-      "copyright_file": {
-        "installed_path": "/usr/share/doc/spacemit-onnxruntime/copyright",
-        "sha256": "de3e277514b725dd7ea8e481067338850276a662f59a5f88dfc61b65a2859a69"
-      },
-      "declared_license": "NOASSERTION",
-      "name": "spacemit-onnxruntime",
-      "review_status": "blocked",
-      "version": "2.0.3+3"
-    },
-    {
-      "artifact": {
-        "filename": "spacemit-tcm_3.0.0+3_riscv64.deb",
-        "sha256": "2763b8946791f47fd20d4bda55e3680c3548e7a6893e605e30e1cbb4455f5fa5"
-      },
-      "blocking_reason": "The package copyright file covers only README.md, declares __NO_COPYRIGHT_NOR_LICENSE__, and retains placeholder upstream metadata rather than licensing the shipped TCM payload.",
-      "concluded_license": "NOASSERTION",
-      "copyright_file": {
-        "installed_path": "/usr/share/doc/spacemit-tcm/copyright",
-        "sha256": "c5ae5de0b80538d412001b735d05442650c78a1f44d4dfed61da530d5ffa5311"
-      },
-      "declared_license": "NOASSERTION",
-      "name": "spacemit-tcm",
-      "review_status": "blocked",
-      "version": "3.0.0+3"
-    }
-  ],
-  "repository": "https://ppa.launchpadcontent.net/spacemit/k3/ubuntu",
+  "packages": [],
+  "repository": "https://github.com/Bean-Harbor/HarborBeacon",
   "schema_version": 1,
-  "suite": "resolute"
+  "suite": "source"
 }

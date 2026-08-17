@@ -79,8 +79,6 @@ install -m 0755 debian/wait-model-runtime-health \
   "$pkg_dir/usr/lib/harboros-model-runtime/wait-health"
 install -m 0644 debian/harboros-model-runtime.service \
   "$pkg_dir/usr/lib/systemd/system/harboros-model-runtime.service"
-install -m 0644 debian/harboros-vlm-runtime.service \
-  "$pkg_dir/usr/lib/systemd/system/harboros-vlm-runtime.service"
 sed -e "s/VERSION_PLACEHOLDER/${DEBIAN_VERSION}/g" \
   -e "s/ARCH_PLACEHOLDER/${deb_arch}/g" \
   debian/model-runtime-control.in > "$pkg_dir/DEBIAN/control"
@@ -122,7 +120,6 @@ python3 scripts/generate_k3_supply_chain.py \
   --input-file "$repo_root/debian/ensure-model-runtime-data-layout" \
   --input-file "$repo_root/debian/wait-model-runtime-health" \
   --input-file "$repo_root/debian/harboros-model-runtime.service" \
-  --input-file "$repo_root/debian/harboros-vlm-runtime.service" \
   --input-file "$repo_root/debian/component-contract-model-runtime.json.in" \
   --input-file "$repo_root/debian/model-runtime-manifest.json.in" \
   --input-file "$repo_root/debian/model-runtime-third-party.json" \
@@ -130,9 +127,6 @@ python3 scripts/generate_k3_supply_chain.py \
   --input-file "$repo_root/debian/FIRST_PARTY_RIGHTS.txt" \
   --input-file "$repo_root/scripts/verify_k3_model_release.py" \
   --model-root "$model_stage" \
-  --runtime-dependency "llama.cpp-tools-spacemit=0.1.1" \
-  --runtime-dependency "spacemit-onnxruntime=2.0.3+3" \
-  --runtime-dependency "spacemit-tcm=3.0.0+3" \
   --binary "$pkg_dir/usr/bin/harbor-model-api" \
   --version "$DEBIAN_VERSION" \
   --target "$target" \

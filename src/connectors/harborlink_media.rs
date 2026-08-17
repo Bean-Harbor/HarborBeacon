@@ -266,6 +266,15 @@ pub struct HarborLinkCameraRegistration {
     pub check: HarborLinkRtspCheck,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HarborLinkCameraProjection {
+    pub camera_id: String,
+    pub enabled: bool,
+    pub status: String,
+    pub stream_configured: bool,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HarborLinkDiscoverySettings {
@@ -335,6 +344,19 @@ impl HarborLinkMediaClient {
         let mut client = Self::new(base_url)?;
         client.local_api_token = read_local_api_token_from_env()?;
         Ok(client)
+    }
+
+    pub fn list_cameras(&self) -> Result<Vec<HarborLinkCameraProjection>, String> {
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                format!("{}/v1/cameras", self.base_url),
+                false,
+            )
+            .timeout(Duration::from_secs(4))
+            .send_harborlink()
+            .map_err(unavailable_error)?;
+        decode_json_response(response, "camera registry list")
     }
 
     pub fn new(base_url: impl Into<String>) -> Result<Self, String> {
@@ -1489,10 +1511,32 @@ fn encode_path_segment(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        encode_path_segment, harborlink_request_scope, HarborLinkContractError,
-        HarborLinkMediaClient, StartDetectionLeaseRequest, StartEventRecordingRequest,
-        StartLiveSessionRequest, StartRecordingRequest,
+        encode_path_segment, harborlink_request_scope, HarborLinkCameraProjection,
+        HarborLinkContractError, HarborLinkMediaClient, StartDetectionLeaseRequest,
+        StartEventRecordingRequest, StartLiveSessionRequest, StartRecordingRequest,
     };
+
+    #[test]
+    fn camera_projection_uses_registry_id_without_exposing_credentials() {
+        let projection: HarborLinkCameraProjection = serde_json::from_value(serde_json::json!({
+            "cameraId": "registry-camera-1",
+            "displayName": "Front door",
+            "enabled": true,
+            "status": "configured",
+            "streamConfigured": true,
+            "credentialConfigured": true,
+            "rtspUrl": "rtsp://user:secret@example.invalid/live"
+        }))
+        .expect("deserialize HarborLink camera projection");
+
+        assert_eq!(projection.camera_id, "registry-camera-1");
+        assert!(projection.enabled);
+        assert!(projection.stream_configured);
+        let serialized = serde_json::to_value(projection).expect("serialize camera projection");
+        assert_eq!(serialized.as_object().map(|value| value.len()), Some(4));
+        assert!(serialized.get("credentialConfigured").is_none());
+        assert!(serialized.get("rtspUrl").is_none());
+    }
 
     #[test]
     fn endpoint_encodes_camera_and_session_identity() {

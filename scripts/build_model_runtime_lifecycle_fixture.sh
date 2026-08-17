@@ -52,8 +52,6 @@ install -m 0755 "$repo_root/scripts/verify_k3_model_release.py" \
   "$pkg_root/usr/lib/harboros-model-runtime/verify-release"
 install -m 0644 "$repo_root/debian/harboros-model-runtime.service" \
   "$pkg_root/usr/lib/systemd/system/harboros-model-runtime.service"
-install -m 0644 "$repo_root/debian/harboros-vlm-runtime.service" \
-  "$pkg_root/usr/lib/systemd/system/harboros-vlm-runtime.service"
 sed -e "s/VERSION_PLACEHOLDER/${version}/g" \
   -e 's/ARCH_PLACEHOLDER/all/g' \
   "$repo_root/debian/model-runtime-control.in" > "$pkg_root/DEBIAN/control"

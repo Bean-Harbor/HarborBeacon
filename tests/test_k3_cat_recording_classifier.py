@@ -138,6 +138,40 @@ class K3CatRecordingClassifierTests(unittest.TestCase):
         self.assertEqual(decision["reason_code"], "cat_visible")
         self.assertEqual(decision["cat_frame_indices"], [2, 5, 7])
 
+    def test_probe_creates_spacemit_session_and_binds_model_sha(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            model_path = Path(temporary_directory) / "model.onnx"
+            model_path.write_bytes(b"model")
+            args = types.SimpleNamespace(
+                model=model_path,
+                expected_sha256=self.classifier.sha256(model_path),
+                threshold=0.62,
+                ai_threads=4,
+                affinity="12;13;14;15",
+                frame=[],
+                probe=True,
+            )
+            sentinel_session = object()
+            with mock.patch.object(
+                self.classifier,
+                "create_session",
+                return_value=(
+                    sentinel_session,
+                    {
+                        "input_name": "images",
+                        "output_name": "scores",
+                        "session_creation_ms": 7,
+                    },
+                ),
+            ) as create_session:
+                result = self.classifier.run(args)
+
+        create_session.assert_called_once_with(model_path.resolve(), 4, "12;13;14;15")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["provider"], "SpaceMITExecutionProvider")
+        self.assertEqual(result["model_sha256"], args.expected_sha256)
+        self.assertEqual(result["session_creation_ms"], 7)
+
     def test_zero_positive_frames_rejects_and_two_require_review(self):
         negative = [
             {"frame_index": index, "cat_probability": 0.10}
