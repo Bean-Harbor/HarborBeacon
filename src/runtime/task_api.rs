@@ -4405,7 +4405,7 @@ impl TaskApiService {
                                 temperature: Some(0.0),
                                 max_tokens: Some(rag_answer_max_tokens()),
                                 timeout: Some(Duration::from_millis(rag_answer_budget_ms())),
-                                json_object_response: false,
+                                json_object_response: true,
                             };
                             let mut llm_result = run_llm_text_with_state_and_options(
                                 &prompt,
@@ -4461,6 +4461,11 @@ impl TaskApiService {
                                             "LLM 请求成功但未生成有效答案，已返回检索证据摘要。"
                                                 .to_string(),
                                         );
+                                    } else if let Some(structured_answer) =
+                                        parse_structured_rag_answer(&generated, citations.len())
+                                    {
+                                        answer = structured_answer;
+                                        answer_generation_status = "generated_once";
                                     } else {
                                         answer = generated;
                                         answer_generation_status = "generated_once";
@@ -10307,13 +10312,13 @@ fn build_rag_answer_prompt(
         "下面是检索得到的可能相关材料，不代表它们一定能够回答用户问题。".to_string(),
         "请先比较原问题与材料，只根据真正满足要求的材料回答，不得补充材料之外的信息。".to_string(),
         "如果材料不足以回答，请明确说明没有找到符合要求的证据。".to_string(),
-        "每个句子或列表项末尾都必须带一个或多个 [n] 形式的有效引用编号。".to_string(),
-        "不得只输出引用编号；不得改写、猜测或虚构文档标题。".to_string(),
+        "answer 必须完整回答问题；citation_ids 必须列出真正支持答案的 evidence citation_id。".to_string(),
+        "不得在 answer 中手写引用编号；不得改写、猜测或虚构文档标题。".to_string(),
         "除非用户明确要求展开，回答应简洁归纳，最多四个句子或六个列表项。".to_string(),
-        "如果问题要求列出文档或文章，必须逐项原样复制 title，并在每项末尾标注对应 [n]。".to_string(),
+        "如果问题要求列出文档或文章，必须在 answer 中逐项原样复制 title，并在 citation_ids 中列出对应编号。".to_string(),
         "回答前检查：结果类型和内容必须满足用户的目标类型与排除条件；不得用其他类型的来源凑数。文字中的景物描写不等于实际图片，只有 image 类型、Markdown 图片或可访问的图片链接才算图片证据。".to_string(),
         "如果存在排除条件，先逐条判断每份材料的主要主题是否违反条件；违反条件的材料不得出现在最终答案中，也不得引用。检查和组织答案在同一次回答中完成，不要输出检查过程。".to_string(),
-        "直接输出面向用户的最终答案并保留 [n] 引用，不要输出 JSON、审查过程或 Markdown 代码块。".to_string(),
+        "只输出 {\"answer\":\"面向用户的完整答案\",\"citation_ids\":[1]} 形式的 JSON 对象，不要输出审查过程或 Markdown 代码块。".to_string(),
         "只引用正面支持最终答案的材料。被判定为不相关、被排除或仅用于比较的候选，不得在答案中提及或引用。".to_string(),
         String::new(),
         format!("问题：{query}"),
@@ -10451,7 +10456,7 @@ fn build_budgeted_rag_answer_prompt_with_history(
 
 fn build_rag_answer_system_prompt() -> String {
     format!(
-        "You are HarborBeacon's evidence-grounded RAG answer composer. Answer once using only the supplied evidence objects. Obey the requested target modality and every negative constraint; never substitute another source type merely to produce an answer. Cite only evidence that positively supports the final answer. Every factual sentence and list item MUST end with one or more in-range citation markers such as [1] or [1][2]. Required format example (syntax only, not evidence for the current question): \"按住重置按钮 5 秒。[1]\" Copy the literal square-bracket citation marker into the answer. If the evidence is insufficient, say so directly. Never invent or rewrite document titles. Keep the answer within about {RAG_ANSWER_SOFT_TARGET_TOKENS} output tokens, prioritize the conclusion, and finish every sentence before stopping. Do not enumerate filenames when result cards already carry the complete list; summarize the result and direct the user to those cards instead. Return only the user-facing answer, not JSON, a review, or the judging process."
+        "You are HarborBeacon's evidence-grounded RAG answer composer. Answer once using only the supplied evidence objects. Obey the requested target modality and every negative constraint; never substitute another source type merely to produce an answer. Cite only evidence that positively supports the final answer. Return exactly one JSON object with this schema: {{\"answer\":\"complete user-facing answer\",\"citation_ids\":[1]}}. The answer field must fully answer the question but must not contain citation markers. citation_ids must contain every in-range evidence citation_id that positively supports the answer and no unrelated evidence. If the evidence is insufficient, say so directly in answer and still include citation_ids for evidence used. Never invent or rewrite document titles. Keep answer within about {RAG_ANSWER_SOFT_TARGET_TOKENS} output tokens, prioritize the conclusion, and finish every sentence before stopping. Do not enumerate filenames when result cards already carry the complete list; summarize the result and direct the user to those cards instead. Return only the JSON object, not Markdown fences, a review, or the judging process."
     )
 }
 
@@ -10460,6 +10465,56 @@ fn normalize_rag_answer_text(text: &str) -> String {
         .trim_matches(|ch: char| ch == '`' || ch.is_whitespace())
         .trim()
         .to_string()
+}
+
+fn parse_structured_rag_answer(text: &str, citation_count: usize) -> Option<String> {
+    let value = parse_json_object_from_text(text)?;
+    let answer = value
+        .get("answer")
+        .and_then(Value::as_str)
+        .map(normalize_rag_answer_text)
+        .filter(|answer| !answer.is_empty())?;
+    if !rag_answer_referenced_indices(&answer).is_empty() {
+        return None;
+    }
+
+    let raw_ids = value.get("citation_ids")?.as_array()?;
+    if raw_ids.is_empty() {
+        return None;
+    }
+    let mut citation_ids = raw_ids
+        .iter()
+        .map(Value::as_u64)
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .map(|id| usize::try_from(id).ok())
+        .collect::<Option<Vec<_>>>()?;
+    if citation_ids
+        .iter()
+        .any(|id| *id == 0 || *id > citation_count)
+    {
+        return None;
+    }
+    citation_ids.sort_unstable();
+    citation_ids.dedup();
+
+    let markers = citation_ids
+        .iter()
+        .map(|id| format!("[{id}]"))
+        .collect::<String>();
+    Some(
+        answer
+            .lines()
+            .map(|line| {
+                if line.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("{}{markers}", line.trim_end())
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
 }
 
 fn validate_rag_answer_citations(
@@ -16379,20 +16434,45 @@ mod tests {
     }
 
     #[test]
-    fn rag_answer_uses_single_pass_text_and_deterministic_citation_validation() {
+    fn rag_answer_uses_structured_output_and_deterministic_citation_validation() {
         let citations = vec![rag_test_citation("春日花园.md", "/knowledge/春日花园.md")];
         let system_prompt = super::build_rag_answer_system_prompt();
         let prompt = super::build_rag_answer_prompt("文章讲了什么？", &citations, None);
 
         assert_eq!(super::RAG_ANSWER_BUDGET_MS, 30_000);
-        assert!(system_prompt.contains("Required format example"));
-        assert!(system_prompt.contains("按住重置按钮 5 秒。[1]"));
-        assert!(system_prompt.contains("literal square-bracket citation marker"));
-        assert!(prompt.contains("每个句子或列表项末尾"));
+        assert!(system_prompt.contains("Return exactly one JSON object"));
+        assert!(system_prompt.contains("\"citation_ids\":[1]"));
+        assert!(system_prompt.contains("must not contain citation markers"));
+        assert!(prompt.contains("citation_ids 必须列出"));
         assert!(prompt.contains("\"citation_id\":1"));
         assert!(prompt.contains("\"title\":\"春日花园.md\""));
         assert!(!prompt.contains("used_citation_ids"));
         assert!(!prompt.contains("unsupported_claims"));
+
+        let structured = super::parse_structured_rag_answer(
+            r#"{"answer":"第一项有证据。\n第二项也有证据。","citation_ids":[2,1,2]}"#,
+            2,
+        )
+        .expect("valid structured answer");
+        assert_eq!(structured, "第一项有证据。[1][2]\n第二项也有证据。[1][2]");
+        assert_eq!(
+            super::validate_rag_answer_citations(&structured, 2),
+            Ok(std::collections::HashSet::from([1, 2]))
+        );
+        assert!(super::parse_structured_rag_answer(
+            r#"{"answer":"没有证据编号。","citation_ids":[]}"#,
+            2,
+        )
+        .is_none());
+        assert!(
+            super::parse_structured_rag_answer(r#"{"answer":"越界。","citation_ids":[3]}"#, 2,)
+                .is_none()
+        );
+        assert!(super::parse_structured_rag_answer(
+            r#"{"answer":"模型不应手写标记。[1]","citation_ids":[1]}"#,
+            2,
+        )
+        .is_none());
 
         let valid = super::validate_rag_answer_citations("文章描写了春天的花园。[1]", 1)
             .expect("in-range citation should pass");
