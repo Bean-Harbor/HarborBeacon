@@ -146,6 +146,11 @@ python3 scripts/generate_k3_supply_chain.py \
   --debian-snapshot "$HARBORBEACON_DEBIAN_SNAPSHOT" \
   --output-dir "$pkg_dir/usr/share/doc/harboros-model-runtime"
 
+find "$pkg_dir" -type d -exec chmod u-s,g-s,o-t {} +
+[[ -z "$(find "$pkg_dir" -type d -perm /7000 -print -quit)" ]] || {
+  echo "error: package directory retains special mode bits" >&2
+  exit 2
+}
 find "$pkg_dir" -print0 | xargs -0 touch --no-dereference --date="@${SOURCE_DATE_EPOCH}"
 SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" dpkg-deb \
   --root-owner-group --build --uniform-compression -Zxz -z9 "$pkg_dir" "$artifact"

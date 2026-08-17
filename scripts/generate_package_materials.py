@@ -1349,6 +1349,8 @@ def verify_installed_evidence_tar(
             name = member.name
             while name.startswith("./"):
                 name = name[2:]
+            if member.isdir() and member.mode & 0o7000:
+                raise ValueError(f"package directory has special mode bits: {name}")
             if name not in expected:
                 continue
             if name in found or not member.isfile():

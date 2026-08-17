@@ -821,6 +821,14 @@ class K3PackagingContractTests(unittest.TestCase):
             self.assertIn("generate_cargo_license_sidecar.py", script)
             self.assertIn("--first-party-notice", script)
             self.assertIn("--third-party-licenses", script)
+            self.assertIn(
+                'find "$pkg_dir" -type d -exec chmod u-s,g-s,o-t {} +', script
+            )
+            self.assertIn('find "$pkg_dir" -type d -perm /7000 -print -quit', script)
+            self.assertLess(
+                script.index('find "$pkg_dir" -type d -exec chmod u-s,g-s,o-t {} +'),
+                script.index('find "$pkg_dir" -print0 | xargs -0 touch'),
+            )
             self.assertNotIn(
                 '--build-provenance "$out_dir/${material_prefix}.build-provenance.json"',
                 script,

@@ -284,6 +284,13 @@ class ModelRuntimeRightsV2Tests(unittest.TestCase):
         for mode, should_pass in ((0o644, True), (0o600, False)):
             archive_bytes = io.BytesIO()
             with tarfile.open(fileobj=archive_bytes, mode="w", format=tarfile.GNU_FORMAT) as archive:
+                directory = tarfile.TarInfo("usr/share/doc/example")
+                directory.type = tarfile.DIRTYPE
+                directory.mode = 0o755
+                directory.uid = 0
+                directory.gid = 0
+                directory.mtime = 123
+                archive.addfile(directory)
                 member = tarfile.TarInfo("usr/share/doc/example/LICENSE")
                 member.mode = mode
                 member.uid = 0
@@ -297,6 +304,25 @@ class ModelRuntimeRightsV2Tests(unittest.TestCase):
             else:
                 with self.assertRaises(ValueError):
                     self.materials.verify_installed_evidence_tar(archive_bytes, [entry], 123)
+        archive_bytes = io.BytesIO()
+        with tarfile.open(fileobj=archive_bytes, mode="w", format=tarfile.GNU_FORMAT) as archive:
+            directory = tarfile.TarInfo("usr/share/doc/example")
+            directory.type = tarfile.DIRTYPE
+            directory.mode = 0o2755
+            directory.uid = 0
+            directory.gid = 0
+            directory.mtime = 123
+            archive.addfile(directory)
+            member = tarfile.TarInfo("usr/share/doc/example/LICENSE")
+            member.mode = 0o644
+            member.uid = 0
+            member.gid = 0
+            member.mtime = 123
+            member.size = len(payload)
+            archive.addfile(member, io.BytesIO(payload))
+        archive_bytes.seek(0)
+        with self.assertRaisesRegex(ValueError, "special mode bits"):
+            self.materials.verify_installed_evidence_tar(archive_bytes, [entry], 123)
         expected = self.outputs.expected_names(self.manifest, "1.0", "riscv64")
         evidence_count = sum(
             len(material["license"]["evidence_files"])
