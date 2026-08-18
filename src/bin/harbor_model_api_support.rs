@@ -17,6 +17,9 @@ use candle_transformers::models::jina_bert::{
 };
 use candle_transformers::models::qwen2::{Config as Qwen2Config, ModelForCausalLM as Qwen2Model};
 use candle_transformers::models::qwen3::{Config as Qwen3Config, ModelForCausalLM as Qwen3Model};
+use candle_transformers::models::xlm_roberta::{
+    Config as XlmRobertaConfig, XLMRobertaForSequenceClassification,
+};
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -33,6 +36,7 @@ const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_CANDLE_CHAT_MODEL_ID: &str =
     "/mnt/software/harborbeacon-agent-ci/model-store/runtimes/harbor-candle/bootstrap-llm";
 const DEFAULT_CANDLE_EMBEDDING_MODEL_ID: &str = "jinaai/jina-embeddings-v2-base-zh";
+const DEFAULT_CANDLE_RERANK_MODEL_ID: &str = "BAAI/bge-reranker-base";
 const DEFAULT_CANDLE_CACHE_DIR: &str =
     "/mnt/software/harborbeacon-agent-ci/model-store/runtimes/harbor-candle/cache";
 const DEFAULT_CANDLE_MAX_NEW_TOKENS: usize = 512;
@@ -40,6 +44,7 @@ const DEFAULT_CANDLE_TEMPERATURE: f64 = 0.2;
 const DEFAULT_CANDLE_REPEAT_PENALTY: f32 = 1.1;
 const DEFAULT_CANDLE_REPEAT_LAST_N: usize = 64;
 const DEFAULT_CANDLE_SEED: u64 = 299_792_458;
+const CANDLE_RERANK_MAX_TOKENS: usize = 512;
 const SERVICE_NAME: &str = "harbor-model-api";
 const HEALTH_OK: &str = "ok";
 const HEALTH_DEGRADED: &str = "degraded";
@@ -93,6 +98,7 @@ impl FromStr for BackendKind {
 pub struct CandleConfig {
     pub chat_model_id: String,
     pub embedding_model_id: String,
+    pub rerank_model_id: String,
     pub cache_dir: String,
     pub max_new_tokens: usize,
     pub temperature: f64,
@@ -106,6 +112,7 @@ impl Default for CandleConfig {
         Self {
             chat_model_id: DEFAULT_CANDLE_CHAT_MODEL_ID.to_string(),
             embedding_model_id: DEFAULT_CANDLE_EMBEDDING_MODEL_ID.to_string(),
+            rerank_model_id: DEFAULT_CANDLE_RERANK_MODEL_ID.to_string(),
             cache_dir: DEFAULT_CANDLE_CACHE_DIR.to_string(),
             max_new_tokens: DEFAULT_CANDLE_MAX_NEW_TOKENS,
             temperature: DEFAULT_CANDLE_TEMPERATURE,
@@ -174,6 +181,10 @@ impl ModelApiConfig {
         config.candle.embedding_model_id = env_or_default(
             "HARBOR_MODEL_API_CANDLE_EMBEDDING_MODEL_ID",
             &config.candle.embedding_model_id,
+        );
+        config.candle.rerank_model_id = env_or_default(
+            "HARBOR_MODEL_API_CANDLE_RERANK_MODEL_ID",
+            &config.candle.rerank_model_id,
         );
         config.candle.cache_dir = env_or_default(
             "HARBOR_MODEL_API_CANDLE_CACHE_DIR",
@@ -272,6 +283,14 @@ impl ModelApiConfig {
                 value if value.starts_with("--candle-embedding-model-id=") => {
                     self.candle.embedding_model_id =
                         value["--candle-embedding-model-id=".len()..].to_string();
+                }
+                "--candle-rerank-model-id" => {
+                    self.candle.rerank_model_id =
+                        take_value(&args, &mut index, "--candle-rerank-model-id")
+                }
+                value if value.starts_with("--candle-rerank-model-id=") => {
+                    self.candle.rerank_model_id =
+                        value["--candle-rerank-model-id=".len()..].to_string();
                 }
                 "--candle-cache-dir" => {
                     self.candle.cache_dir = take_value(&args, &mut index, "--candle-cache-dir")
@@ -392,6 +411,9 @@ impl ModelApiService {
             (Method::Post, "/v1/embeddings") => {
                 self.backend.embeddings(&self.config, headers, body)
             }
+            (Method::Post, "/v1/rerank") | (Method::Post, "/rerank") => {
+                self.backend.rerank(&self.config, headers, body)
+            }
             (Method::Options, _) => no_content(),
             _ => error_response(
                 StatusCode(404),
@@ -423,6 +445,8 @@ struct HealthReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     embedding_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    rerank_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
     ready: bool,
 }
@@ -437,6 +461,8 @@ struct BackendSummary {
     chat_model_loaded: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     embedding_model_loaded: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rerank_model_loaded: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
 }
@@ -505,6 +531,23 @@ impl BackendRuntime {
             Self::SemanticRouter(backend) => backend.embeddings(config),
         }
     }
+
+    fn rerank(
+        &self,
+        config: &ModelApiConfig,
+        _headers: &[Header],
+        body: &[u8],
+    ) -> Response<Cursor<Vec<u8>>> {
+        match self {
+            Self::Candle(backend) => backend.rerank(config, body),
+            Self::OpenAIProxy(_) | Self::SemanticRouter(_) => error_response(
+                StatusCode(404),
+                "UNSUPPORTED_ENDPOINT",
+                "the configured backend does not provide local reranking",
+                "rerank",
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -521,6 +564,7 @@ impl SemanticRouterBackend {
                 model_loaded: Some(true),
                 chat_model_loaded: Some(true),
                 embedding_model_loaded: None,
+                rerank_model_loaded: None,
                 note: Some(
                     "local-only closed-decision semantic router; no cloud fallback".to_string(),
                 ),
@@ -529,6 +573,7 @@ impl SemanticRouterBackend {
             upstream_base_url: config.upstream_base_url.clone(),
             chat_model: Some(config.chat_model.clone()),
             embedding_model: None,
+            rerank_model: None,
             note: Some("resident NSP returns schema-controlled HarborBeacon decisions".to_string()),
             ready: true,
         }
@@ -1130,6 +1175,7 @@ struct CandleBackend {
     config: CandleConfig,
     chat_state: Arc<Mutex<CandleRuntimeState<CandleChatRuntime>>>,
     embedding_state: Arc<Mutex<CandleRuntimeState<CandleEmbeddingRuntime>>>,
+    rerank_state: Arc<Mutex<CandleRuntimeState<CandleRerankRuntime>>>,
 }
 
 #[derive(Debug)]
@@ -1220,6 +1266,21 @@ struct CandleEmbeddingRuntime {
     device: Device,
 }
 
+struct CandleRerankRuntime {
+    model: XLMRobertaForSequenceClassification,
+    tokenizer: Tokenizer,
+    device: Device,
+}
+
+impl fmt::Debug for CandleRerankRuntime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CandleRerankRuntime")
+            .field("tokenizer", &"loaded")
+            .field("device", &self.device)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug)]
 struct CandleChatRequest {
     prompt: String,
@@ -1257,6 +1318,19 @@ struct CandleEmbeddingVector {
 }
 
 #[derive(Debug)]
+struct CandleRerankRequest {
+    query: String,
+    documents: Vec<String>,
+    top_n: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CandleRerankScore {
+    index: usize,
+    score: f32,
+}
+
+#[derive(Debug)]
 struct ResolvedModelAssets {
     tokenizer_file: PathBuf,
     config_file: PathBuf,
@@ -1280,16 +1354,20 @@ impl CandleBackend {
             config,
             chat_state: Arc::new(Mutex::new(CandleRuntimeState::Uninitialized)),
             embedding_state: Arc::new(Mutex::new(CandleRuntimeState::Uninitialized)),
+            rerank_state: Arc::new(Mutex::new(CandleRuntimeState::Uninitialized)),
         }
     }
 
     fn health(&self, config: &ModelApiConfig) -> HealthReport {
         let chat_state = candle_runtime_state_summary(&self.chat_state, "chat");
         let embedding_state = candle_runtime_state_summary(&self.embedding_state, "embedding");
+        let rerank_state = candle_runtime_state_summary(&self.rerank_state, "rerank");
         let chat_available =
             chat_state.loaded || local_model_assets_available(&self.config.chat_model_id);
         let embedding_available =
             embedding_state.loaded || local_model_assets_available(&self.config.embedding_model_id);
+        let rerank_available =
+            rerank_state.loaded || local_model_assets_available(&self.config.rerank_model_id);
         let mut notes = vec![CANDLE_CANDIDATE_NOTE.to_string()];
         if chat_state.loaded || embedding_state.loaded {
             notes.push("model weights are loaded".to_string());
@@ -1312,6 +1390,14 @@ impl CandleBackend {
                 "not loaded"
             }
         ));
+        notes.push(format!(
+            "rerank model weights are {}",
+            if rerank_state.loaded {
+                "loaded"
+            } else {
+                "not loaded"
+            }
+        ));
         if !chat_available {
             notes.push(format!(
                 "chat model assets are not present at {}",
@@ -1324,11 +1410,20 @@ impl CandleBackend {
                 self.config.embedding_model_id
             ));
         }
+        if !rerank_available {
+            notes.push(format!(
+                "rerank model assets are not present at {}",
+                self.config.rerank_model_id
+            ));
+        }
         if let Some(error) = chat_state.last_error.as_ref() {
             notes.push(format!("chat load error: {}", trim_for_note(error)));
         }
         if let Some(error) = embedding_state.last_error.as_ref() {
             notes.push(format!("embedding load error: {}", trim_for_note(error)));
+        }
+        if let Some(error) = rerank_state.last_error.as_ref() {
+            notes.push(format!("rerank load error: {}", trim_for_note(error)));
         }
 
         HealthReport {
@@ -1337,9 +1432,12 @@ impl CandleBackend {
             backend: BackendSummary {
                 kind: BackendKind::Candle.as_str(),
                 ready: true,
-                model_loaded: Some(chat_state.loaded || embedding_state.loaded),
+                model_loaded: Some(
+                    chat_state.loaded || embedding_state.loaded || rerank_state.loaded,
+                ),
                 chat_model_loaded: Some(chat_state.loaded),
                 embedding_model_loaded: Some(embedding_state.loaded),
+                rerank_model_loaded: Some(rerank_state.loaded),
                 note: Some(CANDLE_CANDIDATE_NOTE.to_string()),
             },
             bind: config.bind.clone(),
@@ -1350,6 +1448,7 @@ impl CandleBackend {
             // runtime truth.
             chat_model: chat_available.then(|| self.config.chat_model_id.clone()),
             embedding_model: embedding_available.then(|| self.config.embedding_model_id.clone()),
+            rerank_model: rerank_available.then(|| self.config.rerank_model_id.clone()),
             note: Some(notes.join("; ")),
             ready: true,
         }
@@ -1466,6 +1565,42 @@ impl CandleBackend {
         )
     }
 
+    fn rerank(&self, config: &ModelApiConfig, body: &[u8]) -> Response<Cursor<Vec<u8>>> {
+        let request = match parse_candle_rerank_request(body) {
+            Ok(request) => request,
+            Err(error) => {
+                return error_response(StatusCode(400), "VALIDATION_ERROR", &error, "candle");
+            }
+        };
+
+        let scores = match self.run_rerank(&request) {
+            Ok(scores) => scores,
+            Err(error) => {
+                return error_response(StatusCode(503), "BACKEND_RERANK_FAILED", &error, "candle");
+            }
+        };
+
+        json_response(
+            StatusCode(200),
+            &json!({
+                "model": self.config.rerank_model_id.clone(),
+                "results": scores
+                    .iter()
+                    .map(|value| json!({
+                        "index": value.index,
+                        "relevance_score": value.score,
+                    }))
+                    .collect::<Vec<_>>(),
+                "experimental": {
+                    "backend": "candle",
+                    "mode": "harbor-managed-local-runtime",
+                },
+                "note": CANDLE_CANDIDATE_NOTE,
+                "bind": config.bind,
+            }),
+        )
+    }
+
     fn run_chat(&self, request: &CandleChatRequest) -> Result<CandleChatCompletion, String> {
         self.with_chat_runtime(|runtime| self.generate_with_runtime(runtime, request))
     }
@@ -1475,6 +1610,10 @@ impl CandleBackend {
         request: &CandleEmbeddingRequest,
     ) -> Result<Vec<CandleEmbeddingVector>, String> {
         self.with_embedding_runtime(|runtime| self.embed_with_runtime(runtime, request))
+    }
+
+    fn run_rerank(&self, request: &CandleRerankRequest) -> Result<Vec<CandleRerankScore>, String> {
+        self.with_rerank_runtime(|runtime| self.rerank_with_runtime(runtime, request))
     }
 
     fn with_chat_runtime<T>(
@@ -1535,6 +1674,37 @@ impl CandleBackend {
             )),
             CandleRuntimeState::Uninitialized => {
                 Err("candle embedding runtime did not initialize".to_string())
+            }
+        }
+    }
+
+    fn with_rerank_runtime<T>(
+        &self,
+        f: impl FnOnce(&mut CandleRerankRuntime) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut state = self
+            .rerank_state
+            .lock()
+            .map_err(|_| "candle rerank runtime lock is poisoned".to_string())?;
+
+        if matches!(
+            &*state,
+            CandleRuntimeState::Uninitialized | CandleRuntimeState::Failed(_)
+        ) {
+            *state = match self.load_rerank_runtime() {
+                Ok(runtime) => CandleRuntimeState::Ready(runtime),
+                Err(error) => CandleRuntimeState::Failed(format!("{error:#}")),
+            };
+        }
+
+        match &mut *state {
+            CandleRuntimeState::Ready(runtime) => f(runtime),
+            CandleRuntimeState::Failed(error) => Err(format!(
+                "failed to initialize candle rerank runtime: {}",
+                trim_for_note(error)
+            )),
+            CandleRuntimeState::Uninitialized => {
+                Err("candle rerank runtime did not initialize".to_string())
             }
         }
     }
@@ -1607,6 +1777,34 @@ impl CandleBackend {
         Ok(CandleEmbeddingRuntime {
             model: embedding_model,
             tokenizer: embedding_tokenizer,
+            device,
+        })
+    }
+
+    fn load_rerank_runtime(&self) -> AnyResult<CandleRerankRuntime> {
+        self.prepare_cache()?;
+        let rerank_assets = resolve_model_assets(&self.config.rerank_model_id)?;
+        let device = Device::Cpu;
+        let rerank_tokenizer = Tokenizer::from_file(&rerank_assets.tokenizer_file)
+            .map_err(|error| anyhow!("failed to load rerank tokenizer: {error}"))?;
+        let rerank_vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&rerank_assets.weight_files, DType::F32, &device)
+                .context("failed to mmap rerank weights")?
+        };
+        let rerank_config: XlmRobertaConfig =
+            serde_json::from_slice(&fs::read(&rerank_assets.config_file).with_context(|| {
+                format!(
+                    "failed to read rerank config {}",
+                    rerank_assets.config_file.display()
+                )
+            })?)
+            .context("failed to parse XLM-R rerank config")?;
+        let rerank_model = XLMRobertaForSequenceClassification::new(1, &rerank_config, rerank_vb)
+            .context("failed to construct XLM-R rerank model")?;
+
+        Ok(CandleRerankRuntime {
+            model: rerank_model,
+            tokenizer: rerank_tokenizer,
             device,
         })
     }
@@ -1751,6 +1949,79 @@ impl CandleBackend {
             })
             .collect()
     }
+
+    fn rerank_with_runtime(
+        &self,
+        runtime: &CandleRerankRuntime,
+        request: &CandleRerankRequest,
+    ) -> Result<Vec<CandleRerankScore>, String> {
+        let mut scores = request
+            .documents
+            .iter()
+            .enumerate()
+            .map(|(index, document)| {
+                let encoding = runtime
+                    .tokenizer
+                    .encode((request.query.as_str(), document.as_str()), true)
+                    .map_err(|error| format!("failed to tokenize rerank pair: {error}"))?;
+                let mut ids = encoding.get_ids().to_vec();
+                let mut attention_mask = encoding.get_attention_mask().to_vec();
+                let mut token_type_ids = encoding.get_type_ids().to_vec();
+                if ids.is_empty() {
+                    return Err("rerank pair produced no tokens".to_string());
+                }
+                if ids.len() > CANDLE_RERANK_MAX_TOKENS {
+                    let final_token = ids.last().copied();
+                    ids.truncate(CANDLE_RERANK_MAX_TOKENS);
+                    attention_mask.truncate(CANDLE_RERANK_MAX_TOKENS);
+                    token_type_ids.truncate(CANDLE_RERANK_MAX_TOKENS);
+                    if let Some(final_token) = final_token {
+                        ids[CANDLE_RERANK_MAX_TOKENS - 1] = final_token;
+                    }
+                }
+
+                let input_ids = Tensor::new(ids.as_slice(), &runtime.device)
+                    .and_then(|value| value.unsqueeze(0))
+                    .map_err(|error| format!("failed to build rerank input tensor: {error}"))?;
+                let attention_mask = Tensor::new(attention_mask.as_slice(), &runtime.device)
+                    .and_then(|value| value.unsqueeze(0))
+                    .map_err(|error| format!("failed to build rerank attention mask: {error}"))?;
+                let token_type_ids = Tensor::new(token_type_ids.as_slice(), &runtime.device)
+                    .and_then(|value| value.unsqueeze(0))
+                    .map_err(|error| format!("failed to build rerank token types: {error}"))?;
+                let raw_score = runtime
+                    .model
+                    .forward(&input_ids, &attention_mask, &token_type_ids)
+                    .and_then(|value| value.squeeze(0))
+                    .and_then(|value| value.squeeze(0))
+                    .and_then(|value| value.to_dtype(DType::F32))
+                    .and_then(|value| value.to_scalar::<f32>())
+                    .map_err(|error| format!("candle rerank forward failed: {error}"))?;
+
+                Ok(CandleRerankScore {
+                    index,
+                    score: sigmoid_score(raw_score),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        scores.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.index.cmp(&right.index))
+        });
+        scores.truncate(request.top_n.min(scores.len()));
+        Ok(scores)
+    }
+}
+
+fn sigmoid_score(value: f32) -> f32 {
+    if value >= 0.0 {
+        1.0 / (1.0 + (-value).exp())
+    } else {
+        let exp = value.exp();
+        exp / (1.0 + exp)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1807,12 +2078,14 @@ impl OpenAIProxyBackend {
                     model_loaded: None,
                     chat_model_loaded: None,
                     embedding_model_loaded: None,
+                    rerank_model_loaded: None,
                     note: None,
                 },
                 bind: config.bind.clone(),
                 upstream_base_url: self.upstream_base_url.clone(),
                 chat_model: Some(self.chat_model.clone()),
                 embedding_model: Some(self.embedding_model.clone()),
+                rerank_model: None,
                 note: Some(format!(
                     "upstream health checked via {}",
                     ready_url.unwrap_or_else(|| join_url(&self.upstream_base_url, "/models"))
@@ -1829,6 +2102,7 @@ impl OpenAIProxyBackend {
                     model_loaded: None,
                     chat_model_loaded: None,
                     embedding_model_loaded: None,
+                    rerank_model_loaded: None,
                     note: Some(format!(
                         "upstream health check failed at {} and {}; timeout {} ms",
                         probe_urls[0], probe_urls[1], self.timeout_ms
@@ -1838,6 +2112,7 @@ impl OpenAIProxyBackend {
                 upstream_base_url: self.upstream_base_url.clone(),
                 chat_model: Some(self.chat_model.clone()),
                 embedding_model: Some(self.embedding_model.clone()),
+                rerank_model: None,
                 note: Some(
                     "openai_proxy backend is configured but upstream is unhealthy".to_string(),
                 ),
@@ -2062,6 +2337,47 @@ fn parse_candle_embedding_request(body: &[u8]) -> Result<CandleEmbeddingRequest,
     };
 
     Ok(CandleEmbeddingRequest { inputs })
+}
+
+fn parse_candle_rerank_request(body: &[u8]) -> Result<CandleRerankRequest, String> {
+    let payload: Value =
+        serde_json::from_slice(body).map_err(|error| format!("invalid JSON body: {error}"))?;
+    let query = payload
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "query must be a non-empty string".to_string())?
+        .to_string();
+    let documents = payload
+        .get("documents")
+        .or_else(|| payload.get("texts"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "documents or texts must be a non-empty string array".to_string())?
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| "rerank documents must contain non-empty strings".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if documents.is_empty() {
+        return Err("documents or texts must not be empty".to_string());
+    }
+    let top_n = payload
+        .get("top_n")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(documents.len())
+        .clamp(1, documents.len());
+
+    Ok(CandleRerankRequest {
+        query,
+        documents,
+        top_n,
+    })
 }
 
 fn extract_candle_message_content(message: &Value) -> Option<String> {
@@ -2833,19 +3149,20 @@ fn fail(message: &str) -> ! {
 
 fn print_usage() {
     eprintln!(
-        "Usage: harbor-model-api [--bind ADDR] [--backend candle|openai_proxy|semantic_router] [--upstream-base-url URL] [--chat-model NAME] [--embedding-model NAME] [--request-timeout-ms N] [--candle-model-id ID] [--candle-chat-model-id ID] [--candle-embedding-model-id ID] [--candle-cache-dir DIR] [--candle-max-new-tokens N] [--candle-temperature F]"
+        "Usage: harbor-model-api [--bind ADDR] [--backend candle|openai_proxy|semantic_router] [--upstream-base-url URL] [--chat-model NAME] [--embedding-model NAME] [--request-timeout-ms N] [--candle-model-id ID] [--candle-chat-model-id ID] [--candle-embedding-model-id ID] [--candle-rerank-model-id ID] [--candle-cache-dir DIR] [--candle-max-new-tokens N] [--candle-temperature F]"
     );
 }
 
 pub fn print_startup_banner(config: &ModelApiConfig) {
     match config.backend {
         BackendKind::Candle => println!(
-            "{} listening on http://{} (backend {}, chat model {}, embedding model {}, cache {}, Harbor-managed local runtime)",
+            "{} listening on http://{} (backend {}, chat model {}, embedding model {}, rerank model {}, cache {}, Harbor-managed local runtime)",
             SERVICE_NAME,
             config.bind,
             config.backend,
             config.candle.chat_model_id,
             config.candle.embedding_model_id,
+            config.candle.rerank_model_id,
             config.candle.cache_dir
         ),
         BackendKind::OpenAIProxy => println!(
@@ -3112,6 +3429,10 @@ mod tests {
             config.candle.embedding_model_id,
             DEFAULT_CANDLE_EMBEDDING_MODEL_ID
         );
+        assert_eq!(
+            config.candle.rerank_model_id,
+            DEFAULT_CANDLE_RERANK_MODEL_ID
+        );
         assert_eq!(config.candle.cache_dir, DEFAULT_CANDLE_CACHE_DIR);
         assert_eq!(config.candle.max_new_tokens, DEFAULT_CANDLE_MAX_NEW_TOKENS);
         assert_eq!(config.candle.max_new_tokens, 512);
@@ -3228,6 +3549,51 @@ mod tests {
     }
 
     #[test]
+    fn parse_candle_rerank_request_accepts_documents_and_tei_texts() {
+        let documents = parse_candle_rerank_request(
+            &serde_json::to_vec(&json!({
+                "query": "reset instructions",
+                "documents": ["unrelated", "hold the reset button"],
+                "top_n": 1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(documents.query, "reset instructions");
+        assert_eq!(documents.documents.len(), 2);
+        assert_eq!(documents.top_n, 1);
+
+        let texts = parse_candle_rerank_request(
+            &serde_json::to_vec(&json!({
+                "query": "reset instructions",
+                "texts": ["first", "second"],
+                "top_n": 99
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(texts.documents, vec!["first", "second"]);
+        assert_eq!(texts.top_n, 2);
+    }
+
+    #[test]
+    fn parse_candle_rerank_request_rejects_empty_inputs() {
+        let error = parse_candle_rerank_request(
+            &serde_json::to_vec(&json!({"query": "", "texts": []})).unwrap(),
+        )
+        .expect_err("empty rerank request should fail");
+        assert!(error.contains("query"));
+    }
+
+    #[test]
+    fn sigmoid_score_is_stable_and_monotonic() {
+        assert!(sigmoid_score(-100.0).is_finite());
+        assert!(sigmoid_score(-10.0) < sigmoid_score(0.0));
+        assert!(sigmoid_score(0.0) < sigmoid_score(10.0));
+        assert_eq!(sigmoid_score(0.0), 0.5);
+    }
+
+    #[test]
     fn candle_health_reports_idle_without_loading_missing_models() {
         let config = ModelApiConfig {
             backend: BackendKind::Candle,
@@ -3236,6 +3602,7 @@ mod tests {
         let mut candle = CandleConfig::default();
         candle.chat_model_id = std::env::temp_dir().display().to_string();
         candle.embedding_model_id = std::env::temp_dir().display().to_string();
+        candle.rerank_model_id = std::env::temp_dir().display().to_string();
         let backend = CandleBackend::new(candle);
         let report = backend.health(&config);
         assert!(report.ready);
@@ -3245,6 +3612,7 @@ mod tests {
         assert_eq!(report.backend.model_loaded, Some(false));
         assert!(report.chat_model.is_none());
         assert!(report.embedding_model.is_none());
+        assert!(report.rerank_model.is_none());
         assert!(report
             .note
             .as_deref()
