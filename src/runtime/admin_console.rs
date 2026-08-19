@@ -3643,7 +3643,7 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
             model_kind: ModelKind::Reranker,
             endpoint_kind: ModelEndpointKind::Local,
             provider_key: "rerank_compatible".to_string(),
-            model_name: "local-reranker".to_string(),
+            model_name: "BAAI/bge-reranker-base".to_string(),
             capability_tags: vec!["local_first".to_string(), "rerank".to_string()],
             cost_policy: json!({"cost_hint": "local_or_sidecar"}),
             status: ModelEndpointStatus::Disabled,
