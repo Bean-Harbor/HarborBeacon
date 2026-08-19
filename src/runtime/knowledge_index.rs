@@ -2687,10 +2687,10 @@ fn media_text_sources(
 }
 
 fn transcript_text_sources(
-    audio_path: &Path,
+    media_path: &Path,
     transcript: asr::AsrTranscript,
 ) -> Vec<KnowledgeIndexTextSource> {
-    let source_path = Some(audio_path.to_string_lossy().into_owned());
+    let source_path = Some(media_path.to_string_lossy().into_owned());
     if transcript.segments.is_empty() {
         return vec![KnowledgeIndexTextSource {
             source_kind: "transcript".to_string(),
@@ -2715,6 +2715,20 @@ fn transcript_text_sources(
             ),
         })
         .collect()
+}
+
+fn merge_video_transcript_result(
+    video_path: &Path,
+    result: Result<asr::AsrTranscript, asr::AsrError>,
+    text_sources: &mut Vec<KnowledgeIndexTextSource>,
+    processing_warnings: &mut Vec<String>,
+) {
+    match result {
+        Ok(transcript) => text_sources.extend(transcript_text_sources(video_path, transcript)),
+        Err(error) => processing_warnings.push(format!(
+            "video audio transcription did not produce searchable text: {error}"
+        )),
+    }
 }
 
 fn format_timestamp(milliseconds: u64) -> String {
@@ -2749,6 +2763,13 @@ fn video_text_sources(
             text: sidecar_text,
         });
     }
+
+    merge_video_transcript_result(
+        video_path,
+        asr::transcribe_cached(video_path, index_root),
+        &mut text_sources,
+        &mut processing_warnings,
+    );
 
     let extraction = extract_video_keyframes(video_path, index_root);
     processing_warnings.extend(extraction.warnings);
@@ -3767,15 +3788,17 @@ mod tests {
         build_text_chunk_hierarchy, detect_video_scene_timestamps, embedding_context_limit_error,
         embedding_store_matches_identity, extract_video_keyframes, format_keyframe_percent,
         lexical_query_terms, load_embedding_store, load_embedding_store_with_vectors,
-        merge_video_keyframe_targets, parse_video_frame_quality, parse_video_scene_timestamps,
-        rebuild_embedding_hnsw, save_embedding_store, save_embedding_store_incremental,
-        truncate_embedding_retry_input, video_frame_rejection_reason, video_keyframe_count,
-        video_keyframe_targets, write_compact_embedding_store, KnowledgeEmbeddingEntry,
-        KnowledgeEmbeddingStore, KnowledgeIndexConfig, KnowledgeIndexManifest,
-        KnowledgeIndexService, KnowledgeIndexTextSource, KnowledgeModality, VideoFrameQuality,
+        merge_video_keyframe_targets, merge_video_transcript_result, parse_video_frame_quality,
+        parse_video_scene_timestamps, rebuild_embedding_hnsw, save_embedding_store,
+        save_embedding_store_incremental, truncate_embedding_retry_input,
+        video_frame_rejection_reason, video_keyframe_count, video_keyframe_targets,
+        write_compact_embedding_store, KnowledgeEmbeddingEntry, KnowledgeEmbeddingStore,
+        KnowledgeIndexConfig, KnowledgeIndexManifest, KnowledgeIndexService,
+        KnowledgeIndexTextSource, KnowledgeModality, VideoFrameQuality,
         EMBEDDING_STORE_SCHEMA_VERSION, INDEX_SCHEMA_VERSION,
     };
     use crate::runtime::admin_console::AdminModelCenterState;
+    use crate::runtime::asr::{AsrError, AsrSegment, AsrTranscript};
     use crate::runtime::model_center::EmbeddingEndpointIdentity;
     use std::collections::HashSet;
     use std::fs;
@@ -4638,6 +4661,53 @@ mod tests {
             .all(|frames| frames[0].timestamp_seconds < frames[1].timestamp_seconds));
 
         cleanup_dir(&workspace);
+    }
+
+    #[test]
+    fn video_transcript_result_adds_timestamped_sources_and_preserves_failures() {
+        let video_path = Path::new("/knowledge/entryway.mp4");
+        let mut text_sources = Vec::new();
+        let mut warnings = Vec::new();
+
+        merge_video_transcript_result(
+            video_path,
+            Ok(AsrTranscript {
+                provider_key: "whisper_cpp".to_string(),
+                language: Some("zh".to_string()),
+                text: "设备报警后关闭电源".to_string(),
+                segments: vec![AsrSegment {
+                    start_ms: 1_250,
+                    end_ms: 4_500,
+                    text: "设备报警后关闭电源".to_string(),
+                }],
+            }),
+            &mut text_sources,
+            &mut warnings,
+        );
+
+        assert!(warnings.is_empty());
+        assert_eq!(text_sources.len(), 1);
+        assert_eq!(text_sources[0].source_kind, "transcript");
+        assert_eq!(text_sources[0].provider_key.as_deref(), Some("whisper_cpp"));
+        assert_eq!(
+            text_sources[0].source_path.as_deref(),
+            Some("/knowledge/entryway.mp4")
+        );
+        assert_eq!(
+            text_sources[0].text,
+            "[00:00:01.250 --> 00:00:04.500] 设备报警后关闭电源"
+        );
+
+        merge_video_transcript_result(
+            video_path,
+            Err(AsrError::Failed("input has no audio stream".to_string())),
+            &mut text_sources,
+            &mut warnings,
+        );
+
+        assert_eq!(text_sources.len(), 1);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("input has no audio stream"));
     }
 
     #[test]

@@ -1314,9 +1314,12 @@ fn build_hit_candidate(
         KnowledgeModality::Image => content_source_kinds
             .iter()
             .any(|kind| matches!(kind.as_str(), "vlm" | "ocr")),
-        KnowledgeModality::Video => content_source_kinds
-            .iter()
-            .any(|kind| matches!(kind.as_str(), "vlm_keyframe" | "video_sidecar")),
+        KnowledgeModality::Video => content_source_kinds.iter().any(|kind| {
+            matches!(
+                kind.as_str(),
+                "vlm_keyframe" | "video_sidecar" | "transcript"
+            )
+        }),
         _ => searchable_text.is_some_and(|text| !text.trim().is_empty()),
     };
     let lexical_score = indexed_lexical_score
@@ -1402,9 +1405,12 @@ fn is_content_derived_source(modality: KnowledgeModality, content_source_kinds: 
             .iter()
             .any(|kind| matches!(kind.as_str(), "vlm" | "ocr")),
         KnowledgeModality::Audio => content_source_kinds.iter().any(|kind| kind == "transcript"),
-        KnowledgeModality::Video => content_source_kinds
-            .iter()
-            .any(|kind| matches!(kind.as_str(), "vlm_keyframe" | "video_sidecar")),
+        KnowledgeModality::Video => content_source_kinds.iter().any(|kind| {
+            matches!(
+                kind.as_str(),
+                "vlm_keyframe" | "video_sidecar" | "transcript"
+            )
+        }),
     }
 }
 
@@ -3703,6 +3709,86 @@ mod tests {
         assert_eq!(response.reply_pack.citations.len(), 1);
         assert_eq!(response.reply_pack.citations[0].modality, "video");
         assert!(response.reply_pack.summary.contains("视频片段"));
+
+        cleanup_dir(&root);
+        cleanup_dir(&index_root);
+    }
+
+    #[test]
+    fn video_search_treats_audio_transcript_as_indexed_content() {
+        let _guard = INDEX_TEST_LOCK.lock().expect("lock");
+        let root = unique_dir("harborbeacon-knowledge-video-transcript");
+        let index_root = unique_dir("harborbeacon-knowledge-index-store");
+        fs::create_dir_all(&root).expect("create root");
+        fs::create_dir_all(&index_root).expect("create index root");
+        let video_path = root.join("alarm-clip.mp4");
+        fs::write(&video_path, b"fake-video").expect("write video");
+        let service = KnowledgeIndexService::from_config(
+            KnowledgeIndexConfig::new(index_root.clone()).expect("config"),
+        )
+        .expect("service");
+        let snapshot = service.load_or_refresh(&root).expect("seed manifest path");
+        fs::write(
+            snapshot.manifest_path,
+            serde_json::to_string_pretty(&json!({
+                "schema_version": 2,
+                "root": root.to_string_lossy(),
+                "root_signature": {
+                    "modified_unix_millis": 0,
+                    "size_bytes": 0
+                },
+                "generated_at": "200",
+                "directories": [],
+                "entries": [{
+                    "modality": "video",
+                    "path": video_path.to_string_lossy(),
+                    "title": "alarm-clip.mp4",
+                    "searchable_text": "[00:00:01.250 --> 00:00:04.500] 设备报警后关闭电源",
+                    "chunks": [{
+                        "chunk_id": "chunk-0001",
+                        "line_start": 1,
+                        "line_end": 1,
+                        "text": "[00:00:01.250 --> 00:00:04.500] 设备报警后关闭电源",
+                        "source_kind": "transcript",
+                        "source_path": video_path.to_string_lossy()
+                    }],
+                    "text_sources": [{
+                        "source_kind": "transcript",
+                        "source_path": video_path.to_string_lossy(),
+                        "provider_key": "whisper_cpp",
+                        "text": "[00:00:01.250 --> 00:00:04.500] 设备报警后关闭电源"
+                    }],
+                    "file_signature": {
+                        "modified_unix_millis": 0,
+                        "size_bytes": 10
+                    }
+                }]
+            }))
+            .expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let response = KnowledgeSearchService::search(KnowledgeSearchRequest {
+            query: "设备报警后做什么".to_string(),
+            configured_roots: vec![root.to_string_lossy().into_owned()],
+            index_root: Some(index_root.to_string_lossy().into_owned()),
+            roots: vec![root.to_string_lossy().into_owned()],
+            include_documents: false,
+            include_images: false,
+            include_videos: true,
+            limit: 5,
+            ..KnowledgeSearchRequest::new("")
+        })
+        .expect("video transcript search");
+
+        assert_eq!(response.videos.len(), 1);
+        assert_eq!(response.videos[0].provenance.as_deref(), Some("transcript"));
+        assert_eq!(response.videos[0].content_source_kinds, vec!["transcript"]);
+        assert!(response.videos[0].content_indexed);
+        assert!(response.videos[0].content_match_used);
+        assert!(!response.videos[0].filename_match_used);
+        assert_eq!(response.reply_pack.citations.len(), 1);
+        assert_eq!(response.reply_pack.citations[0].modality, "video");
 
         cleanup_dir(&root);
         cleanup_dir(&index_root);
