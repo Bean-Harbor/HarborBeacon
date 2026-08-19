@@ -94,6 +94,41 @@ impl FromStr for BackendKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandleResidencyPolicy {
+    RetainAll,
+    Sequential,
+}
+
+impl CandleResidencyPolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RetainAll => "retain_all",
+            Self::Sequential => "sequential",
+        }
+    }
+}
+
+impl Default for CandleResidencyPolicy {
+    fn default() -> Self {
+        Self::RetainAll
+    }
+}
+
+impl FromStr for CandleResidencyPolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "retain_all" | "retain-all" => Ok(Self::RetainAll),
+            "sequential" => Ok(Self::Sequential),
+            other => Err(format!(
+                "unsupported candle residency policy '{other}'; expected retain_all or sequential"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CandleConfig {
     pub chat_model_id: String,
@@ -105,6 +140,7 @@ pub struct CandleConfig {
     pub repeat_penalty: f32,
     pub repeat_last_n: usize,
     pub seed: u64,
+    pub residency_policy: CandleResidencyPolicy,
 }
 
 impl Default for CandleConfig {
@@ -119,6 +155,7 @@ impl Default for CandleConfig {
             repeat_penalty: DEFAULT_CANDLE_REPEAT_PENALTY,
             repeat_last_n: DEFAULT_CANDLE_REPEAT_LAST_N,
             seed: DEFAULT_CANDLE_SEED,
+            residency_policy: CandleResidencyPolicy::default(),
         }
     }
 }
@@ -202,6 +239,12 @@ impl ModelApiConfig {
         )
         .parse::<f64>()
         .unwrap_or_else(|error| fail(&format!("invalid candle temperature: {error}")));
+        config.candle.residency_policy = env_or_default(
+            "HARBOR_MODEL_API_CANDLE_RESIDENCY_POLICY",
+            config.candle.residency_policy.as_str(),
+        )
+        .parse::<CandleResidencyPolicy>()
+        .unwrap_or_else(|error| fail(&error));
         config
     }
 
@@ -1214,6 +1257,19 @@ fn candle_runtime_state_summary<T>(
     }
 }
 
+fn evict_candle_runtime<T>(
+    state: &Arc<Mutex<CandleRuntimeState<T>>>,
+    runtime_label: &str,
+) -> Result<(), String> {
+    let mut state = state
+        .lock()
+        .map_err(|_| format!("candle {runtime_label} runtime lock is poisoned"))?;
+    if matches!(&*state, CandleRuntimeState::Ready(_)) {
+        *state = CandleRuntimeState::Uninitialized;
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct CandleChatRuntime {
     model: CandleChatModel,
@@ -1369,6 +1425,10 @@ impl CandleBackend {
         let rerank_available =
             rerank_state.loaded || local_model_assets_available(&self.config.rerank_model_id);
         let mut notes = vec![CANDLE_CANDIDATE_NOTE.to_string()];
+        notes.push(format!(
+            "model residency policy is {}",
+            self.config.residency_policy.as_str()
+        ));
         if chat_state.loaded || embedding_state.loaded {
             notes.push("model weights are loaded".to_string());
         } else {
@@ -1602,6 +1662,10 @@ impl CandleBackend {
     }
 
     fn run_chat(&self, request: &CandleChatRequest) -> Result<CandleChatCompletion, String> {
+        if self.config.residency_policy == CandleResidencyPolicy::Sequential {
+            evict_candle_runtime(&self.embedding_state, "embedding")?;
+            evict_candle_runtime(&self.rerank_state, "rerank")?;
+        }
         self.with_chat_runtime(|runtime| self.generate_with_runtime(runtime, request))
     }
 
@@ -1609,10 +1673,18 @@ impl CandleBackend {
         &self,
         request: &CandleEmbeddingRequest,
     ) -> Result<Vec<CandleEmbeddingVector>, String> {
+        if self.config.residency_policy == CandleResidencyPolicy::Sequential {
+            evict_candle_runtime(&self.chat_state, "chat")?;
+            evict_candle_runtime(&self.rerank_state, "rerank")?;
+        }
         self.with_embedding_runtime(|runtime| self.embed_with_runtime(runtime, request))
     }
 
     fn run_rerank(&self, request: &CandleRerankRequest) -> Result<Vec<CandleRerankScore>, String> {
+        if self.config.residency_policy == CandleResidencyPolicy::Sequential {
+            evict_candle_runtime(&self.chat_state, "chat")?;
+            evict_candle_runtime(&self.embedding_state, "embedding")?;
+        }
         self.with_rerank_runtime(|runtime| self.rerank_with_runtime(runtime, request))
     }
 
@@ -3591,6 +3663,31 @@ mod tests {
         assert!(sigmoid_score(-10.0) < sigmoid_score(0.0));
         assert!(sigmoid_score(0.0) < sigmoid_score(10.0));
         assert_eq!(sigmoid_score(0.0), 0.5);
+    }
+
+    #[test]
+    fn candle_residency_policy_parses_supported_values() {
+        assert_eq!(
+            "retain_all".parse::<CandleResidencyPolicy>().unwrap(),
+            CandleResidencyPolicy::RetainAll
+        );
+        assert_eq!(
+            "sequential".parse::<CandleResidencyPolicy>().unwrap(),
+            CandleResidencyPolicy::Sequential
+        );
+        assert!("unknown".parse::<CandleResidencyPolicy>().is_err());
+    }
+
+    #[test]
+    fn evict_candle_runtime_releases_ready_state() {
+        let state = Arc::new(Mutex::new(CandleRuntimeState::Ready("loaded")));
+
+        evict_candle_runtime(&state, "test").unwrap();
+
+        assert!(matches!(
+            &*state.lock().expect("runtime state"),
+            CandleRuntimeState::Uninitialized
+        ));
     }
 
     #[test]
