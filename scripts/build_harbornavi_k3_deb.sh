@@ -60,6 +60,7 @@ mkdir -p "$pkg_dir/etc/systemd/system"
 mkdir -p "$pkg_dir/usr/lib/harboros-beacon"
 mkdir -p "$pkg_dir/usr/share/doc/harboros-beacon"
 mkdir -p "$pkg_dir/var/lib/harboros-beacon/vision-models/mobilenetv2-cat-binary-v2-20260806"
+mkdir -p "$pkg_dir/var/lib/harboros-beacon/vision-models/package-roboflow-v1-320x320-fp32"
 find "$build_root" -type d -exec chmod a-s,u=rwx,go=rx {} +
 
 cp "${cargo_release_dir}/harboros-beacon" "$pkg_dir/usr/bin/harboros-beacon"
@@ -82,6 +83,16 @@ sed 's/\r$//' config/harbornavi-k3/vision-models/mobilenetv2-cat-binary-v2-20260
 chmod 0644 \
   "$pkg_dir/var/lib/harboros-beacon/vision-models/mobilenetv2-cat-binary-v2-20260806/mobilenetv2_cat_binary_int8.onnx" \
   "$pkg_dir/var/lib/harboros-beacon/vision-models/mobilenetv2-cat-binary-v2-20260806/runtime-contract.json"
+cp config/harbornavi-k3/vision-models/package-roboflow-v1-320x320-fp32/yolov8n-package-roboflow-v1-320x320.onnx \
+  "$pkg_dir/var/lib/harboros-beacon/vision-models/package-roboflow-v1-320x320-fp32/yolov8n-package-roboflow-v1-320x320.onnx"
+sed 's/\r$//' config/harbornavi-k3/vision-models/package-roboflow-v1-320x320-fp32/label.txt \
+  > "$pkg_dir/var/lib/harboros-beacon/vision-models/package-roboflow-v1-320x320-fp32/label.txt"
+sed 's/\r$//' config/harbornavi-k3/vision-models/package-roboflow-v1-320x320-fp32/runtime-contract.json \
+  > "$pkg_dir/var/lib/harboros-beacon/vision-models/package-roboflow-v1-320x320-fp32/runtime-contract.json"
+chmod 0644 \
+  "$pkg_dir/var/lib/harboros-beacon/vision-models/package-roboflow-v1-320x320-fp32/yolov8n-package-roboflow-v1-320x320.onnx" \
+  "$pkg_dir/var/lib/harboros-beacon/vision-models/package-roboflow-v1-320x320-fp32/label.txt" \
+  "$pkg_dir/var/lib/harboros-beacon/vision-models/package-roboflow-v1-320x320-fp32/runtime-contract.json"
 
 sed 's/\r$//' debian/harboros-beacon.service > "$pkg_dir/etc/systemd/system/harboros-beacon.service"
 sed 's/\r$//' debian/semantic-router.service > "$pkg_dir/etc/systemd/system/semantic-router.service"
@@ -122,6 +133,9 @@ semantic_router_binary=/usr/bin/harbor-model-api
 semantic_router_healthz=http://127.0.0.1:4176/healthz
 default_model=/var/lib/harboros-beacon/models/yolov8n_192x320.q.onnx
 default_labels=/var/lib/harboros-beacon/models/label.txt
+package_yolo_model=/var/lib/harboros-beacon/vision-models/package-roboflow-v1-320x320-fp32/yolov8n-package-roboflow-v1-320x320.onnx
+package_yolo_labels=/var/lib/harboros-beacon/vision-models/package-roboflow-v1-320x320-fp32/label.txt
+package_yolo_model_sha256=c9df4e5e872f2857b3bcad1910121dee7358b1625cf32620938cb54dcc985568
 capture_modes=oneshot_ffmpeg,persistent_ffmpeg,local_restream
 fixed_rate_scheduler=enabled
 default_four_channel_phase_offsets=0ms,2500ms,5000ms,7500ms

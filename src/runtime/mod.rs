@@ -5,6 +5,8 @@ pub mod admin_console;
 pub mod ai_resource_scheduler;
 pub mod asr;
 pub mod automation;
+pub mod cat_detection_control;
+pub mod cat_detection_retry_scheduler;
 pub mod cat_recording_classifier;
 pub mod cat_recording_reconciliation;
 pub mod cat_recording_validation;

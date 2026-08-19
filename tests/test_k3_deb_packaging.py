@@ -10,6 +10,55 @@ BUILD_SCRIPT = REPOSITORY_ROOT / "scripts" / "build_harbornavi_k3_deb.sh"
 
 
 class K3DebPackagingTests(unittest.TestCase):
+    def test_package_detector_model_contract_is_consistent_across_runtime_and_package(self):
+        model_directory = (
+            REPOSITORY_ROOT
+            / "config"
+            / "harbornavi-k3"
+            / "vision-models"
+            / "package-roboflow-v1-320x320-fp32"
+        )
+        model_path = model_directory / "yolov8n-package-roboflow-v1-320x320.onnx"
+        labels_path = model_directory / "label.txt"
+        self.assertTrue(
+            (model_directory / "runtime-contract.json").is_file(),
+            "package detector runtime contract must be packaged",
+        )
+        self.assertTrue(model_path.is_file(), "package detector model must be packaged")
+        self.assertTrue(labels_path.is_file(), "package detector labels must be packaged")
+        runtime_contract = json.loads(
+            (model_directory / "runtime-contract.json").read_text(encoding="utf-8")
+        )
+        actual_sha256 = hashlib.sha256(model_path.read_bytes()).hexdigest()
+        systemd_unit = (
+            REPOSITORY_ROOT / "debian" / "harboros-beacon.service"
+        ).read_text(encoding="utf-8")
+        build_script = BUILD_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertEqual(
+            actual_sha256,
+            "c9df4e5e872f2857b3bcad1910121dee7358b1625cf32620938cb54dcc985568",
+        )
+        self.assertEqual(runtime_contract["model_sha256"], actual_sha256)
+        self.assertEqual(labels_path.read_text(encoding="utf-8").strip(), "package")
+        self.assertEqual(runtime_contract["runtime"]["provider"], "SpaceMITExecutionProvider")
+        self.assertEqual(runtime_contract["model"]["precision"], "fp32")
+        self.assertIn(
+            "Environment=HARBOR_K3_PACKAGE_YOLO_MODEL="
+            "/var/lib/harboros-beacon/vision-models/package-roboflow-v1-320x320-fp32/"
+            "yolov8n-package-roboflow-v1-320x320.onnx",
+            systemd_unit,
+        )
+        self.assertIn(
+            "Environment=HARBOR_K3_PACKAGE_YOLO_LABELS="
+            "/var/lib/harboros-beacon/vision-models/package-roboflow-v1-320x320-fp32/"
+            "label.txt",
+            systemd_unit,
+        )
+        self.assertIn(model_path.relative_to(REPOSITORY_ROOT).as_posix(), build_script)
+        self.assertIn(labels_path.relative_to(REPOSITORY_ROOT).as_posix(), build_script)
+        self.assertIn("package_yolo_model_sha256=" + actual_sha256, build_script)
+
     def test_classifier_model_contract_is_consistent_across_runtime_and_package(self):
         model_directory = (
             REPOSITORY_ROOT
@@ -44,7 +93,7 @@ class K3DebPackagingTests(unittest.TestCase):
             systemd_unit,
         )
         self.assertIn(f"cat_recording_classifier_sha256={expected_sha256}", build_script)
-        self.assertIn(str(model_path.relative_to(REPOSITORY_ROOT)), build_script)
+        self.assertIn(model_path.relative_to(REPOSITORY_ROOT).as_posix(), build_script)
         self.assertEqual(runtime_contract["video_decision"]["maximum_frames"], 9)
         self.assertEqual(runtime_contract["video_decision"]["minimum_positive_frames"], 3)
         self.assertIn("CAT_RECORDING_CLASSIFIER_MAX_FRAMES: usize = 9", rust_runtime)
@@ -61,6 +110,16 @@ class K3DebPackagingTests(unittest.TestCase):
         self.assertIn(
             "Environment=HARBOR_K3_CAT_RECORDING_RECONCILIATION_PATH="
             "/var/lib/harboros-beacon/cat-recording-reconciliation.json",
+            unit,
+        )
+
+    def test_cat_detection_control_uses_the_state_directory(self):
+        unit = (REPOSITORY_ROOT / "debian" / "harboros-beacon.service").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "Environment=HARBOR_K3_CAT_DETECTION_CONTROL_PATH="
+            "/var/lib/harboros-beacon/cat-detection-controls.json",
             unit,
         )
 

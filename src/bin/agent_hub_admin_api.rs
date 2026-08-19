@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::ffi::OsStr;
 use std::fmt::Write as _;
@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -29,9 +29,10 @@ use tiny_http::{Header, Method, Request, Response, ResponseBox, Server, StatusCo
 use uuid::Uuid;
 
 use harborbeacon_local_agent::connectors::harborlink_media::{
-    harborlink_request_scope, HarborLinkCredentialStatus, HarborLinkEventRecordingLease,
-    HarborLinkHomeAssistantStatus, HarborLinkLiveSession, HarborLinkMediaClient,
-    HarborLinkRecordingArtifact, HarborLinkRecordingStatus,
+    harborlink_request_scope, HarborLinkContractError, HarborLinkCredentialStatus,
+    HarborLinkDetectionLease, HarborLinkEventRecordingLease, HarborLinkHomeAssistantStatus,
+    HarborLinkLiveSession, HarborLinkMediaClient, HarborLinkRecordingArtifact,
+    HarborLinkRecordingStatus,
 };
 #[cfg(test)]
 use harborbeacon_local_agent::connectors::home_assistant::validate_home_assistant_service_fields as validate_home_assistant_service_fields_shared;
@@ -95,6 +96,17 @@ use harborbeacon_local_agent::runtime::admin_console::{
 use harborbeacon_local_agent::runtime::ai_resource_scheduler::{
     acquire_ai_resource_lease, ai_resource_scheduler_snapshot, AiLeaseErrorKind,
     AiLeaseQuarantineReason, AiResourceLease, AiWorkload, AI_RESOURCE_QUEUE_MODE,
+};
+use harborbeacon_local_agent::runtime::cat_detection_control::{
+    default_control_path as default_cat_detection_control_path,
+    validate_cat_detection_control_camera_id, CatDetectionControlPolicy, CatDetectionControlStore,
+    MAX_CAT_DETECTION_CONTROL_POLICIES, MAX_PENDING_DETECTION_LEASES,
+};
+#[cfg(test)]
+use harborbeacon_local_agent::runtime::cat_detection_retry_scheduler::CatDetectionRetrySchedulerProbe;
+use harborbeacon_local_agent::runtime::cat_detection_retry_scheduler::{
+    CatDetectionRetryEntry, CatDetectionRetryOutcome, CatDetectionRetryScheduler,
+    CatDetectionRetrySchedulerConfig,
 };
 use harborbeacon_local_agent::runtime::cat_recording_classifier::{
     aggregate_cat_recording_predictions, build_classifier_command, classifier_config_from_env,
@@ -189,6 +201,8 @@ const ADMIN_HTTP_WORKER_COUNT: usize = 32;
 const ADMIN_HTTP_REQUEST_QUEUE_CAPACITY: usize = 256;
 const MAX_VISION_EVENT_INGEST_INFLIGHT: usize = 8;
 const DETECTION_JOB_MONITOR_INTERVAL: Duration = Duration::from_secs(1);
+const DETECTION_LEASE_CLEANUP_RETRY_INITIAL: Duration = Duration::from_secs(1);
+const DETECTION_LEASE_CLEANUP_RETRY_MAX: Duration = Duration::from_secs(60);
 const CAT_RECORDING_VALIDATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const CAT_RECORDING_VALIDATION_RUNTIME_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 const CAT_RECORDING_VALIDATION_MAX_BYTES: u64 = 256 * 1024 * 1024;
@@ -227,6 +241,13 @@ const DEFAULT_DETECTION_WORKER: &str =
     "/usr/lib/harboros-beacon/harbornavi_k3_yolo_stream_worker.py";
 const DEFAULT_DETECTION_MODEL: &str = "/var/lib/harboros-beacon/models/yolov8n_192x320.q.onnx";
 const DEFAULT_DETECTION_LABELS: &str = "/var/lib/harboros-beacon/models/label.txt";
+const DEFAULT_PACKAGE_DETECTION_MODEL: &str = "/var/lib/harboros-beacon/vision-models/package-roboflow-v1-320x320-fp32/yolov8n-package-roboflow-v1-320x320.onnx";
+const DEFAULT_PACKAGE_DETECTION_LABELS: &str =
+    "/var/lib/harboros-beacon/vision-models/package-roboflow-v1-320x320-fp32/label.txt";
+const PACKAGE_DETECTION_MODEL_ENV: &str = "HARBOR_K3_PACKAGE_YOLO_MODEL";
+const PACKAGE_DETECTION_LABELS_ENV: &str = "HARBOR_K3_PACKAGE_YOLO_LABELS";
+const DEFAULT_PACKAGE_DETECTION_MAX_FPS: f64 = 5.0;
+const DEFAULT_PACKAGE_DETECTION_CONFIDENCE: f64 = 0.25;
 const DEFAULT_DETECTION_OUTPUT_ROOT: &str = "/run/harboros-beacon/detection-jobs";
 const CAT_AUTO_RECORD_ENABLED_ENV: &str = "HARBOR_K3_CAT_AUTO_RECORD_ENABLED";
 const CAT_AUTO_RECORD_START_FRAMES_ENV: &str = "HARBOR_K3_CAT_AUTO_RECORD_START_CONSECUTIVE_FRAMES";
@@ -245,6 +266,8 @@ const DEFAULT_CAT_AUTO_RECORD_START_DURATION_MS: u64 = 500;
 const DEFAULT_CAT_AUTO_RECORD_STOP_CONSECUTIVE_FRAMES: u64 = 15;
 const DEFAULT_CAT_AUTO_RECORD_STOP_DURATION_MS: u64 = 3_000;
 const LIVE_MANAGED_DETECTION_TTL_SECONDS: u64 = 300;
+const CAT_DETECTION_CONTROL_RETRY_INITIAL_SECONDS: u64 = 1;
+const CAT_DETECTION_CONTROL_RETRY_MAX_SECONDS: u64 = 60;
 const CAT_AUTO_DETECTION_RENEW_WINDOW_SECONDS: i64 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -487,14 +510,62 @@ pub struct AdminApi {
     guardian_action_runs: Arc<Mutex<HashMap<String, u64>>>,
     guardian_rule_cache: Arc<Mutex<HomeGuardianRuleCache>>,
     guardian_activity_log_lock: Arc<Mutex<()>>,
-    detection_job_lifecycle_lock: Arc<Mutex<()>>,
     detection_jobs: Arc<Mutex<HashMap<String, DetectionJobRuntime>>>,
+    detection_lease_cleanup_retries:
+        Arc<Mutex<HashMap<DetectionLeaseCleanupRetryKey, DetectionLeaseCleanupRetryState>>>,
+    cat_detection_control_store: Option<CatDetectionControlStore>,
+    cat_detection_controls: Arc<Mutex<BTreeMap<String, CatDetectionControlPolicy>>>,
+    cat_detection_control_store_load_error: Arc<Mutex<Option<String>>>,
+    cat_detection_control_coordination: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
+    cat_detection_control_reconciliation:
+        Arc<Mutex<HashMap<String, CatDetectionControlReconciliation>>>,
+    cat_detection_retry_scheduler: Option<CatDetectionRetryScheduler>,
+    cat_detection_retry_scheduling_context: CatDetectionRetrySchedulingContext,
     cat_auto_recording: Arc<Mutex<HashMap<String, CatAutoRecordingState>>>,
     cat_recording_reconciliation_store: CatRecordingReconciliationStore,
     cat_recording_validation_mode: CatRecordingValidationMode,
     cat_recording_validation_store: CatRecordingValidationStore,
     http_runtime: HttpRuntimeCounters,
     vision_ingest_limiter: VisionIngestLimiter,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CatDetectionRetrySchedulingContext {
+    External,
+    WorkerExecution,
+}
+
+struct CatDetectionRetryExecutionContext {
+    api: AdminApi,
+}
+
+impl CatDetectionRetryExecutionContext {
+    fn new(api: &AdminApi) -> Self {
+        let mut execution_api = api.clone();
+        execution_api.cat_detection_retry_scheduler = None;
+        execution_api.cat_detection_retry_scheduling_context =
+            CatDetectionRetrySchedulingContext::WorkerExecution;
+        Self { api: execution_api }
+    }
+
+    fn execute(&self, entry: CatDetectionRetryEntry) -> CatDetectionRetryOutcome {
+        match self
+            .api
+            .coordinate_cat_detection_control(&entry.camera_id, entry.revision)
+        {
+            Ok(CatDetectionControlCoordination::Converged)
+            | Ok(CatDetectionControlCoordination::Superseded) => CatDetectionRetryOutcome::Complete,
+            Ok(CatDetectionControlCoordination::Draining) => CatDetectionRetryOutcome::Retry,
+            Err(error) => {
+                eprintln!(
+                    "HarborBeacon cat detection control retry remains pending for {}: {}",
+                    redact_admin_string(&entry.camera_id),
+                    redact_admin_string(&error)
+                );
+                CatDetectionRetryOutcome::Retry
+            }
+        }
+    }
 }
 
 type CatAutoRecordingState = CatRecordingReconciliationState;
@@ -505,6 +576,13 @@ struct CatAutoRecordingConfig {
     start_duration_ms: u64,
     stop_consecutive_frames: u64,
     stop_duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatAutoRecordingCommitPersistence {
+    MemoryOnly,
+    Upsert,
+    Remove,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2053,6 +2131,14 @@ struct DetectionJobConfig {
     stream_profile: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DetectionModelProfile {
+    model_env: &'static str,
+    labels_env: &'static str,
+    default_model: &'static str,
+    default_labels: &'static str,
+}
+
 #[derive(Debug, Clone)]
 struct DetectionProfileHandoffState {
     config: DetectionJobConfig,
@@ -2137,11 +2223,278 @@ struct DetectionJobStartResponse {
     reused: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct CatDetectionControlResponse {
+    camera_id: String,
+    explicit: bool,
+    desired_enabled: bool,
+    desired_stream_profile: String,
+    effective_status: String,
+    effective_stream_profile: Option<String>,
+    job_id: Option<String>,
+    updated_at: Option<String>,
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatDetectionControlRequest {
+    enabled: bool,
+    stream_profile: String,
+}
+
+#[derive(Debug, Clone)]
+struct CatDetectionControlReconciliation {
+    effective_status: String,
+    message: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CatDetectionControlCoordination {
+    Converged,
+    Draining,
+    Superseded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DetectionLeaseCreateFailureDisposition {
+    RetrySameAttempt,
+    ConfirmedNotCreated,
+    Conflict,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DetectionProfileRollbackResolution {
+    None,
+    Restored { stream_profile: String },
+    CleanedUp { stream_profile: String },
+    ConfirmedNotCreated { stream_profile: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RollbackResolutionMode {
+    RestorePreviousProfile,
+    CleanupOnly,
+}
+
 struct DetectionJobRuntime {
     projection: DetectionJobProjection,
     output_dir: PathBuf,
     child: Option<Child>,
     ai_lease: Option<AiResourceLease>,
+    detection_lease_cleanup_confirmed: bool,
+}
+
+#[derive(Clone, Debug)]
+struct DetectionLeaseCleanupIntent {
+    job_id: String,
+    camera_id: String,
+    lease_id: String,
+    target_label: String,
+    base_message: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct DetectionLeaseCleanupRetryKey {
+    job_id: String,
+    camera_id: String,
+    lease_id: String,
+}
+
+impl From<&DetectionLeaseCleanupIntent> for DetectionLeaseCleanupRetryKey {
+    fn from(intent: &DetectionLeaseCleanupIntent) -> Self {
+        Self {
+            job_id: intent.job_id.clone(),
+            camera_id: intent.camera_id.clone(),
+            lease_id: intent.lease_id.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DetectionLeaseCleanupRetryState {
+    consecutive_failures: u8,
+    next_attempt_at: Instant,
+}
+
+impl DetectionLeaseCleanupRetryState {
+    fn after_failure(previous: Option<Self>, now: Instant) -> Self {
+        let consecutive_failures = previous
+            .map(|state| state.consecutive_failures)
+            .unwrap_or_default()
+            .saturating_add(1);
+        let exponent = u32::from(consecutive_failures.saturating_sub(1)).min(6);
+        let delay = DETECTION_LEASE_CLEANUP_RETRY_INITIAL
+            .checked_mul(1_u32 << exponent)
+            .unwrap_or(DETECTION_LEASE_CLEANUP_RETRY_MAX)
+            .min(DETECTION_LEASE_CLEANUP_RETRY_MAX);
+        Self {
+            consecutive_failures,
+            next_attempt_at: now + delay,
+        }
+    }
+}
+
+fn terminal_detection_lease_cleanup_intents(
+    jobs: &HashMap<String, DetectionJobRuntime>,
+) -> Vec<DetectionLeaseCleanupIntent> {
+    jobs.iter()
+        .filter(|(_, runtime)| {
+            runtime.child.is_none()
+                && !runtime.detection_lease_cleanup_confirmed
+                && !runtime.projection.lease_id.is_empty()
+                && matches!(
+                    runtime.projection.status.as_str(),
+                    "completed" | "failed" | "expired" | "stopped"
+                )
+        })
+        .map(|(job_id, runtime)| DetectionLeaseCleanupIntent {
+            job_id: job_id.clone(),
+            camera_id: runtime.projection.camera_id.clone(),
+            lease_id: runtime.projection.lease_id.clone(),
+            target_label: runtime
+                .projection
+                .target_labels
+                .first()
+                .cloned()
+                .unwrap_or_default(),
+            base_message: detection_lease_cleanup_base_message(
+                runtime.projection.message.as_deref(),
+            ),
+        })
+        .collect()
+}
+
+fn cat_control_owns_detection_cleanup(intent: &DetectionLeaseCleanupIntent) -> bool {
+    intent.target_label == "cat"
+}
+
+fn detection_lease_cleanup_base_message(message: Option<&str>) -> Option<String> {
+    const CLEANUP_SUFFIX: &str = "; detection lease cleanup was incomplete:";
+    const CLEANUP_ONLY: &str = "detection lease cleanup was incomplete:";
+    message.and_then(|message| {
+        let message = message
+            .split_once(CLEANUP_SUFFIX)
+            .map(|(base, _)| base)
+            .unwrap_or(message);
+        (!message.starts_with(CLEANUP_ONLY) && !message.is_empty()).then(|| message.to_string())
+    })
+}
+
+fn commit_detection_lease_cleanup_result(
+    jobs: &mut HashMap<String, DetectionJobRuntime>,
+    intent: &DetectionLeaseCleanupIntent,
+    result: Result<(), String>,
+) -> bool {
+    let Some(runtime) = jobs.get_mut(&intent.job_id) else {
+        return false;
+    };
+    if runtime.projection.camera_id != intent.camera_id
+        || runtime.projection.lease_id != intent.lease_id
+        || runtime.child.is_some()
+        || !matches!(
+            runtime.projection.status.as_str(),
+            "completed" | "failed" | "expired" | "stopped"
+        )
+    {
+        return false;
+    }
+    runtime.projection.updated_at = current_rfc3339_timestamp();
+    match result {
+        Ok(()) => {
+            runtime.detection_lease_cleanup_confirmed = true;
+            runtime.projection.message = intent.base_message.clone();
+        }
+        Err(error) => {
+            runtime.detection_lease_cleanup_confirmed = false;
+            let cleanup = format!(
+                "detection lease cleanup was incomplete: {}",
+                redact_admin_string(&error)
+            );
+            runtime.projection.message = Some(match intent.base_message.as_deref() {
+                Some(base) => format!("{base}; {cleanup}"),
+                None => cleanup,
+            });
+        }
+    }
+    true
+}
+
+fn detection_lease_responsibility_ids(
+    camera_id: &str,
+    persisted_pending: impl IntoIterator<Item = String>,
+    jobs: &HashMap<String, DetectionJobRuntime>,
+) -> Vec<String> {
+    detection_lease_responsibility_ids_for_target(camera_id, persisted_pending, jobs, None)
+}
+
+fn detection_lease_responsibility_ids_for_target(
+    camera_id: &str,
+    persisted_pending: impl IntoIterator<Item = String>,
+    jobs: &HashMap<String, DetectionJobRuntime>,
+    target_label: Option<&str>,
+) -> Vec<String> {
+    let mut lease_ids = persisted_pending
+        .into_iter()
+        .filter(|lease_id| !lease_id.is_empty())
+        .collect::<BTreeSet<_>>();
+    lease_ids.extend(
+        jobs.values()
+            .filter(|runtime| {
+                runtime.projection.camera_id == camera_id
+                    && !runtime.detection_lease_cleanup_confirmed
+                    && !runtime.projection.lease_id.is_empty()
+                    && target_label.is_none_or(|target_label| {
+                        detection_projection_targets(&runtime.projection, target_label)
+                    })
+            })
+            .map(|runtime| runtime.projection.lease_id.clone()),
+    );
+    lease_ids.into_iter().collect()
+}
+
+fn detection_projection_targets(projection: &DetectionJobProjection, target_label: &str) -> bool {
+    projection.target_labels.as_slice() == [target_label]
+}
+
+fn healthy_detection_lease_to_preserve(
+    camera_id: &str,
+    stream_profile: &str,
+    jobs: &HashMap<String, DetectionJobRuntime>,
+) -> Option<String> {
+    let mut running = jobs.values().filter(|runtime| {
+        runtime.projection.camera_id == camera_id
+            && runtime.projection.status == "running"
+            && detection_projection_targets(&runtime.projection, "cat")
+    });
+    let runtime = running.next()?;
+    if running.next().is_some()
+        || runtime.projection.stream_profile != stream_profile
+        || runtime.projection.lease_id.is_empty()
+    {
+        return None;
+    }
+    Some(runtime.projection.lease_id.clone())
+}
+
+fn healthy_detection_profile_to_restore(
+    camera_id: &str,
+    desired_stream_profile: &str,
+    jobs: &HashMap<String, DetectionJobRuntime>,
+) -> Option<String> {
+    let mut running = jobs.values().filter(|runtime| {
+        runtime.projection.camera_id == camera_id
+            && runtime.projection.status == "running"
+            && detection_projection_targets(&runtime.projection, "cat")
+    });
+    let runtime = running.next()?;
+    if running.next().is_some()
+        || runtime.projection.stream_profile == desired_stream_profile
+        || runtime.projection.lease_id.is_empty()
+    {
+        return None;
+    }
+    Some(runtime.projection.stream_profile.clone())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2156,6 +2509,12 @@ enum DetectionChildStopOutcome {
 struct DetectionChildStopReport {
     outcome: DetectionChildStopOutcome,
     warning: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AdminApiBackgroundWorkers {
+    Enabled,
+    Disabled,
 }
 
 type StateResponse = HubStateSnapshot;
@@ -2214,6 +2573,30 @@ impl AdminApi {
         cat_recording_reconciliation_store: CatRecordingReconciliationStore,
         cat_recording_validation_store: CatRecordingValidationStore,
     ) -> Self {
+        Self::new_with_dependencies_and_background_workers(
+            admin_store,
+            task_service,
+            harbor_assistant_dist,
+            public_origin,
+            harborlink_media,
+            cat_recording_validation_mode,
+            cat_recording_reconciliation_store,
+            cat_recording_validation_store,
+            AdminApiBackgroundWorkers::Enabled,
+        )
+    }
+
+    fn new_with_dependencies_and_background_workers(
+        admin_store: AdminConsoleStore,
+        task_service: TaskApiService,
+        harbor_assistant_dist: PathBuf,
+        public_origin: String,
+        harborlink_media: HarborLinkMediaClient,
+        cat_recording_validation_mode: CatRecordingValidationMode,
+        cat_recording_reconciliation_store: CatRecordingReconciliationStore,
+        cat_recording_validation_store: CatRecordingValidationStore,
+        background_workers: AdminApiBackgroundWorkers,
+    ) -> Self {
         let (guardian_sender, guardian_receiver) =
             sync_channel(HOME_GUARDIAN_EVALUATION_QUEUE_CAPACITY);
         let cat_auto_recording = cat_recording_reconciliation_store
@@ -2221,6 +2604,34 @@ impl AdminApi {
             .unwrap_or_else(|error| fail(&error))
             .into_iter()
             .collect::<HashMap<_, _>>();
+        let (cat_detection_control_store, cat_detection_controls, cat_detection_control_error) =
+            match CatDetectionControlStore::try_new(default_cat_detection_control_path()) {
+                Ok(store) => match store.load() {
+                    Ok(controls) => (Some(store), controls, None),
+                    Err(error) => (Some(store), BTreeMap::new(), Some(error)),
+                },
+                Err(error) => (None, BTreeMap::new(), Some(error)),
+            };
+        let cat_detection_retry_scheduler =
+            if background_workers == AdminApiBackgroundWorkers::Enabled {
+                match CatDetectionRetryScheduler::new(CatDetectionRetrySchedulerConfig {
+                    worker_count: 4,
+                    capacity: MAX_CAT_DETECTION_CONTROL_POLICIES,
+                    initial_delay: Duration::from_secs(CAT_DETECTION_CONTROL_RETRY_INITIAL_SECONDS),
+                    max_delay: Duration::from_secs(CAT_DETECTION_CONTROL_RETRY_MAX_SECONDS),
+                }) {
+                    Ok(scheduler) => Some(scheduler),
+                    Err(error) => {
+                        eprintln!(
+                            "HarborBeacon cat detection retry scheduling is unavailable: {}",
+                            redact_admin_string(&error)
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
         let api = Self {
             admin_store,
             task_service,
@@ -2242,8 +2653,17 @@ impl AdminApi {
             guardian_action_runs: Arc::new(Mutex::new(HashMap::new())),
             guardian_rule_cache: Arc::new(Mutex::new(HomeGuardianRuleCache::default())),
             guardian_activity_log_lock: Arc::new(Mutex::new(())),
-            detection_job_lifecycle_lock: Arc::new(Mutex::new(())),
             detection_jobs: Arc::new(Mutex::new(HashMap::new())),
+            detection_lease_cleanup_retries: Arc::new(Mutex::new(HashMap::new())),
+            cat_detection_control_store,
+            cat_detection_controls: Arc::new(Mutex::new(cat_detection_controls)),
+            cat_detection_control_store_load_error: Arc::new(Mutex::new(
+                cat_detection_control_error,
+            )),
+            cat_detection_control_coordination: Arc::new(Mutex::new(HashMap::new())),
+            cat_detection_control_reconciliation: Arc::new(Mutex::new(HashMap::new())),
+            cat_detection_retry_scheduler,
+            cat_detection_retry_scheduling_context: CatDetectionRetrySchedulingContext::External,
             cat_auto_recording: Arc::new(Mutex::new(cat_auto_recording)),
             cat_recording_reconciliation_store,
             cat_recording_validation_mode,
@@ -2252,11 +2672,38 @@ impl AdminApi {
             vision_ingest_limiter: VisionIngestLimiter::new(),
         };
         api.refresh_home_guardian_rule_cache_best_effort();
-        api.start_home_guardian_worker(guardian_receiver);
-        api.start_detection_job_monitor();
-        api.start_cat_auto_recording_worker();
-        api.start_cat_recording_validation_worker();
+        if background_workers == AdminApiBackgroundWorkers::Enabled {
+            api.start_home_guardian_worker(guardian_receiver);
+            api.start_detection_job_monitor();
+            api.start_cat_auto_recording_worker();
+            api.start_cat_recording_validation_worker();
+            api.start_cat_detection_control_recovery();
+        }
         api
+    }
+
+    #[cfg(test)]
+    fn new_with_dependencies_for_test(
+        admin_store: AdminConsoleStore,
+        task_service: TaskApiService,
+        harbor_assistant_dist: PathBuf,
+        public_origin: String,
+        harborlink_media: HarborLinkMediaClient,
+        cat_recording_validation_mode: CatRecordingValidationMode,
+        cat_recording_reconciliation_store: CatRecordingReconciliationStore,
+        cat_recording_validation_store: CatRecordingValidationStore,
+    ) -> Self {
+        Self::new_with_dependencies_and_background_workers(
+            admin_store,
+            task_service,
+            harbor_assistant_dist,
+            public_origin,
+            harborlink_media,
+            cat_recording_validation_mode,
+            cat_recording_reconciliation_store,
+            cat_recording_validation_store,
+            AdminApiBackgroundWorkers::Disabled,
+        )
     }
 
     #[cfg(test)]
@@ -2266,7 +2713,7 @@ impl AdminApi {
         harbor_assistant_dist: PathBuf,
         public_origin: String,
     ) -> Self {
-        Self::new_with_dependencies(
+        Self::new_with_dependencies_for_test(
             admin_store,
             task_service,
             harbor_assistant_dist,
@@ -2309,13 +2756,202 @@ impl AdminApi {
         let _ = thread::Builder::new()
             .name("detection-job-monitor".to_string())
             .spawn(move || loop {
-                if let Ok(mut jobs) = worker.detection_jobs.lock() {
-                    for runtime in jobs.values_mut() {
-                        worker.refresh_detection_job(runtime);
-                    }
+                if let Err(error) = worker.monitor_detection_jobs_once() {
+                    eprintln!(
+                        "HarborBeacon detection job monitor pass failed: {}",
+                        redact_admin_string(&error)
+                    );
                 }
                 thread::sleep(DETECTION_JOB_MONITOR_INTERVAL);
             });
+    }
+
+    fn monitor_detection_jobs_once(&self) -> Result<(), String> {
+        self.monitor_detection_jobs_once_at(Instant::now())
+    }
+
+    fn monitor_detection_jobs_once_at(&self, now: Instant) -> Result<(), String> {
+        let (camera_ids, all_cleanup_intents) = {
+            let mut jobs = self
+                .detection_jobs
+                .lock()
+                .map_err(|_| "detection job state is unavailable".to_string())?;
+            let camera_ids = jobs
+                .values()
+                .map(|runtime| runtime.projection.camera_id.clone())
+                .collect::<HashSet<_>>();
+            for runtime in jobs.values_mut() {
+                self.refresh_detection_job(runtime);
+            }
+            let cleanup_intents = terminal_detection_lease_cleanup_intents(&jobs);
+            (camera_ids, cleanup_intents)
+        };
+        let current_cleanup_keys = all_cleanup_intents
+            .iter()
+            .map(DetectionLeaseCleanupRetryKey::from)
+            .collect::<HashSet<_>>();
+        let explicit_cameras = self
+            .cat_detection_controls
+            .lock()
+            .map_err(|_| "cat detection control state is unavailable".to_string())?
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let cat_control_owned_cleanup_keys = all_cleanup_intents
+            .iter()
+            .filter(|intent| {
+                cat_control_owns_detection_cleanup(intent)
+                    && explicit_cameras.contains(&intent.camera_id)
+            })
+            .map(DetectionLeaseCleanupRetryKey::from)
+            .collect::<HashSet<_>>();
+        let cleanup_intents = {
+            let mut retries = self
+                .detection_lease_cleanup_retries
+                .lock()
+                .map_err(|_| "detection lease cleanup retry state is unavailable".to_string())?;
+            retries.retain(|key, _| {
+                current_cleanup_keys.contains(key) && !cat_control_owned_cleanup_keys.contains(key)
+            });
+            all_cleanup_intents
+                .into_iter()
+                .filter(|intent| {
+                    cat_control_owned_cleanup_keys
+                        .contains(&DetectionLeaseCleanupRetryKey::from(intent))
+                        || retries
+                            .get(&DetectionLeaseCleanupRetryKey::from(intent))
+                            .is_none_or(|retry| retry.next_attempt_at <= now)
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut first_error = None;
+        for intent in cleanup_intents {
+            if let Err(error) = self.cleanup_terminal_detection_lease(intent, now) {
+                first_error.get_or_insert(error);
+            }
+        }
+        if let Ok(mut jobs) = self.detection_jobs.lock() {
+            prune_detection_job_history(&mut jobs);
+        }
+        for camera_id in camera_ids {
+            self.schedule_cat_detection_runtime_drift(&camera_id);
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn cleanup_terminal_detection_lease(
+        &self,
+        intent: DetectionLeaseCleanupIntent,
+        now: Instant,
+    ) -> Result<(), String> {
+        let camera_lock = self.cat_detection_control_camera_lock(&intent.camera_id)?;
+        let _camera_coordination = camera_lock
+            .lock()
+            .map_err(|_| "cat detection camera coordination is unavailable".to_string())?;
+        let still_current = self
+            .detection_jobs
+            .lock()
+            .map_err(|_| "detection job state is unavailable".to_string())?
+            .get(&intent.job_id)
+            .is_some_and(|runtime| {
+                runtime.projection.camera_id == intent.camera_id
+                    && runtime.projection.lease_id == intent.lease_id
+                    && runtime.child.is_none()
+                    && !runtime.detection_lease_cleanup_confirmed
+                    && matches!(
+                        runtime.projection.status.as_str(),
+                        "completed" | "failed" | "expired" | "stopped"
+                    )
+            });
+        if !still_current {
+            return Ok(());
+        }
+        let explicit_policy = if cat_control_owns_detection_cleanup(&intent) {
+            self.cat_detection_explicit_policy(&intent.camera_id)?
+        } else {
+            None
+        };
+        if let Some(policy) = explicit_policy.as_ref() {
+            self.detection_lease_cleanup_retries
+                .lock()
+                .map_err(|_| "detection lease cleanup retry state is unavailable".to_string())?
+                .remove(&DetectionLeaseCleanupRetryKey::from(&intent));
+            if policy
+                .pending_detection_lease_ids
+                .iter()
+                .any(|lease_id| lease_id == &intent.lease_id)
+            {
+                self.schedule_cat_detection_control_retry(
+                    &intent.camera_id,
+                    policy.updated_at_epoch_ms,
+                );
+                return Ok(());
+            }
+            self.retain_pending_detection_leases(&intent.camera_id, [intent.lease_id.clone()])?;
+        }
+        let cleanup_result =
+            self.stop_detection_lease_idempotently(&intent.camera_id, &intent.lease_id);
+        let applied = {
+            let mut jobs = self
+                .detection_jobs
+                .lock()
+                .map_err(|_| "detection job state is unavailable".to_string())?;
+            commit_detection_lease_cleanup_result(&mut jobs, &intent, cleanup_result.clone())
+        };
+        if applied && explicit_policy.is_none() {
+            let retry_key = DetectionLeaseCleanupRetryKey::from(&intent);
+            let mut retries = self
+                .detection_lease_cleanup_retries
+                .lock()
+                .map_err(|_| "detection lease cleanup retry state is unavailable".to_string())?;
+            if cleanup_result.is_ok() {
+                retries.remove(&retry_key);
+            } else {
+                let previous = retries.get(&retry_key).copied();
+                retries.insert(
+                    retry_key,
+                    DetectionLeaseCleanupRetryState::after_failure(previous, now),
+                );
+            }
+        }
+        if let Some(policy) = explicit_policy.as_ref() {
+            if !applied || cleanup_result.is_err() {
+                self.schedule_cat_detection_control_retry(
+                    &intent.camera_id,
+                    policy.updated_at_epoch_ms,
+                );
+            }
+        }
+        if applied && cleanup_result.is_ok() {
+            if let Some(policy) = explicit_policy {
+                if let Err(error) = self.clear_pending_detection_leases(
+                    &intent.camera_id,
+                    &HashSet::from([intent.lease_id.clone()]),
+                ) {
+                    self.schedule_cat_detection_control_retry(
+                        &intent.camera_id,
+                        policy.updated_at_epoch_ms,
+                    );
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn stop_detection_lease_idempotently(
+        &self,
+        camera_id: &str,
+        lease_id: &str,
+    ) -> Result<(), String> {
+        match self
+            .harborlink_media
+            .stop_detection_lease(camera_id, lease_id)
+        {
+            Ok(_) => Ok(()),
+            Err(error) if harborlink_error_status_code(&error) == Some(404) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     fn start_cat_auto_recording_worker(&self) {
@@ -2816,6 +3452,17 @@ impl AdminApi {
     }
 
     fn reconcile_cat_recording(&self, state: &CatAutoRecordingState) -> Result<(), String> {
+        let camera_lock = self.cat_detection_control_camera_lock(&state.camera_id)?;
+        let _camera_coordination = camera_lock
+            .lock()
+            .map_err(|_| "cat detection camera coordination is unavailable".to_string())?;
+        self.reconcile_cat_recording_coordinated(state)
+    }
+
+    fn reconcile_cat_recording_coordinated(
+        &self,
+        state: &CatAutoRecordingState,
+    ) -> Result<(), String> {
         let Some(event_id) = state.event_id.as_deref() else {
             return Ok(());
         };
@@ -2836,12 +3483,12 @@ impl AdminApi {
                 recovered.phase = CatRecordingReconciliationPhase::Active;
                 recovered.lease_id = Some(lease.lease_id.clone());
                 recovered.stream_profile = Some(lease.stream_profile.clone());
-                self.cat_recording_reconciliation_store
-                    .upsert(recovered.clone())?;
-                self.cat_auto_recording
-                    .lock()
-                    .map_err(|_| "cat auto-recording state is unavailable".to_string())?
-                    .insert(recovered.camera_id.clone(), recovered);
+                self.commit_cat_auto_recording_state_if_current(
+                    &state.camera_id,
+                    &Some(state.clone()),
+                    Some(recovered),
+                    CatAutoRecordingCommitPersistence::Upsert,
+                )?;
                 return Ok(());
             }
         }
@@ -2868,12 +3515,12 @@ impl AdminApi {
                 && cat_auto_recording_epoch_ms().saturating_sub(state.created_at_epoch_ms)
                     >= CAT_RECORDING_PENDING_START_TIMEOUT_MS;
             if lease_not_found && pending_start_expired {
-                self.cat_recording_reconciliation_store
-                    .remove(&state.camera_id)?;
-                self.cat_auto_recording
-                    .lock()
-                    .map_err(|_| "cat auto-recording state is unavailable".to_string())?
-                    .remove(&state.camera_id);
+                self.commit_cat_auto_recording_state_if_current(
+                    &state.camera_id,
+                    &Some(state.clone()),
+                    None,
+                    CatAutoRecordingCommitPersistence::Remove,
+                )?;
                 return Ok(());
             }
             return Err(format!(
@@ -2881,12 +3528,12 @@ impl AdminApi {
             ));
         }
         self.register_cat_recording_validation_artifacts(&artifacts, &state.detection_evidence)?;
-        self.cat_recording_reconciliation_store
-            .remove(&state.camera_id)?;
-        self.cat_auto_recording
-            .lock()
-            .map_err(|_| "cat auto-recording state is unavailable".to_string())?
-            .remove(&state.camera_id);
+        self.commit_cat_auto_recording_state_if_current(
+            &state.camera_id,
+            &Some(state.clone()),
+            None,
+            CatAutoRecordingCommitPersistence::Remove,
+        )?;
         Ok(())
     }
 
@@ -2895,7 +3542,7 @@ impl AdminApi {
         state: &CatAutoRecordingState,
         error: String,
     ) -> Result<(), String> {
-        self.reconcile_cat_recording(state)
+        self.reconcile_cat_recording_coordinated(state)
             .map_err(|reconciliation_error| {
                 format!("{error}; cat recording reconciliation failed: {reconciliation_error}")
             })
@@ -2919,7 +3566,9 @@ impl AdminApi {
             jobs.values_mut()
                 .filter_map(|runtime| {
                     self.refresh_detection_job(runtime);
-                    (runtime.projection.status == "running").then(|| {
+                    (runtime.projection.status == "running"
+                        && detection_projection_targets(&runtime.projection, "cat"))
+                    .then(|| {
                         (
                             runtime.projection.camera_id.clone(),
                             runtime.projection.stream_profile.clone(),
@@ -2963,6 +3612,7 @@ impl AdminApi {
             .iter()
             .filter(|(_, runtime)| {
                 runtime.projection.status == "running"
+                    && detection_projection_targets(&runtime.projection, "cat")
                     && detection_lease_renewal_due(&runtime.projection.expires_at, now)
             })
             .map(|(job_id, runtime)| {
@@ -2975,10 +3625,13 @@ impl AdminApi {
             .collect::<Vec<_>>();
         let mut first_error = None;
         for (job_id, camera_id, lease_id) in candidates {
-            let _lifecycle = self
-                .detection_job_lifecycle_lock
+            let camera_lock = self.cat_detection_control_camera_lock(&camera_id)?;
+            let _camera_coordination = camera_lock
                 .lock()
-                .map_err(|_| "detection job lifecycle is unavailable".to_string())?;
+                .map_err(|_| "cat detection camera coordination is unavailable".to_string())?;
+            if !self.cat_detection_may_run(&camera_id)? {
+                continue;
+            }
             let still_due = self
                 .detection_jobs
                 .lock()
@@ -3037,15 +3690,88 @@ impl AdminApi {
         latest_result: Option<&Value>,
         config: CatAutoRecordingConfig,
     ) -> Result<(), String> {
-        let now = cat_auto_recording_epoch_ms();
-        let sample =
-            latest_result.and_then(|result| parse_cat_detection_streak_sample(result, now));
+        let camera_lock = self.cat_detection_control_camera_lock(camera_id)?;
+        let _camera_coordination = camera_lock
+            .lock()
+            .map_err(|_| "cat detection camera coordination is unavailable".to_string())?;
+        if !self.cat_detection_may_run(camera_id)? {
+            return self
+                .finish_cat_recording_for_disabled_camera_locked(camera_id)
+                .map(|_| ());
+        }
+        self.process_cat_detection_result_coordinated(
+            camera_id,
+            stream_profile,
+            latest_result,
+            config,
+        )
+    }
 
+    fn cat_auto_recording_state_snapshot(
+        &self,
+        camera_id: &str,
+    ) -> Result<Option<CatAutoRecordingState>, String> {
+        Ok(self
+            .cat_auto_recording
+            .lock()
+            .map_err(|_| "cat auto-recording state is unavailable".to_string())?
+            .get(camera_id)
+            .cloned())
+    }
+
+    fn commit_cat_auto_recording_state_if_current(
+        &self,
+        camera_id: &str,
+        expected: &Option<CatAutoRecordingState>,
+        replacement: Option<CatAutoRecordingState>,
+        persistence: CatAutoRecordingCommitPersistence,
+    ) -> Result<(), String> {
         let mut states = self
             .cat_auto_recording
             .lock()
             .map_err(|_| "cat auto-recording state is unavailable".to_string())?;
-        let state = states.entry(camera_id.to_string()).or_default();
+        if states.get(camera_id) != expected.as_ref() {
+            return Err(format!(
+                "cat auto-recording state changed while camera {camera_id} was being coordinated"
+            ));
+        }
+        match persistence {
+            CatAutoRecordingCommitPersistence::MemoryOnly => {}
+            CatAutoRecordingCommitPersistence::Upsert => {
+                let state = replacement.as_ref().ok_or_else(|| {
+                    "cat auto-recording durable upsert requires state".to_string()
+                })?;
+                self.cat_recording_reconciliation_store
+                    .upsert(state.clone())?;
+            }
+            CatAutoRecordingCommitPersistence::Remove => {
+                self.cat_recording_reconciliation_store.remove(camera_id)?;
+            }
+        }
+        match replacement {
+            Some(state) => {
+                states.insert(camera_id.to_string(), state);
+            }
+            None => {
+                states.remove(camera_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn process_cat_detection_result_coordinated(
+        &self,
+        camera_id: &str,
+        stream_profile: &str,
+        latest_result: Option<&Value>,
+        config: CatAutoRecordingConfig,
+    ) -> Result<(), String> {
+        let now = cat_auto_recording_epoch_ms();
+        let sample =
+            latest_result.and_then(|result| parse_cat_detection_streak_sample(result, now));
+
+        let mut expected = self.cat_auto_recording_state_snapshot(camera_id)?;
+        let mut state = expected.clone().unwrap_or_default();
         state.camera_id = camera_id.to_string();
         if state
             .stream_profile
@@ -3060,7 +3786,6 @@ impl AdminApi {
                     Ok(stopped) => stopped,
                     Err(error) => {
                         let reconciliation_state = state.clone();
-                        drop(states);
                         return self.reconcile_cat_recording_after_link_error(
                             &reconciliation_state,
                             error,
@@ -3071,10 +3796,17 @@ impl AdminApi {
                     &stopped.artifacts,
                     &state.detection_evidence,
                 )?;
-                self.cat_recording_reconciliation_store.remove(camera_id)?;
             }
-            *state = CatAutoRecordingState::default();
-            state.camera_id = camera_id.to_string();
+            let mut reset = CatAutoRecordingState::default();
+            reset.camera_id = camera_id.to_string();
+            self.commit_cat_auto_recording_state_if_current(
+                camera_id,
+                &expected,
+                Some(reset.clone()),
+                CatAutoRecordingCommitPersistence::Remove,
+            )?;
+            expected = Some(reset.clone());
+            state = reset;
         }
         state.stream_profile = Some(stream_profile.to_string());
         let new_sample =
@@ -3085,6 +3817,32 @@ impl AdminApi {
         let transition = new_sample
             .map(|sample| cat_auto_recording_transition(state.lease_id.is_some(), &sample, config))
             .unwrap_or(CatAutoRecordingTransition::Hold);
+
+        if state.lease_id.is_some() {
+            if let Some(sample) = new_sample.filter(|sample| sample.detection_count > 0) {
+                if !state
+                    .detection_evidence
+                    .iter()
+                    .any(|evidence| evidence.sequence == sample.sequence)
+                {
+                    record_cat_detection_evidence(&mut state.detection_evidence, &sample);
+                }
+            }
+        }
+        let intent_persistence = if state.event_id.is_some() {
+            CatAutoRecordingCommitPersistence::Upsert
+        } else {
+            CatAutoRecordingCommitPersistence::MemoryOnly
+        };
+        if expected.as_ref() != Some(&state) {
+            self.commit_cat_auto_recording_state_if_current(
+                camera_id,
+                &expected,
+                Some(state.clone()),
+                intent_persistence,
+            )?;
+            expected = Some(state.clone());
+        }
 
         if transition == CatAutoRecordingTransition::Start {
             let trigger_epoch_ms =
@@ -3098,7 +3856,7 @@ impl AdminApi {
                 .event_recording_status(camera_id)
                 .ok()
                 .filter(is_harborbeacon_cat_event_recording);
-            let mut start_event_recording = || {
+            let mut start_event_recording = || -> Result<HarborLinkEventRecordingLease, String> {
                 let event_id = format!("cat-activity-{}", Uuid::new_v4().simple());
                 state.phase = CatRecordingReconciliationPhase::PendingStart;
                 state.created_at_epoch_ms = now;
@@ -3108,8 +3866,13 @@ impl AdminApi {
                 if let Some(sample) = new_sample.filter(|sample| sample.detection_count > 0) {
                     record_cat_detection_evidence(&mut state.detection_evidence, &sample);
                 }
-                self.cat_recording_reconciliation_store
-                    .upsert(state.clone())?;
+                self.commit_cat_auto_recording_state_if_current(
+                    camera_id,
+                    &expected,
+                    Some(state.clone()),
+                    CatAutoRecordingCommitPersistence::Upsert,
+                )?;
+                expected = Some(state.clone());
                 self.harborlink_media.start_event_recording(
                     camera_id,
                     &event_id,
@@ -3135,11 +3898,6 @@ impl AdminApi {
             state.event_id = Some(lease.event_id);
             state.lease_id = Some(lease.lease_id);
             state.last_renewed_epoch_ms = now;
-            self.cat_recording_reconciliation_store
-                .upsert(state.clone())?;
-        }
-
-        if state.lease_id.is_some() {
             if let Some(sample) = new_sample.filter(|sample| sample.detection_count > 0) {
                 if !state
                     .detection_evidence
@@ -3147,10 +3905,15 @@ impl AdminApi {
                     .any(|evidence| evidence.sequence == sample.sequence)
                 {
                     record_cat_detection_evidence(&mut state.detection_evidence, &sample);
-                    self.cat_recording_reconciliation_store
-                        .upsert(state.clone())?;
                 }
             }
+            self.commit_cat_auto_recording_state_if_current(
+                camera_id,
+                &expected,
+                Some(state.clone()),
+                CatAutoRecordingCommitPersistence::Upsert,
+            )?;
+            expected = Some(state.clone());
         }
 
         if let Some(lease_id) = state.lease_id.clone() {
@@ -3162,7 +3925,6 @@ impl AdminApi {
                     Ok(stopped) => stopped,
                     Err(error) => {
                         let reconciliation_state = state.clone();
-                        drop(states);
                         return self.reconcile_cat_recording_after_link_error(
                             &reconciliation_state,
                             error,
@@ -3173,9 +3935,14 @@ impl AdminApi {
                     &stopped.artifacts,
                     &state.detection_evidence,
                 )?;
-                self.cat_recording_reconciliation_store.remove(camera_id)?;
-                *state = CatAutoRecordingState::default();
-                state.camera_id = camera_id.to_string();
+                let mut reset = CatAutoRecordingState::default();
+                reset.camera_id = camera_id.to_string();
+                self.commit_cat_auto_recording_state_if_current(
+                    camera_id,
+                    &expected,
+                    Some(reset),
+                    CatAutoRecordingCommitPersistence::Remove,
+                )?;
             } else if sample.is_some()
                 && now.saturating_sub(state.last_renewed_epoch_ms)
                     >= CAT_AUTO_RECORD_RENEW_INTERVAL_SECONDS * 1_000
@@ -3190,12 +3957,15 @@ impl AdminApi {
                         state.event_id = Some(renewed.event_id);
                         state.lease_id = Some(renewed.lease_id);
                         state.last_renewed_epoch_ms = now;
-                        self.cat_recording_reconciliation_store
-                            .upsert(state.clone())?;
+                        self.commit_cat_auto_recording_state_if_current(
+                            camera_id,
+                            &expected,
+                            Some(state.clone()),
+                            CatAutoRecordingCommitPersistence::Upsert,
+                        )?;
                     }
                     Err(error) => {
                         let reconciliation_state = state.clone();
-                        drop(states);
                         return self.reconcile_cat_recording_after_link_error(
                             &reconciliation_state,
                             error,
@@ -3207,19 +3977,74 @@ impl AdminApi {
         Ok(())
     }
 
+    fn finish_cat_recording_for_disabled_camera_locked(
+        &self,
+        camera_id: &str,
+    ) -> Result<bool, String> {
+        let state = self
+            .cat_auto_recording
+            .lock()
+            .map_err(|_| "cat auto-recording state is unavailable".to_string())?
+            .get(camera_id)
+            .cloned();
+        let Some(state) = state else {
+            return Ok(true);
+        };
+        if state.event_id.is_none() && state.lease_id.is_none() {
+            self.commit_cat_auto_recording_state_if_current(
+                camera_id,
+                &Some(state),
+                None,
+                CatAutoRecordingCommitPersistence::Remove,
+            )?;
+            return Ok(true);
+        }
+        self.reconcile_cat_recording_coordinated(&state)
+            .map_err(|error| {
+                format!(
+                    "failed to drain disabled camera recording: {}",
+                    redact_admin_string(&error)
+                )
+            })?;
+        let recording_remains = self
+            .cat_auto_recording
+            .lock()
+            .map_err(|_| "cat auto-recording state is unavailable".to_string())?
+            .contains_key(camera_id);
+        Ok(!recording_remains)
+    }
+
     fn stop_orphaned_cat_recordings(
         &self,
         active_cameras: &HashSet<String>,
         reconciliation_failed_cameras: &HashSet<String>,
     ) -> Result<(), String> {
-        let mut states = self
-            .cat_auto_recording
-            .lock()
-            .map_err(|_| "cat auto-recording state is unavailable".to_string())?;
-        let mut completed = Vec::new();
-        for (camera_id, state) in states.iter_mut() {
-            if active_cameras.contains(camera_id)
-                || reconciliation_failed_cameras.contains(camera_id)
+        let camera_ids = {
+            let states = self
+                .cat_auto_recording
+                .lock()
+                .map_err(|_| "cat auto-recording state is unavailable".to_string())?;
+            states.keys().cloned().collect::<Vec<_>>()
+        };
+        for camera_id in camera_ids {
+            let camera_lock = self.cat_detection_control_camera_lock(&camera_id)?;
+            let _camera_coordination = camera_lock
+                .lock()
+                .map_err(|_| "cat detection camera coordination is unavailable".to_string())?;
+            let state = self
+                .cat_auto_recording
+                .lock()
+                .map_err(|_| "cat auto-recording state is unavailable".to_string())?
+                .get(&camera_id)
+                .cloned();
+            let Some(state) = state else {
+                continue;
+            };
+            if !self.cat_detection_may_run(&camera_id)? {
+                continue;
+            }
+            if active_cameras.contains(&camera_id)
+                || reconciliation_failed_cameras.contains(&camera_id)
                 || state.phase == CatRecordingReconciliationPhase::PendingStart
             {
                 continue;
@@ -3227,7 +4052,7 @@ impl AdminApi {
             if let Some(lease_id) = state.lease_id.clone() {
                 match self
                     .harborlink_media
-                    .stop_event_recording(camera_id, &lease_id)
+                    .stop_event_recording(&camera_id, &lease_id)
                 {
                     Ok(stopped) => self
                         .register_cat_recording_validation_artifacts(
@@ -3236,20 +4061,16 @@ impl AdminApi {
                         )
                         .map(|_| ()),
                     Err(error) => {
-                        let reconciliation_state = state.clone();
-                        drop(states);
-                        return self.reconcile_cat_recording_after_link_error(
-                            &reconciliation_state,
-                            error,
-                        );
+                        return self.reconcile_cat_recording_after_link_error(&state, error);
                     }
                 }?;
             }
-            self.cat_recording_reconciliation_store.remove(camera_id)?;
-            completed.push(camera_id.clone());
-        }
-        for camera_id in completed {
-            states.remove(&camera_id);
+            self.commit_cat_auto_recording_state_if_current(
+                &camera_id,
+                &Some(state),
+                None,
+                CatAutoRecordingCommitPersistence::Remove,
+            )?;
         }
         Ok(())
     }
@@ -4044,6 +4865,19 @@ impl AdminApi {
                 .handle_cat_detection_observation(
                     &path,
                     &raw_url,
+                    gate_principal.as_ref().expect("gate principal"),
+                )
+                .boxed(),
+            Method::Get if parse_cat_detection_control_camera_id(&path).is_some() => self
+                .handle_get_cat_detection_control(
+                    &path,
+                    gate_principal.as_ref().expect("gate principal"),
+                )
+                .boxed(),
+            Method::Put if parse_cat_detection_control_camera_id(&path).is_some() => self
+                .handle_put_cat_detection_control(
+                    &path,
+                    &mut request,
                     gate_principal.as_ref().expect("gate principal"),
                 )
                 .boxed(),
@@ -7022,6 +7856,1436 @@ impl AdminApi {
         }
     }
 
+    fn handle_get_cat_detection_control(
+        &self,
+        path: &str,
+        gate_principal: &GateAuthenticatedPrincipal,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let camera_id = match parse_cat_detection_control_camera_id(path) {
+            Some(camera_id) => camera_id,
+            None => return error_json(StatusCode(400), "invalid cat detection control path"),
+        };
+        if let Err(error) = validate_cat_detection_control_camera_id(&camera_id) {
+            return error_json(StatusCode(400), &error);
+        }
+        if let Err((status, error)) = self.authorize_detection_camera_action(
+            gate_principal,
+            &camera_id,
+            AccessAction::CameraView,
+        ) {
+            return error_json(status, &error);
+        }
+        if let Err(error) = self.load_camera_device(&camera_id) {
+            if error.contains("device not found") {
+                return error_json(StatusCode(404), &error);
+            }
+            return error_json(StatusCode(422), &error);
+        }
+        if let Some(error) = self
+            .cat_detection_control_store_load_error
+            .lock()
+            .ok()
+            .and_then(|error| error.clone())
+        {
+            return cat_detection_control_unavailable_response(&error);
+        }
+
+        match self.cat_detection_control_response(&camera_id) {
+            Ok(response) => ok_json(&response),
+            Err(error) => cat_detection_control_unavailable_response(&error),
+        }
+    }
+
+    fn handle_put_cat_detection_control(
+        &self,
+        path: &str,
+        request: &mut Request,
+        gate_principal: &GateAuthenticatedPrincipal,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let camera_id = match parse_cat_detection_control_camera_id(path) {
+            Some(camera_id) => camera_id,
+            None => return error_json(StatusCode(400), "invalid cat detection control path"),
+        };
+        if let Err(error) = validate_cat_detection_control_camera_id(&camera_id) {
+            return error_json(StatusCode(400), &error);
+        }
+        let body = match read_json_body_limited::<CatDetectionControlRequest>(request, 4 * 1024) {
+            Ok(body) => body,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        if let Err((status, error)) = self.authorize_detection_camera_action(
+            gate_principal,
+            &camera_id,
+            AccessAction::CameraOperate,
+        ) {
+            return error_json(status, &error);
+        }
+        if let Err(error) = self.load_camera_device(&camera_id) {
+            if error.contains("device not found") {
+                return error_json(StatusCode(404), &error);
+            }
+            return error_json(StatusCode(422), &error);
+        }
+
+        match self.apply_cat_detection_control(&camera_id, body.enabled, &body.stream_profile) {
+            Ok(response) => ok_json(&response),
+            Err((status, error)) if status == StatusCode(503) => {
+                cat_detection_control_unavailable_response(&error)
+            }
+            Err((status, error)) => error_json(status, &error),
+        }
+    }
+
+    fn cat_detection_explicit_policy(
+        &self,
+        camera_id: &str,
+    ) -> Result<Option<CatDetectionControlPolicy>, String> {
+        if let Some(error) = self
+            .cat_detection_control_store_load_error
+            .lock()
+            .map_err(|_| "cat detection control load state is unavailable".to_string())?
+            .clone()
+        {
+            return Err(error);
+        }
+        self.cat_detection_controls
+            .lock()
+            .map_err(|_| "cat detection control state is unavailable".to_string())
+            .map(|controls| controls.get(camera_id).cloned())
+    }
+
+    fn persist_cat_detection_policy(
+        &self,
+        policy: CatDetectionControlPolicy,
+    ) -> Result<(), String> {
+        let mut controls = self
+            .cat_detection_controls
+            .lock()
+            .map_err(|_| "cat detection control state is unavailable".to_string())?;
+        let store = self.cat_detection_control_store.as_ref().ok_or_else(|| {
+            self.cat_detection_control_store_load_error
+                .lock()
+                .ok()
+                .and_then(|error| error.clone())
+                .unwrap_or_else(|| "cat detection control store is unavailable".to_string())
+        })?;
+        store.upsert(policy.clone())?;
+        controls.insert(policy.camera_id.clone(), policy);
+        Ok(())
+    }
+
+    fn known_detection_lease_ids_for_camera(&self, camera_id: &str) -> Result<Vec<String>, String> {
+        let jobs = self
+            .detection_jobs
+            .lock()
+            .map_err(|_| "detection job state is unavailable".to_string())?;
+        Ok(detection_lease_responsibility_ids(
+            camera_id,
+            std::iter::empty(),
+            &jobs,
+        ))
+    }
+
+    fn retain_pending_detection_leases(
+        &self,
+        camera_id: &str,
+        lease_ids: impl IntoIterator<Item = String>,
+    ) -> Result<(), String> {
+        let mut policy = self
+            .cat_detection_explicit_policy(camera_id)?
+            .ok_or_else(|| "cat detection control policy is unavailable".to_string())?;
+        let mut pending = policy.pending_detection_lease_ids.clone();
+        pending.extend(lease_ids);
+        policy.set_pending_detection_lease_ids(pending)?;
+        self.persist_cat_detection_policy(policy)
+    }
+
+    fn clear_pending_detection_leases(
+        &self,
+        camera_id: &str,
+        cleared_lease_ids: &HashSet<String>,
+    ) -> Result<(), String> {
+        if cleared_lease_ids.is_empty() {
+            return Ok(());
+        }
+        let mut policy = self
+            .cat_detection_explicit_policy(camera_id)?
+            .ok_or_else(|| "cat detection control policy is unavailable".to_string())?;
+        let remaining = policy
+            .pending_detection_lease_ids
+            .iter()
+            .filter(|lease_id| !cleared_lease_ids.contains(*lease_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        policy.set_pending_detection_lease_ids(remaining)?;
+        self.persist_cat_detection_policy(policy)
+    }
+
+    fn cat_detection_may_run(&self, camera_id: &str) -> Result<bool, String> {
+        self.cat_detection_explicit_policy(camera_id)
+            .map(|control| control.is_none_or(|control| control.desired_enabled))
+    }
+
+    fn prepare_cat_detection_create_attempt(
+        &self,
+        camera_id: &str,
+        stream_profile: &str,
+    ) -> Result<String, String> {
+        let mut policy = self
+            .cat_detection_explicit_policy(camera_id)?
+            .ok_or_else(|| "cat detection control policy is unavailable".to_string())?;
+        if let Some(attempt_id) = policy.detection_lease_create_attempt_id.clone() {
+            if policy.detection_lease_create_attempt_stream_profile() != Some(stream_profile) {
+                return Err(
+                    "unresolved cat detection create attempt must be reconciled before changing stream profile"
+                        .to_string(),
+                );
+            }
+            return Ok(attempt_id);
+        }
+        let attempt_id = Uuid::new_v4().simple().to_string();
+        policy.set_detection_lease_create_attempt(
+            Some(attempt_id.clone()),
+            Some(stream_profile.to_string()),
+        )?;
+        self.persist_cat_detection_policy(policy)?;
+        Ok(attempt_id)
+    }
+
+    fn clear_cat_detection_create_attempt(
+        &self,
+        camera_id: &str,
+        expected_attempt_id: &str,
+    ) -> Result<(), String> {
+        let Some(mut policy) = self.cat_detection_explicit_policy(camera_id)? else {
+            return Ok(());
+        };
+        if policy.detection_lease_create_attempt_id.as_deref() != Some(expected_attempt_id) {
+            return Ok(());
+        }
+        policy.set_detection_lease_create_attempt(None, None)?;
+        self.persist_cat_detection_policy(policy)
+    }
+
+    fn prepare_cat_detection_profile_rollback(
+        &self,
+        camera_id: &str,
+        stream_profile: &str,
+    ) -> Result<String, String> {
+        let mut policy = self
+            .cat_detection_explicit_policy(camera_id)?
+            .ok_or_else(|| "cat detection control policy is unavailable".to_string())?;
+        if let Some(attempt_id) = policy.rollback_detection_lease_create_attempt_id.clone() {
+            if policy.rollback_stream_profile.as_deref() != Some(stream_profile) {
+                return Err(
+                    "unresolved cat detection rollback must be reconciled before changing stream profile"
+                        .to_string(),
+                );
+            }
+            return Ok(attempt_id);
+        }
+        let attempt_id = Uuid::new_v4().simple().to_string();
+        policy.set_rollback_detection_lease_create_attempt(
+            Some(attempt_id.clone()),
+            Some(stream_profile.to_string()),
+        )?;
+        self.persist_cat_detection_policy(policy)?;
+        Ok(attempt_id)
+    }
+
+    fn clear_cat_detection_profile_rollback(
+        &self,
+        camera_id: &str,
+        expected_attempt_id: &str,
+    ) -> Result<(), String> {
+        let Some(mut policy) = self.cat_detection_explicit_policy(camera_id)? else {
+            return Ok(());
+        };
+        if policy.rollback_detection_lease_create_attempt_id.as_deref() != Some(expected_attempt_id)
+        {
+            return Ok(());
+        }
+        policy.set_rollback_detection_lease_create_attempt(None, None)?;
+        self.persist_cat_detection_policy(policy)
+    }
+
+    fn transfer_cat_detection_profile_rollback_to_pending(
+        &self,
+        camera_id: &str,
+        expected_attempt_id: &str,
+        lease_id: String,
+    ) -> Result<(), String> {
+        let mut policy = self
+            .cat_detection_explicit_policy(camera_id)?
+            .ok_or_else(|| "cat detection control policy is unavailable".to_string())?;
+        if policy.rollback_detection_lease_create_attempt_id.as_deref() != Some(expected_attempt_id)
+        {
+            return Err("cat detection rollback attempt changed during reconciliation".to_string());
+        }
+        let mut pending = policy.pending_detection_lease_ids.clone();
+        pending.push(lease_id);
+        policy.set_pending_detection_lease_ids(pending)?;
+        policy.set_rollback_detection_lease_create_attempt(None, None)?;
+        self.persist_cat_detection_policy(policy)
+    }
+
+    fn resolve_cat_detection_profile_rollback(
+        &self,
+        camera_id: &str,
+        mode: RollbackResolutionMode,
+    ) -> Result<DetectionProfileRollbackResolution, String> {
+        let policy = self
+            .cat_detection_explicit_policy(camera_id)?
+            .ok_or_else(|| "cat detection control policy is unavailable".to_string())?;
+        let Some(attempt_id) = policy.rollback_detection_lease_create_attempt_id.clone() else {
+            return Ok(DetectionProfileRollbackResolution::None);
+        };
+        let stream_profile = policy
+            .rollback_stream_profile
+            .clone()
+            .ok_or_else(|| "cat detection rollback profile is unavailable".to_string())?;
+        let config = DetectionJobConfig {
+            camera_id: camera_id.to_string(),
+            target_label: "cat".to_string(),
+            ttl_seconds: LIVE_MANAGED_DETECTION_TTL_SECONDS,
+            max_fps: DEFAULT_DETECTION_MAX_FPS,
+            confidence: DEFAULT_DETECTION_CONFIDENCE,
+            stream_profile: stream_profile.clone(),
+        };
+        let request_scope = cat_detection_rollback_request_scope(camera_id, &attempt_id);
+        if mode == RollbackResolutionMode::CleanupOnly {
+            let _request_scope = harborlink_request_scope(Some(&request_scope));
+            let lease = match self.harborlink_media.start_detection_lease(
+                camera_id,
+                &stream_profile,
+                LIVE_MANAGED_DETECTION_TTL_SECONDS,
+                CAT_AUTO_RECORD_PRE_ROLL_SECONDS,
+            ) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    return match classify_detection_lease_create_failure(&error) {
+                        DetectionLeaseCreateFailureDisposition::RetrySameAttempt => Err(error),
+                        DetectionLeaseCreateFailureDisposition::ConfirmedNotCreated => {
+                            self.clear_cat_detection_profile_rollback(camera_id, &attempt_id)?;
+                            Ok(DetectionProfileRollbackResolution::ConfirmedNotCreated {
+                                stream_profile,
+                            })
+                        }
+                        DetectionLeaseCreateFailureDisposition::Conflict => {
+                            self.clear_cat_detection_profile_rollback(camera_id, &attempt_id)?;
+                            Err(error)
+                        }
+                    };
+                }
+            };
+            validate_detection_lease_create_response(&lease, camera_id, &stream_profile)?;
+            self.transfer_cat_detection_profile_rollback_to_pending(
+                camera_id,
+                &attempt_id,
+                lease.lease_id,
+            )?;
+            self.stop_detection_jobs_for_camera_locked(camera_id)?;
+            return Ok(DetectionProfileRollbackResolution::CleanedUp { stream_profile });
+        }
+        match self.start_detection_job_locked_with_request_scope(
+            config,
+            false,
+            false,
+            Some(request_scope),
+        ) {
+            Ok(started) => {
+                if let Some(runtime) = self
+                    .detection_jobs
+                    .lock()
+                    .map_err(|_| "detection job state is unavailable".to_string())?
+                    .get_mut(&started.projection.job_id)
+                {
+                    runtime.projection.managed_by_live = false;
+                }
+                Ok(DetectionProfileRollbackResolution::Restored { stream_profile })
+            }
+            Err((_, error)) => match classify_detection_lease_create_failure(&error) {
+                DetectionLeaseCreateFailureDisposition::RetrySameAttempt => Err(error),
+                DetectionLeaseCreateFailureDisposition::ConfirmedNotCreated => {
+                    self.clear_cat_detection_profile_rollback(camera_id, &attempt_id)?;
+                    Ok(DetectionProfileRollbackResolution::ConfirmedNotCreated { stream_profile })
+                }
+                DetectionLeaseCreateFailureDisposition::Conflict => {
+                    self.clear_cat_detection_profile_rollback(camera_id, &attempt_id)?;
+                    Err(error)
+                }
+            },
+        }
+    }
+
+    fn transfer_cat_detection_create_attempt_to_pending(
+        &self,
+        camera_id: &str,
+        expected_attempt_id: &str,
+        lease_id: String,
+    ) -> Result<(), String> {
+        let mut policy = self
+            .cat_detection_explicit_policy(camera_id)?
+            .ok_or_else(|| "cat detection control policy is unavailable".to_string())?;
+        if policy.detection_lease_create_attempt_id.as_deref() != Some(expected_attempt_id) {
+            return Err("cat detection create attempt changed during reconciliation".to_string());
+        }
+        let mut pending = policy.pending_detection_lease_ids.clone();
+        pending.push(lease_id);
+        policy.set_pending_detection_lease_ids(pending)?;
+        policy.set_detection_lease_create_attempt(None, None)?;
+        self.persist_cat_detection_policy(policy)
+    }
+
+    fn resolve_cat_detection_create_attempt_to_pending(
+        &self,
+        camera_id: &str,
+    ) -> Result<(), String> {
+        let policy = self
+            .cat_detection_explicit_policy(camera_id)?
+            .ok_or_else(|| "cat detection control policy is unavailable".to_string())?;
+        let Some(attempt_id) = policy.detection_lease_create_attempt_id.clone() else {
+            return Ok(());
+        };
+        let stream_profile = policy
+            .detection_lease_create_attempt_stream_profile()
+            .ok_or_else(|| "cat detection create attempt profile is unavailable".to_string())?
+            .to_string();
+        let request_scope = cat_detection_start_request_scope(camera_id, &attempt_id);
+        let _request_scope = harborlink_request_scope(Some(&request_scope));
+        let lease = match self.harborlink_media.start_detection_lease(
+            camera_id,
+            &stream_profile,
+            LIVE_MANAGED_DETECTION_TTL_SECONDS,
+            CAT_AUTO_RECORD_PRE_ROLL_SECONDS,
+        ) {
+            Ok(lease) => lease,
+            Err(error) => match classify_detection_lease_create_failure(&error) {
+                DetectionLeaseCreateFailureDisposition::RetrySameAttempt => return Err(error),
+                DetectionLeaseCreateFailureDisposition::ConfirmedNotCreated => {
+                    self.clear_cat_detection_create_attempt(camera_id, &attempt_id)?;
+                    return Ok(());
+                }
+                DetectionLeaseCreateFailureDisposition::Conflict => {
+                    self.clear_cat_detection_create_attempt(camera_id, &attempt_id)?;
+                    return Err(error);
+                }
+            },
+        };
+        validate_detection_lease_create_response(&lease, camera_id, &stream_profile)?;
+        self.transfer_cat_detection_create_attempt_to_pending(
+            camera_id,
+            &attempt_id,
+            lease.lease_id,
+        )
+    }
+
+    fn schedule_cat_detection_runtime_drift(&self, camera_id: &str) {
+        let Ok(Some(policy)) = self.cat_detection_explicit_policy(camera_id) else {
+            return;
+        };
+        let (running, residual_runtime) = match self.detection_jobs.lock() {
+            Ok(jobs) => {
+                let preserved = policy
+                    .desired_enabled
+                    .then(|| {
+                        healthy_detection_lease_to_preserve(
+                            camera_id,
+                            &policy.stream_profile,
+                            &jobs,
+                        )
+                    })
+                    .flatten();
+                let responsibilities = detection_lease_responsibility_ids_for_target(
+                    camera_id,
+                    policy.pending_detection_lease_ids.clone(),
+                    &jobs,
+                    (!policy.desired_enabled).then_some("cat"),
+                );
+                (
+                    preserved.is_some(),
+                    responsibilities
+                        .iter()
+                        .any(|lease_id| preserved.as_deref() != Some(lease_id.as_str())),
+                )
+            }
+            Err(_) => return,
+        };
+        let needs_reconciliation = if policy.desired_enabled {
+            !running
+                || residual_runtime
+                || policy.detection_lease_create_attempt_id.is_some()
+                || policy.rollback_detection_lease_create_attempt_id.is_some()
+        } else {
+            residual_runtime
+                || !policy.pending_detection_lease_ids.is_empty()
+                || policy.detection_lease_create_attempt_id.is_some()
+                || policy.rollback_detection_lease_create_attempt_id.is_some()
+        };
+        if !needs_reconciliation {
+            return;
+        }
+        let _ = self.set_cat_detection_reconciliation(
+            camera_id,
+            if policy.desired_enabled && running {
+                "running"
+            } else {
+                "failed"
+            },
+            Some(if policy.desired_enabled && running {
+                "cat detection worker is running; residual lease cleanup is pending".to_string()
+            } else {
+                "cat detection runtime drift requires reconciliation".to_string()
+            }),
+        );
+        self.schedule_cat_detection_control_retry(camera_id, policy.updated_at_epoch_ms);
+    }
+
+    fn cat_detection_control_camera_lock(&self, camera_id: &str) -> Result<Arc<Mutex<()>>, String> {
+        let mut coordination = self
+            .cat_detection_control_coordination
+            .lock()
+            .map_err(|_| "cat detection control coordination is unavailable".to_string())?;
+        coordination.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = coordination.get(camera_id).and_then(Weak::upgrade) {
+            return Ok(lock);
+        }
+        let lock = Arc::new(Mutex::new(()));
+        coordination.insert(camera_id.to_string(), Arc::downgrade(&lock));
+        Ok(lock)
+    }
+
+    fn start_cat_detection_control_recovery(&self) {
+        let controls = match self.cat_detection_controls.lock() {
+            Ok(controls) => controls.values().cloned().collect::<Vec<_>>(),
+            Err(_) => return,
+        };
+        for policy in controls {
+            let camera_id = policy.camera_id;
+            let revision = policy.updated_at_epoch_ms;
+            self.enqueue_cat_detection_control_retry(&camera_id, revision, Duration::ZERO);
+        }
+    }
+
+    fn coordinate_cat_detection_control(
+        &self,
+        camera_id: &str,
+        expected_revision: u128,
+    ) -> Result<CatDetectionControlCoordination, String> {
+        let camera_lock = self.cat_detection_control_camera_lock(camera_id)?;
+        let _camera_guard = camera_lock
+            .lock()
+            .map_err(|_| "cat detection control camera coordination is unavailable".to_string())?;
+        let Some(policy) = self.cat_detection_explicit_policy(camera_id)? else {
+            return Ok(CatDetectionControlCoordination::Superseded);
+        };
+        if policy.updated_at_epoch_ms != expected_revision {
+            return Ok(CatDetectionControlCoordination::Superseded);
+        }
+        self.load_camera_device(camera_id)?;
+        self.set_cat_detection_reconciliation(
+            camera_id,
+            if policy.desired_enabled {
+                "starting"
+            } else {
+                "stopping"
+            },
+            None,
+        )?;
+        match self.reconcile_cat_detection_control_locked(camera_id) {
+            Ok(CatDetectionControlCoordination::Converged)
+            | Ok(CatDetectionControlCoordination::Superseded) => {
+                self.set_cat_detection_reconciliation(
+                    camera_id,
+                    if policy.desired_enabled {
+                        "running"
+                    } else {
+                        "stopped"
+                    },
+                    None,
+                )?;
+                Ok(CatDetectionControlCoordination::Converged)
+            }
+            Ok(CatDetectionControlCoordination::Draining) => {
+                self.set_cat_detection_reconciliation(
+                    camera_id,
+                    "stopping",
+                    Some("active cat recording is draining".to_string()),
+                )?;
+                Ok(CatDetectionControlCoordination::Draining)
+            }
+            Err(error) => {
+                self.set_cat_detection_reconciliation(
+                    camera_id,
+                    "failed",
+                    Some(redact_admin_string(&error)),
+                )?;
+                Err(error)
+            }
+        }
+    }
+
+    fn schedule_cat_detection_control_retry(&self, camera_id: &str, revision: u128) {
+        self.enqueue_cat_detection_control_retry(
+            camera_id,
+            revision,
+            Duration::from_secs(CAT_DETECTION_CONTROL_RETRY_INITIAL_SECONDS),
+        );
+    }
+
+    fn enqueue_cat_detection_control_retry(
+        &self,
+        camera_id: &str,
+        revision: u128,
+        delay: Duration,
+    ) {
+        let current_revision = self
+            .cat_detection_explicit_policy(camera_id)
+            .ok()
+            .flatten()
+            .map(|policy| policy.updated_at_epoch_ms);
+        if current_revision != Some(revision) {
+            return;
+        }
+        let Some(scheduler) = self.cat_detection_retry_scheduler.as_ref() else {
+            if self.cat_detection_retry_scheduling_context
+                == CatDetectionRetrySchedulingContext::WorkerExecution
+            {
+                eprintln!(
+                    "HarborBeacon cat detection retry for {} is delegated to the active worker outcome",
+                    redact_admin_string(camera_id)
+                );
+                return;
+            }
+            let message = "cat detection retry scheduling is unavailable".to_string();
+            let _ =
+                self.set_cat_detection_reconciliation(camera_id, "failed", Some(message.clone()));
+            eprintln!(
+                "HarborBeacon cat detection retry was not scheduled for {}: {}",
+                redact_admin_string(camera_id),
+                message
+            );
+            return;
+        };
+        let execution = CatDetectionRetryExecutionContext::new(self);
+        let result = scheduler.enqueue(
+            camera_id,
+            revision,
+            delay,
+            Arc::new(move |entry| execution.execute(entry)),
+        );
+        if let Err(error) = result {
+            let message = format!("cat detection retry scheduling failed: {error}");
+            let _ = self.set_cat_detection_reconciliation(
+                camera_id,
+                "failed",
+                Some(redact_admin_string(&message)),
+            );
+            eprintln!(
+                "HarborBeacon cat detection retry was not scheduled for {}: {}",
+                redact_admin_string(camera_id),
+                redact_admin_string(&error)
+            );
+        }
+    }
+
+    fn idle_cat_detection_control_retry(&self, camera_id: &str) {
+        if let Some(scheduler) = self.cat_detection_retry_scheduler.as_ref() {
+            scheduler.cancel(camera_id);
+        }
+    }
+
+    #[cfg(test)]
+    fn cancel_cat_detection_retry_workers_for_test(&self) {
+        if let Some(scheduler) = self.cat_detection_retry_scheduler.as_ref() {
+            let _ = scheduler.shutdown_and_join();
+        }
+    }
+
+    #[cfg(test)]
+    fn with_cat_detection_retry_scheduler_for_test(mut self) -> Self {
+        self = self.with_cat_detection_retry_scheduler_config_for_test(
+            CatDetectionRetrySchedulerConfig {
+                worker_count: 2,
+                capacity: MAX_CAT_DETECTION_CONTROL_POLICIES,
+                initial_delay: Duration::from_millis(10),
+                max_delay: Duration::from_millis(80),
+            },
+        );
+        self
+    }
+
+    #[cfg(test)]
+    fn with_cat_detection_retry_scheduler_config_for_test(
+        mut self,
+        config: CatDetectionRetrySchedulerConfig,
+    ) -> Self {
+        self.cat_detection_retry_scheduler =
+            Some(CatDetectionRetryScheduler::new(config).expect("test retry scheduler starts"));
+        self
+    }
+
+    #[cfg(test)]
+    fn cat_detection_retry_scheduler_probe_for_test(&self) -> CatDetectionRetrySchedulerProbe {
+        self.cat_detection_retry_scheduler
+            .as_ref()
+            .expect("test retry scheduler")
+            .probe()
+    }
+
+    #[cfg(test)]
+    fn cat_detection_retry_contains_camera_for_test(&self, camera_id: &str) -> bool {
+        self.cat_detection_retry_scheduler
+            .as_ref()
+            .is_some_and(|scheduler| scheduler.contains_camera(camera_id))
+    }
+
+    #[cfg(test)]
+    fn cat_detection_retry_queue_len_for_test(&self) -> usize {
+        self.cat_detection_retry_scheduler
+            .as_ref()
+            .map(CatDetectionRetryScheduler::queued_len)
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    fn cat_detection_retry_active_jobs_for_test(&self) -> usize {
+        self.cat_detection_retry_scheduler
+            .as_ref()
+            .map(CatDetectionRetryScheduler::active_jobs)
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    fn cat_detection_retry_worker_count_for_test(&self) -> usize {
+        self.cat_detection_retry_scheduler
+            .as_ref()
+            .map(CatDetectionRetryScheduler::worker_count)
+            .unwrap_or_default()
+    }
+
+    fn apply_cat_detection_control(
+        &self,
+        camera_id: &str,
+        enabled: bool,
+        stream_profile: &str,
+    ) -> Result<CatDetectionControlResponse, (StatusCode, String)> {
+        let camera_lock = self
+            .cat_detection_control_camera_lock(camera_id)
+            .map_err(|error| (StatusCode(503), error))?;
+        let _camera_guard = camera_lock.lock().map_err(|_| {
+            (
+                StatusCode(503),
+                "cat detection control camera coordination is unavailable".to_string(),
+            )
+        })?;
+        let mut previous_policy = self
+            .cat_detection_explicit_policy(camera_id)
+            .map_err(|error| (StatusCode(503), error))?;
+        if enabled
+            && previous_policy
+                .as_ref()
+                .is_some_and(|policy| policy.rollback_detection_lease_create_attempt_id.is_some())
+        {
+            self.resolve_cat_detection_profile_rollback(
+                camera_id,
+                RollbackResolutionMode::RestorePreviousProfile,
+            )
+            .map_err(|error| (StatusCode(503), error))?;
+            previous_policy = self
+                .cat_detection_explicit_policy(camera_id)
+                .map_err(|error| (StatusCode(503), error))?;
+        }
+        let previous_revision = previous_policy
+            .as_ref()
+            .map(|policy| policy.updated_at_epoch_ms)
+            .unwrap_or(0);
+        let previous_pending = previous_policy
+            .as_ref()
+            .map(|policy| policy.pending_detection_lease_ids.clone())
+            .unwrap_or_default();
+        let previous_attempt = previous_policy.as_ref().and_then(|policy| {
+            policy.detection_lease_create_attempt_id.clone().zip(
+                policy
+                    .detection_lease_create_attempt_stream_profile()
+                    .map(str::to_string),
+            )
+        });
+        let previous_rollback = previous_policy.as_ref().and_then(|policy| {
+            policy
+                .rollback_detection_lease_create_attempt_id
+                .clone()
+                .zip(policy.rollback_stream_profile.clone())
+        });
+        let mut policy = CatDetectionControlPolicy::new(
+            camera_id,
+            enabled,
+            stream_profile.to_string(),
+            cat_auto_recording_epoch_ms().max(previous_revision.saturating_add(1)),
+        )
+        .map_err(|error| (StatusCode(400), error))?;
+        let mut pending = previous_pending;
+        if !enabled {
+            pending.extend(
+                self.known_detection_lease_ids_for_camera(camera_id)
+                    .map_err(|error| (StatusCode(503), error))?,
+            );
+        }
+        policy
+            .set_pending_detection_lease_ids(pending)
+            .map_err(|error| (StatusCode(503), error))?;
+        if let Some((attempt_id, attempt_stream_profile)) = previous_attempt {
+            policy
+                .set_detection_lease_create_attempt(Some(attempt_id), Some(attempt_stream_profile))
+                .map_err(|error| (StatusCode(503), error))?;
+        }
+        if let Some((attempt_id, rollback_stream_profile)) = previous_rollback {
+            policy
+                .set_rollback_detection_lease_create_attempt(
+                    Some(attempt_id),
+                    Some(rollback_stream_profile),
+                )
+                .map_err(|error| (StatusCode(503), error))?;
+        }
+        let policy_revision = policy.updated_at_epoch_ms;
+        self.persist_cat_detection_policy(policy)
+            .map_err(|error| (StatusCode(503), error))?;
+        *self
+            .cat_detection_control_store_load_error
+            .lock()
+            .map_err(|_| {
+                (
+                    StatusCode(503),
+                    "cat detection control load state is unavailable".to_string(),
+                )
+            })? = None;
+        self.set_cat_detection_reconciliation(
+            camera_id,
+            if enabled { "starting" } else { "stopping" },
+            None,
+        )
+        .map_err(|error| (StatusCode(503), error))?;
+
+        let reconciliation_pending = match self.reconcile_cat_detection_control_locked(camera_id) {
+            Ok(CatDetectionControlCoordination::Converged)
+            | Ok(CatDetectionControlCoordination::Superseded) => {
+                self.set_cat_detection_reconciliation(
+                    camera_id,
+                    if enabled { "running" } else { "stopped" },
+                    None,
+                )
+                .map_err(|error| (StatusCode(503), error))?;
+                false
+            }
+            Ok(CatDetectionControlCoordination::Draining) => {
+                self.set_cat_detection_reconciliation(
+                    camera_id,
+                    "stopping",
+                    Some("active cat recording is draining".to_string()),
+                )
+                .map_err(|error| (StatusCode(503), error))?;
+                true
+            }
+            Err(error) => {
+                self.set_cat_detection_reconciliation(
+                    camera_id,
+                    "failed",
+                    Some(redact_admin_string(&error)),
+                )
+                .map_err(|state_error| (StatusCode(503), state_error))?;
+                true
+            }
+        };
+        if reconciliation_pending {
+            self.schedule_cat_detection_control_retry(camera_id, policy_revision);
+        } else {
+            self.idle_cat_detection_control_retry(camera_id);
+        }
+        self.cat_detection_control_response(camera_id)
+            .map_err(|error| (StatusCode(503), error))
+    }
+
+    fn reconcile_cat_detection_control_locked(
+        &self,
+        camera_id: &str,
+    ) -> Result<CatDetectionControlCoordination, String> {
+        let mut policy = self
+            .cat_detection_explicit_policy(camera_id)?
+            .ok_or_else(|| "cat detection control policy is unavailable".to_string())?;
+        let rollback_mode = if policy.desired_enabled {
+            RollbackResolutionMode::RestorePreviousProfile
+        } else {
+            RollbackResolutionMode::CleanupOnly
+        };
+        match self.resolve_cat_detection_profile_rollback(camera_id, rollback_mode)? {
+            DetectionProfileRollbackResolution::None => {}
+            DetectionProfileRollbackResolution::Restored { stream_profile } => {
+                return Err(format!(
+                    "profile switch remains incomplete; restored {stream_profile} detection while desired {} reconciliation remains pending",
+                    policy.stream_profile
+                ));
+            }
+            DetectionProfileRollbackResolution::CleanedUp { .. } => {}
+            DetectionProfileRollbackResolution::ConfirmedNotCreated { stream_profile } => {
+                if rollback_mode == RollbackResolutionMode::RestorePreviousProfile {
+                    return Err(format!(
+                        "profile switch remains incomplete; {stream_profile} rollback was confirmed not created and desired {} reconciliation remains pending",
+                        policy.stream_profile
+                    ));
+                }
+            }
+        }
+        policy = self
+            .cat_detection_explicit_policy(camera_id)?
+            .ok_or_else(|| "cat detection control policy is unavailable".to_string())?;
+        let healthy_worker_does_not_resolve_create_attempt = if policy.desired_enabled
+            && policy.detection_lease_create_attempt_id.is_some()
+            && policy.detection_lease_create_attempt_stream_profile()
+                == Some(policy.stream_profile.as_str())
+        {
+            let mut jobs = self
+                .detection_jobs
+                .lock()
+                .map_err(|_| "detection job state is unavailable".to_string())?;
+            for runtime in jobs
+                .values_mut()
+                .filter(|runtime| runtime.projection.camera_id == camera_id)
+            {
+                self.refresh_detection_job(runtime);
+            }
+            healthy_detection_lease_to_preserve(camera_id, &policy.stream_profile, &jobs).is_some()
+        } else {
+            false
+        };
+        let attempt_needs_separate_reconciliation =
+            policy.detection_lease_create_attempt_id.is_some()
+                && (!policy.desired_enabled
+                    || policy.detection_lease_create_attempt_stream_profile()
+                        != Some(policy.stream_profile.as_str())
+                    || healthy_worker_does_not_resolve_create_attempt);
+        if attempt_needs_separate_reconciliation {
+            self.resolve_cat_detection_create_attempt_to_pending(camera_id)?;
+            policy = self
+                .cat_detection_explicit_policy(camera_id)?
+                .ok_or_else(|| "cat detection control policy is unavailable".to_string())?;
+        }
+        if !policy.desired_enabled {
+            let detection_result = self.stop_cat_detection_jobs_for_camera_locked(camera_id);
+            let recording_result = self.finish_cat_recording_for_disabled_camera_locked(camera_id);
+            detection_result?;
+            return recording_result.map(|finished| {
+                if finished {
+                    CatDetectionControlCoordination::Converged
+                } else {
+                    CatDetectionControlCoordination::Draining
+                }
+            });
+        }
+
+        let (preserved_lease_id, rollback_stream_profile) = {
+            let mut jobs = self
+                .detection_jobs
+                .lock()
+                .map_err(|_| "detection job state is unavailable".to_string())?;
+            for runtime in jobs
+                .values_mut()
+                .filter(|runtime| runtime.projection.camera_id == camera_id)
+            {
+                self.refresh_detection_job(runtime);
+            }
+            (
+                healthy_detection_lease_to_preserve(camera_id, &policy.stream_profile, &jobs),
+                healthy_detection_profile_to_restore(camera_id, &policy.stream_profile, &jobs),
+            )
+        };
+        let cleanup_required = {
+            let jobs = self
+                .detection_jobs
+                .lock()
+                .map_err(|_| "detection job state is unavailable".to_string())?;
+            detection_lease_responsibility_ids(
+                camera_id,
+                policy.pending_detection_lease_ids.clone(),
+                &jobs,
+            )
+            .iter()
+            .any(|lease_id| preserved_lease_id.as_deref() != Some(lease_id.as_str()))
+        };
+        if cleanup_required {
+            self.stop_detection_jobs_for_camera_locked_preserving(
+                camera_id,
+                preserved_lease_id.as_deref(),
+            )?;
+        }
+        if let Some(preserved_lease_id) = preserved_lease_id.as_deref() {
+            self.clear_pending_detection_leases(
+                camera_id,
+                &HashSet::from([preserved_lease_id.to_string()]),
+            )?;
+            if let Some(runtime) = self
+                .detection_jobs
+                .lock()
+                .map_err(|_| "detection job state is unavailable".to_string())?
+                .values_mut()
+                .find(|runtime| {
+                    runtime.projection.camera_id == camera_id
+                        && runtime.projection.lease_id == preserved_lease_id
+                })
+            {
+                runtime.projection.managed_by_live = false;
+            }
+            return Ok(CatDetectionControlCoordination::Converged);
+        }
+        let active_runtime = self
+            .detection_jobs
+            .lock()
+            .map_err(|_| "detection job state is unavailable".to_string())?
+            .values()
+            .any(|runtime| {
+                runtime.projection.camera_id == camera_id
+                    && (runtime.projection.status == "running" || runtime.child.is_some())
+            });
+        if active_runtime {
+            self.stop_detection_jobs_for_camera_locked(camera_id)?;
+        }
+        let config = DetectionJobConfig {
+            camera_id: camera_id.to_string(),
+            target_label: "cat".to_string(),
+            ttl_seconds: LIVE_MANAGED_DETECTION_TTL_SECONDS,
+            max_fps: DEFAULT_DETECTION_MAX_FPS,
+            confidence: DEFAULT_DETECTION_CONFIDENCE,
+            stream_profile: policy.stream_profile.clone(),
+        };
+        let started = match self.start_controlled_detection_job_locked(config, false) {
+            Ok(started) => started,
+            Err((_, error)) => {
+                if classify_detection_lease_create_failure(&error)
+                    != DetectionLeaseCreateFailureDisposition::ConfirmedNotCreated
+                {
+                    return Err(error);
+                }
+                let Some(rollback_stream_profile) = rollback_stream_profile else {
+                    return Err(error);
+                };
+                self.prepare_cat_detection_profile_rollback(camera_id, &rollback_stream_profile)?;
+                return match self.resolve_cat_detection_profile_rollback(
+                    camera_id,
+                    RollbackResolutionMode::RestorePreviousProfile,
+                ) {
+                    Ok(DetectionProfileRollbackResolution::Restored { stream_profile }) => {
+                        Err(format!(
+                            "failed to switch detection to {}: {error}; restored {stream_profile} detection",
+                            policy.stream_profile
+                        ))
+                    }
+                    Ok(DetectionProfileRollbackResolution::ConfirmedNotCreated {
+                        stream_profile,
+                    }) => Err(format!(
+                        "failed to switch detection to {}: {error}; failed to restore {stream_profile} detection because rollback was confirmed not created",
+                        policy.stream_profile
+                    )),
+                    Ok(DetectionProfileRollbackResolution::None) => Err(format!(
+                        "failed to switch detection to {}: {error}; rollback state disappeared before restoration",
+                        policy.stream_profile
+                    )),
+                    Ok(DetectionProfileRollbackResolution::CleanedUp { stream_profile }) => {
+                        Err(format!(
+                            "failed to switch detection to {}: {error}; {stream_profile} rollback was cleaned up instead of restored",
+                            policy.stream_profile
+                        ))
+                    }
+                    Err(rollback_error) => Err(format!(
+                        "failed to switch detection to {}: {error}; {rollback_stream_profile} rollback remains unresolved: {rollback_error}",
+                        policy.stream_profile
+                    )),
+                };
+            }
+        };
+        if let Some(runtime) = self
+            .detection_jobs
+            .lock()
+            .map_err(|_| "detection job state is unavailable".to_string())?
+            .get_mut(&started.projection.job_id)
+        {
+            runtime.projection.managed_by_live = false;
+        }
+        Ok(CatDetectionControlCoordination::Converged)
+    }
+
+    fn stop_detection_jobs_for_camera_locked(&self, camera_id: &str) -> Result<(), String> {
+        self.stop_detection_jobs_for_camera_locked_preserving_target(camera_id, None, None)
+    }
+
+    fn stop_cat_detection_jobs_for_camera_locked(&self, camera_id: &str) -> Result<(), String> {
+        self.stop_detection_jobs_for_camera_locked_preserving_target(camera_id, None, Some("cat"))
+    }
+
+    fn stop_detection_jobs_for_camera_locked_preserving(
+        &self,
+        camera_id: &str,
+        preserved_lease_id: Option<&str>,
+    ) -> Result<(), String> {
+        self.stop_detection_jobs_for_camera_locked_preserving_target(
+            camera_id,
+            preserved_lease_id,
+            None,
+        )
+    }
+
+    fn stop_detection_jobs_for_camera_locked_preserving_target(
+        &self,
+        camera_id: &str,
+        preserved_lease_id: Option<&str>,
+        target_label: Option<&str>,
+    ) -> Result<(), String> {
+        let policy_pending = self
+            .cat_detection_explicit_policy(camera_id)?
+            .map(|policy| policy.pending_detection_lease_ids)
+            .unwrap_or_default();
+        let known_lease_ids = {
+            let jobs = self
+                .detection_jobs
+                .lock()
+                .map_err(|_| "detection job state is unavailable".to_string())?;
+            detection_lease_responsibility_ids_for_target(
+                camera_id,
+                policy_pending,
+                &jobs,
+                target_label,
+            )
+            .into_iter()
+            .filter(|lease_id| preserved_lease_id != Some(lease_id.as_str()))
+            .collect::<Vec<_>>()
+        };
+        self.retain_pending_detection_leases(camera_id, known_lease_ids.clone())?;
+        let mut first_error = None;
+        let mut worker_failed_leases = HashSet::new();
+        let known_lease_ids_set = known_lease_ids.iter().cloned().collect::<HashSet<_>>();
+        let mut detached = {
+            let mut jobs = self
+                .detection_jobs
+                .lock()
+                .map_err(|_| "detection job state is unavailable".to_string())?;
+            jobs.iter_mut()
+                .filter(|(_, runtime)| {
+                    runtime.projection.camera_id == camera_id
+                        && known_lease_ids_set.contains(&runtime.projection.lease_id)
+                })
+                .map(|(job_id, runtime)| {
+                    if runtime.projection.status == "running" || runtime.child.is_some() {
+                        runtime.projection.status = "stopping".to_string();
+                        runtime.projection.updated_at = current_rfc3339_timestamp();
+                    }
+                    (
+                        job_id.clone(),
+                        DetectionJobRuntime {
+                            projection: runtime.projection.clone(),
+                            output_dir: runtime.output_dir.clone(),
+                            child: runtime.child.take(),
+                            ai_lease: runtime.ai_lease.take(),
+                            detection_lease_cleanup_confirmed: runtime
+                                .detection_lease_cleanup_confirmed,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for (_, runtime) in &mut detached {
+            if runtime.projection.status == "stopping" || runtime.child.is_some() {
+                let stop_result = stop_detection_child(runtime);
+                match complete_detection_job_stop(runtime, "stopped", stop_result) {
+                    Ok(note) => runtime.projection.message = note,
+                    Err(error) => {
+                        worker_failed_leases.insert(runtime.projection.lease_id.clone());
+                        runtime.projection.status = "stopping".to_string();
+                        runtime.projection.message = Some(redact_admin_string(&error));
+                        first_error.get_or_insert(error);
+                    }
+                }
+                refresh_detection_job_outputs(runtime);
+            }
+        }
+        let mut cleared = preserved_lease_id
+            .map(ToString::to_string)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        for lease_id in known_lease_ids {
+            if worker_failed_leases.contains(&lease_id) {
+                continue;
+            }
+            match self
+                .harborlink_media
+                .stop_detection_lease(camera_id, &lease_id)
+            {
+                Ok(_) => {
+                    cleared.insert(lease_id.clone());
+                    for (_, runtime) in detached
+                        .iter_mut()
+                        .filter(|(_, runtime)| runtime.projection.lease_id == lease_id)
+                    {
+                        runtime.detection_lease_cleanup_confirmed = true;
+                        runtime.projection.status = "stopped".to_string();
+                        runtime.projection.message = None;
+                        refresh_detection_job_outputs(runtime);
+                    }
+                }
+                Err(error) if harborlink_error_status_code(&error) == Some(404) => {
+                    cleared.insert(lease_id.clone());
+                    for (_, runtime) in detached
+                        .iter_mut()
+                        .filter(|(_, runtime)| runtime.projection.lease_id == lease_id)
+                    {
+                        runtime.detection_lease_cleanup_confirmed = true;
+                        runtime.projection.status = "stopped".to_string();
+                        runtime.projection.message = None;
+                        refresh_detection_job_outputs(runtime);
+                    }
+                }
+                Err(error) => {
+                    let error = format!(
+                        "detection lease cleanup was incomplete: {}",
+                        redact_admin_string(&error)
+                    );
+                    for (_, runtime) in detached
+                        .iter_mut()
+                        .filter(|(_, runtime)| runtime.projection.lease_id == lease_id)
+                    {
+                        runtime.detection_lease_cleanup_confirmed = false;
+                        runtime.projection.status = "stopping".to_string();
+                        runtime.projection.message = Some(error.clone());
+                        refresh_detection_job_outputs(runtime);
+                    }
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        {
+            let mut jobs = self
+                .detection_jobs
+                .lock()
+                .map_err(|_| "detection job state is unavailable".to_string())?;
+            for (job_id, mut completed) in detached {
+                let Some(runtime) = jobs.get_mut(&job_id) else {
+                    continue;
+                };
+                if runtime.projection.camera_id != camera_id
+                    || runtime.projection.lease_id != completed.projection.lease_id
+                {
+                    continue;
+                }
+                runtime.projection = completed.projection;
+                runtime.child = completed.child.take();
+                runtime.ai_lease = completed.ai_lease.take();
+                runtime.detection_lease_cleanup_confirmed =
+                    completed.detection_lease_cleanup_confirmed;
+            }
+        }
+        self.clear_pending_detection_leases(camera_id, &cleared)?;
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn set_cat_detection_reconciliation(
+        &self,
+        camera_id: &str,
+        effective_status: &str,
+        message: Option<String>,
+    ) -> Result<(), String> {
+        self.cat_detection_control_reconciliation
+            .lock()
+            .map_err(|_| "cat detection reconciliation state is unavailable".to_string())?
+            .insert(
+                camera_id.to_string(),
+                CatDetectionControlReconciliation {
+                    effective_status: effective_status.to_string(),
+                    message,
+                },
+            );
+        Ok(())
+    }
+
+    fn cat_detection_control_response(
+        &self,
+        camera_id: &str,
+    ) -> Result<CatDetectionControlResponse, String> {
+        let load_error = self
+            .cat_detection_control_store_load_error
+            .lock()
+            .map_err(|_| "cat detection control load state is unavailable".to_string())?
+            .clone();
+        if let Some(error) = load_error {
+            return Err(error);
+        }
+        let control = self
+            .cat_detection_controls
+            .lock()
+            .map_err(|_| "cat detection control state is unavailable".to_string())?
+            .get(camera_id)
+            .cloned();
+        let reconciliation = self
+            .cat_detection_control_reconciliation
+            .lock()
+            .map_err(|_| "cat detection reconciliation state is unavailable".to_string())?
+            .get(camera_id)
+            .cloned();
+        let (running, residual_runtime) = {
+            let mut jobs = self
+                .detection_jobs
+                .lock()
+                .map_err(|_| "detection job state is unavailable".to_string())?;
+            for runtime in jobs
+                .values_mut()
+                .filter(|runtime| runtime.projection.camera_id == camera_id)
+            {
+                self.refresh_detection_job(runtime);
+            }
+            (
+                jobs.values()
+                    .find(|runtime| {
+                        runtime.projection.camera_id == camera_id
+                            && runtime.projection.status == "running"
+                            && detection_projection_targets(&runtime.projection, "cat")
+                    })
+                    .map(|runtime| runtime.projection.clone()),
+                jobs.values().any(|runtime| {
+                    runtime.projection.camera_id == camera_id
+                        && if control
+                            .as_ref()
+                            .is_some_and(|control| !control.desired_enabled)
+                        {
+                            detection_projection_targets(&runtime.projection, "cat")
+                                && (!runtime.detection_lease_cleanup_confirmed
+                                    || runtime.child.is_some())
+                        } else {
+                            runtime.projection.status != "stopped"
+                        }
+                }),
+            )
+        };
+        let explicit = control.is_some();
+        let desired_enabled = control
+            .as_ref()
+            .map(|control| control.desired_enabled)
+            .unwrap_or_else(|| running.is_some());
+        let desired_stream_profile = control
+            .as_ref()
+            .map(|control| control.stream_profile.clone())
+            .or_else(|| {
+                running
+                    .as_ref()
+                    .map(|projection| projection.stream_profile.clone())
+            })
+            .unwrap_or_else(|| "sub".to_string());
+        let pending_cleanup = control
+            .as_ref()
+            .is_some_and(|control| !control.pending_detection_lease_ids.is_empty());
+        let pending_create_attempt = control
+            .as_ref()
+            .is_some_and(|control| control.detection_lease_create_attempt_id.is_some());
+        let pending_rollback_attempt = control
+            .as_ref()
+            .is_some_and(|control| control.rollback_detection_lease_create_attempt_id.is_some());
+        let running_matches_desired = running
+            .as_ref()
+            .is_some_and(|projection| projection.stream_profile == desired_stream_profile);
+        let recording_active = self
+            .cat_auto_recording
+            .lock()
+            .map_err(|_| "cat auto-recording state is unavailable".to_string())?
+            .contains_key(camera_id);
+        let mut drift_message = None;
+        let effective_status = match control.as_ref() {
+            None if running.is_some() => "running",
+            None => "stopped",
+            Some(control)
+                if control.desired_enabled
+                    && running_matches_desired
+                    && !pending_create_attempt
+                    && !pending_rollback_attempt =>
+            {
+                "running"
+            }
+            Some(control) if control.desired_enabled => {
+                let cached_status = reconciliation
+                    .as_ref()
+                    .map(|state| state.effective_status.as_str());
+                if pending_create_attempt || pending_rollback_attempt {
+                    drift_message = Some(if pending_rollback_attempt {
+                        "cat detection profile rollback result is unresolved; reconciliation is pending"
+                            .to_string()
+                    } else {
+                        "cat detection create result is unresolved; reconciliation is pending"
+                            .to_string()
+                    });
+                    "failed"
+                } else if running.is_some() && matches!(cached_status, Some("failed")) {
+                    "failed"
+                } else if residual_runtime
+                    || matches!(cached_status, Some("running" | "failed" | "stopped"))
+                {
+                    drift_message = Some(
+                        "desired cat detection worker is not running; reconciliation is pending"
+                            .to_string(),
+                    );
+                    "failed"
+                } else {
+                    "starting"
+                }
+            }
+            Some(_)
+                if pending_create_attempt
+                    || pending_rollback_attempt
+                    || pending_cleanup
+                    || residual_runtime
+                    || recording_active =>
+            {
+                if pending_create_attempt {
+                    drift_message = Some(
+                        "cat detection create result is unresolved; reconciliation is pending"
+                            .to_string(),
+                    );
+                } else if pending_rollback_attempt {
+                    drift_message = Some(
+                        "cat detection profile rollback result is unresolved; reconciliation is pending"
+                            .to_string(),
+                    );
+                }
+                reconciliation
+                    .as_ref()
+                    .map(|state| state.effective_status.as_str())
+                    .filter(|status| matches!(*status, "stopping" | "failed"))
+                    .unwrap_or("failed")
+            }
+            Some(_) => "stopped",
+        };
+        if drift_message.is_some() {
+            self.set_cat_detection_reconciliation(camera_id, "failed", drift_message.clone())?;
+            if let Some(control) = control.as_ref() {
+                self.schedule_cat_detection_control_retry(camera_id, control.updated_at_epoch_ms);
+            }
+        }
+        if control.is_some() {
+            self.schedule_cat_detection_runtime_drift(camera_id);
+        }
+
+        Ok(CatDetectionControlResponse {
+            camera_id: camera_id.to_string(),
+            explicit,
+            desired_enabled,
+            desired_stream_profile,
+            effective_status: effective_status.to_string(),
+            effective_stream_profile: running
+                .as_ref()
+                .map(|projection| projection.stream_profile.clone()),
+            job_id: running.as_ref().map(|projection| projection.job_id.clone()),
+            updated_at: control
+                .as_ref()
+                .and_then(|control| format_epoch_millis(control.updated_at_epoch_ms)),
+            message: drift_message
+                .or_else(|| reconciliation.and_then(|state| state.message))
+                .or_else(|| running.and_then(|projection| projection.message)),
+        })
+    }
+
     fn handle_start_detection_job(
         &self,
         request: &mut Request,
@@ -7049,8 +9313,45 @@ impl AdminApi {
             return error_json(StatusCode(422), &error);
         }
 
+        let camera_lock = match self.cat_detection_control_camera_lock(&config.camera_id) {
+            Ok(lock) => lock,
+            Err(error) => return error_json(StatusCode(503), &error),
+        };
+        let _camera_coordination = match camera_lock.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return error_json(
+                    StatusCode(503),
+                    "cat detection camera coordination is unavailable",
+                )
+            }
+        };
+        let explicit_policy = match self.cat_detection_explicit_policy(&config.camera_id) {
+            Ok(policy) => policy,
+            Err(error) => return cat_detection_control_unavailable_response(&error),
+        };
+        if config.target_label == "cat"
+            && explicit_policy
+                .as_ref()
+                .is_some_and(|policy| policy.rollback_detection_lease_create_attempt_id.is_some())
+        {
+            return cat_detection_rollback_unresolved_response();
+        }
+        if config.target_label == "cat"
+            && explicit_policy
+                .as_ref()
+                .is_some_and(|policy| policy.desired_enabled)
+        {
+            return error_json(
+                StatusCode(409),
+                "cat detection is owned by explicit control for this camera",
+            );
+        }
         match self.start_detection_job(config, false) {
             Ok(projection) => ok_json(&projection),
+            Err((status, error)) if status == StatusCode(503) => {
+                cat_detection_control_unavailable_response(&error)
+            }
             Err((status, error)) => error_json(status, &error),
         }
     }
@@ -7060,19 +9361,142 @@ impl AdminApi {
         config: DetectionJobConfig,
         managed_by_live: bool,
     ) -> Result<DetectionJobStartResponse, (StatusCode, String)> {
-        let _lifecycle = self.detection_job_lifecycle_lock.lock().map_err(|_| {
-            (
-                StatusCode(503),
-                "detection job lifecycle is unavailable".to_string(),
-            )
-        })?;
         self.start_detection_job_locked(config, managed_by_live)
+    }
+
+    fn start_controlled_detection_job_locked(
+        &self,
+        config: DetectionJobConfig,
+        managed_by_live: bool,
+    ) -> Result<DetectionJobStartResponse, (StatusCode, String)> {
+        self.start_detection_job_locked_with_attempt(config, managed_by_live, true)
+    }
+
+    fn fail_detection_job_initialization(
+        &self,
+        config: &DetectionJobConfig,
+        managed_by_live: bool,
+        lease: &HarborLinkDetectionLease,
+        job_id: &str,
+        output_dir: &Path,
+        status: StatusCode,
+        initialization_error: String,
+    ) -> (StatusCode, String) {
+        let projection = DetectionJobProjection {
+            job_id: job_id.to_string(),
+            camera_id: config.camera_id.clone(),
+            status: "failed".to_string(),
+            target_labels: vec![config.target_label.clone()],
+            stream_profile: config.stream_profile.clone(),
+            max_fps: config.max_fps,
+            confidence: config.confidence,
+            lease_id: lease.lease_id.clone(),
+            started_at: lease.started_at.clone(),
+            updated_at: lease.updated_at.clone(),
+            expires_at: lease.expires_at.clone(),
+            managed_by_live,
+            latest_result: None,
+            metrics: None,
+            message: Some(initialization_error.clone()),
+        };
+        if let Ok(mut jobs) = self.detection_jobs.lock() {
+            jobs.insert(
+                job_id.to_string(),
+                DetectionJobRuntime {
+                    projection,
+                    output_dir: output_dir.to_path_buf(),
+                    child: None,
+                    ai_lease: None,
+                    detection_lease_cleanup_confirmed: false,
+                },
+            );
+        }
+        let cleanup = self
+            .harborlink_media
+            .stop_detection_lease(&config.camera_id, &lease.lease_id);
+        let cleanup_confirmed = cleanup.is_ok()
+            || cleanup
+                .as_ref()
+                .err()
+                .is_some_and(|error| harborlink_error_status_code(error) == Some(404));
+        let mut message = initialization_error;
+        let mut needs_retry = !cleanup_confirmed;
+        if cleanup_confirmed && config.target_label == "cat" {
+            if self
+                .cat_detection_explicit_policy(&config.camera_id)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                if let Err(error) = self.clear_pending_detection_leases(
+                    &config.camera_id,
+                    &HashSet::from([lease.lease_id.clone()]),
+                ) {
+                    needs_retry = true;
+                    message = format!(
+                        "{message}; failed to persist completed detection lease cleanup: {}",
+                        redact_admin_string(&error)
+                    );
+                }
+            }
+        } else if let Err(error) = cleanup {
+            message = format!(
+                "{message}; detection lease cleanup was incomplete: {}",
+                redact_admin_string(&error)
+            );
+        }
+        if let Ok(mut jobs) = self.detection_jobs.lock() {
+            if let Some(runtime) = jobs.get_mut(job_id) {
+                runtime.detection_lease_cleanup_confirmed = cleanup_confirmed;
+                runtime.projection.message = Some(message.clone());
+            }
+        }
+        if config.target_label == "cat" {
+            let _ = self.set_cat_detection_reconciliation(
+                &config.camera_id,
+                "failed",
+                Some(message.clone()),
+            );
+            if let Ok(Some(policy)) = self.cat_detection_explicit_policy(&config.camera_id) {
+                if needs_retry {
+                    self.schedule_cat_detection_control_retry(
+                        &config.camera_id,
+                        policy.updated_at_epoch_ms,
+                    );
+                }
+            }
+        }
+        (status, message)
     }
 
     fn start_detection_job_locked(
         &self,
         config: DetectionJobConfig,
         managed_by_live: bool,
+    ) -> Result<DetectionJobStartResponse, (StatusCode, String)> {
+        self.start_detection_job_locked_with_attempt(config, managed_by_live, false)
+    }
+
+    fn start_detection_job_locked_with_attempt(
+        &self,
+        config: DetectionJobConfig,
+        managed_by_live: bool,
+        use_control_attempt: bool,
+    ) -> Result<DetectionJobStartResponse, (StatusCode, String)> {
+        self.start_detection_job_locked_with_request_scope(
+            config,
+            managed_by_live,
+            use_control_attempt,
+            None,
+        )
+    }
+
+    fn start_detection_job_locked_with_request_scope(
+        &self,
+        config: DetectionJobConfig,
+        managed_by_live: bool,
+        use_control_attempt: bool,
+        request_scope_override: Option<String>,
     ) -> Result<DetectionJobStartResponse, (StatusCode, String)> {
         let provider =
             match normalize_detection_provider(env::var("HARBOR_K3_YOLO_PROVIDER").ok().as_deref())
@@ -7097,6 +9521,7 @@ impl AdminApi {
             match reusable_detection_job_projection(
                 &jobs,
                 config.camera_id.as_str(),
+                config.target_label.as_str(),
                 config.stream_profile.as_str(),
             ) {
                 Ok(Some(projection)) => {
@@ -7119,34 +9544,102 @@ impl AdminApi {
             (status, format!("YOLO A100 resource is busy: {error}"))
         })?;
 
-        let mut jobs = self.detection_jobs.lock().map_err(|_| {
-            (
-                StatusCode(503),
-                "detection job state is unavailable".to_string(),
-            )
-        })?;
-        for runtime in jobs
-            .values_mut()
-            .filter(|runtime| runtime.projection.camera_id == config.camera_id)
-        {
-            self.refresh_detection_job(runtime);
-        }
-        match reusable_detection_job_projection(
-            &jobs,
-            config.camera_id.as_str(),
-            config.stream_profile.as_str(),
-        ) {
-            Ok(Some(projection)) => {
-                return Ok(DetectionJobStartResponse {
-                    projection,
-                    reused: true,
-                });
+        let explicit_policy = self
+            .cat_detection_explicit_policy(&config.camera_id)
+            .map_err(|error| (StatusCode(503), error))?;
+        validate_detection_target_policy(&config.target_label, explicit_policy.as_ref())
+            .map_err(|error| (StatusCode(409), error))?;
+        let pending_lease_ids = explicit_policy
+            .as_ref()
+            .map(|policy| policy.pending_detection_lease_ids.clone())
+            .unwrap_or_default();
+        let responsibility_ids = {
+            let mut jobs = self.detection_jobs.lock().map_err(|_| {
+                (
+                    StatusCode(503),
+                    "detection job state is unavailable".to_string(),
+                )
+            })?;
+            for runtime in jobs
+                .values_mut()
+                .filter(|runtime| runtime.projection.camera_id == config.camera_id)
+            {
+                self.refresh_detection_job(runtime);
             }
-            Ok(None) => {}
-            Err(error) => return Err((StatusCode(409), error)),
+            match reusable_detection_job_projection(
+                &jobs,
+                config.camera_id.as_str(),
+                config.target_label.as_str(),
+                config.stream_profile.as_str(),
+            ) {
+                Ok(Some(projection)) => {
+                    return Ok(DetectionJobStartResponse {
+                        projection,
+                        reused: true,
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => return Err((StatusCode(409), error)),
+            }
+            prune_detection_job_history(&mut jobs);
+            detection_lease_responsibility_ids(&config.camera_id, pending_lease_ids, &jobs)
+        };
+        let unresolved_create_attempt = explicit_policy
+            .as_ref()
+            .is_some_and(|policy| policy.detection_lease_create_attempt_id.is_some());
+        let unresolved_rollback_attempt = explicit_policy
+            .as_ref()
+            .is_some_and(|policy| policy.rollback_detection_lease_create_attempt_id.is_some());
+        let replays_unresolved_control_attempt = use_control_attempt
+            && explicit_policy.as_ref().is_some_and(|policy| {
+                policy.detection_lease_create_attempt_id.is_some()
+                    && policy.detection_lease_create_attempt_stream_profile()
+                        == Some(config.stream_profile.as_str())
+            });
+        let rollback_attempt_id = request_scope_override.as_ref().and_then(|_| {
+            explicit_policy.as_ref().and_then(|policy| {
+                (policy.rollback_stream_profile.as_deref() == Some(config.stream_profile.as_str()))
+                    .then(|| policy.rollback_detection_lease_create_attempt_id.clone())
+                    .flatten()
+            })
+        });
+        let replays_unresolved_rollback_attempt = rollback_attempt_id.is_some();
+        let reserved_responsibility_count = responsibility_ids
+            .len()
+            .saturating_add(usize::from(
+                unresolved_create_attempt && !replays_unresolved_control_attempt,
+            ))
+            .saturating_add(usize::from(
+                unresolved_rollback_attempt && !replays_unresolved_rollback_attempt,
+            ));
+        if reserved_responsibility_count >= MAX_PENDING_DETECTION_LEASES {
+            return Err((
+                StatusCode(409),
+                format!(
+                    "cannot create detection lease: camera already has {MAX_PENDING_DETECTION_LEASES} unresolved detection lease cleanup responsibilities"
+                ),
+            ));
         }
-        prune_detection_job_history(&mut jobs);
 
+        let create_attempt_id = if use_control_attempt {
+            Some(
+                self.prepare_cat_detection_create_attempt(
+                    &config.camera_id,
+                    &config.stream_profile,
+                )
+                .map_err(|error| (StatusCode(503), error))?,
+            )
+        } else {
+            None
+        };
+        let stable_request_scope = request_scope_override.or_else(|| {
+            create_attempt_id
+                .as_deref()
+                .map(|attempt_id| cat_detection_start_request_scope(&config.camera_id, attempt_id))
+        });
+        let _stable_request_scope = stable_request_scope
+            .as_deref()
+            .map(|scope| harborlink_request_scope(Some(scope)));
         let lease = match self.harborlink_media.start_detection_lease(
             &config.camera_id,
             &config.stream_profile,
@@ -7154,31 +9647,65 @@ impl AdminApi {
             CAT_AUTO_RECORD_PRE_ROLL_SECONDS,
         ) {
             Ok(lease) => lease,
-            Err(error) => return Err((StatusCode(502), error)),
+            Err(error) => {
+                if let Some(attempt_id) = create_attempt_id.as_deref() {
+                    if classify_detection_lease_create_failure(&error)
+                        != DetectionLeaseCreateFailureDisposition::RetrySameAttempt
+                    {
+                        self.clear_cat_detection_create_attempt(&config.camera_id, attempt_id)
+                            .map_err(|clear_error| (StatusCode(503), clear_error))?;
+                    }
+                }
+                return Err((StatusCode(502), error));
+            }
         };
+        validate_detection_lease_create_response(&lease, &config.camera_id, &config.stream_profile)
+            .map_err(|error| (StatusCode(502), error))?;
+        if let Some(attempt_id) = create_attempt_id.as_deref() {
+            self.transfer_cat_detection_create_attempt_to_pending(
+                &config.camera_id,
+                attempt_id,
+                lease.lease_id.clone(),
+            )
+            .map_err(|error| (StatusCode(503), error))?;
+        } else if let Some(attempt_id) = rollback_attempt_id.as_deref() {
+            self.transfer_cat_detection_profile_rollback_to_pending(
+                &config.camera_id,
+                attempt_id,
+                lease.lease_id.clone(),
+            )
+            .map_err(|error| (StatusCode(503), error))?;
+        } else if explicit_policy.is_some() && config.target_label == "cat" {
+            self.retain_pending_detection_leases(&config.camera_id, [lease.lease_id.clone()])
+                .map_err(|error| (StatusCode(503), error))?;
+        }
+        let job_id = format!("yolo-{}", Uuid::new_v4().simple());
+        let output_root = env::var("HARBOR_K3_YOLO_OUTPUT_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(DEFAULT_DETECTION_OUTPUT_ROOT));
+        let output_dir = output_root.join(&job_id);
         let source = match lease.local_rtsp_url.as_deref() {
             Some(source) if source.starts_with("rtsp://127.0.0.1:") => source,
             _ => {
-                let _ = self
-                    .harborlink_media
-                    .stop_detection_lease(&config.camera_id, &lease.lease_id);
-                return Err((
+                return Err(self.fail_detection_job_initialization(
+                    &config,
+                    managed_by_live,
+                    &lease,
+                    &job_id,
+                    &output_dir,
                     StatusCode(502),
                     "HarborLink did not return a loopback detection source".to_string(),
                 ));
             }
         };
 
-        let job_id = format!("yolo-{}", Uuid::new_v4().simple());
-        let output_root = env::var("HARBOR_K3_YOLO_OUTPUT_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(DEFAULT_DETECTION_OUTPUT_ROOT));
-        let output_dir = output_root.join(&job_id);
         if let Err(error) = fs::create_dir_all(&output_dir) {
-            let _ = self
-                .harborlink_media
-                .stop_detection_lease(&config.camera_id, &lease.lease_id);
-            return Err((
+            return Err(self.fail_detection_job_initialization(
+                &config,
+                managed_by_live,
+                &lease,
+                &job_id,
+                &output_dir,
                 StatusCode(500),
                 format!("failed to create detection output directory: {error}"),
             ));
@@ -7187,11 +9714,13 @@ impl AdminApi {
         let stderr = match fs::File::create(&stderr_path) {
             Ok(stderr) => stderr,
             Err(error) => {
-                let _ = self
-                    .harborlink_media
-                    .stop_detection_lease(&config.camera_id, &lease.lease_id);
                 cleanup_detection_job_output_dir(&output_dir);
-                return Err((
+                return Err(self.fail_detection_job_initialization(
+                    &config,
+                    managed_by_live,
+                    &lease,
+                    &job_id,
+                    &output_dir,
                     StatusCode(500),
                     format!("failed to create detection worker log: {error}"),
                 ));
@@ -7200,10 +9729,12 @@ impl AdminApi {
         let python = env::var("HARBOR_K3_YOLO_PYTHON").unwrap_or_else(|_| "python3".to_string());
         let worker = env::var("HARBOR_K3_YOLO_WORKER")
             .unwrap_or_else(|_| DEFAULT_DETECTION_WORKER.to_string());
-        let model = env::var("HARBOR_K3_YOLO_MODEL")
-            .unwrap_or_else(|_| DEFAULT_DETECTION_MODEL.to_string());
-        let labels = env::var("HARBOR_K3_YOLO_LABELS")
-            .unwrap_or_else(|_| DEFAULT_DETECTION_LABELS.to_string());
+        let model_profile = detection_model_profile(&config.target_label)
+            .map_err(|error| (StatusCode(500), error))?;
+        let model = env::var(model_profile.model_env)
+            .unwrap_or_else(|_| model_profile.default_model.to_string());
+        let labels = env::var(model_profile.labels_env)
+            .unwrap_or_else(|_| model_profile.default_labels.to_string());
         let child = Command::new(python)
             .arg(worker)
             .arg("--source")
@@ -7229,17 +9760,22 @@ impl AdminApi {
         let child = match child {
             Ok(child) => child,
             Err(error) => {
-                let _ = self
-                    .harborlink_media
-                    .stop_detection_lease(&config.camera_id, &lease.lease_id);
                 cleanup_detection_job_output_dir(&output_dir);
-                return Err((
+                return Err(self.fail_detection_job_initialization(
+                    &config,
+                    managed_by_live,
+                    &lease,
+                    &job_id,
+                    &output_dir,
                     StatusCode(500),
                     format!("failed to start detection worker: {error}"),
                 ));
             }
         };
 
+        let responsibility_camera_id = config.camera_id.clone();
+        let responsibility_lease_id = lease.lease_id.clone();
+        let cat_target = config.target_label == "cat";
         let projection = DetectionJobProjection {
             job_id: job_id.clone(),
             camera_id: config.camera_id,
@@ -7257,15 +9793,46 @@ impl AdminApi {
             metrics: None,
             message: None,
         };
-        jobs.insert(
-            job_id,
-            DetectionJobRuntime {
-                projection: projection.clone(),
-                output_dir,
-                child: Some(child),
-                ai_lease: Some(ai_lease),
-            },
-        );
+        self.detection_jobs
+            .lock()
+            .map_err(|_| {
+                (
+                    StatusCode(503),
+                    "detection job state is unavailable".to_string(),
+                )
+            })?
+            .insert(
+                job_id.clone(),
+                DetectionJobRuntime {
+                    projection: projection.clone(),
+                    output_dir,
+                    child: Some(child),
+                    ai_lease: Some(ai_lease),
+                    detection_lease_cleanup_confirmed: false,
+                },
+            );
+        if explicit_policy.is_some() && cat_target {
+            if let Err(error) = self.clear_pending_detection_leases(
+                &responsibility_camera_id,
+                &HashSet::from([responsibility_lease_id]),
+            ) {
+                if let Ok(mut jobs) = self.detection_jobs.lock() {
+                    if let Some(runtime) = jobs.get_mut(&job_id) {
+                        runtime.projection.message = Some(format!(
+                            "detection worker started but responsibility transfer is pending: {}",
+                            redact_admin_string(&error)
+                        ));
+                    }
+                }
+                if let Some(policy) = explicit_policy.as_ref() {
+                    self.schedule_cat_detection_control_retry(
+                        &responsibility_camera_id,
+                        policy.updated_at_epoch_ms,
+                    );
+                }
+                return Err((StatusCode(503), error));
+            }
+        }
         Ok(DetectionJobStartResponse {
             projection,
             reused: false,
@@ -7280,12 +9847,96 @@ impl AdminApi {
         if !cat_auto_recording_enabled() {
             return Ok(());
         }
-
-        let _lifecycle = self
-            .detection_job_lifecycle_lock
+        let camera_lock = self.cat_detection_control_camera_lock(camera_id)?;
+        let _camera_coordination = camera_lock
             .lock()
-            .map_err(|_| "detection job lifecycle is unavailable".to_string())?;
+            .map_err(|_| "cat detection camera coordination is unavailable".to_string())?;
+        if let Some(policy) = self.cat_detection_explicit_policy(camera_id)? {
+            if !policy.desired_enabled {
+                return Ok(());
+            }
+            self.set_cat_detection_reconciliation(camera_id, "starting", None)?;
+            return match self.reconcile_cat_detection_control_locked(camera_id) {
+                Ok(CatDetectionControlCoordination::Converged)
+                | Ok(CatDetectionControlCoordination::Superseded) => {
+                    self.set_cat_detection_reconciliation(camera_id, "running", None)?;
+                    self.idle_cat_detection_control_retry(camera_id);
+                    Ok(())
+                }
+                Ok(CatDetectionControlCoordination::Draining) => {
+                    self.schedule_cat_detection_control_retry(
+                        camera_id,
+                        policy.updated_at_epoch_ms,
+                    );
+                    Ok(())
+                }
+                Err(error) => {
+                    self.set_cat_detection_reconciliation(
+                        camera_id,
+                        "failed",
+                        Some(redact_admin_string(&error)),
+                    )?;
+                    self.schedule_cat_detection_control_retry(
+                        camera_id,
+                        policy.updated_at_epoch_ms,
+                    );
+                    Err(error)
+                }
+            };
+        }
+        self.ensure_live_managed_detection_job_locked(camera_id, stream_profile)
+    }
 
+    fn ensure_live_managed_detection_job_locked(
+        &self,
+        camera_id: &str,
+        stream_profile: &str,
+    ) -> Result<(), String> {
+        let reusable_lease = {
+            let mut jobs = self
+                .detection_jobs
+                .lock()
+                .map_err(|_| "detection job state is unavailable".to_string())?;
+            for runtime in jobs
+                .values_mut()
+                .filter(|runtime| runtime.projection.camera_id == camera_id)
+            {
+                self.refresh_detection_job(runtime);
+            }
+            jobs.iter_mut()
+                .find(|(_, runtime)| {
+                    runtime.projection.camera_id == camera_id
+                        && runtime.projection.status == "running"
+                        && detection_job_matches_stream_profile(&runtime.projection, stream_profile)
+                })
+                .map(|(job_id, runtime)| {
+                    runtime.projection.managed_by_live = true;
+                    (job_id.clone(), runtime.projection.lease_id.clone())
+                })
+        };
+        if let Some((job_id, lease_id)) = reusable_lease {
+            let lease = self.harborlink_media.renew_detection_lease(
+                camera_id,
+                &lease_id,
+                LIVE_MANAGED_DETECTION_TTL_SECONDS,
+            )?;
+            let mut jobs = self
+                .detection_jobs
+                .lock()
+                .map_err(|_| "detection job state is unavailable".to_string())?;
+            let runtime = jobs
+                .get_mut(&job_id)
+                .filter(|runtime| {
+                    runtime.projection.status == "running"
+                        && runtime.projection.lease_id == lease_id
+                })
+                .ok_or_else(|| {
+                    "detection job changed while the live lease was being renewed".to_string()
+                })?;
+            runtime.projection.expires_at = lease.expires_at;
+            runtime.projection.updated_at = lease.updated_at;
+            return Ok(());
+        }
         let previous = {
             let mut jobs = self
                 .detection_jobs
@@ -7303,18 +9954,6 @@ impl AdminApi {
                 drop(jobs);
                 return self.start_live_managed_detection_profile_locked(camera_id, stream_profile);
             };
-
-            if detection_job_matches_stream_profile(&runtime.projection, stream_profile) {
-                runtime.projection.managed_by_live = true;
-                let lease = self.harborlink_media.renew_detection_lease(
-                    camera_id,
-                    &runtime.projection.lease_id,
-                    LIVE_MANAGED_DETECTION_TTL_SECONDS,
-                )?;
-                runtime.projection.expires_at = lease.expires_at;
-                runtime.projection.updated_at = lease.updated_at;
-                return Ok(());
-            }
 
             let previous = DetectionProfileHandoffState {
                 config: DetectionJobConfig {
@@ -7351,19 +9990,39 @@ impl AdminApi {
             .harborlink_media
             .stop_detection_lease(camera_id, &previous.lease_id)
         {
-            return Err(self.restore_previous_detection_profile_locked(
-                &previous,
-                stream_profile,
-                format!("failed to stop previous detection lease: {error}"),
+            return Err(format!(
+                "failed to stop previous detection lease while switching from {} to {stream_profile}; cleanup result is unresolved: {error}",
+                previous.config.stream_profile
             ));
+        }
+        if let Some(runtime) = self
+            .detection_jobs
+            .lock()
+            .map_err(|_| "detection job state is unavailable".to_string())?
+            .values_mut()
+            .find(|runtime| {
+                runtime.projection.camera_id == camera_id
+                    && runtime.projection.lease_id == previous.lease_id
+            })
+        {
+            runtime.detection_lease_cleanup_confirmed = true;
         }
 
         match self.start_live_managed_detection_profile_locked(camera_id, stream_profile) {
             Ok(()) => Ok(()),
-            Err(error) => Err(self.restore_previous_detection_profile_locked(
-                &previous,
-                stream_profile,
-                error,
+            Err(error)
+                if classify_detection_lease_create_failure(&error)
+                    == DetectionLeaseCreateFailureDisposition::ConfirmedNotCreated =>
+            {
+                Err(self.restore_previous_detection_profile_locked(
+                    &previous,
+                    stream_profile,
+                    error,
+                ))
+            }
+            Err(error) => Err(format!(
+                "failed to switch detection from {} to {stream_profile}; target create result is unresolved: {error}",
+                previous.config.stream_profile
             )),
         }
     }
@@ -7409,42 +10068,158 @@ impl AdminApi {
     }
 
     fn stop_live_managed_detection_job(&self, camera_id: &str) -> Result<(), String> {
-        let mut jobs = self
-            .detection_jobs
+        let camera_lock = self.cat_detection_control_camera_lock(camera_id)?;
+        let _camera_coordination = camera_lock
             .lock()
-            .map_err(|_| "detection job state is unavailable".to_string())?;
-        for runtime in jobs.values_mut().filter(|runtime| {
-            runtime.projection.camera_id == camera_id && runtime.projection.managed_by_live
-        }) {
-            self.refresh_detection_job(runtime);
-            if cat_auto_recording_enabled() {
+            .map_err(|_| "cat detection camera coordination is unavailable".to_string())?;
+        let explicit_policy = self.cat_detection_explicit_policy(camera_id)?;
+        let keep_running = explicit_policy
+            .as_ref()
+            .is_some_and(|policy| policy.desired_enabled)
+            || (explicit_policy.is_none() && cat_auto_recording_enabled());
+        if keep_running {
+            let mut jobs = self
+                .detection_jobs
+                .lock()
+                .map_err(|_| "detection job state is unavailable".to_string())?;
+            for runtime in jobs.values_mut().filter(|runtime| {
+                runtime.projection.camera_id == camera_id && runtime.projection.managed_by_live
+            }) {
                 runtime.projection.managed_by_live = false;
-                continue;
             }
-            if runtime.projection.status != "running" {
-                continue;
-            }
-            let stop_result = stop_detection_child(runtime);
-            let worker_stop_note = complete_detection_job_stop(runtime, "stopped", stop_result)?;
-            let lease_stop_note = self
-                .harborlink_media
-                .stop_detection_lease(camera_id, &runtime.projection.lease_id)
-                .err()
-                .map(|error| {
-                    format!(
-                        "detection lease cleanup was incomplete: {}",
-                        redact_admin_string(&error)
+            return Ok(());
+        }
+        let mut detached = {
+            let mut jobs = self
+                .detection_jobs
+                .lock()
+                .map_err(|_| "detection job state is unavailable".to_string())?;
+            jobs.iter_mut()
+                .filter(|(_, runtime)| {
+                    runtime.projection.camera_id == camera_id
+                        && runtime.projection.managed_by_live
+                        && (runtime.projection.status == "running"
+                            || runtime.child.is_some()
+                            || !runtime.detection_lease_cleanup_confirmed)
+                })
+                .map(|(job_id, runtime)| {
+                    runtime.projection.status = "stopping".to_string();
+                    runtime.projection.managed_by_live = false;
+                    runtime.projection.updated_at = current_rfc3339_timestamp();
+                    (
+                        job_id.clone(),
+                        DetectionJobRuntime {
+                            projection: runtime.projection.clone(),
+                            output_dir: runtime.output_dir.clone(),
+                            child: runtime.child.take(),
+                            ai_lease: runtime.ai_lease.take(),
+                            detection_lease_cleanup_confirmed: runtime
+                                .detection_lease_cleanup_confirmed,
+                        },
                     )
-                });
-            runtime.projection.message = match (worker_stop_note, lease_stop_note) {
-                (Some(worker), Some(lease)) => Some(format!("{worker}; {lease}")),
-                (Some(worker), None) => Some(worker),
-                (None, Some(lease)) => Some(lease),
-                (None, None) => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let pending = detached
+            .iter()
+            .filter(|(_, runtime)| !runtime.detection_lease_cleanup_confirmed)
+            .map(|(_, runtime)| runtime.projection.lease_id.clone())
+            .filter(|lease_id| !lease_id.is_empty())
+            .collect::<HashSet<_>>();
+        if explicit_policy.is_some() {
+            self.retain_pending_detection_leases(camera_id, pending.iter().cloned())?;
+        }
+        let mut first_error = None;
+        let mut worker_failed = HashSet::new();
+        for (_, runtime) in &mut detached {
+            let worker_note = if runtime.child.is_some() {
+                let stop_result = stop_detection_child(runtime);
+                match complete_detection_job_stop(runtime, "stopped", stop_result) {
+                    Ok(note) => note,
+                    Err(error) => {
+                        worker_failed.insert(runtime.projection.lease_id.clone());
+                        runtime.projection.status = "stopping".to_string();
+                        runtime.projection.message = Some(redact_admin_string(&error));
+                        first_error.get_or_insert(error);
+                        refresh_detection_job_outputs(runtime);
+                        continue;
+                    }
+                }
+            } else {
+                runtime.projection.status = "stopped".to_string();
+                None
             };
+            runtime.projection.message = worker_note;
             refresh_detection_job_outputs(runtime);
         }
-        Ok(())
+        let mut cleared = HashSet::new();
+        for lease_id in pending {
+            if worker_failed.contains(&lease_id) {
+                continue;
+            }
+            match self
+                .harborlink_media
+                .stop_detection_lease(camera_id, &lease_id)
+            {
+                Ok(_) => {
+                    cleared.insert(lease_id.clone());
+                    for (_, runtime) in detached
+                        .iter_mut()
+                        .filter(|(_, runtime)| runtime.projection.lease_id == lease_id)
+                    {
+                        runtime.detection_lease_cleanup_confirmed = true;
+                        runtime.projection.status = "stopped".to_string();
+                        runtime.projection.message = None;
+                    }
+                }
+                Err(error) if harborlink_error_status_code(&error) == Some(404) => {
+                    cleared.insert(lease_id.clone());
+                    for (_, runtime) in detached
+                        .iter_mut()
+                        .filter(|(_, runtime)| runtime.projection.lease_id == lease_id)
+                    {
+                        runtime.detection_lease_cleanup_confirmed = true;
+                        runtime.projection.status = "stopped".to_string();
+                        runtime.projection.message = None;
+                    }
+                }
+                Err(error) => {
+                    let error = format!(
+                        "detection lease cleanup was incomplete: {}",
+                        redact_admin_string(&error)
+                    );
+                    for (_, runtime) in detached
+                        .iter_mut()
+                        .filter(|(_, runtime)| runtime.projection.lease_id == lease_id)
+                    {
+                        runtime.detection_lease_cleanup_confirmed = false;
+                        runtime.projection.message = Some(error.clone());
+                    }
+                }
+            }
+        }
+        {
+            let mut jobs = self
+                .detection_jobs
+                .lock()
+                .map_err(|_| "detection job state is unavailable".to_string())?;
+            for (job_id, mut completed) in detached {
+                if let Some(runtime) = jobs.get_mut(&job_id).filter(|runtime| {
+                    runtime.projection.camera_id == camera_id
+                        && runtime.projection.lease_id == completed.projection.lease_id
+                }) {
+                    runtime.projection = completed.projection;
+                    runtime.child = completed.child.take();
+                    runtime.ai_lease = completed.ai_lease.take();
+                    runtime.detection_lease_cleanup_confirmed =
+                        completed.detection_lease_cleanup_confirmed;
+                }
+            }
+        }
+        if explicit_policy.is_some() {
+            self.clear_pending_detection_leases(camera_id, &cleared)?;
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn handle_get_detection_job(
@@ -7510,6 +10285,7 @@ impl AdminApi {
         for runtime in jobs.values_mut().filter(|runtime| {
             runtime.projection.camera_id == camera_id
                 && runtime.projection.stream_profile == stream_profile
+                && detection_projection_targets(&runtime.projection, "cat")
         }) {
             self.refresh_detection_job(runtime);
             if runtime.projection.status != "running" {
@@ -7609,10 +10385,61 @@ impl AdminApi {
         ) {
             return error_json(status, &error);
         }
-        let _lifecycle = match self.detection_job_lifecycle_lock.lock() {
-            Ok(lifecycle) => lifecycle,
-            Err(_) => return error_json(StatusCode(503), "detection job lifecycle is unavailable"),
+        let camera_lock = match self.cat_detection_control_camera_lock(&camera_id) {
+            Ok(lock) => lock,
+            Err(error) => return error_json(StatusCode(503), &error),
         };
+        let _camera_coordination = match camera_lock.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return error_json(
+                    StatusCode(503),
+                    "cat detection camera coordination is unavailable",
+                )
+            }
+        };
+        let (lease_id, target_label) = {
+            let mut jobs = match self.detection_jobs.lock() {
+                Ok(jobs) => jobs,
+                Err(_) => return error_json(StatusCode(503), "detection job state is unavailable"),
+            };
+            let Some(runtime) = jobs.get_mut(&job_id) else {
+                return error_json(StatusCode(404), "detection job was not found");
+            };
+            self.refresh_detection_job(runtime);
+            if runtime.projection.status != "running" {
+                return error_json(
+                    StatusCode(409),
+                    "only a running detection job can be renewed",
+                );
+            }
+            (
+                runtime.projection.lease_id.clone(),
+                runtime
+                    .projection
+                    .target_labels
+                    .first()
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        };
+        let explicit_policy = match self.cat_detection_explicit_policy(&camera_id) {
+            Ok(policy) => policy,
+            Err(error) => return cat_detection_control_unavailable_response(&error),
+        };
+        if let Err(error) =
+            validate_detection_job_renewal_policy(&target_label, explicit_policy.as_ref())
+        {
+            return error_json(StatusCode(409), &error);
+        }
+        let lease =
+            match self
+                .harborlink_media
+                .renew_detection_lease(&camera_id, &lease_id, ttl_seconds)
+            {
+                Ok(lease) => lease,
+                Err(error) => return error_json(StatusCode(502), &error),
+            };
         let mut jobs = match self.detection_jobs.lock() {
             Ok(jobs) => jobs,
             Err(_) => return error_json(StatusCode(503), "detection job state is unavailable"),
@@ -7620,25 +10447,15 @@ impl AdminApi {
         let Some(runtime) = jobs.get_mut(&job_id) else {
             return error_json(StatusCode(404), "detection job was not found");
         };
-        self.refresh_detection_job(runtime);
-        if runtime.projection.status != "running" {
+        if runtime.projection.status != "running" || runtime.projection.lease_id != lease_id {
             return error_json(
                 StatusCode(409),
-                "only a running detection job can be renewed",
+                "detection job changed while the lease was being renewed",
             );
         }
-        match self.harborlink_media.renew_detection_lease(
-            &runtime.projection.camera_id,
-            &runtime.projection.lease_id,
-            ttl_seconds,
-        ) {
-            Ok(lease) => {
-                runtime.projection.expires_at = lease.expires_at;
-                runtime.projection.updated_at = lease.updated_at;
-                ok_json(&runtime.projection)
-            }
-            Err(error) => error_json(StatusCode(502), &error),
-        }
+        runtime.projection.expires_at = lease.expires_at;
+        runtime.projection.updated_at = lease.updated_at;
+        ok_json(&runtime.projection)
     }
 
     fn handle_stop_detection_job(
@@ -7661,15 +10478,43 @@ impl AdminApi {
         ) {
             return error_json(status, &error);
         }
-        let mut jobs = match self.detection_jobs.lock() {
-            Ok(jobs) => jobs,
-            Err(_) => return error_json(StatusCode(503), "detection job state is unavailable"),
+        let camera_lock = match self.cat_detection_control_camera_lock(&camera_id) {
+            Ok(lock) => lock,
+            Err(error) => return error_json(StatusCode(503), &error),
         };
-        let Some(runtime) = jobs.get_mut(&job_id) else {
-            return error_json(StatusCode(404), "detection job was not found");
+        let _camera_coordination = match camera_lock.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return error_json(
+                    StatusCode(503),
+                    "cat detection camera coordination is unavailable",
+                )
+            }
         };
-        self.refresh_detection_job(runtime);
-        if runtime.projection.status == "running" {
+        let explicit_policy = match self.cat_detection_explicit_policy(&camera_id) {
+            Ok(Some(policy)) if policy.desired_enabled => {
+                return error_json(
+                    StatusCode(409),
+                    "cat detection is explicitly enabled for this camera",
+                )
+            }
+            Ok(policy) => policy,
+            Err(error) => return cat_detection_control_unavailable_response(&error),
+        };
+        let (projection, cleanup_confirmed) = {
+            let jobs = match self.detection_jobs.lock() {
+                Ok(jobs) => jobs,
+                Err(_) => return error_json(StatusCode(503), "detection job state is unavailable"),
+            };
+            let Some(runtime) = jobs.get(&job_id) else {
+                return error_json(StatusCode(404), "detection job was not found");
+            };
+            (
+                runtime.projection.clone(),
+                runtime.detection_lease_cleanup_confirmed,
+            )
+        };
+        if projection.status == "running" {
             let cat_auto_recording = match self.cat_auto_recording.lock() {
                 Ok(states) => states,
                 Err(_) => {
@@ -7677,40 +10522,140 @@ impl AdminApi {
                 }
             };
             if let Some(conflict) = detection_job_reference_conflict(
-                &runtime.projection,
+                &projection,
                 &cat_auto_recording,
                 cat_auto_recording_enabled(),
             ) {
                 return error_json(StatusCode(409), conflict);
             }
-            drop(cat_auto_recording);
-            let stop_result = stop_detection_child(runtime);
-            let worker_stop_note =
-                match complete_detection_job_stop(runtime, "stopped", stop_result) {
+        }
+        if explicit_policy.is_some() && !cleanup_confirmed && !projection.lease_id.is_empty() {
+            if let Err(error) =
+                self.retain_pending_detection_leases(&camera_id, [projection.lease_id.clone()])
+            {
+                return cat_detection_control_unavailable_response(&error);
+            }
+        }
+        let mut detached = {
+            let mut jobs = match self.detection_jobs.lock() {
+                Ok(jobs) => jobs,
+                Err(_) => return error_json(StatusCode(503), "detection job state is unavailable"),
+            };
+            let Some(runtime) = jobs.get_mut(&job_id) else {
+                return error_json(StatusCode(404), "detection job was not found");
+            };
+            if runtime.projection.status == "stopped"
+                && runtime.child.is_none()
+                && runtime.detection_lease_cleanup_confirmed
+            {
+                return ok_json(&runtime.projection);
+            }
+            runtime.projection.status = "stopping".to_string();
+            runtime.projection.updated_at = current_rfc3339_timestamp();
+            DetectionJobRuntime {
+                projection: runtime.projection.clone(),
+                output_dir: runtime.output_dir.clone(),
+                child: runtime.child.take(),
+                ai_lease: runtime.ai_lease.take(),
+                detection_lease_cleanup_confirmed: runtime.detection_lease_cleanup_confirmed,
+            }
+        };
+        let mut worker_stop_note = None;
+        if detached.child.is_some() {
+            let stop_result = stop_detection_child(&mut detached);
+            worker_stop_note =
+                match complete_detection_job_stop(&mut detached, "stopped", stop_result) {
                     Ok(note) => note,
                     Err(error) => {
-                        refresh_detection_job_outputs(runtime);
+                        refresh_detection_job_outputs(&mut detached);
+                        if let Ok(mut jobs) = self.detection_jobs.lock() {
+                            if let Some(runtime) = jobs.get_mut(&job_id) {
+                                runtime.projection = detached.projection;
+                                runtime.child = detached.child;
+                                runtime.ai_lease = detached.ai_lease;
+                                runtime.detection_lease_cleanup_confirmed =
+                                    detached.detection_lease_cleanup_confirmed;
+                            }
+                        }
+                        if let Some(policy) = explicit_policy.as_ref() {
+                            self.schedule_cat_detection_control_retry(
+                                &camera_id,
+                                policy.updated_at_epoch_ms,
+                            );
+                        }
                         return error_json(StatusCode(503), &error);
                     }
                 };
-            let lease_result = self
-                .harborlink_media
-                .stop_detection_lease(&runtime.projection.camera_id, &runtime.projection.lease_id);
-            let lease_stop_note = lease_result.err().map(|error| {
-                format!(
-                    "detection lease cleanup was incomplete: {}",
-                    redact_admin_string(&error)
-                )
-            });
-            runtime.projection.message = match (worker_stop_note, lease_stop_note) {
-                (Some(worker), Some(lease)) => Some(format!("{worker}; {lease}")),
-                (Some(worker), None) => Some(worker),
-                (None, Some(lease)) => Some(lease),
-                (None, None) => None,
-            };
+        } else {
+            detached.projection.status = "stopped".to_string();
+            detached.projection.updated_at = current_rfc3339_timestamp();
         }
-        refresh_detection_job_outputs(runtime);
-        ok_json(&runtime.projection)
+        let lease_stop_note = if detached.detection_lease_cleanup_confirmed
+            || detached.projection.lease_id.is_empty()
+        {
+            None
+        } else {
+            match self.stop_detection_lease_idempotently(&camera_id, &detached.projection.lease_id)
+            {
+                Ok(()) => {
+                    detached.detection_lease_cleanup_confirmed = true;
+                    None
+                }
+                Err(error) => {
+                    detached.detection_lease_cleanup_confirmed = false;
+                    Some(format!(
+                        "detection lease cleanup was incomplete: {}",
+                        redact_admin_string(&error)
+                    ))
+                }
+            }
+        };
+        let mut persistence_error = None;
+        if detached.detection_lease_cleanup_confirmed {
+            if let Some(policy) = explicit_policy.as_ref() {
+                let cleared = HashSet::from([detached.projection.lease_id.clone()]);
+                if let Err(error) = self.clear_pending_detection_leases(&camera_id, &cleared) {
+                    persistence_error = Some(error);
+                    self.schedule_cat_detection_control_retry(
+                        &camera_id,
+                        policy.updated_at_epoch_ms,
+                    );
+                }
+            }
+        } else if let Some(policy) = explicit_policy.as_ref() {
+            self.schedule_cat_detection_control_retry(&camera_id, policy.updated_at_epoch_ms);
+        }
+        detached.projection.message = match (worker_stop_note, lease_stop_note, persistence_error) {
+            (Some(worker), Some(lease), Some(store)) => Some(format!(
+                "{worker}; {lease}; {}",
+                redact_admin_string(&store)
+            )),
+            (Some(worker), Some(lease), None) => Some(format!("{worker}; {lease}")),
+            (Some(worker), None, Some(store)) => {
+                Some(format!("{worker}; {}", redact_admin_string(&store)))
+            }
+            (None, Some(lease), Some(store)) => {
+                Some(format!("{lease}; {}", redact_admin_string(&store)))
+            }
+            (Some(worker), None, None) => Some(worker),
+            (None, Some(lease), None) => Some(lease),
+            (None, None, Some(store)) => Some(redact_admin_string(&store)),
+            (None, None, None) => None,
+        };
+        refresh_detection_job_outputs(&mut detached);
+        let response = detached.projection.clone();
+        let mut jobs = match self.detection_jobs.lock() {
+            Ok(jobs) => jobs,
+            Err(_) => return error_json(StatusCode(503), "detection job state is unavailable"),
+        };
+        let Some(runtime) = jobs.get_mut(&job_id) else {
+            return error_json(StatusCode(404), "detection job was not found");
+        };
+        runtime.projection = detached.projection;
+        runtime.child = detached.child;
+        runtime.ai_lease = detached.ai_lease;
+        runtime.detection_lease_cleanup_confirmed = detached.detection_lease_cleanup_confirmed;
+        ok_json(&response)
     }
 
     fn detection_job_camera_id(&self, job_id: &str) -> Result<String, (StatusCode, String)> {
@@ -7732,10 +10677,6 @@ impl AdminApi {
             let stop_result = stop_detection_child(runtime);
             match complete_detection_job_stop(runtime, "expired", stop_result) {
                 Ok(worker_stop_note) => {
-                    let _ = self.harborlink_media.stop_detection_lease(
-                        &runtime.projection.camera_id,
-                        &runtime.projection.lease_id,
-                    );
                     runtime.projection.message = Some(match worker_stop_note {
                         Some(note) => format!("detection lease expired; {note}"),
                         None => "detection lease expired".to_string(),
@@ -7751,10 +10692,6 @@ impl AdminApi {
                 Some(Ok(Some(status))) => {
                     runtime.child = None;
                     runtime.ai_lease.take();
-                    let _ = self.harborlink_media.stop_detection_lease(
-                        &runtime.projection.camera_id,
-                        &runtime.projection.lease_id,
-                    );
                     runtime.projection.status = if status.success() {
                         "completed".to_string()
                     } else {
@@ -7768,10 +10705,6 @@ impl AdminApi {
                     let stop_result = stop_detection_child(runtime);
                     match complete_detection_job_stop(runtime, "failed", stop_result) {
                         Ok(worker_stop_note) => {
-                            let _ = self.harborlink_media.stop_detection_lease(
-                                &runtime.projection.camera_id,
-                                &runtime.projection.lease_id,
-                            );
                             runtime.projection.message = Some(format!(
                                 "failed to inspect detection worker: {}{}",
                                 inspect_error,
@@ -11743,6 +14676,85 @@ fn principal_skips_manual_camera_connect_approval(principal: &AccessPrincipal) -
     matches!(principal.role_kind, RoleKind::Owner | RoleKind::Admin)
 }
 
+fn next_cat_detection_control_retry_delay(current_seconds: u64) -> u64 {
+    current_seconds
+        .saturating_mul(2)
+        .min(CAT_DETECTION_CONTROL_RETRY_MAX_SECONDS)
+}
+
+fn cat_detection_start_request_scope(camera_id: &str, attempt_id: &str) -> String {
+    format!(
+        "cat-detection-start-{attempt_id}-{}",
+        short_sha256(camera_id)
+    )
+}
+
+fn cat_detection_rollback_request_scope(camera_id: &str, attempt_id: &str) -> String {
+    format!(
+        "cat-detection-rollback-{attempt_id}-{}",
+        short_sha256(camera_id)
+    )
+}
+
+fn harborlink_error_status_code(error: &str) -> Option<u64> {
+    serde_json::from_str::<Value>(error)
+        .ok()
+        .and_then(|error| error["statusCode"].as_u64())
+}
+
+fn classify_detection_lease_create_failure(error: &str) -> DetectionLeaseCreateFailureDisposition {
+    let Ok(error) = serde_json::from_str::<HarborLinkContractError>(error) else {
+        return DetectionLeaseCreateFailureDisposition::RetrySameAttempt;
+    };
+    match error.code.as_str() {
+        "REQUEST_IN_PROGRESS" | "HARBORLINK_INVALID_RESPONSE" => {
+            DetectionLeaseCreateFailureDisposition::RetrySameAttempt
+        }
+        "DETECTION_LEASE_ACTIVE" | "REQUEST_ID_CONFLICT" => {
+            DetectionLeaseCreateFailureDisposition::Conflict
+        }
+        "CAMERA_NOT_CONFIGURED"
+        | "CAMERA_NOT_FOUND"
+        | "INVALID_CAMERA_ID"
+        | "INVALID_DETECTION_LEASE_ID"
+        | "INVALID_REQUEST"
+        | "INVALID_STREAM_PROFILE"
+        | "LOCAL_CONTRACT_AUTHENTICATION_FAILED"
+        | "LOCAL_CONTRACT_AUTHENTICATION_REQUIRED"
+        | "LOCAL_CONTRACT_VERSION_INCOMPATIBLE"
+        | "LOCAL_CONTRACT_VERSION_REQUIRED"
+        | "REQUEST_ID_REQUIRED"
+            if (400..500).contains(&error.status_code) && !error.retryable =>
+        {
+            DetectionLeaseCreateFailureDisposition::ConfirmedNotCreated
+        }
+        _ => DetectionLeaseCreateFailureDisposition::RetrySameAttempt,
+    }
+}
+
+fn validate_detection_lease_create_response(
+    lease: &HarborLinkDetectionLease,
+    expected_camera_id: &str,
+    expected_stream_profile: &str,
+) -> Result<(), String> {
+    if lease.lease_id.is_empty()
+        || lease.lease_id.len() > 256
+        || lease.lease_id.chars().any(char::is_control)
+    {
+        return Err("HarborLink returned an invalid detection lease identity".to_string());
+    }
+    if lease.camera_id != expected_camera_id {
+        return Err("HarborLink returned a mismatched detection lease camera".to_string());
+    }
+    if lease.stream_profile != expected_stream_profile {
+        return Err("HarborLink returned a mismatched detection lease stream profile".to_string());
+    }
+    if lease.status != "running" {
+        return Err("HarborLink returned an invalid detection lease status".to_string());
+    }
+    Ok(())
+}
+
 fn main() {
     let cli = Cli::parse();
     let device_registry_path = resolve_state_path(&cli.device_registry);
@@ -11992,6 +15004,8 @@ fn is_gate_principal_knowledge_endpoint(method: &Method, path: &str) -> bool {
 fn is_gate_principal_endpoint(method: &Method, path: &str) -> bool {
     is_gate_principal_knowledge_endpoint(method, path)
         || (method == &Method::Get && is_cat_detection_observation_path(path))
+        || (matches!(method, &Method::Get | &Method::Put)
+            && parse_cat_detection_control_camera_id(path).is_some())
         || path == "/api/vision/detection-jobs"
         || path.starts_with("/api/vision/detection-jobs/")
 }
@@ -12157,12 +15171,18 @@ fn authenticate_harbornavi_device_principal(
     workspace_id: String,
 ) -> Result<GateAuthenticatedPrincipal, GatePrincipalAuthError> {
     let path = raw_url.split('?').next().unwrap_or(raw_url);
-    let camera_id = parse_cat_detection_observation_camera_id(path).ok_or_else(|| {
-        GatePrincipalAuthError::new(
+    let (camera_id, required_role, role_kind) = if let Some(camera_id) =
+        parse_cat_detection_observation_camera_id(path)
+    {
+        (camera_id, "CAMERA_VIEW", RoleKind::Viewer)
+    } else if let Some(camera_id) = parse_cat_detection_control_camera_id(path) {
+        (camera_id, "CAMERA_CONTROL", RoleKind::Operator)
+    } else {
+        return Err(GatePrincipalAuthError::new(
             StatusCode(403),
-            "HarborNavi device principals are limited to observation reads",
-        )
-    })?;
+            "HarborNavi device principals are limited to camera observation and cat detection control",
+        ));
+    };
     let session_id = principal_id
         .strip_prefix("harbornavi-device:")
         .filter(|value| {
@@ -12175,10 +15195,10 @@ fn authenticate_harbornavi_device_principal(
             "principal id is malformed",
         ));
     }
-    if roles.trim() != "CAMERA_VIEW" {
+    if roles.trim() != required_role {
         return Err(GatePrincipalAuthError::new(
             StatusCode(403),
-            "CAMERA_VIEW role is required",
+            format!("{required_role} role is required"),
         ));
     }
     let camera_scope = required_gate_principal_header(headers, "X-Harbor-Camera-Scope")?;
@@ -12192,7 +15212,7 @@ fn authenticate_harbornavi_device_principal(
         workspace_id,
         user_id: principal_id.clone(),
         display_name: principal_id,
-        role_kind: RoleKind::Viewer,
+        role_kind,
     }))
 }
 
@@ -12204,22 +15224,28 @@ fn authenticate_harbornavi_lan_principal(
     workspace_id: String,
 ) -> Result<GateAuthenticatedPrincipal, GatePrincipalAuthError> {
     let path = raw_url.split('?').next().unwrap_or(raw_url);
-    let camera_id = parse_cat_detection_observation_camera_id(path).ok_or_else(|| {
-        GatePrincipalAuthError::new(
-            StatusCode(403),
-            "HarborNavi LAN principals are limited to observation reads",
-        )
-    })?;
+    let (camera_id, required_role, role_kind) = parse_cat_detection_observation_camera_id(path)
+        .map(|camera_id| (camera_id, "CAMERA_VIEW", RoleKind::Viewer))
+        .or_else(|| {
+            parse_cat_detection_control_camera_id(path)
+                .map(|camera_id| (camera_id, "CAMERA_CONTROL", RoleKind::Operator))
+        })
+        .ok_or_else(|| {
+            GatePrincipalAuthError::new(
+                StatusCode(403),
+                "HarborNavi LAN principals are limited to camera observation and cat detection control",
+            )
+        })?;
     if principal_id != "harbornavi-lan:anonymous" {
         return Err(GatePrincipalAuthError::new(
             StatusCode(400),
             "principal id is malformed",
         ));
     }
-    if roles.trim() != "CAMERA_VIEW" {
+    if roles.trim() != required_role {
         return Err(GatePrincipalAuthError::new(
             StatusCode(403),
-            "CAMERA_VIEW role is required",
+            format!("{required_role} role is required"),
         ));
     }
     let camera_scope = required_gate_principal_header(headers, "X-Harbor-Camera-Scope")?;
@@ -12233,7 +15259,7 @@ fn authenticate_harbornavi_lan_principal(
         workspace_id,
         user_id: principal_id.clone(),
         display_name: principal_id,
-        role_kind: RoleKind::Viewer,
+        role_kind,
     }))
 }
 
@@ -12358,20 +15384,37 @@ fn normalize_detection_job_start(
         .map(|label| label.trim().to_ascii_lowercase())
         .filter(|label| !label.is_empty())
         .collect::<Vec<_>>();
-    if target_labels.iter().any(|label| label != "cat") {
-        return Err("this deployment only supports target_labels=[\"cat\"]".to_string());
-    }
+    let target_label = match target_labels.as_slice() {
+        [] => "cat".to_string(),
+        [label] if matches!(label.as_str(), "cat" | "package") => label.clone(),
+        [label] => {
+            return Err(format!(
+                "unsupported detection target {label}; supported targets are cat and package"
+            ))
+        }
+        _ => return Err("target_labels must contain exactly one target".to_string()),
+    };
     let ttl_seconds = request
         .duration_seconds
         .unwrap_or(DEFAULT_DETECTION_JOB_TTL_SECONDS);
     if !(MIN_DETECTION_JOB_TTL_SECONDS..=MAX_DETECTION_JOB_TTL_SECONDS).contains(&ttl_seconds) {
         return Err("duration_seconds must be between 60 and 900".to_string());
     }
-    let max_fps = request.max_fps.unwrap_or(DEFAULT_DETECTION_MAX_FPS);
+    let default_max_fps = if target_label == "package" {
+        DEFAULT_PACKAGE_DETECTION_MAX_FPS
+    } else {
+        DEFAULT_DETECTION_MAX_FPS
+    };
+    let max_fps = request.max_fps.unwrap_or(default_max_fps);
     if !max_fps.is_finite() || !(0.0..=MAX_DETECTION_MAX_FPS).contains(&max_fps) || max_fps == 0.0 {
         return Err("max_fps must be greater than 0 and at most 25".to_string());
     }
-    let confidence = request.confidence.unwrap_or(DEFAULT_DETECTION_CONFIDENCE);
+    let default_confidence = if target_label == "package" {
+        DEFAULT_PACKAGE_DETECTION_CONFIDENCE
+    } else {
+        DEFAULT_DETECTION_CONFIDENCE
+    };
+    let confidence = request.confidence.unwrap_or(default_confidence);
     if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) || confidence == 0.0 {
         return Err("confidence must be greater than 0 and at most 1".to_string());
     }
@@ -12385,12 +15428,82 @@ fn normalize_detection_job_start(
     }
     Ok(DetectionJobConfig {
         camera_id,
-        target_label: "cat".to_string(),
+        target_label,
         ttl_seconds,
         max_fps,
         confidence,
         stream_profile,
     })
+}
+
+fn detection_model_profile(target_label: &str) -> Result<DetectionModelProfile, String> {
+    match target_label {
+        "cat" => Ok(DetectionModelProfile {
+            model_env: "HARBOR_K3_YOLO_MODEL",
+            labels_env: "HARBOR_K3_YOLO_LABELS",
+            default_model: DEFAULT_DETECTION_MODEL,
+            default_labels: DEFAULT_DETECTION_LABELS,
+        }),
+        "package" => Ok(DetectionModelProfile {
+            model_env: PACKAGE_DETECTION_MODEL_ENV,
+            labels_env: PACKAGE_DETECTION_LABELS_ENV,
+            default_model: DEFAULT_PACKAGE_DETECTION_MODEL,
+            default_labels: DEFAULT_PACKAGE_DETECTION_LABELS,
+        }),
+        _ => Err(format!("unsupported detection target: {target_label}")),
+    }
+}
+
+fn validate_detection_target_policy(
+    target_label: &str,
+    policy: Option<&CatDetectionControlPolicy>,
+) -> Result<(), String> {
+    match target_label {
+        "cat" => {
+            if policy.is_some_and(|policy| !policy.desired_enabled) {
+                return Err("cat detection is explicitly disabled for this camera".to_string());
+            }
+            Ok(())
+        }
+        "package" => {
+            let policy = policy.ok_or_else(|| {
+                "cat detection must be explicitly disabled before package detection can start"
+                    .to_string()
+            })?;
+            if policy.desired_enabled {
+                return Err(
+                    "package detection cannot start while cat detection is enabled".to_string(),
+                );
+            }
+            if !policy.pending_detection_lease_ids.is_empty()
+                || policy.detection_lease_create_attempt_id.is_some()
+                || policy.rollback_detection_lease_create_attempt_id.is_some()
+            {
+                return Err(
+                    "cat detection is still draining; package detection cannot start yet"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
+        _ => Err(format!("unsupported detection target: {target_label}")),
+    }
+}
+
+fn validate_detection_job_renewal_policy(
+    target_label: &str,
+    policy: Option<&CatDetectionControlPolicy>,
+) -> Result<(), String> {
+    if target_label != "package" {
+        return validate_detection_target_policy(target_label, policy);
+    }
+    let policy = policy.ok_or_else(|| {
+        "cat detection must be explicitly disabled before package detection can renew".to_string()
+    })?;
+    if policy.desired_enabled {
+        return Err("package detection cannot renew while cat detection is enabled".to_string());
+    }
+    Ok(())
 }
 
 fn normalize_detection_provider(value: Option<&str>) -> Result<String, String> {
@@ -13722,6 +16835,23 @@ fn parse_cat_detection_observation_camera_id(path: &str) -> Option<String> {
     .then_some(camera_id)
 }
 
+fn parse_cat_detection_control_camera_id(path: &str) -> Option<String> {
+    let encoded = path
+        .strip_prefix("/api/cameras/")?
+        .strip_suffix("/cat-detection/control")?;
+    if encoded.is_empty() || encoded.contains('/') {
+        return None;
+    }
+    let camera_id = percent_decode_path_segment(encoded).ok()?;
+    (!camera_id.is_empty()
+        && camera_id.len() <= 128
+        && !camera_id.chars().any(char::is_control)
+        && !camera_id
+            .chars()
+            .any(|character| matches!(character, '\\' | '?' | '#')))
+    .then_some(camera_id)
+}
+
 fn detection_job_has_expired(expires_at: &str) -> bool {
     OffsetDateTime::parse(expires_at.trim(), &Rfc3339)
         .map(|timestamp| timestamp <= OffsetDateTime::now_utc())
@@ -13949,6 +17079,7 @@ fn refresh_detection_job_outputs(runtime: &mut DetectionJobRuntime) {
 fn reusable_detection_job_projection(
     jobs: &HashMap<String, DetectionJobRuntime>,
     camera_id: &str,
+    target_label: &str,
     stream_profile: &str,
 ) -> Result<Option<DetectionJobProjection>, String> {
     let projection = jobs
@@ -13960,6 +17091,16 @@ fn reusable_detection_job_projection(
     let Some(projection) = projection else {
         return Ok(None);
     };
+    let running_target = projection
+        .target_labels
+        .first()
+        .map(String::as_str)
+        .unwrap_or("unknown");
+    if projection.target_labels.as_slice() != [target_label] {
+        return Err(format!(
+            "a {running_target} detection job is already running; stop it before switching to {target_label}"
+        ));
+    }
     if detection_job_matches_stream_profile(&projection, stream_profile) {
         return Ok(Some(projection));
     }
@@ -14007,7 +17148,12 @@ fn prune_detection_job_history(jobs: &mut HashMap<String, DetectionJobRuntime>) 
     while jobs.len() >= MAX_DETECTION_JOB_HISTORY {
         let Some(job_id) = jobs
             .iter()
-            .filter(|(_, runtime)| runtime.projection.status != "running")
+            .filter(|(_, runtime)| {
+                runtime.projection.status != "running"
+                    && runtime.child.is_none()
+                    && runtime.ai_lease.is_none()
+                    && runtime.detection_lease_cleanup_confirmed
+            })
             .min_by_key(|(_, runtime)| runtime.projection.updated_at.as_str())
             .map(|(job_id, _)| job_id.clone())
         else {
@@ -15054,6 +18200,38 @@ fn error_json(status: StatusCode, message: &str) -> Response<std::io::Cursor<Vec
         }
     }
     json_response(status, &json!({ "error": message }))
+}
+
+fn cat_detection_control_unavailable_response(
+    internal_error: &str,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    eprintln!(
+        "HarborBeacon cat detection control is unavailable: {}",
+        redact_admin_string(internal_error)
+    );
+    error_json(
+        StatusCode(503),
+        &json!({
+            "statusCode": 503,
+            "code": "CAT_DETECTION_CONTROL_UNAVAILABLE",
+            "message": "Cat detection control is temporarily unavailable.",
+            "retryable": true,
+        })
+        .to_string(),
+    )
+}
+
+fn cat_detection_rollback_unresolved_response() -> Response<std::io::Cursor<Vec<u8>>> {
+    error_json(
+        StatusCode(409),
+        &json!({
+            "statusCode": 409,
+            "code": "CAT_DETECTION_ROLLBACK_UNRESOLVED",
+            "message": "Cat detection profile rollback is unresolved for this camera.",
+            "retryable": true,
+        })
+        .to_string(),
+    )
 }
 
 fn deprecated_im_binding_message() -> &'static str {
@@ -24819,6 +27997,14 @@ fn current_rfc3339_timestamp() -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
+fn format_epoch_millis(epoch_millis: u128) -> Option<String> {
+    let nanos = i128::try_from(epoch_millis).ok()?.checked_mul(1_000_000)?;
+    OffsetDateTime::from_unix_timestamp_nanos(nanos)
+        .ok()?
+        .format(&Rfc3339)
+        .ok()
+}
+
 fn dvr_timeline_segment_from_harborlink(
     artifact: HarborLinkRecordingArtifact,
     from_secs: Option<u64>,
@@ -25075,13 +28261,14 @@ mod tests {
         build_outreach_delivery_notification_request, build_rag_readiness_response,
         build_redacted_diagnostics_bundle, build_release_readiness_response,
         build_rtsp_url_from_patch, cat_auto_recording_epoch_ms, cat_auto_recording_transition,
-        cat_recording_validation_retry_delay, cat_recording_validation_status_for_decision,
-        cleanup_detection_job_output_dir, current_epoch_secs, default_model_download_target_path,
+        cat_control_owns_detection_cleanup, cat_recording_validation_retry_delay,
+        cat_recording_validation_status_for_decision, cleanup_detection_job_output_dir,
+        current_epoch_secs, default_model_download_target_path,
         default_model_download_target_path_in_root, default_model_endpoints,
-        detection_job_matches_stream_profile, dvr_timeline_segment_from_harborlink,
-        ensure_local_admin_access, ensure_local_camera_access,
-        harbor_assistant_build_missing_response, harbor_assistant_search_session_id,
-        hardware_class_for_probe, has_forwarding_headers,
+        detection_job_matches_stream_profile, detection_lease_responsibility_ids_for_target,
+        detection_model_profile, dvr_timeline_segment_from_harborlink, ensure_local_admin_access,
+        ensure_local_camera_access, harbor_assistant_build_missing_response,
+        harbor_assistant_search_session_id, hardware_class_for_probe, has_forwarding_headers,
         huggingface_download_should_fallback_to_plain_http, huggingface_resolve_url,
         identity_query_suffix, is_admin_surface_path, is_gate_principal_endpoint,
         is_gate_principal_knowledge_endpoint, is_harbor_assistant_client_route,
@@ -25128,21 +28315,25 @@ mod tests {
         run_model_download_transfer, sanitize_cat_recording_validation_error,
         sanitized_outreach_delivery_request_audit, select_cat_recording_classifier_sample_targets,
         select_followup_cat_recording_sample_targets, service_overloaded_response,
-        snapshot_artifact_from_task_response, summarize_media_tool_stderr, url_encode_path_segment,
+        snapshot_artifact_from_task_response, summarize_media_tool_stderr,
+        terminal_detection_lease_cleanup_intents, url_encode_path_segment,
+        validate_detection_job_renewal_policy, validate_detection_target_policy,
         validate_home_assistant_service_fields, validate_home_assistant_service_smoke,
         validate_outreach_delivery_request, AdminApi, CameraLiveSessionProjection,
         CameraStreamProfile, CatAutoRecordingConfig, CatAutoRecordingTransition,
-        CatDetectionStreakSample, CatRecordingFrameProfile, CatRecordingFrameSeekStrategy,
-        CatRecordingSampleTarget, DetectionJobProjection, DetectionJobRuntime,
-        DetectionJobStartRequest, GateAuthenticatedPrincipal, HarborLinkEventRecordingLease,
-        HarborLinkHomeAssistantStatus, HarborLinkLiveSession, HarborLinkMediaClient,
-        HarborLinkRecordingArtifact, HarborLinkRecordingStatus, HomeAssistantServiceSmokeRequest,
-        HomeGuardianEvaluationQueue, KnowledgeSearchApiRequest, LocalModelRuntimeProjection,
-        ManualAddRequest, ModelRuntimeActivationRequest, ModelRuntimeActivationResult,
+        CatDetectionControlCoordination, CatDetectionStreakSample, CatRecordingFrameProfile,
+        CatRecordingFrameSeekStrategy, CatRecordingSampleTarget, DetectionJobConfig,
+        DetectionJobProjection, DetectionJobRuntime, DetectionJobStartRequest,
+        GateAuthenticatedPrincipal, HarborLinkEventRecordingLease, HarborLinkHomeAssistantStatus,
+        HarborLinkLiveSession, HarborLinkMediaClient, HarborLinkRecordingArtifact,
+        HarborLinkRecordingStatus, HomeAssistantServiceSmokeRequest, HomeGuardianEvaluationQueue,
+        KnowledgeSearchApiRequest, LocalModelRuntimeProjection, ManualAddRequest,
+        ModelRuntimeActivationRequest, ModelRuntimeActivationResult,
         OutreachDeliveryRecipientRequest, OutreachDeliveryRequest, VisionIngestLimiter,
-        DEFAULT_HF_ENDPOINT, HARBORBEACON_WEB_API_TOKEN_ENV, HARBOR_ASSISTANT_SEARCH_SURFACE,
-        HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS, HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS,
-        MAX_DETECTION_JOB_HISTORY, MAX_VISION_EVENT_INGEST_INFLIGHT, PRIVACY_GATEWAY_AUDIT_ACTION,
+        DEFAULT_DETECTION_MODEL, DEFAULT_HF_ENDPOINT, HARBORBEACON_WEB_API_TOKEN_ENV,
+        HARBOR_ASSISTANT_SEARCH_SURFACE, HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS,
+        HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS, MAX_DETECTION_JOB_HISTORY,
+        MAX_VISION_EVENT_INGEST_INFLIGHT, PRIVACY_GATEWAY_AUDIT_ACTION,
     };
     use harborbeacon_local_agent::connectors::notifications::{
         NotificationDeliveryError, NotificationDestinationKind, NotificationRecipientIdType,
@@ -25170,6 +28361,9 @@ mod tests {
         AutomationRuleReview, BridgeProviderConfig, DeviceEvidenceRecord, HomeAssistantAdminState,
         KnowledgeSettings, KnowledgeSourceRoot, ModelDownloadJobRecord, NotificationTargetRecord,
         RagResourceProfile, RemoteViewConfig,
+    };
+    use harborbeacon_local_agent::runtime::cat_detection_control::{
+        CatDetectionControlPolicy, CatDetectionControlStore,
     };
     use harborbeacon_local_agent::runtime::cat_recording_reconciliation::{
         CatRecordingReconciliationPhase, CatRecordingReconciliationState,
@@ -25208,24 +28402,84 @@ mod tests {
     use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::sync_channel;
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, Barrier, Condvar, Mutex, OnceLock};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-    fn hf_endpoint_env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    #[derive(Default)]
+    struct TestProcessEnvLockState {
+        owner: Option<thread::ThreadId>,
+        depth: usize,
     }
 
-    fn cat_auto_recording_env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    struct TestProcessEnvLock {
+        state: Mutex<TestProcessEnvLockState>,
+        changed: Condvar,
     }
 
-    fn gate_principal_env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    struct TestProcessEnvGuard {
+        lock: &'static TestProcessEnvLock,
+        owner: thread::ThreadId,
+    }
+
+    impl TestProcessEnvLock {
+        fn lock(&'static self) -> Result<TestProcessEnvGuard, &'static str> {
+            let owner = thread::current().id();
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "test process environment lock is poisoned")?;
+            while state
+                .owner
+                .as_ref()
+                .is_some_and(|current| current != &owner)
+            {
+                state = self
+                    .changed
+                    .wait(state)
+                    .map_err(|_| "test process environment lock is poisoned")?;
+            }
+            state.owner = Some(owner.clone());
+            state.depth += 1;
+            Ok(TestProcessEnvGuard { lock: self, owner })
+        }
+    }
+
+    impl Drop for TestProcessEnvGuard {
+        fn drop(&mut self) {
+            let Ok(mut state) = self.lock.state.lock() else {
+                return;
+            };
+            if state.owner.as_ref() != Some(&self.owner) || state.depth == 0 {
+                return;
+            }
+            state.depth -= 1;
+            if state.depth == 0 {
+                state.owner = None;
+                self.lock.changed.notify_one();
+            }
+        }
+    }
+
+    fn process_env_lock() -> &'static TestProcessEnvLock {
+        static LOCK: OnceLock<TestProcessEnvLock> = OnceLock::new();
+        LOCK.get_or_init(|| TestProcessEnvLock {
+            state: Mutex::new(TestProcessEnvLockState::default()),
+            changed: Condvar::new(),
+        })
+    }
+
+    fn hf_endpoint_env_lock() -> &'static TestProcessEnvLock {
+        process_env_lock()
+    }
+
+    fn cat_auto_recording_env_lock() -> &'static TestProcessEnvLock {
+        process_env_lock()
+    }
+
+    fn gate_principal_env_lock() -> &'static TestProcessEnvLock {
+        process_env_lock()
     }
     use tiny_http::{Header, Method, Server, StatusCode};
 
@@ -25274,18 +28528,90 @@ mod tests {
     }
 
     fn build_test_admin_api(prefix: &str) -> (AdminApi, Vec<PathBuf>) {
+        build_test_admin_api_with_harborlink(
+            prefix,
+            HarborLinkMediaClient::new("http://127.0.0.1:9")
+                .expect("fixed test HarborLink endpoint must be valid"),
+            &[],
+        )
+    }
+
+    #[test]
+    fn test_admin_api_constructor_does_not_start_background_workers() {
+        let (api, _paths) = build_test_admin_api("no-background-workers");
+
+        assert_eq!(Arc::strong_count(&api.detection_jobs), 1);
+    }
+
+    #[test]
+    fn process_environment_guards_serialize_different_variables() {
+        let (first_ready_sender, first_ready_receiver) = sync_channel(1);
+        let (release_first_sender, release_first_receiver) = sync_channel(1);
+        let first = thread::spawn(move || {
+            let _guard = EnvGuard::set("HARBORBEACON_TEST_ENV_SERIAL_A", "first");
+            first_ready_sender.send(()).expect("first guard ready");
+            release_first_receiver.recv().expect("release first guard");
+        });
+        first_ready_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first guard acquired");
+
+        let (second_ready_sender, second_ready_receiver) = sync_channel(1);
+        let second = thread::spawn(move || {
+            let _guard = EnvGuard::set("HARBORBEACON_TEST_ENV_SERIAL_B", "second");
+            second_ready_sender.send(()).expect("second guard ready");
+        });
+
+        assert!(matches!(
+            second_ready_receiver.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        release_first_sender.send(()).expect("release first guard");
+        second_ready_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second guard acquired after first released");
+        first.join().expect("first env worker");
+        second.join().expect("second env worker");
+    }
+
+    fn build_test_admin_api_with_harborlink(
+        prefix: &str,
+        harborlink_media: HarborLinkMediaClient,
+        camera_ids: &[&str],
+    ) -> (AdminApi, Vec<PathBuf>) {
         let admin_path = unique_store_path(&format!("{prefix}-state"));
         let registry_path = unique_store_path(&format!("{prefix}-registry"));
         let conversation_path = unique_store_path(&format!("{prefix}-runtime"));
+        let reconciliation_path = unique_store_path(&format!("{prefix}-reconciliation"));
+        let validation_path = unique_store_path(&format!("{prefix}-validation"));
         let registry_store = DeviceRegistryStore::new(registry_path.clone());
+        let cameras = camera_ids
+            .iter()
+            .map(|camera_id| {
+                CameraDevice::new(
+                    *camera_id,
+                    "Control Test Camera",
+                    "rtsp://camera.invalid/sub",
+                )
+            })
+            .collect::<Vec<_>>();
+        if !cameras.is_empty() {
+            registry_store
+                .save_devices(&cameras)
+                .expect("save test cameras before API initialization");
+        }
         let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store);
         let conversation_store = TaskConversationStore::new(conversation_path.clone());
         let task_service = TaskApiService::new(admin_store.clone(), conversation_store);
-        let api = AdminApi::new_for_test(
+        let api = AdminApi::new_with_dependencies_for_test(
             admin_store,
             task_service,
             PathBuf::from("frontend/harbor-assistant/dist/harbor-assistant"),
             "http://harborbeacon.local:4174".to_string(),
+            harborlink_media,
+            CatRecordingValidationMode::Off,
+            CatRecordingReconciliationStore::new(reconciliation_path),
+            CatRecordingValidationStore::new(validation_path),
         );
         (api, vec![admin_path, registry_path, conversation_path])
     }
@@ -25336,6 +28662,22 @@ mod tests {
             output_dir: std::env::temp_dir().join(format!("harborbeacon-{job_id}")),
             child,
             ai_lease: None,
+            detection_lease_cleanup_confirmed: false,
+        }
+    }
+
+    fn install_unconfirmed_detection_runtimes(
+        api: &AdminApi,
+        camera_id: &str,
+        lease_ids: &[String],
+    ) {
+        let mut jobs = api.detection_jobs.lock().expect("detection jobs");
+        for (index, lease_id) in lease_ids.iter().enumerate() {
+            let job_id = format!("responsibility-{index:02}");
+            let mut runtime = sample_running_detection_job(&job_id, camera_id, false, None);
+            runtime.projection.status = "stopped".to_string();
+            runtime.projection.lease_id = lease_id.clone();
+            jobs.insert(job_id, runtime);
         }
     }
 
@@ -25410,6 +28752,491 @@ mod tests {
         (format!("http://{address}"), requests, server)
     }
 
+    fn spawn_detection_cleanup_boundary_server(
+        camera_id: &str,
+        lease_ids: Vec<String>,
+        control_path: PathBuf,
+    ) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("HarborLink listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking HarborLink listener");
+        let address = listener.local_addr().expect("HarborLink address");
+        let camera_id = camera_id.to_string();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server_requests = requests.clone();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            for (index, lease_id) in lease_ids.iter().enumerate() {
+                let mut accepted = None;
+                while Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            accepted = Some(stream);
+                            break;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("HarborLink accept failed: {error}"),
+                    }
+                }
+                let Some(mut stream) = accepted else {
+                    return;
+                };
+                let request = read_test_http_request(&mut stream);
+                let expected_path = format!("/v1/cameras/{camera_id}/detection-leases/{lease_id}");
+                assert!(
+                    request.starts_with(&format!("DELETE {expected_path} ")),
+                    "unexpected HarborLink request: {request}"
+                );
+                if index == 0 {
+                    let persisted = CatDetectionControlStore::try_new(control_path.clone())
+                        .expect("open persisted control before cleanup")
+                        .load()
+                        .expect("load persisted control before cleanup");
+                    assert!(!persisted[&camera_id].desired_enabled);
+                    assert_eq!(persisted[&camera_id].pending_detection_lease_ids.len(), 64);
+                }
+                server_requests
+                    .lock()
+                    .expect("HarborLink requests")
+                    .push(request);
+                let body =
+                    detection_lease_response(&camera_id, lease_id, "stopped", "sub").to_string();
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(), body
+                        )
+                        .as_bytes(),
+                    )
+                    .expect("write HarborLink response");
+            }
+        });
+        (format!("http://{address}"), requests, server)
+    }
+
+    fn spawn_harborlink_request_counter_server(
+    ) -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("HarborLink listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking HarborLink listener");
+        let address = listener.local_addr().expect("HarborLink address");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let server_request_count = request_count.clone();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let request = read_test_http_request(&mut stream);
+                        assert!(
+                            request.starts_with("POST /v1/cameras/camera.252/detection-leases "),
+                            "unexpected HarborLink request: {request}"
+                        );
+                        server_request_count.fetch_add(1, Ordering::SeqCst);
+                        let body =
+                            json!({"error": "unexpected detection lease creation"}).to_string();
+                        stream
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    body.len(), body
+                                )
+                                .as_bytes(),
+                            )
+                            .expect("write HarborLink response");
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("HarborLink accept failed: {error}"),
+                }
+            }
+        });
+        (format!("http://{address}"), request_count, server)
+    }
+
+    fn spawn_detection_idempotency_replay_server(
+    ) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("HarborLink listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking HarborLink listener");
+        let address = listener.local_addr().expect("HarborLink address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server_requests = requests.clone();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            for attempt in 0..3 {
+                let mut accepted = None;
+                while Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            accepted = Some(stream);
+                            break;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("HarborLink accept failed: {error}"),
+                    }
+                }
+                let Some(mut stream) = accepted else {
+                    return;
+                };
+                let request = read_test_http_request(&mut stream);
+                assert!(
+                    request.starts_with("POST /v1/cameras/camera.252/detection-leases "),
+                    "unexpected HarborLink request: {request}"
+                );
+                server_requests
+                    .lock()
+                    .expect("HarborLink requests")
+                    .push(request);
+                if attempt < 2 {
+                    continue;
+                }
+                let body = detection_lease_response(
+                    "camera.252",
+                    "detect-idempotency-replay",
+                    "running",
+                    "sub",
+                )
+                .to_string();
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(), body
+                        )
+                        .as_bytes(),
+                    )
+                    .expect("write replayed detection lease");
+            }
+        });
+        (format!("http://{address}"), requests, server)
+    }
+
+    fn spawn_detection_attempt_resolution_server(
+        lost_post_responses: usize,
+        expect_delete: bool,
+    ) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("HarborLink listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking HarborLink listener");
+        let address = listener.local_addr().expect("HarborLink address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server_requests = requests.clone();
+        let server = thread::spawn(move || {
+            let request_total = lost_post_responses + 1 + usize::from(expect_delete);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            for request_index in 0..request_total {
+                let mut accepted = None;
+                while Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            accepted = Some(stream);
+                            break;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("HarborLink accept failed: {error}"),
+                    }
+                }
+                let Some(mut stream) = accepted else {
+                    return;
+                };
+                let request = read_test_http_request(&mut stream);
+                server_requests
+                    .lock()
+                    .expect("HarborLink requests")
+                    .push(request.clone());
+                if request_index < lost_post_responses {
+                    assert!(
+                        request.starts_with("POST /v1/cameras/camera.252/detection-leases "),
+                        "unexpected lost-response request: {request}"
+                    );
+                    continue;
+                }
+                if request_index == lost_post_responses {
+                    assert!(
+                        request.starts_with("POST /v1/cameras/camera.252/detection-leases "),
+                        "unexpected replay request: {request}"
+                    );
+                    let body = detection_lease_response(
+                        "camera.252",
+                        "detect-attempt-resolution",
+                        "running",
+                        "sub",
+                    )
+                    .to_string();
+                    stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(), body
+                            )
+                            .as_bytes(),
+                        )
+                        .expect("write replayed detection lease");
+                    continue;
+                }
+                assert!(
+                    request.starts_with(
+                        "DELETE /v1/cameras/camera.252/detection-leases/detect-attempt-resolution "
+                    ),
+                    "unexpected cleanup request: {request}"
+                );
+                let body = detection_lease_response(
+                    "camera.252",
+                    "detect-attempt-resolution",
+                    "stopped",
+                    "sub",
+                )
+                .to_string();
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(), body
+                        )
+                        .as_bytes(),
+                    )
+                    .expect("write stopped detection lease");
+            }
+        });
+        (format!("http://{address}"), requests, server)
+    }
+
+    fn spawn_public_worker_with_unresolved_control_attempt_server(
+        replayed_lease_id: &'static str,
+    ) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("HarborLink listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking HarborLink listener");
+        let address = listener.local_addr().expect("HarborLink address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server_requests = requests.clone();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let request_count = if replayed_lease_id == "detect-public-healthy" {
+                2
+            } else {
+                3
+            };
+            for request_index in 0..request_count {
+                let mut accepted = None;
+                while Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            accepted = Some(stream);
+                            break;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("HarborLink accept failed: {error}"),
+                    }
+                }
+                let Some(mut stream) = accepted else {
+                    return;
+                };
+                let request = read_test_http_request(&mut stream);
+                server_requests
+                    .lock()
+                    .expect("HarborLink requests")
+                    .push(request.clone());
+                match request_index {
+                    0 => {
+                        assert!(
+                            request.starts_with("POST /v1/cameras/camera.252/detection-leases ")
+                        );
+                        let body = detection_lease_response(
+                            "camera.252",
+                            "detect-public-healthy",
+                            "running",
+                            "sub",
+                        )
+                        .to_string();
+                        stream
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    body.len(), body
+                                )
+                                .as_bytes(),
+                            )
+                            .expect("write public detection lease");
+                    }
+                    1 => {
+                        assert!(
+                            request.starts_with("POST /v1/cameras/camera.252/detection-leases ")
+                        );
+                        let body = detection_lease_response(
+                            "camera.252",
+                            replayed_lease_id,
+                            "running",
+                            "sub",
+                        )
+                        .to_string();
+                        stream
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    body.len(), body
+                                )
+                                .as_bytes(),
+                            )
+                            .expect("write detection lease");
+                    }
+                    _ => {
+                        assert!(request.starts_with(
+                            "DELETE /v1/cameras/camera.252/detection-leases/detect-control-unresolved "
+                        ));
+                        let body = detection_lease_response(
+                            "camera.252",
+                            "detect-control-unresolved",
+                            "stopped",
+                            "sub",
+                        )
+                        .to_string();
+                        stream
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    body.len(), body
+                                )
+                                .as_bytes(),
+                            )
+                            .expect("write stopped detection lease");
+                    }
+                }
+            }
+        });
+        (format!("http://{address}"), requests, server)
+    }
+
+    fn test_request_header(request: &str, expected_name: &str) -> Option<String> {
+        request.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case(expected_name)
+                .then(|| value.trim().to_string())
+        })
+    }
+
+    #[derive(Clone, Copy)]
+    enum DetectionInitializationCleanupFailure {
+        ErrorResponse,
+        LostResponse,
+    }
+
+    fn spawn_detection_initialization_recovery_server(
+        cleanup_failure: DetectionInitializationCleanupFailure,
+    ) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("HarborLink listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking HarborLink listener");
+        let address = listener.local_addr().expect("HarborLink address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server_requests = requests.clone();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            for step in 0..4 {
+                let mut accepted = None;
+                while Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            accepted = Some(stream);
+                            break;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("HarborLink accept failed: {error}"),
+                    }
+                }
+                let Some(mut stream) = accepted else {
+                    return;
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .expect("HarborLink read timeout");
+                let request = read_test_http_request(&mut stream);
+                let (method, lease_id) = match step {
+                    0 => ("POST", "detect-initialization-failed"),
+                    1 | 2 => ("DELETE", "detect-initialization-failed"),
+                    _ => ("POST", "detect-initialization-recovered"),
+                };
+                let expected_path = if method == "POST" {
+                    "/v1/cameras/camera.252/detection-leases".to_string()
+                } else {
+                    format!("/v1/cameras/camera.252/detection-leases/{lease_id}")
+                };
+                assert!(
+                    request.starts_with(&format!("{method} {expected_path} ")),
+                    "unexpected HarborLink request: {request}"
+                );
+                server_requests
+                    .lock()
+                    .expect("HarborLink requests")
+                    .push(request);
+
+                if step == 1
+                    && matches!(
+                        cleanup_failure,
+                        DetectionInitializationCleanupFailure::LostResponse
+                    )
+                {
+                    continue;
+                }
+                let (status, body) = match step {
+                    0 => (
+                        "200 OK",
+                        detection_lease_response("camera.252", lease_id, "running", "sub"),
+                    ),
+                    1 => (
+                        "500 Internal Server Error",
+                        json!({"error": "initial cleanup failed"}),
+                    ),
+                    2 if matches!(
+                        cleanup_failure,
+                        DetectionInitializationCleanupFailure::LostResponse
+                    ) =>
+                    {
+                        ("404 Not Found", json!({"error": "not_found"}))
+                    }
+                    2 => (
+                        "200 OK",
+                        detection_lease_response("camera.252", lease_id, "stopped", "sub"),
+                    ),
+                    _ => (
+                        "200 OK",
+                        detection_lease_response("camera.252", lease_id, "running", "sub"),
+                    ),
+                };
+                let body = body.to_string();
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(), body
+                        )
+                        .as_bytes(),
+                    )
+                    .expect("write HarborLink response");
+            }
+        });
+        (format!("http://{address}"), requests, server)
+    }
+
     fn read_test_http_request(stream: &mut std::net::TcpStream) -> String {
         let mut request = Vec::new();
         let mut buffer = [0_u8; 4096];
@@ -25459,6 +29286,33 @@ mod tests {
             "pre_roll_seconds": 3,
             "pre_roll_ready": true
         })
+    }
+
+    fn event_recording_lease_response(
+        camera_id: &str,
+        lease_id: &str,
+        event_id: &str,
+        status: &str,
+    ) -> Value {
+        serde_json::to_value(HarborLinkEventRecordingLease {
+            camera_id: camera_id.to_string(),
+            lease_id: lease_id.to_string(),
+            event_id: event_id.to_string(),
+            owner: "harborbeacon".to_string(),
+            status: status.to_string(),
+            stream_profile: "sub".to_string(),
+            labels: vec!["cat".to_string()],
+            started_at: "2026-08-11T00:00:00Z".to_string(),
+            updated_at: "2026-08-11T00:01:00Z".to_string(),
+            expires_at: "2026-08-11T00:01:00Z".to_string(),
+            pre_roll_seconds: 3,
+            trigger_epoch_ms: 1_786_060_800_000_u64,
+            artifacts: vec![sample_cat_recording_artifact(
+                "recordings~cat-control-stop",
+                event_id,
+            )],
+        })
+        .expect("event recording response")
     }
 
     fn install_sleeping_detection_worker(prefix: &str) -> (PathBuf, Vec<EnvGuard>) {
@@ -25617,6 +29471,73 @@ mod tests {
         reader.read_to_string(&mut text).expect("read response");
         let value = serde_json::from_str(&text).expect("json response");
         (status, value)
+    }
+
+    fn install_cat_detection_control_test_environment(prefix: &str) -> (PathBuf, Vec<EnvGuard>) {
+        let control_path = unique_store_path(&format!("{prefix}-control"));
+        let reconciliation_path = unique_store_path(&format!("{prefix}-reconciliation"));
+        let validation_path = unique_store_path(&format!("{prefix}-validation"));
+        let guards = vec![
+            EnvGuard::set(
+                "HARBOR_K3_CAT_DETECTION_CONTROL_PATH",
+                control_path.to_str().expect("UTF-8 control path"),
+            ),
+            EnvGuard::set(
+                "HARBOR_K3_CAT_RECORDING_RECONCILIATION_PATH",
+                reconciliation_path
+                    .to_str()
+                    .expect("UTF-8 reconciliation path"),
+            ),
+            EnvGuard::set(
+                "HARBOR_K3_CAT_RECORDING_VALIDATION_STORE_PATH",
+                validation_path.to_str().expect("UTF-8 validation path"),
+            ),
+            EnvGuard::set("HARBOR_K3_CAT_AUTO_RECORD_ENABLED", "true"),
+        ];
+        (control_path, guards)
+    }
+
+    fn save_test_camera(api: &AdminApi, camera_id: &str) {
+        api.admin_store
+            .registry_store()
+            .save_devices(&[CameraDevice::new(
+                camera_id,
+                "Control Test Camera",
+                "rtsp://camera.invalid/sub",
+            )])
+            .expect("save test camera");
+    }
+
+    fn spawn_admin_test_server(
+        api: AdminApi,
+        request_count: usize,
+    ) -> (String, thread::JoinHandle<()>) {
+        let server = Server::http("127.0.0.1:0").expect("admin test server");
+        let base_url = format!("http://{}", server.server_addr());
+        let server_thread = thread::spawn(move || {
+            for _ in 0..request_count {
+                let request = server
+                    .recv_timeout(Duration::from_secs(3))
+                    .expect("receive admin request")
+                    .expect("admin request");
+                api.handle(request);
+            }
+        });
+        (base_url, server_thread)
+    }
+
+    fn gate_admin_request(
+        client: &Client,
+        method: reqwest::Method,
+        url: String,
+    ) -> reqwest::blocking::RequestBuilder {
+        client
+            .request(method, url)
+            .bearer_auth("service-token")
+            .header("X-Harbor-Principal-Source", "harboros")
+            .header("X-Harbor-Principal-Id", "harboros:uid:1000")
+            .header("X-Harbor-Principal-Roles", "FULL_ADMIN")
+            .header("X-Harbor-Workspace-Id", "home-1")
     }
 
     fn sample_outreach_delivery_request() -> OutreachDeliveryRequest {
@@ -26004,28 +29925,37 @@ mod tests {
     }
 
     struct EnvGuard {
+        _process_lock: TestProcessEnvGuard,
         key: String,
         original: Option<String>,
     }
 
     impl EnvGuard {
         fn set(key: &str, value: &str) -> Self {
+            let process_lock = process_env_lock()
+                .lock()
+                .expect("test process environment lock");
             let original = std::env::var(key).ok();
             unsafe {
                 std::env::set_var(key, value);
             }
             Self {
+                _process_lock: process_lock,
                 key: key.to_string(),
                 original,
             }
         }
 
         fn remove(key: &str) -> Self {
+            let process_lock = process_env_lock()
+                .lock()
+                .expect("test process environment lock");
             let original = std::env::var(key).ok();
             unsafe {
                 std::env::remove_var(key);
             }
             Self {
+                _process_lock: process_lock,
                 key: key.to_string(),
                 original,
             }
@@ -26142,7 +30072,7 @@ mod tests {
     }
 
     #[test]
-    fn detection_job_request_is_cat_only_and_bounded() {
+    fn detection_job_request_supports_bounded_cat_and_package_targets() {
         let config = normalize_detection_job_start(DetectionJobStartRequest {
             camera_id: "camera.252".to_string(),
             target_labels: Vec::new(),
@@ -26155,6 +30085,19 @@ mod tests {
         assert_eq!(config.target_label, "cat");
         assert_eq!(config.ttl_seconds, 60);
         assert_eq!(config.max_fps, 25.0);
+
+        let package = normalize_detection_job_start(DetectionJobStartRequest {
+            camera_id: "camera.252".to_string(),
+            target_labels: vec![" PACKAGE ".to_string()],
+            duration_seconds: Some(60),
+            max_fps: None,
+            confidence: None,
+            stream_profile: Some("sub".to_string()),
+        })
+        .expect("package request");
+        assert_eq!(package.target_label, "package");
+        assert_eq!(package.max_fps, 5.0);
+        assert_eq!(package.confidence, 0.25);
         assert_eq!(config.stream_profile, "sub");
 
         let config = normalize_detection_job_start(DetectionJobStartRequest {
@@ -26187,8 +30130,20 @@ mod tests {
             confidence: Some(0.35),
             stream_profile: Some("sub".to_string()),
         })
-        .expect_err("non-cat label must be rejected");
+        .expect_err("unsupported label must be rejected");
         assert!(error.contains("cat"));
+        assert!(error.contains("package"));
+
+        let error = normalize_detection_job_start(DetectionJobStartRequest {
+            camera_id: "camera.252".to_string(),
+            target_labels: vec!["cat".to_string(), "package".to_string()],
+            duration_seconds: Some(60),
+            max_fps: Some(5.0),
+            confidence: Some(0.35),
+            stream_profile: Some("sub".to_string()),
+        })
+        .expect_err("mixed targets must be rejected");
+        assert!(error.contains("exactly one"));
 
         let error = normalize_detection_job_start(DetectionJobStartRequest {
             camera_id: "camera.252".to_string(),
@@ -26225,20 +30180,26 @@ mod tests {
             output_dir: std::env::temp_dir().join("harborbeacon-live-managed-projection"),
             child: None,
             ai_lease: None,
+            detection_lease_cleanup_confirmed: false,
         };
 
         let projection = serde_json::to_value(&runtime.projection).expect("serialize projection");
         let jobs = HashMap::from([(runtime.projection.job_id.clone(), runtime)]);
-        let reused = reusable_detection_job_projection(&jobs, "camera.252", "sub")
+        let reused = reusable_detection_job_projection(&jobs, "camera.252", "cat", "sub")
             .expect("matching stream profile")
             .expect("reuse running live-managed job");
-        let mismatch = reusable_detection_job_projection(&jobs, "camera.252", "main")
+        let mismatch = reusable_detection_job_projection(&jobs, "camera.252", "cat", "main")
             .expect_err("a running sub-stream job must not be reused for main stream");
+        let target_mismatch =
+            reusable_detection_job_projection(&jobs, "camera.252", "package", "sub")
+                .expect_err("a running cat job must not be reused for package detection");
 
         assert_eq!(projection["managed_by_live"], true);
         assert_eq!(reused.job_id, "yolo-live-managed");
         assert!(mismatch.contains("sub"));
         assert!(mismatch.contains("main"));
+        assert!(target_mismatch.contains("cat"));
+        assert!(target_mismatch.contains("package"));
         assert!(reused.managed_by_live);
         assert!(detection_job_matches_stream_profile(&reused, "sub"));
         assert!(!detection_job_matches_stream_profile(&reused, "main"));
@@ -26252,6 +30213,97 @@ mod tests {
         assert_eq!(start_response["managed_by_live"], true);
         assert_eq!(start_response["reused"], true);
         assert!(start_response.get("projection").is_none());
+    }
+
+    #[test]
+    fn package_detection_requires_cat_control_to_be_explicitly_disabled_and_drained() {
+        let disabled = CatDetectionControlPolicy::new("camera.252", false, "sub", 1)
+            .expect("disabled cat policy");
+        validate_detection_target_policy("package", Some(&disabled))
+            .expect("package may run after cat detection is disabled and drained");
+
+        let enabled = CatDetectionControlPolicy::new("camera.252", true, "sub", 1)
+            .expect("enabled cat policy");
+        let error = validate_detection_target_policy("package", Some(&enabled))
+            .expect_err("package must not run while cat detection is enabled");
+        assert!(error.contains("enabled"));
+
+        let error = validate_detection_target_policy("package", None)
+            .expect_err("package must fail closed without an explicit cat policy");
+        assert!(error.contains("explicitly disabled"));
+
+        let mut draining = disabled.clone();
+        draining
+            .set_pending_detection_lease_ids(["detect-cat".to_string()])
+            .expect("pending cat lease");
+        let error = validate_detection_target_policy("package", Some(&draining))
+            .expect_err("package must wait for cat lease cleanup");
+        assert!(error.contains("draining"));
+    }
+
+    #[test]
+    fn package_detection_uses_an_independent_versioned_model_profile() {
+        let profile = detection_model_profile("package").expect("package model profile");
+        assert_eq!(profile.model_env, "HARBOR_K3_PACKAGE_YOLO_MODEL");
+        assert_eq!(profile.labels_env, "HARBOR_K3_PACKAGE_YOLO_LABELS");
+        assert!(profile
+            .default_model
+            .contains("package-roboflow-v1-320x320-fp32"));
+        assert!(profile.default_model.ends_with(".onnx"));
+        assert!(profile.default_labels.ends_with("/label.txt"));
+
+        let cat = detection_model_profile("cat").expect("cat model profile");
+        assert_eq!(cat.model_env, "HARBOR_K3_YOLO_MODEL");
+        assert_eq!(cat.default_model, DEFAULT_DETECTION_MODEL);
+        assert_ne!(profile.default_model, cat.default_model);
+    }
+
+    #[test]
+    fn disabled_cat_control_ignores_package_runtime_responsibilities() {
+        let cat = sample_running_detection_job("yolo-cat", "camera.252", false, None);
+        let mut package = sample_running_detection_job("yolo-package", "camera.252", false, None);
+        package.projection.target_labels = vec!["package".to_string()];
+        package.projection.lease_id = "detect-package".to_string();
+        let jobs = HashMap::from([
+            (cat.projection.job_id.clone(), cat),
+            (package.projection.job_id.clone(), package),
+        ]);
+
+        let cat_only = detection_lease_responsibility_ids_for_target(
+            "camera.252",
+            std::iter::empty(),
+            &jobs,
+            Some("cat"),
+        );
+        assert_eq!(cat_only, vec!["detect-yolo-cat".to_string()]);
+
+        let all = detection_lease_responsibility_ids_for_target(
+            "camera.252",
+            std::iter::empty(),
+            &jobs,
+            None,
+        );
+        assert_eq!(
+            all,
+            vec!["detect-package".to_string(), "detect-yolo-cat".to_string()]
+        );
+    }
+
+    #[test]
+    fn package_detection_renewal_remains_allowed_while_cat_control_is_disabled() {
+        let mut disabled = CatDetectionControlPolicy::new("camera.252", false, "sub", 1)
+            .expect("disabled cat policy");
+        disabled
+            .set_pending_detection_lease_ids(["detect-package".to_string()])
+            .expect("tracked package lease");
+        validate_detection_job_renewal_policy("package", Some(&disabled))
+            .expect("package renewal must remain allowed while cat detection stays disabled");
+
+        let enabled = CatDetectionControlPolicy::new("camera.252", true, "sub", 2)
+            .expect("enabled cat policy");
+        let error = validate_detection_job_renewal_policy("package", Some(&enabled))
+            .expect_err("package renewal must stop once cat detection is enabled");
+        assert!(error.contains("enabled"));
     }
 
     #[test]
@@ -26426,7 +30478,7 @@ mod tests {
     fn run_successful_live_detection_profile_handoff(old_profile: &str, new_profile: &str) {
         let _env_lock = cat_auto_recording_env_lock()
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .expect("test process environment lock");
         let job_id = format!("yolo-profile-handoff-{old_profile}-to-{new_profile}");
         let old_lease_id = format!("detect-{job_id}");
         let new_lease_id = format!("detect-profile-{new_profile}");
@@ -26520,7 +30572,7 @@ mod tests {
     fn live_profile_switch_restores_old_detection_profile_when_new_start_fails() {
         let _env_lock = cat_auto_recording_env_lock()
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .expect("test process environment lock");
         let job_id = "yolo-profile-handoff-rollback";
         let old_lease_id = format!("detect-{job_id}");
         let restored_lease_id = "detect-restored-sub";
@@ -26536,8 +30588,13 @@ mod tests {
                 method: "POST",
                 path: "/v1/cameras/camera.252/detection-leases".to_string(),
                 request_profile: Some("main".to_string()),
-                status: "500 Internal Server Error",
-                response: json!({ "error": "injected main detection start failure" }),
+                status: "400 Bad Request",
+                response: json!({"error": {
+                    "code": "INVALID_STREAM_PROFILE",
+                    "message": "injected main detection start failure",
+                    "retryable": false,
+                    "dependency": "harborlink"
+                }}),
             },
             DetectionLeaseServerStep {
                 method: "POST",
@@ -26751,12 +30808,8 @@ mod tests {
                 }
             }
         });
-        let (mut api, mut paths) = build_test_admin_api("auto-renew-detection");
-        let reconciliation_path = unique_store_path("auto-renew-detection-reconciliation");
-        api.cat_recording_reconciliation_store =
-            CatRecordingReconciliationStore::new(reconciliation_path.clone());
+        let (mut api, paths) = build_test_admin_api("auto-renew-detection");
         api.cat_auto_recording = Arc::new(Mutex::new(HashMap::new()));
-        paths.push(reconciliation_path);
         let _enabled = EnvGuard::set("HARBOR_K3_CAT_AUTO_RECORD_ENABLED", "true");
         api.harborlink_media =
             HarborLinkMediaClient::new(format!("http://{address}")).expect("HarborLink client");
@@ -29235,6 +33288,7 @@ mod tests {
                 super::acquire_ai_resource_lease(super::AiWorkload::Yolo)
                     .expect("acquire YOLO resources"),
             ),
+            detection_lease_cleanup_confirmed: false,
         };
 
         let stop_result = super::stop_detection_child_with(&mut runtime, |_| {
@@ -29296,6 +33350,7 @@ mod tests {
                 super::acquire_ai_resource_lease(super::AiWorkload::Yolo)
                     .expect("acquire YOLO resources"),
             ),
+            detection_lease_cleanup_confirmed: false,
         };
 
         let stop_result = super::stop_detection_child_with(&mut runtime, |child| {
@@ -29381,7 +33436,7 @@ mod tests {
     }
 
     #[test]
-    fn detection_job_history_is_bounded_without_removing_running_jobs() {
+    fn detection_job_history_prunes_only_cleanup_confirmed_terminal_jobs() {
         let mut jobs = HashMap::new();
         for index in 0..=MAX_DETECTION_JOB_HISTORY {
             let job_id = format!("yolo-{index:032x}");
@@ -29416,6 +33471,7 @@ mod tests {
                     )),
                     child: None,
                     ai_lease: None,
+                    detection_lease_cleanup_confirmed: status != "running",
                 },
             );
         }
@@ -29426,6 +33482,50 @@ mod tests {
         assert!(jobs
             .values()
             .any(|runtime| runtime.projection.status == "running"));
+    }
+
+    #[test]
+    fn detection_job_history_may_exceed_limit_to_retain_unconfirmed_cleanup() {
+        let mut jobs = HashMap::new();
+        for index in 0..=MAX_DETECTION_JOB_HISTORY + 2 {
+            let job_id = format!("unconfirmed-{index}");
+            jobs.insert(
+                job_id.clone(),
+                DetectionJobRuntime {
+                    projection: DetectionJobProjection {
+                        job_id,
+                        camera_id: format!("camera-{index}"),
+                        status: ["completed", "stopped", "failed"][index % 3].to_string(),
+                        target_labels: vec!["cat".to_string()],
+                        stream_profile: "sub".to_string(),
+                        max_fps: 5.0,
+                        confidence: 0.35,
+                        lease_id: format!("detect-unconfirmed-{index}"),
+                        started_at: "2026-07-23T00:00:00Z".to_string(),
+                        updated_at: "2026-07-23T00:00:00Z".to_string(),
+                        expires_at: "2026-07-23T00:15:00Z".to_string(),
+                        managed_by_live: false,
+                        latest_result: None,
+                        metrics: None,
+                        message: None,
+                    },
+                    output_dir: std::env::temp_dir().join(format!(
+                        "harborbeacon-prune-unconfirmed-{}-{index}",
+                        std::process::id()
+                    )),
+                    child: None,
+                    ai_lease: None,
+                    detection_lease_cleanup_confirmed: false,
+                },
+            );
+        }
+
+        prune_detection_job_history(&mut jobs);
+
+        assert_eq!(jobs.len(), MAX_DETECTION_JOB_HISTORY + 3);
+        assert!(jobs
+            .values()
+            .all(|runtime| !runtime.detection_lease_cleanup_confirmed));
     }
 
     #[test]
@@ -31930,7 +36030,7 @@ mod tests {
     fn huggingface_endpoint_prefers_job_metadata_then_env_then_default_mirror() {
         let _guard = hf_endpoint_env_lock()
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .expect("test process environment lock");
         let env_guard = EnvGuard::set("HF_ENDPOINT", "https://env-mirror.example/");
 
         assert_eq!(
@@ -31957,7 +36057,7 @@ mod tests {
     fn huggingface_endpoint_candidates_dedupe_metadata_env_and_builtin_fallbacks() {
         let _guard = hf_endpoint_env_lock()
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .expect("test process environment lock");
         let _env_guard = EnvGuard::set(
             "HF_ENDPOINTS",
             "https://env-one.example/; https://hf-mirror.com/",
@@ -34070,6 +38170,39 @@ mod tests {
         .collect()
     }
 
+    fn trusted_harbornavi_device_control_headers(camera_id: &str) -> Vec<Header> {
+        let mut headers = trusted_harbornavi_device_headers(camera_id);
+        headers.retain(|header| {
+            !header
+                .field
+                .as_str()
+                .to_string()
+                .eq_ignore_ascii_case("X-Harbor-Principal-Roles")
+        });
+        headers.push(
+            Header::from_bytes(
+                b"X-Harbor-Principal-Roles".as_slice(),
+                b"CAMERA_CONTROL".as_slice(),
+            )
+            .expect("header"),
+        );
+        headers
+    }
+
+    fn trusted_harbornavi_lan_headers(camera_id: &str, role: &str) -> Vec<Header> {
+        [
+            ("Authorization", "Bearer service-token"),
+            ("X-Harbor-Principal-Source", "harbornavi-lan"),
+            ("X-Harbor-Principal-Id", "harbornavi-lan:anonymous"),
+            ("X-Harbor-Principal-Roles", role),
+            ("X-Harbor-Workspace-Id", "home-1"),
+            ("X-Harbor-Camera-Scope", camera_id),
+        ]
+        .into_iter()
+        .map(|(name, value)| Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("header"))
+        .collect()
+    }
+
     #[test]
     fn gate_principal_auth_fails_closed_before_reading_identity() {
         let missing_config = authenticate_gate_principal_headers(
@@ -34267,18 +38400,59 @@ mod tests {
     }
 
     #[test]
+    fn harbornavi_device_principal_controls_only_its_scoped_camera() {
+        let control_path = "/api/cameras/camera.252/cat-detection/control";
+        let principal = authenticate_gate_principal_headers(
+            Some("service-token"),
+            control_path,
+            &trusted_harbornavi_device_control_headers("camera.252"),
+            "home-1",
+        )
+        .expect("camera-scoped device control principal");
+        assert_eq!(principal.0.role_kind, RoleKind::Operator);
+        let (api, paths) = build_test_admin_api("device-control-principal");
+        assert!(api
+            .authorize_detection_camera_action(
+                &principal,
+                "camera.252",
+                AccessAction::CameraOperate,
+            )
+            .is_ok());
+
+        let wrong_camera = authenticate_gate_principal_headers(
+            Some("service-token"),
+            control_path,
+            &trusted_harbornavi_device_control_headers("camera.999"),
+            "home-1",
+        )
+        .expect_err("device control camera scope mismatch");
+        assert_eq!(wrong_camera.status, StatusCode(403));
+
+        let detection_jobs = authenticate_gate_principal_headers(
+            Some("service-token"),
+            "/api/vision/detection-jobs",
+            &trusted_harbornavi_device_control_headers("camera.252"),
+            "home-1",
+        )
+        .expect_err("device control principal must not access detection jobs");
+        assert_eq!(detection_jobs.status, StatusCode(403));
+
+        let observation = authenticate_gate_principal_headers(
+            Some("service-token"),
+            "/api/cameras/camera.252/cat-detection/observation?stream_profile=sub",
+            &trusted_harbornavi_device_control_headers("camera.252"),
+            "home-1",
+        )
+        .expect_err("device control role is not an observation role");
+        assert_eq!(observation.status, StatusCode(403));
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
     fn harbornavi_lan_principal_is_camera_scoped_and_observation_only() {
         let observation_path =
             "/api/cameras/camera.252/cat-detection/observation?stream_profile=sub";
-        let headers = vec![
-            Header::from_bytes(b"Authorization", b"Bearer service-token").expect("header"),
-            Header::from_bytes(b"X-Harbor-Principal-Source", b"harbornavi-lan").expect("header"),
-            Header::from_bytes(b"X-Harbor-Principal-Id", b"harbornavi-lan:anonymous")
-                .expect("header"),
-            Header::from_bytes(b"X-Harbor-Principal-Roles", b"CAMERA_VIEW").expect("header"),
-            Header::from_bytes(b"X-Harbor-Workspace-Id", b"home-1").expect("header"),
-            Header::from_bytes(b"X-Harbor-Camera-Scope", b"camera.252").expect("header"),
-        ];
+        let headers = trusted_harbornavi_lan_headers("camera.252", "CAMERA_VIEW");
         let principal = authenticate_gate_principal_headers(
             Some("service-token"),
             observation_path,
@@ -34316,6 +38490,58 @@ mod tests {
         )
         .expect_err("LAN principal camera scope mismatch");
         assert_eq!(wrong_camera.status, StatusCode(403));
+    }
+
+    #[test]
+    fn harbornavi_lan_principal_controls_only_its_scoped_camera() {
+        let control_path = "/api/cameras/camera.252/cat-detection/control";
+        let headers = trusted_harbornavi_lan_headers("camera.252", "CAMERA_CONTROL");
+        let principal = authenticate_gate_principal_headers(
+            Some("service-token"),
+            control_path,
+            &headers,
+            "home-1",
+        )
+        .expect("camera-scoped LAN control principal");
+        assert_eq!(principal.0.role_kind, RoleKind::Operator);
+        assert_eq!(principal.0.user_id, "harbornavi-lan:anonymous");
+
+        let (api, paths) = build_test_admin_api("lan-control-principal");
+        assert!(api
+            .authorize_detection_camera_action(
+                &principal,
+                "camera.252",
+                AccessAction::CameraOperate,
+            )
+            .is_ok());
+
+        let wrong_camera = authenticate_gate_principal_headers(
+            Some("service-token"),
+            control_path,
+            &trusted_harbornavi_lan_headers("camera.999", "CAMERA_CONTROL"),
+            "home-1",
+        )
+        .expect_err("LAN control camera scope mismatch");
+        assert_eq!(wrong_camera.status, StatusCode(403));
+
+        let detection_jobs = authenticate_gate_principal_headers(
+            Some("service-token"),
+            "/api/vision/detection-jobs",
+            &headers,
+            "home-1",
+        )
+        .expect_err("LAN control principal must not access detection jobs");
+        assert_eq!(detection_jobs.status, StatusCode(403));
+
+        let observation = authenticate_gate_principal_headers(
+            Some("service-token"),
+            "/api/cameras/camera.252/cat-detection/observation?stream_profile=sub",
+            &headers,
+            "home-1",
+        )
+        .expect_err("LAN control role is not an observation role");
+        assert_eq!(observation.status, StatusCode(403));
+        cleanup_test_paths(&paths);
     }
 
     #[test]
@@ -34364,6 +38590,10 @@ mod tests {
             &Method::Get,
             "/api/cameras/camera.252/cat-detection/observation"
         ));
+    }
+
+    mod cat_detection_control_tests {
+        include!("agent_hub_admin_api/cat_detection_control_tests.rs");
     }
 
     #[test]
