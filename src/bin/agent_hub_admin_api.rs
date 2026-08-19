@@ -168,6 +168,11 @@ use harborbeacon_local_agent::runtime::model_center::{
     vlm_execution_runtime_snapshot, CatRecordingVlmExecution, ModelEndpointTestResult,
     ADMIN_STATE_PATH_ENV,
 };
+use harborbeacon_local_agent::runtime::package_detection_control::{
+    default_control_path as default_package_detection_control_path,
+    validate_package_detection_control_camera_id, PackageDetectionControlPolicy,
+    PackageDetectionControlStore,
+};
 use harborbeacon_local_agent::runtime::privacy_gateway::PRIVACY_GATEWAY_POLICY_VERSION;
 use harborbeacon_local_agent::runtime::registry::{
     CameraCapabilities, CameraDevice, DeviceRegistryStore, DeviceStatus,
@@ -521,6 +526,13 @@ pub struct AdminApi {
         Arc<Mutex<HashMap<String, CatDetectionControlReconciliation>>>,
     cat_detection_retry_scheduler: Option<CatDetectionRetryScheduler>,
     cat_detection_retry_scheduling_context: CatDetectionRetrySchedulingContext,
+    package_detection_control_store: Option<PackageDetectionControlStore>,
+    package_detection_controls: Arc<Mutex<BTreeMap<String, PackageDetectionControlPolicy>>>,
+    package_detection_control_store_load_error: Arc<Mutex<Option<String>>>,
+    package_detection_control_reconciliation:
+        Arc<Mutex<HashMap<String, CatDetectionControlReconciliation>>>,
+    package_detection_retry_scheduler: Option<CatDetectionRetryScheduler>,
+    package_detection_retry_scheduling_context: CatDetectionRetrySchedulingContext,
     cat_auto_recording: Arc<Mutex<HashMap<String, CatAutoRecordingState>>>,
     cat_recording_reconciliation_store: CatRecordingReconciliationStore,
     cat_recording_validation_mode: CatRecordingValidationMode,
@@ -537,6 +549,39 @@ enum CatDetectionRetrySchedulingContext {
 
 struct CatDetectionRetryExecutionContext {
     api: AdminApi,
+}
+
+struct PackageDetectionRetryExecutionContext {
+    api: AdminApi,
+}
+
+impl PackageDetectionRetryExecutionContext {
+    fn new(api: &AdminApi) -> Self {
+        let mut execution_api = api.clone();
+        execution_api.package_detection_retry_scheduler = None;
+        execution_api.package_detection_retry_scheduling_context =
+            CatDetectionRetrySchedulingContext::WorkerExecution;
+        Self { api: execution_api }
+    }
+
+    fn execute(&self, entry: CatDetectionRetryEntry) -> CatDetectionRetryOutcome {
+        match self
+            .api
+            .coordinate_package_detection_control(&entry.camera_id, entry.revision)
+        {
+            Ok(CatDetectionControlCoordination::Converged)
+            | Ok(CatDetectionControlCoordination::Superseded) => CatDetectionRetryOutcome::Complete,
+            Ok(CatDetectionControlCoordination::Draining) => CatDetectionRetryOutcome::Retry,
+            Err(error) => {
+                eprintln!(
+                    "HarborBeacon package detection control retry remains pending for {}: {}",
+                    redact_admin_string(&entry.camera_id),
+                    redact_admin_string(&error)
+                );
+                CatDetectionRetryOutcome::Retry
+            }
+        }
+    }
 }
 
 impl CatDetectionRetryExecutionContext {
@@ -2612,6 +2657,17 @@ impl AdminApi {
                 },
                 Err(error) => (None, BTreeMap::new(), Some(error)),
             };
+        let (
+            package_detection_control_store,
+            package_detection_controls,
+            package_detection_control_error,
+        ) = match PackageDetectionControlStore::try_new(default_package_detection_control_path()) {
+            Ok(store) => match store.load() {
+                Ok(controls) => (Some(store), controls, None),
+                Err(error) => (Some(store), BTreeMap::new(), Some(error)),
+            },
+            Err(error) => (None, BTreeMap::new(), Some(error)),
+        };
         let cat_detection_retry_scheduler =
             if background_workers == AdminApiBackgroundWorkers::Enabled {
                 match CatDetectionRetryScheduler::new(CatDetectionRetrySchedulerConfig {
@@ -2624,6 +2680,26 @@ impl AdminApi {
                     Err(error) => {
                         eprintln!(
                             "HarborBeacon cat detection retry scheduling is unavailable: {}",
+                            redact_admin_string(&error)
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+        let package_detection_retry_scheduler =
+            if background_workers == AdminApiBackgroundWorkers::Enabled {
+                match CatDetectionRetryScheduler::new(CatDetectionRetrySchedulerConfig {
+                    worker_count: 2,
+                    capacity: MAX_CAT_DETECTION_CONTROL_POLICIES,
+                    initial_delay: Duration::from_secs(CAT_DETECTION_CONTROL_RETRY_INITIAL_SECONDS),
+                    max_delay: Duration::from_secs(CAT_DETECTION_CONTROL_RETRY_MAX_SECONDS),
+                }) {
+                    Ok(scheduler) => Some(scheduler),
+                    Err(error) => {
+                        eprintln!(
+                            "HarborBeacon package detection retry scheduling is unavailable: {}",
                             redact_admin_string(&error)
                         );
                         None
@@ -2664,6 +2740,15 @@ impl AdminApi {
             cat_detection_control_reconciliation: Arc::new(Mutex::new(HashMap::new())),
             cat_detection_retry_scheduler,
             cat_detection_retry_scheduling_context: CatDetectionRetrySchedulingContext::External,
+            package_detection_control_store,
+            package_detection_controls: Arc::new(Mutex::new(package_detection_controls)),
+            package_detection_control_store_load_error: Arc::new(Mutex::new(
+                package_detection_control_error,
+            )),
+            package_detection_control_reconciliation: Arc::new(Mutex::new(HashMap::new())),
+            package_detection_retry_scheduler,
+            package_detection_retry_scheduling_context:
+                CatDetectionRetrySchedulingContext::External,
             cat_auto_recording: Arc::new(Mutex::new(cat_auto_recording)),
             cat_recording_reconciliation_store,
             cat_recording_validation_mode,
@@ -2678,6 +2763,7 @@ impl AdminApi {
             api.start_cat_auto_recording_worker();
             api.start_cat_recording_validation_worker();
             api.start_cat_detection_control_recovery();
+            api.start_package_detection_control_recovery();
         }
         api
     }
@@ -2835,8 +2921,110 @@ impl AdminApi {
         }
         for camera_id in camera_ids {
             self.schedule_cat_detection_runtime_drift(&camera_id);
+            self.schedule_package_detection_runtime_drift(&camera_id);
+        }
+        if let Err(error) = self.renew_package_detection_leases() {
+            first_error.get_or_insert(error);
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    fn renew_package_detection_leases(&self) -> Result<(), String> {
+        let now = OffsetDateTime::now_utc();
+        let candidates = self
+            .detection_jobs
+            .lock()
+            .map_err(|_| "detection job state is unavailable".to_string())?
+            .iter()
+            .filter(|(_, runtime)| {
+                runtime.projection.status == "running"
+                    && detection_projection_targets(&runtime.projection, "package")
+                    && detection_lease_renewal_due(&runtime.projection.expires_at, now)
+            })
+            .map(|(job_id, runtime)| {
+                (
+                    job_id.clone(),
+                    runtime.projection.camera_id.clone(),
+                    runtime.projection.lease_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut first_error = None;
+        for (job_id, camera_id, lease_id) in candidates {
+            let camera_lock = self.cat_detection_control_camera_lock(&camera_id)?;
+            let _camera_guard = camera_lock.lock().map_err(|_| {
+                "package detection control camera coordination is unavailable".to_string()
+            })?;
+            let policy = self.package_detection_explicit_policy(&camera_id)?;
+            if !policy.as_ref().is_some_and(|policy| policy.desired_enabled) {
+                continue;
+            }
+            match self.harborlink_media.renew_detection_lease(
+                &camera_id,
+                &lease_id,
+                LIVE_MANAGED_DETECTION_TTL_SECONDS,
+            ) {
+                Ok(lease) if lease.camera_id == camera_id && lease.lease_id == lease_id => {
+                    if let Some(runtime) = self
+                        .detection_jobs
+                        .lock()
+                        .map_err(|_| "detection job state is unavailable".to_string())?
+                        .get_mut(&job_id)
+                    {
+                        runtime.projection.expires_at = lease.expires_at;
+                        runtime.projection.updated_at = lease.updated_at;
+                    }
+                }
+                Ok(_) => {
+                    first_error.get_or_insert_with(|| {
+                        format!(
+                            "HarborLink returned a mismatched package detection lease for camera {camera_id}"
+                        )
+                    });
+                }
+                Err(error) => {
+                    let message = format!(
+                        "failed to renew package detection for camera {camera_id}: {}",
+                        redact_admin_string(&error)
+                    );
+                    let _ = self.set_package_detection_reconciliation(
+                        &camera_id,
+                        "failed",
+                        Some(message.clone()),
+                    );
+                    if let Some(policy) = policy {
+                        self.schedule_package_detection_control_retry(
+                            &camera_id,
+                            policy.updated_at_epoch_ms,
+                        );
+                    }
+                    first_error.get_or_insert(message);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn schedule_package_detection_runtime_drift(&self, camera_id: &str) {
+        let Ok(Some(policy)) = self.package_detection_explicit_policy(camera_id) else {
+            return;
+        };
+        let running = self.detection_jobs.lock().ok().is_some_and(|jobs| {
+            jobs.values().any(|runtime| {
+                runtime.projection.camera_id == camera_id
+                    && runtime.projection.status == "running"
+                    && detection_projection_targets(&runtime.projection, "package")
+                    && runtime.projection.stream_profile == policy.stream_profile
+            })
+        });
+        let needs_reconciliation = if policy.desired_enabled {
+            !running
+        } else {
+            running || !policy.pending_detection_lease_ids.is_empty()
+        };
+        if needs_reconciliation {
+            self.schedule_package_detection_control_retry(camera_id, policy.updated_at_epoch_ms);
+        }
     }
 
     fn cleanup_terminal_detection_lease(
@@ -4876,6 +5064,19 @@ impl AdminApi {
                 .boxed(),
             Method::Put if parse_cat_detection_control_camera_id(&path).is_some() => self
                 .handle_put_cat_detection_control(
+                    &path,
+                    &mut request,
+                    gate_principal.as_ref().expect("gate principal"),
+                )
+                .boxed(),
+            Method::Get if parse_package_detection_control_camera_id(&path).is_some() => self
+                .handle_get_package_detection_control(
+                    &path,
+                    gate_principal.as_ref().expect("gate principal"),
+                )
+                .boxed(),
+            Method::Put if parse_package_detection_control_camera_id(&path).is_some() => self
+                .handle_put_package_detection_control(
                     &path,
                     &mut request,
                     gate_principal.as_ref().expect("gate principal"),
@@ -7936,6 +8137,81 @@ impl AdminApi {
         }
     }
 
+    fn handle_get_package_detection_control(
+        &self,
+        path: &str,
+        gate_principal: &GateAuthenticatedPrincipal,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let camera_id = match parse_package_detection_control_camera_id(path) {
+            Some(camera_id) => camera_id,
+            None => return error_json(StatusCode(400), "invalid package detection control path"),
+        };
+        if let Err(error) = validate_package_detection_control_camera_id(&camera_id) {
+            return error_json(StatusCode(400), &error);
+        }
+        if let Err((status, error)) = self.authorize_detection_camera_action(
+            gate_principal,
+            &camera_id,
+            AccessAction::CameraView,
+        ) {
+            return error_json(status, &error);
+        }
+        if let Err(error) = self.load_camera_device(&camera_id) {
+            return error_json(
+                if error.contains("device not found") {
+                    StatusCode(404)
+                } else {
+                    StatusCode(422)
+                },
+                &error,
+            );
+        }
+        match self.package_detection_control_response(&camera_id) {
+            Ok(response) => ok_json(&response),
+            Err(error) => error_json(StatusCode(503), &error),
+        }
+    }
+
+    fn handle_put_package_detection_control(
+        &self,
+        path: &str,
+        request: &mut Request,
+        gate_principal: &GateAuthenticatedPrincipal,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let camera_id = match parse_package_detection_control_camera_id(path) {
+            Some(camera_id) => camera_id,
+            None => return error_json(StatusCode(400), "invalid package detection control path"),
+        };
+        if let Err(error) = validate_package_detection_control_camera_id(&camera_id) {
+            return error_json(StatusCode(400), &error);
+        }
+        let body = match read_json_body_limited::<CatDetectionControlRequest>(request, 4 * 1024) {
+            Ok(body) => body,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        if let Err((status, error)) = self.authorize_detection_camera_action(
+            gate_principal,
+            &camera_id,
+            AccessAction::CameraOperate,
+        ) {
+            return error_json(status, &error);
+        }
+        if let Err(error) = self.load_camera_device(&camera_id) {
+            return error_json(
+                if error.contains("device not found") {
+                    StatusCode(404)
+                } else {
+                    StatusCode(422)
+                },
+                &error,
+            );
+        }
+        match self.apply_package_detection_control(&camera_id, body.enabled, &body.stream_profile) {
+            Ok(response) => ok_json(&response),
+            Err((status, error)) => error_json(status, &error),
+        }
+    }
+
     fn cat_detection_explicit_policy(
         &self,
         camera_id: &str,
@@ -7972,6 +8248,185 @@ impl AdminApi {
         store.upsert(policy.clone())?;
         controls.insert(policy.camera_id.clone(), policy);
         Ok(())
+    }
+
+    fn package_detection_explicit_policy(
+        &self,
+        camera_id: &str,
+    ) -> Result<Option<PackageDetectionControlPolicy>, String> {
+        if let Some(error) = self
+            .package_detection_control_store_load_error
+            .lock()
+            .map_err(|_| "package detection control load state is unavailable".to_string())?
+            .clone()
+        {
+            return Err(error);
+        }
+        self.package_detection_controls
+            .lock()
+            .map_err(|_| "package detection control state is unavailable".to_string())
+            .map(|controls| controls.get(camera_id).cloned())
+    }
+
+    fn persist_package_detection_policy(
+        &self,
+        policy: PackageDetectionControlPolicy,
+    ) -> Result<(), String> {
+        let mut controls = self
+            .package_detection_controls
+            .lock()
+            .map_err(|_| "package detection control state is unavailable".to_string())?;
+        let store = self
+            .package_detection_control_store
+            .as_ref()
+            .ok_or_else(|| {
+                self.package_detection_control_store_load_error
+                    .lock()
+                    .ok()
+                    .and_then(|error| error.clone())
+                    .unwrap_or_else(|| "package detection control store is unavailable".to_string())
+            })?;
+        store.upsert(policy.clone())?;
+        controls.insert(policy.camera_id.clone(), policy);
+        Ok(())
+    }
+
+    fn retain_pending_package_detection_leases(
+        &self,
+        camera_id: &str,
+        lease_ids: impl IntoIterator<Item = String>,
+    ) -> Result<(), String> {
+        let mut policy = self
+            .package_detection_explicit_policy(camera_id)?
+            .ok_or_else(|| "package detection control policy is unavailable".to_string())?;
+        let mut pending = policy.pending_detection_lease_ids.clone();
+        pending.extend(lease_ids);
+        policy.set_pending_detection_lease_ids(pending)?;
+        self.persist_package_detection_policy(policy)
+    }
+
+    fn clear_pending_package_detection_leases(
+        &self,
+        camera_id: &str,
+        cleared_lease_ids: &HashSet<String>,
+    ) -> Result<(), String> {
+        if cleared_lease_ids.is_empty() {
+            return Ok(());
+        }
+        let mut policy = self
+            .package_detection_explicit_policy(camera_id)?
+            .ok_or_else(|| "package detection control policy is unavailable".to_string())?;
+        let remaining = policy
+            .pending_detection_lease_ids
+            .iter()
+            .filter(|lease_id| !cleared_lease_ids.contains(*lease_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        policy.set_pending_detection_lease_ids(remaining)?;
+        self.persist_package_detection_policy(policy)
+    }
+
+    fn prepare_package_detection_create_attempt(
+        &self,
+        camera_id: &str,
+        stream_profile: &str,
+    ) -> Result<String, String> {
+        let mut policy = self
+            .package_detection_explicit_policy(camera_id)?
+            .ok_or_else(|| "package detection control policy is unavailable".to_string())?;
+        if let Some(attempt_id) = policy.detection_lease_create_attempt_id.clone() {
+            if policy.detection_lease_create_attempt_stream_profile() != Some(stream_profile) {
+                return Err(
+                    "unresolved package detection create attempt must be reconciled before changing stream profile"
+                        .to_string(),
+                );
+            }
+            return Ok(attempt_id);
+        }
+        let attempt_id = Uuid::new_v4().simple().to_string();
+        policy.set_detection_lease_create_attempt(
+            Some(attempt_id.clone()),
+            Some(stream_profile.to_string()),
+        )?;
+        self.persist_package_detection_policy(policy)?;
+        Ok(attempt_id)
+    }
+
+    fn transfer_package_detection_create_attempt_to_pending(
+        &self,
+        camera_id: &str,
+        expected_attempt_id: &str,
+        lease_id: String,
+    ) -> Result<(), String> {
+        let mut policy = self
+            .package_detection_explicit_policy(camera_id)?
+            .ok_or_else(|| "package detection control policy is unavailable".to_string())?;
+        if policy.detection_lease_create_attempt_id.as_deref() != Some(expected_attempt_id) {
+            return Err(
+                "package detection create attempt changed during reconciliation".to_string(),
+            );
+        }
+        let mut pending = policy.pending_detection_lease_ids.clone();
+        pending.push(lease_id);
+        policy.set_pending_detection_lease_ids(pending)?;
+        policy.set_detection_lease_create_attempt(None, None)?;
+        self.persist_package_detection_policy(policy)
+    }
+
+    fn clear_package_detection_create_attempt(
+        &self,
+        camera_id: &str,
+        expected_attempt_id: &str,
+    ) -> Result<(), String> {
+        let Some(mut policy) = self.package_detection_explicit_policy(camera_id)? else {
+            return Ok(());
+        };
+        if policy.detection_lease_create_attempt_id.as_deref() != Some(expected_attempt_id) {
+            return Ok(());
+        }
+        policy.set_detection_lease_create_attempt(None, None)?;
+        self.persist_package_detection_policy(policy)
+    }
+
+    fn resolve_package_detection_create_attempt_to_pending(
+        &self,
+        camera_id: &str,
+    ) -> Result<(), String> {
+        let policy = self
+            .package_detection_explicit_policy(camera_id)?
+            .ok_or_else(|| "package detection control policy is unavailable".to_string())?;
+        let Some(attempt_id) = policy.detection_lease_create_attempt_id.clone() else {
+            return Ok(());
+        };
+        let stream_profile = policy
+            .detection_lease_create_attempt_stream_profile()
+            .ok_or_else(|| "package detection create attempt profile is unavailable".to_string())?
+            .to_string();
+        let request_scope = package_detection_start_request_scope(camera_id, &attempt_id);
+        let _request_scope = harborlink_request_scope(Some(&request_scope));
+        match self.harborlink_media.start_detection_lease(
+            camera_id,
+            &stream_profile,
+            LIVE_MANAGED_DETECTION_TTL_SECONDS,
+            CAT_AUTO_RECORD_PRE_ROLL_SECONDS,
+        ) {
+            Ok(lease) => {
+                validate_detection_lease_create_response(&lease, camera_id, &stream_profile)?;
+                self.transfer_package_detection_create_attempt_to_pending(
+                    camera_id,
+                    &attempt_id,
+                    lease.lease_id,
+                )
+            }
+            Err(error) => match classify_detection_lease_create_failure(&error) {
+                DetectionLeaseCreateFailureDisposition::RetrySameAttempt => Err(error),
+                DetectionLeaseCreateFailureDisposition::ConfirmedNotCreated
+                | DetectionLeaseCreateFailureDisposition::Conflict => {
+                    self.clear_package_detection_create_attempt(camera_id, &attempt_id)?;
+                    Ok(())
+                }
+            },
+        }
     }
 
     fn known_detection_lease_ids_for_camera(&self, camera_id: &str) -> Result<Vec<String>, String> {
@@ -8367,6 +8822,148 @@ impl AdminApi {
         }
     }
 
+    fn start_package_detection_control_recovery(&self) {
+        let controls = match self.package_detection_controls.lock() {
+            Ok(controls) => controls.values().cloned().collect::<Vec<_>>(),
+            Err(_) => return,
+        };
+        for policy in controls {
+            self.enqueue_package_detection_control_retry(
+                &policy.camera_id,
+                policy.updated_at_epoch_ms,
+                Duration::ZERO,
+            );
+        }
+    }
+
+    fn coordinate_package_detection_control(
+        &self,
+        camera_id: &str,
+        expected_revision: u128,
+    ) -> Result<CatDetectionControlCoordination, String> {
+        let camera_lock = self.cat_detection_control_camera_lock(camera_id)?;
+        let _camera_guard = camera_lock.lock().map_err(|_| {
+            "package detection control camera coordination is unavailable".to_string()
+        })?;
+        let Some(policy) = self.package_detection_explicit_policy(camera_id)? else {
+            return Ok(CatDetectionControlCoordination::Superseded);
+        };
+        if policy.updated_at_epoch_ms != expected_revision {
+            return Ok(CatDetectionControlCoordination::Superseded);
+        }
+        self.load_camera_device(camera_id)?;
+        self.set_package_detection_reconciliation(
+            camera_id,
+            if policy.desired_enabled {
+                "starting"
+            } else {
+                "stopping"
+            },
+            None,
+        )?;
+        match self.reconcile_package_detection_control_locked(camera_id) {
+            Ok(CatDetectionControlCoordination::Converged)
+            | Ok(CatDetectionControlCoordination::Superseded) => {
+                self.set_package_detection_reconciliation(
+                    camera_id,
+                    if policy.desired_enabled {
+                        "running"
+                    } else {
+                        "stopped"
+                    },
+                    None,
+                )?;
+                Ok(CatDetectionControlCoordination::Converged)
+            }
+            Ok(CatDetectionControlCoordination::Draining) => {
+                self.set_package_detection_reconciliation(
+                    camera_id,
+                    "stopping",
+                    Some("package detection lease cleanup is pending".to_string()),
+                )?;
+                Ok(CatDetectionControlCoordination::Draining)
+            }
+            Err(error) => {
+                self.set_package_detection_reconciliation(
+                    camera_id,
+                    "failed",
+                    Some(redact_admin_string(&error)),
+                )?;
+                Err(error)
+            }
+        }
+    }
+
+    fn schedule_package_detection_control_retry(&self, camera_id: &str, revision: u128) {
+        self.enqueue_package_detection_control_retry(
+            camera_id,
+            revision,
+            Duration::from_secs(CAT_DETECTION_CONTROL_RETRY_INITIAL_SECONDS),
+        );
+    }
+
+    fn enqueue_package_detection_control_retry(
+        &self,
+        camera_id: &str,
+        revision: u128,
+        delay: Duration,
+    ) {
+        let current_revision = self
+            .package_detection_explicit_policy(camera_id)
+            .ok()
+            .flatten()
+            .map(|policy| policy.updated_at_epoch_ms);
+        if current_revision != Some(revision) {
+            return;
+        }
+        let Some(scheduler) = self.package_detection_retry_scheduler.as_ref() else {
+            if self.package_detection_retry_scheduling_context
+                != CatDetectionRetrySchedulingContext::WorkerExecution
+            {
+                let _ = self.set_package_detection_reconciliation(
+                    camera_id,
+                    "failed",
+                    Some("package detection retry scheduling is unavailable".to_string()),
+                );
+            }
+            return;
+        };
+        let execution = PackageDetectionRetryExecutionContext::new(self);
+        if let Err(error) = scheduler.enqueue(
+            camera_id,
+            revision,
+            delay,
+            Arc::new(move |entry| execution.execute(entry)),
+        ) {
+            let _ = self.set_package_detection_reconciliation(
+                camera_id,
+                "failed",
+                Some(format!(
+                    "package detection retry scheduling failed: {error}"
+                )),
+            );
+        }
+    }
+
+    fn set_package_detection_reconciliation(
+        &self,
+        camera_id: &str,
+        effective_status: &str,
+        message: Option<String>,
+    ) -> Result<(), String> {
+        self.package_detection_control_reconciliation
+            .lock()
+            .map_err(|_| "package detection reconciliation state is unavailable".to_string())?
+            .insert(
+                camera_id.to_string(),
+                CatDetectionControlReconciliation {
+                    effective_status: effective_status.to_string(),
+                    message,
+                },
+            );
+        Ok(())
+    }
+
     fn coordinate_cat_detection_control(
         &self,
         camera_id: &str,
@@ -8579,6 +9176,20 @@ impl AdminApi {
                 "cat detection control camera coordination is unavailable".to_string(),
             )
         })?;
+        if enabled {
+            let package_policy = self
+                .package_detection_explicit_policy(camera_id)
+                .map_err(|error| (StatusCode(503), error))?;
+            validate_detector_control_enable_conflict("cat", None, package_policy.as_ref())
+                .map_err(|error| (StatusCode(409), error))?;
+            if self.detector_runtime_conflicts(camera_id, "cat")? {
+                return Err((
+                    StatusCode(409),
+                    "package detection is still running or draining; turn it off before enabling cat detection"
+                        .to_string(),
+                ));
+            }
+        }
         let mut previous_policy = self
             .cat_detection_explicit_policy(camera_id)
             .map_err(|error| (StatusCode(503), error))?;
@@ -8705,6 +9316,170 @@ impl AdminApi {
             .map_err(|error| (StatusCode(503), error))
     }
 
+    fn detector_runtime_conflicts(
+        &self,
+        camera_id: &str,
+        requested_target: &str,
+    ) -> Result<bool, (StatusCode, String)> {
+        let conflicting_target = match requested_target {
+            "cat" => "package",
+            "package" => "cat",
+            _ => {
+                return Err((
+                    StatusCode(400),
+                    format!("unsupported detector target: {requested_target}"),
+                ))
+            }
+        };
+        let mut jobs = self.detection_jobs.lock().map_err(|_| {
+            (
+                StatusCode(503),
+                "detection job state is unavailable".to_string(),
+            )
+        })?;
+        for runtime in jobs
+            .values_mut()
+            .filter(|runtime| runtime.projection.camera_id == camera_id)
+        {
+            self.refresh_detection_job(runtime);
+        }
+        Ok(jobs.values().any(|runtime| {
+            runtime.projection.camera_id == camera_id
+                && detection_projection_targets(&runtime.projection, conflicting_target)
+                && (runtime.projection.status == "running"
+                    || runtime.projection.status == "stopping"
+                    || runtime.child.is_some()
+                    || !runtime.detection_lease_cleanup_confirmed)
+        }))
+    }
+
+    fn apply_package_detection_control(
+        &self,
+        camera_id: &str,
+        enabled: bool,
+        stream_profile: &str,
+    ) -> Result<CatDetectionControlResponse, (StatusCode, String)> {
+        let camera_lock = self
+            .cat_detection_control_camera_lock(camera_id)
+            .map_err(|error| (StatusCode(503), error))?;
+        let _camera_guard = camera_lock.lock().map_err(|_| {
+            (
+                StatusCode(503),
+                "package detection control camera coordination is unavailable".to_string(),
+            )
+        })?;
+        let cat_policy = self
+            .cat_detection_explicit_policy(camera_id)
+            .map_err(|error| (StatusCode(503), error))?;
+        if enabled {
+            validate_detector_control_enable_conflict("package", cat_policy.as_ref(), None)
+                .map_err(|error| (StatusCode(409), error))?;
+            if self.detector_runtime_conflicts(camera_id, "package")? {
+                return Err((
+                    StatusCode(409),
+                    "cat detection is still running or draining; turn it off before enabling package detection"
+                        .to_string(),
+                ));
+            }
+        }
+        let previous = self
+            .package_detection_explicit_policy(camera_id)
+            .map_err(|error| (StatusCode(503), error))?;
+        let previous_revision = previous
+            .as_ref()
+            .map(|policy| policy.updated_at_epoch_ms)
+            .unwrap_or(0);
+        let mut policy = PackageDetectionControlPolicy::new(
+            camera_id,
+            enabled,
+            stream_profile,
+            cat_auto_recording_epoch_ms().max(previous_revision.saturating_add(1)),
+        )
+        .map_err(|error| (StatusCode(400), error))?;
+        let mut pending = previous
+            .as_ref()
+            .map(|policy| policy.pending_detection_lease_ids.clone())
+            .unwrap_or_default();
+        if !enabled {
+            let jobs = self.detection_jobs.lock().map_err(|_| {
+                (
+                    StatusCode(503),
+                    "detection job state is unavailable".to_string(),
+                )
+            })?;
+            pending.extend(detection_lease_responsibility_ids_for_target(
+                camera_id,
+                std::iter::empty(),
+                &jobs,
+                Some("package"),
+            ));
+        }
+        policy
+            .set_pending_detection_lease_ids(pending)
+            .map_err(|error| (StatusCode(503), error))?;
+        if let Some(previous) = previous.as_ref() {
+            if let Some(attempt_id) = previous.detection_lease_create_attempt_id.clone() {
+                policy
+                    .set_detection_lease_create_attempt(
+                        Some(attempt_id),
+                        previous
+                            .detection_lease_create_attempt_stream_profile()
+                            .map(str::to_string),
+                    )
+                    .map_err(|error| (StatusCode(503), error))?;
+            }
+        }
+        let revision = policy.updated_at_epoch_ms;
+        self.persist_package_detection_policy(policy)
+            .map_err(|error| (StatusCode(503), error))?;
+        *self
+            .package_detection_control_store_load_error
+            .lock()
+            .map_err(|_| {
+                (
+                    StatusCode(503),
+                    "package detection control load state is unavailable".to_string(),
+                )
+            })? = None;
+        self.set_package_detection_reconciliation(
+            camera_id,
+            if enabled { "starting" } else { "stopping" },
+            None,
+        )
+        .map_err(|error| (StatusCode(503), error))?;
+        match self.reconcile_package_detection_control_locked(camera_id) {
+            Ok(CatDetectionControlCoordination::Converged)
+            | Ok(CatDetectionControlCoordination::Superseded) => {
+                self.set_package_detection_reconciliation(
+                    camera_id,
+                    if enabled { "running" } else { "stopped" },
+                    None,
+                )
+                .map_err(|error| (StatusCode(503), error))?;
+            }
+            Ok(CatDetectionControlCoordination::Draining) => {
+                self.set_package_detection_reconciliation(
+                    camera_id,
+                    "stopping",
+                    Some("package detection lease cleanup is pending".to_string()),
+                )
+                .map_err(|error| (StatusCode(503), error))?;
+                self.schedule_package_detection_control_retry(camera_id, revision);
+            }
+            Err(error) => {
+                self.set_package_detection_reconciliation(
+                    camera_id,
+                    "failed",
+                    Some(redact_admin_string(&error)),
+                )
+                .map_err(|state_error| (StatusCode(503), state_error))?;
+                self.schedule_package_detection_control_retry(camera_id, revision);
+            }
+        }
+        self.package_detection_control_response(camera_id)
+            .map_err(|error| (StatusCode(503), error))
+    }
+
     fn reconcile_cat_detection_control_locked(
         &self,
         camera_id: &str,
@@ -8712,6 +9487,14 @@ impl AdminApi {
         let mut policy = self
             .cat_detection_explicit_policy(camera_id)?
             .ok_or_else(|| "cat detection control policy is unavailable".to_string())?;
+        if policy.desired_enabled {
+            let package_policy = self.package_detection_explicit_policy(camera_id)?;
+            validate_detector_control_enable_conflict(
+                "cat",
+                Some(&policy),
+                package_policy.as_ref(),
+            )?;
+        }
         let rollback_mode = if policy.desired_enabled {
             RollbackResolutionMode::RestorePreviousProfile
         } else {
@@ -8912,6 +9695,211 @@ impl AdminApi {
         Ok(CatDetectionControlCoordination::Converged)
     }
 
+    fn reconcile_package_detection_control_locked(
+        &self,
+        camera_id: &str,
+    ) -> Result<CatDetectionControlCoordination, String> {
+        let policy = self
+            .package_detection_explicit_policy(camera_id)?
+            .ok_or_else(|| "package detection control policy is unavailable".to_string())?;
+        if !policy.desired_enabled {
+            return self.stop_package_detection_jobs_for_camera_locked(camera_id);
+        }
+        let cat_policy = self.cat_detection_explicit_policy(camera_id)?;
+        validate_detector_control_enable_conflict("package", cat_policy.as_ref(), Some(&policy))?;
+        if self
+            .detector_runtime_conflicts(camera_id, "package")
+            .map_err(|(_, error)| error)?
+        {
+            return Err(
+                "cat detection is still running or draining; package detection cannot start"
+                    .to_string(),
+            );
+        }
+        let reusable = {
+            let mut jobs = self
+                .detection_jobs
+                .lock()
+                .map_err(|_| "detection job state is unavailable".to_string())?;
+            for runtime in jobs
+                .values_mut()
+                .filter(|runtime| runtime.projection.camera_id == camera_id)
+            {
+                self.refresh_detection_job(runtime);
+            }
+            reusable_detection_job_projection(&jobs, camera_id, "package", &policy.stream_profile)?
+        };
+        let projection = if let Some(projection) = reusable {
+            projection
+        } else {
+            self.stop_package_detection_jobs_for_camera_locked(camera_id)?;
+            let config = DetectionJobConfig {
+                camera_id: camera_id.to_string(),
+                target_label: "package".to_string(),
+                ttl_seconds: LIVE_MANAGED_DETECTION_TTL_SECONDS,
+                max_fps: DEFAULT_PACKAGE_DETECTION_MAX_FPS,
+                confidence: DEFAULT_PACKAGE_DETECTION_CONFIDENCE,
+                stream_profile: policy.stream_profile.clone(),
+            };
+            self.start_package_controlled_detection_job_locked(config)?
+        };
+        self.retain_pending_package_detection_leases(camera_id, [projection.lease_id.clone()])?;
+        Ok(CatDetectionControlCoordination::Converged)
+    }
+
+    fn start_package_controlled_detection_job_locked(
+        &self,
+        config: DetectionJobConfig,
+    ) -> Result<DetectionJobProjection, String> {
+        let attempt_id = self
+            .prepare_package_detection_create_attempt(&config.camera_id, &config.stream_profile)?;
+        let request_scope = package_detection_start_request_scope(&config.camera_id, &attempt_id);
+        match self.start_detection_job_locked_with_request_scope(
+            config.clone(),
+            false,
+            false,
+            Some(request_scope),
+        ) {
+            Ok(started) => {
+                self.transfer_package_detection_create_attempt_to_pending(
+                    &config.camera_id,
+                    &attempt_id,
+                    started.projection.lease_id.clone(),
+                )?;
+                Ok(started.projection)
+            }
+            Err((_, error)) => {
+                if classify_detection_lease_create_failure(&error)
+                    != DetectionLeaseCreateFailureDisposition::RetrySameAttempt
+                {
+                    self.clear_package_detection_create_attempt(&config.camera_id, &attempt_id)?;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn stop_package_detection_jobs_for_camera_locked(
+        &self,
+        camera_id: &str,
+    ) -> Result<CatDetectionControlCoordination, String> {
+        self.resolve_package_detection_create_attempt_to_pending(camera_id)?;
+        let policy_pending = self
+            .package_detection_explicit_policy(camera_id)?
+            .map(|policy| policy.pending_detection_lease_ids)
+            .unwrap_or_default();
+        let known_lease_ids = {
+            let jobs = self
+                .detection_jobs
+                .lock()
+                .map_err(|_| "detection job state is unavailable".to_string())?;
+            detection_lease_responsibility_ids_for_target(
+                camera_id,
+                policy_pending,
+                &jobs,
+                Some("package"),
+            )
+        };
+        self.retain_pending_package_detection_leases(camera_id, known_lease_ids.clone())?;
+        let known = known_lease_ids.iter().cloned().collect::<HashSet<_>>();
+        let mut detached = {
+            let mut jobs = self
+                .detection_jobs
+                .lock()
+                .map_err(|_| "detection job state is unavailable".to_string())?;
+            jobs.iter_mut()
+                .filter(|(_, runtime)| {
+                    runtime.projection.camera_id == camera_id
+                        && known.contains(&runtime.projection.lease_id)
+                })
+                .map(|(job_id, runtime)| {
+                    runtime.projection.status = "stopping".to_string();
+                    runtime.projection.updated_at = current_rfc3339_timestamp();
+                    (
+                        job_id.clone(),
+                        DetectionJobRuntime {
+                            projection: runtime.projection.clone(),
+                            output_dir: runtime.output_dir.clone(),
+                            child: runtime.child.take(),
+                            ai_lease: runtime.ai_lease.take(),
+                            detection_lease_cleanup_confirmed: runtime
+                                .detection_lease_cleanup_confirmed,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut first_error = None;
+        let mut cleared = HashSet::new();
+        for (_, runtime) in &mut detached {
+            if runtime.child.is_some() {
+                let stop_result = stop_detection_child(runtime);
+                if let Err(error) = complete_detection_job_stop(runtime, "stopped", stop_result) {
+                    runtime.projection.status = "stopping".to_string();
+                    runtime.projection.message = Some(redact_admin_string(&error));
+                    first_error.get_or_insert(error);
+                    continue;
+                }
+            }
+            if runtime.detection_lease_cleanup_confirmed || runtime.projection.lease_id.is_empty() {
+                cleared.insert(runtime.projection.lease_id.clone());
+                runtime.projection.status = "stopped".to_string();
+                continue;
+            }
+            match self.stop_detection_lease_idempotently(camera_id, &runtime.projection.lease_id) {
+                Ok(()) => {
+                    runtime.detection_lease_cleanup_confirmed = true;
+                    runtime.projection.status = "stopped".to_string();
+                    runtime.projection.message = None;
+                    cleared.insert(runtime.projection.lease_id.clone());
+                }
+                Err(error) => {
+                    runtime.projection.status = "stopping".to_string();
+                    runtime.projection.message = Some(redact_admin_string(&error));
+                    first_error.get_or_insert(error);
+                }
+            }
+            refresh_detection_job_outputs(runtime);
+        }
+        let represented = detached
+            .iter()
+            .map(|(_, runtime)| runtime.projection.lease_id.clone())
+            .collect::<HashSet<_>>();
+        for lease_id in known_lease_ids
+            .iter()
+            .filter(|lease_id| !represented.contains(*lease_id))
+        {
+            match self.stop_detection_lease_idempotently(camera_id, lease_id) {
+                Ok(()) => {
+                    cleared.insert(lease_id.clone());
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        {
+            let mut jobs = self
+                .detection_jobs
+                .lock()
+                .map_err(|_| "detection job state is unavailable".to_string())?;
+            for (job_id, mut completed) in detached {
+                if let Some(runtime) = jobs.get_mut(&job_id) {
+                    runtime.projection = completed.projection;
+                    runtime.child = completed.child.take();
+                    runtime.ai_lease = completed.ai_lease.take();
+                    runtime.detection_lease_cleanup_confirmed =
+                        completed.detection_lease_cleanup_confirmed;
+                }
+            }
+        }
+        self.clear_pending_package_detection_leases(camera_id, &cleared)?;
+        if first_error.is_some() {
+            return Ok(CatDetectionControlCoordination::Draining);
+        }
+        Ok(CatDetectionControlCoordination::Converged)
+    }
+
     fn stop_detection_jobs_for_camera_locked(&self, camera_id: &str) -> Result<(), String> {
         self.stop_detection_jobs_for_camera_locked_preserving_target(camera_id, None, None)
     }
@@ -9101,6 +10089,86 @@ impl AdminApi {
                 },
             );
         Ok(())
+    }
+
+    fn package_detection_control_response(
+        &self,
+        camera_id: &str,
+    ) -> Result<CatDetectionControlResponse, String> {
+        let control = self.package_detection_explicit_policy(camera_id)?;
+        let explicit = control.is_some();
+        let desired_enabled = control
+            .as_ref()
+            .is_some_and(|control| control.desired_enabled);
+        let desired_stream_profile = control
+            .as_ref()
+            .map(|control| control.stream_profile.clone())
+            .unwrap_or_else(|| "sub".to_string());
+        let reconciliation = self
+            .package_detection_control_reconciliation
+            .lock()
+            .map_err(|_| "package detection reconciliation state is unavailable".to_string())?
+            .get(camera_id)
+            .cloned();
+        let running = {
+            let mut jobs = self
+                .detection_jobs
+                .lock()
+                .map_err(|_| "detection job state is unavailable".to_string())?;
+            for runtime in jobs
+                .values_mut()
+                .filter(|runtime| runtime.projection.camera_id == camera_id)
+            {
+                self.refresh_detection_job(runtime);
+            }
+            jobs.values()
+                .find(|runtime| {
+                    runtime.projection.camera_id == camera_id
+                        && runtime.projection.status == "running"
+                        && detection_projection_targets(&runtime.projection, "package")
+                })
+                .map(|runtime| runtime.projection.clone())
+        };
+        let pending_cleanup = control
+            .as_ref()
+            .is_some_and(|control| !control.pending_detection_lease_ids.is_empty());
+        let running_matches_desired = running
+            .as_ref()
+            .is_some_and(|projection| projection.stream_profile == desired_stream_profile);
+        let effective_status = if desired_enabled && running_matches_desired {
+            "running"
+        } else if desired_enabled {
+            reconciliation
+                .as_ref()
+                .map(|state| state.effective_status.as_str())
+                .filter(|status| matches!(*status, "starting" | "failed"))
+                .unwrap_or("starting")
+        } else if pending_cleanup || running.is_some() {
+            reconciliation
+                .as_ref()
+                .map(|state| state.effective_status.as_str())
+                .filter(|status| matches!(*status, "stopping" | "failed"))
+                .unwrap_or("stopping")
+        } else {
+            "stopped"
+        };
+        Ok(CatDetectionControlResponse {
+            camera_id: camera_id.to_string(),
+            explicit,
+            desired_enabled,
+            desired_stream_profile,
+            effective_status: effective_status.to_string(),
+            effective_stream_profile: running
+                .as_ref()
+                .map(|projection| projection.stream_profile.clone()),
+            job_id: running.as_ref().map(|projection| projection.job_id.clone()),
+            updated_at: control
+                .as_ref()
+                .and_then(|control| format_epoch_millis(control.updated_at_epoch_ms)),
+            message: reconciliation
+                .and_then(|state| state.message)
+                .or_else(|| running.and_then(|projection| projection.message)),
+        })
     }
 
     fn cat_detection_control_response(
@@ -9330,12 +10398,33 @@ impl AdminApi {
             Ok(policy) => policy,
             Err(error) => return cat_detection_control_unavailable_response(&error),
         };
+        let package_policy = match self.package_detection_explicit_policy(&config.camera_id) {
+            Ok(policy) => policy,
+            Err(error) => return error_json(StatusCode(503), &error),
+        };
+        if let Err(error) = validate_detector_control_enable_conflict(
+            &config.target_label,
+            explicit_policy.as_ref(),
+            package_policy.as_ref(),
+        ) {
+            return error_json(StatusCode(409), &error);
+        }
         if config.target_label == "cat"
             && explicit_policy
                 .as_ref()
                 .is_some_and(|policy| policy.rollback_detection_lease_create_attempt_id.is_some())
         {
             return cat_detection_rollback_unresolved_response();
+        }
+        if config.target_label == "package"
+            && package_policy
+                .as_ref()
+                .is_some_and(|policy| policy.desired_enabled)
+        {
+            return error_json(
+                StatusCode(409),
+                "package detection is owned by explicit control for this camera",
+            );
         }
         if config.target_label == "cat"
             && explicit_policy
@@ -9547,6 +10636,15 @@ impl AdminApi {
         let explicit_policy = self
             .cat_detection_explicit_policy(&config.camera_id)
             .map_err(|error| (StatusCode(503), error))?;
+        let package_policy = self
+            .package_detection_explicit_policy(&config.camera_id)
+            .map_err(|error| (StatusCode(503), error))?;
+        validate_detector_control_enable_conflict(
+            &config.target_label,
+            explicit_policy.as_ref(),
+            package_policy.as_ref(),
+        )
+        .map_err(|error| (StatusCode(409), error))?;
         validate_detection_target_policy(&config.target_label, explicit_policy.as_ref())
             .map_err(|error| (StatusCode(409), error))?;
         let pending_lease_ids = explicit_policy
@@ -14689,6 +15787,13 @@ fn cat_detection_start_request_scope(camera_id: &str, attempt_id: &str) -> Strin
     )
 }
 
+fn package_detection_start_request_scope(camera_id: &str, attempt_id: &str) -> String {
+    format!(
+        "package-detection-start-{attempt_id}-{}",
+        short_sha256(camera_id)
+    )
+}
+
 fn cat_detection_rollback_request_scope(camera_id: &str, attempt_id: &str) -> String {
     format!(
         "cat-detection-rollback-{attempt_id}-{}",
@@ -15006,6 +16111,8 @@ fn is_gate_principal_endpoint(method: &Method, path: &str) -> bool {
         || (method == &Method::Get && is_cat_detection_observation_path(path))
         || (matches!(method, &Method::Get | &Method::Put)
             && parse_cat_detection_control_camera_id(path).is_some())
+        || (matches!(method, &Method::Get | &Method::Put)
+            && parse_package_detection_control_camera_id(path).is_some())
         || path == "/api/vision/detection-jobs"
         || path.starts_with("/api/vision/detection-jobs/")
 }
@@ -15175,7 +16282,9 @@ fn authenticate_harbornavi_device_principal(
         parse_cat_detection_observation_camera_id(path)
     {
         (camera_id, "CAMERA_VIEW", RoleKind::Viewer)
-    } else if let Some(camera_id) = parse_cat_detection_control_camera_id(path) {
+    } else if let Some(camera_id) = parse_cat_detection_control_camera_id(path)
+        .or_else(|| parse_package_detection_control_camera_id(path))
+    {
         (camera_id, "CAMERA_CONTROL", RoleKind::Operator)
     } else {
         return Err(GatePrincipalAuthError::new(
@@ -15228,6 +16337,7 @@ fn authenticate_harbornavi_lan_principal(
         .map(|camera_id| (camera_id, "CAMERA_VIEW", RoleKind::Viewer))
         .or_else(|| {
             parse_cat_detection_control_camera_id(path)
+                .or_else(|| parse_package_detection_control_camera_id(path))
                 .map(|camera_id| (camera_id, "CAMERA_CONTROL", RoleKind::Operator))
         })
         .ok_or_else(|| {
@@ -15488,6 +16598,34 @@ fn validate_detection_target_policy(
         }
         _ => Err(format!("unsupported detection target: {target_label}")),
     }
+}
+
+fn validate_detector_control_enable_conflict(
+    requested_target: &str,
+    cat_policy: Option<&CatDetectionControlPolicy>,
+    package_policy: Option<&PackageDetectionControlPolicy>,
+) -> Result<(), String> {
+    match requested_target {
+        "cat" if package_policy.is_some_and(detector_control_policy_blocks_peer) => Err(
+            "package detection is enabled or still draining; turn it off before enabling cat detection"
+                .to_string(),
+        ),
+        "package" if cat_policy.is_some_and(detector_control_policy_blocks_peer) => Err(
+            "cat detection is enabled or still draining; turn it off before enabling package detection"
+                .to_string(),
+        ),
+        "cat" | "package" => Ok(()),
+        _ => Err(format!(
+            "unsupported detector control target: {requested_target}"
+        )),
+    }
+}
+
+fn detector_control_policy_blocks_peer(policy: &CatDetectionControlPolicy) -> bool {
+    policy.desired_enabled
+        || !policy.pending_detection_lease_ids.is_empty()
+        || policy.detection_lease_create_attempt_id.is_some()
+        || policy.rollback_detection_lease_create_attempt_id.is_some()
 }
 
 fn validate_detection_job_renewal_policy(
@@ -16839,6 +17977,23 @@ fn parse_cat_detection_control_camera_id(path: &str) -> Option<String> {
     let encoded = path
         .strip_prefix("/api/cameras/")?
         .strip_suffix("/cat-detection/control")?;
+    if encoded.is_empty() || encoded.contains('/') {
+        return None;
+    }
+    let camera_id = percent_decode_path_segment(encoded).ok()?;
+    (!camera_id.is_empty()
+        && camera_id.len() <= 128
+        && !camera_id.chars().any(char::is_control)
+        && !camera_id
+            .chars()
+            .any(|character| matches!(character, '\\' | '?' | '#')))
+    .then_some(camera_id)
+}
+
+fn parse_package_detection_control_camera_id(path: &str) -> Option<String> {
+    let encoded = path
+        .strip_prefix("/api/cameras/")?
+        .strip_suffix("/package-detection/control")?;
     if encoded.is_empty() || encoded.contains('/') {
         return None;
     }
@@ -28299,11 +29454,11 @@ mod tests {
         parse_model_download_cancel_path, parse_model_download_job_path, parse_model_endpoint_path,
         parse_model_endpoint_test_path, parse_model_runtime_install_path,
         parse_notification_target_delete_path, parse_optional_unix_seconds,
-        parse_share_link_revoke_path, parse_shared_camera_live_page_path,
-        parse_shared_camera_live_stream_path, parse_static_byte_range, percent_decode_path_segment,
-        preview_static_file_response, probe_local_model_runtime,
-        probe_local_openai_compatible_serving_model, prune_detection_job_history,
-        read_media_pipe_tail, reconcile_stale_knowledge_index_jobs,
+        parse_package_detection_control_camera_id, parse_share_link_revoke_path,
+        parse_shared_camera_live_page_path, parse_shared_camera_live_stream_path,
+        parse_static_byte_range, percent_decode_path_segment, preview_static_file_response,
+        probe_local_model_runtime, probe_local_openai_compatible_serving_model,
+        prune_detection_job_history, read_media_pipe_tail, reconcile_stale_knowledge_index_jobs,
         reconciliation_terminal_artifacts, redact_account_management_snapshot, redact_admin_string,
         redact_bridge_provider_config, redact_camera_device_projection,
         redact_model_endpoint_response, redact_state_snapshot, redact_stream_url_credentials,
@@ -28318,12 +29473,12 @@ mod tests {
         snapshot_artifact_from_task_response, summarize_media_tool_stderr,
         terminal_detection_lease_cleanup_intents, url_encode_path_segment,
         validate_detection_job_renewal_policy, validate_detection_target_policy,
-        validate_home_assistant_service_fields, validate_home_assistant_service_smoke,
-        validate_outreach_delivery_request, AdminApi, CameraLiveSessionProjection,
-        CameraStreamProfile, CatAutoRecordingConfig, CatAutoRecordingTransition,
-        CatDetectionControlCoordination, CatDetectionStreakSample, CatRecordingFrameProfile,
-        CatRecordingFrameSeekStrategy, CatRecordingSampleTarget, DetectionJobConfig,
-        DetectionJobProjection, DetectionJobRuntime, DetectionJobStartRequest,
+        validate_detector_control_enable_conflict, validate_home_assistant_service_fields,
+        validate_home_assistant_service_smoke, validate_outreach_delivery_request, AdminApi,
+        CameraLiveSessionProjection, CameraStreamProfile, CatAutoRecordingConfig,
+        CatAutoRecordingTransition, CatDetectionControlCoordination, CatDetectionStreakSample,
+        CatRecordingFrameProfile, CatRecordingFrameSeekStrategy, CatRecordingSampleTarget,
+        DetectionJobConfig, DetectionJobProjection, DetectionJobRuntime, DetectionJobStartRequest,
         GateAuthenticatedPrincipal, HarborLinkEventRecordingLease, HarborLinkHomeAssistantStatus,
         HarborLinkLiveSession, HarborLinkMediaClient, HarborLinkRecordingArtifact,
         HarborLinkRecordingStatus, HomeAssistantServiceSmokeRequest, HomeGuardianEvaluationQueue,
@@ -28381,6 +29536,7 @@ mod tests {
         KnowledgeIndexService, KnowledgeIndexTextSource, KnowledgeModality,
     };
     use harborbeacon_local_agent::runtime::model_center::CatRecordingVlmExecution;
+    use harborbeacon_local_agent::runtime::package_detection_control::PackageDetectionControlPolicy;
     use harborbeacon_local_agent::runtime::privacy_gateway::PRIVACY_GATEWAY_POLICY_VERSION;
     use harborbeacon_local_agent::runtime::registry::{CameraDevice, DeviceRegistryStore};
     use harborbeacon_local_agent::runtime::remote_view;
@@ -29487,6 +30643,12 @@ mod tests {
                 reconciliation_path
                     .to_str()
                     .expect("UTF-8 reconciliation path"),
+            ),
+            EnvGuard::set(
+                "HARBOR_K3_PACKAGE_DETECTION_CONTROL_PATH",
+                unique_store_path(&format!("{prefix}-package-control"))
+                    .to_str()
+                    .expect("UTF-8 package control path"),
             ),
             EnvGuard::set(
                 "HARBOR_K3_CAT_RECORDING_VALIDATION_STORE_PATH",
@@ -38594,6 +39756,10 @@ mod tests {
 
     mod cat_detection_control_tests {
         include!("agent_hub_admin_api/cat_detection_control_tests.rs");
+    }
+
+    mod package_detection_control_tests {
+        include!("agent_hub_admin_api/package_detection_control_tests.rs");
     }
 
     #[test]

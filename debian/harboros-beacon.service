@@ -13,6 +13,7 @@ Environment=HARBORLINK_MEDIA_API_URL=http://127.0.0.1:8790
 Environment=HARBORBEACON_SOUTHBOUND_MODE=harborlink
 Environment=HARBOR_K3_CAT_AUTO_RECORD_ENABLED=true
 Environment=HARBOR_K3_CAT_DETECTION_CONTROL_PATH=/var/lib/harboros-beacon/cat-detection-controls.json
+Environment=HARBOR_K3_PACKAGE_DETECTION_CONTROL_PATH=/var/lib/harboros-beacon/package-detection-controls.json
 Environment=HARBOR_K3_PACKAGE_YOLO_MODEL=/var/lib/harboros-beacon/vision-models/package-roboflow-v1-320x320-fp32/yolov8n-package-roboflow-v1-320x320.onnx
 Environment=HARBOR_K3_PACKAGE_YOLO_LABELS=/var/lib/harboros-beacon/vision-models/package-roboflow-v1-320x320-fp32/label.txt
 Environment=HARBOR_K3_CAT_RECORDING_RECONCILIATION_PATH=/var/lib/harboros-beacon/cat-recording-reconciliation.json

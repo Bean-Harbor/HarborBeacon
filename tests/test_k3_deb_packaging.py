@@ -122,6 +122,11 @@ class K3DebPackagingTests(unittest.TestCase):
             "/var/lib/harboros-beacon/cat-detection-controls.json",
             unit,
         )
+        self.assertIn(
+            "Environment=HARBOR_K3_PACKAGE_DETECTION_CONTROL_PATH="
+            "/var/lib/harboros-beacon/package-detection-controls.json",
+            unit,
+        )
 
     def test_all_systemd_units_are_packaged_read_only(self):
         script = BUILD_SCRIPT.read_text(encoding="utf-8")
