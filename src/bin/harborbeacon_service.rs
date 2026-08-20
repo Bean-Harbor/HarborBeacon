@@ -25,6 +25,8 @@ use harborbeacon_local_agent::runtime::registry::DeviceRegistryStore;
 use harborbeacon_local_agent::runtime::task_api::TaskApiService;
 use harborbeacon_local_agent::runtime::task_session::TaskConversationStore;
 
+const MODEL_API_TOKEN_ENV: &str = "HARBOR_MODEL_API_TOKEN";
+
 #[derive(Debug, Clone)]
 struct Cli {
     bind: String,
@@ -405,6 +407,7 @@ fn main() {
     let cli = Cli::parse();
     let semantic_router_topology = semantic_router_topology()
         .unwrap_or_else(|error| fail(&format!("invalid semantic-router topology: {error}")));
+    require_model_api_token().unwrap_or_else(|error| fail(&error));
     let service_token = resolve_service_token(cli.service_token.clone());
     let service = HarborBeaconService::new(&cli, service_token, semantic_router_topology);
     let server = Server::http(&cli.bind).unwrap_or_else(|error| {
@@ -422,6 +425,22 @@ fn main() {
         let service = service.clone();
         thread::spawn(move || service.handle(request));
     }
+}
+
+fn require_model_api_token() -> Result<String, String> {
+    let token = env::var(MODEL_API_TOKEN_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{MODEL_API_TOKEN_ENV} is not configured"))?;
+    if token.len() < 32
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(format!("{MODEL_API_TOKEN_ENV} is invalid"));
+    }
+    Ok(token)
 }
 
 fn inference_model_path(path: &str) -> String {
@@ -626,6 +645,26 @@ mod tests {
             inference_model_path("/api/beacon/inference/v1/chat/completions"),
             "/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn model_api_token_is_required_and_validated() {
+        let _lock = env_lock().lock().expect("env lock");
+        let _token = EnvGuard::remove(MODEL_API_TOKEN_ENV);
+        assert_eq!(
+            require_model_api_token().unwrap_err(),
+            "HARBOR_MODEL_API_TOKEN is not configured"
+        );
+
+        env::set_var(MODEL_API_TOKEN_ENV, "predictable-short-token");
+        assert_eq!(
+            require_model_api_token().unwrap_err(),
+            "HARBOR_MODEL_API_TOKEN is invalid"
+        );
+
+        let valid = "model_token_0123456789abcdef0123456789abcdef";
+        env::set_var(MODEL_API_TOKEN_ENV, valid);
+        assert_eq!(require_model_api_token().unwrap(), valid);
     }
 
     #[test]

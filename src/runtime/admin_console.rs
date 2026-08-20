@@ -909,7 +909,6 @@ fn default_automation_review_status() -> String {
 }
 const MODEL_API_TOKEN_ENV: &str = "HARBOR_MODEL_API_TOKEN";
 const DEFAULT_MODEL_API_BASE_URL: &str = "http://127.0.0.1:4174/api/inference/v1";
-const DEFAULT_MODEL_API_TOKEN: &str = "harbor-local-model-token";
 
 impl AdminConsoleStore {
     pub fn new(path: impl Into<PathBuf>, registry_store: DeviceRegistryStore) -> Self {
@@ -3299,16 +3298,37 @@ fn align_embedding_endpoint_identity_with_runtime(endpoint: &mut ModelEndpoint) 
 fn normalize_builtin_local_model_api_endpoint(endpoint: &mut ModelEndpoint) {
     if !matches!(
         endpoint.model_endpoint_id.as_str(),
-        "embed-local-openai-compatible" | "llm-local-openai-compatible"
+        "embed-local-openai-compatible"
+            | "rerank-local-compatible"
+            | "llm-local-openai-compatible"
+            | "vlm-local-openai-compatible"
     ) {
         return;
     }
-    if !endpoint
-        .provider_key
-        .eq_ignore_ascii_case("openai_compatible")
-    {
+    if !model_endpoint_metadata_bool(endpoint, "builtin") {
         return;
     }
+
+    let Some(default_endpoint) = default_model_endpoints()
+        .into_iter()
+        .find(|default| default.model_endpoint_id == endpoint.model_endpoint_id)
+    else {
+        return;
+    };
+    let api_key = default_endpoint
+        .metadata
+        .get("api_key")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    set_model_endpoint_metadata_string(endpoint, "api_key", api_key);
+    set_model_endpoint_metadata_bool(
+        endpoint,
+        "api_key_configured",
+        model_endpoint_metadata_bool(&default_endpoint, "api_key_configured"),
+    );
+    set_model_endpoint_metadata_bool(endpoint, "api_key_required", true);
+
     if endpoint.model_endpoint_id == "llm-local-openai-compatible" {
         ensure_model_endpoint_tag(endpoint, "assistant_input_parser");
         ensure_model_endpoint_tag(endpoint, "k3_nsp");
@@ -3330,23 +3350,11 @@ fn normalize_builtin_local_model_api_endpoint(endpoint: &mut ModelEndpoint) {
         return;
     }
 
-    let Some(default_endpoint) = default_model_endpoints()
-        .into_iter()
-        .find(|default| default.model_endpoint_id == endpoint.model_endpoint_id)
-    else {
-        return;
-    };
-
-    for key in ["base_url", "healthz_url", "api_key"] {
+    for key in ["base_url", "healthz_url"] {
         if let Some(value) = model_endpoint_metadata_string(&default_endpoint, key) {
             set_model_endpoint_metadata_string(endpoint, key, value);
         }
     }
-    set_model_endpoint_metadata_bool(
-        endpoint,
-        "api_key_configured",
-        model_endpoint_metadata_bool(&default_endpoint, "api_key_configured"),
-    );
     set_model_endpoint_metadata_bool(endpoint, "legacy_model_api_migrated", true);
     set_model_endpoint_metadata_string(
         endpoint,
@@ -3594,6 +3602,7 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
     let local_base_url = local_model_api_base_url();
     let local_healthz_url = local_model_api_healthz_url(&local_base_url);
     let local_api_key = local_model_api_token();
+    let local_api_key_configured = !local_api_key.is_empty();
     vec![
         ModelEndpoint {
             model_endpoint_id: "ocr-local-tesseract".to_string(),
@@ -3633,7 +3642,8 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
                 "base_url": local_base_url.clone(),
                 "healthz_url": local_healthz_url.clone(),
                 "api_key": local_api_key.clone(),
-                "api_key_configured": true,
+                "api_key_configured": local_api_key_configured,
+                "api_key_required": true,
             }),
         },
         ModelEndpoint {
@@ -3652,7 +3662,8 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
                 "base_url": local_base_url.clone(),
                 "healthz_url": local_healthz_url.clone(),
                 "api_key": local_api_key.clone(),
-                "api_key_configured": true,
+                "api_key_configured": local_api_key_configured,
+                "api_key_required": true,
                 "rerank_path": "/rerank",
                 "cloud_fallback_allowed": false,
             }),
@@ -3679,7 +3690,8 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
                 "base_url": local_base_url.clone(),
                 "healthz_url": local_healthz_url.clone(),
                 "api_key": local_api_key.clone(),
-                "api_key_configured": true,
+                "api_key_configured": local_api_key_configured,
+                "api_key_required": true,
                 "semantic_router": true,
                 "local_only": true,
                 "cloud_fallback_allowed": false,
@@ -3737,7 +3749,8 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
                 "base_url": local_base_url,
                 "healthz_url": local_healthz_url,
                 "api_key": local_api_key,
-                "api_key_configured": true,
+                "api_key_configured": local_api_key_configured,
+                "api_key_required": true,
             }),
         },
     ]
@@ -3765,7 +3778,7 @@ fn local_model_api_token() -> String {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_MODEL_API_TOKEN.to_string())
+        .unwrap_or_default()
 }
 
 pub fn default_model_route_policies() -> Vec<ModelRoutePolicy> {
@@ -7099,6 +7112,53 @@ mod tests {
             json!("http://127.0.0.1:4174/api/inference/healthz")
         );
         assert_eq!(endpoint.metadata["legacy_model_api_migrated"], json!(true));
+    }
+
+    #[test]
+    fn sanitize_model_center_replaces_persisted_builtin_fixed_model_token() {
+        let previous = std::env::var("HARBOR_MODEL_API_TOKEN").ok();
+        let current_token = "current_model_token_0123456789abcdef0123456789abcdef";
+        std::env::set_var("HARBOR_MODEL_API_TOKEN", current_token);
+        let state = AdminModelCenterState {
+            endpoints: vec![ModelEndpoint {
+                model_endpoint_id: "llm-local-openai-compatible".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Llm,
+                endpoint_kind: ModelEndpointKind::Local,
+                provider_key: "openai_compatible".to_string(),
+                model_name: "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
+                capability_tags: vec!["local_first".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({
+                    "builtin": true,
+                    "base_url": "http://127.0.0.1:4174/api/inference/v1",
+                    "healthz_url": "http://127.0.0.1:4174/api/inference/healthz",
+                    "api_key": "harbor-local-model-token",
+                    "api_key_configured": true,
+                }),
+            }],
+            route_policies: default_model_route_policies(),
+            model_store_root: default_model_store_root(),
+            capability_bindings: Vec::new(),
+            runtimes: Vec::new(),
+        };
+
+        let sanitized = sanitize_model_center_state(state);
+        if let Some(value) = previous {
+            std::env::set_var("HARBOR_MODEL_API_TOKEN", value);
+        } else {
+            std::env::remove_var("HARBOR_MODEL_API_TOKEN");
+        }
+        let endpoint = sanitized
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "llm-local-openai-compatible")
+            .expect("llm endpoint");
+        assert_eq!(endpoint.metadata["api_key"], json!(current_token));
+        assert_eq!(endpoint.metadata["api_key_configured"], json!(true));
+        assert_eq!(endpoint.metadata["api_key_required"], json!(true));
     }
 
     #[test]

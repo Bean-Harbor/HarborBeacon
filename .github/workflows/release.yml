@@ -68,6 +68,12 @@ jobs:
           cp ./debian/harboros-beacon.service ${PKG_DIR}/etc/systemd/system/
           chmod 0644 ${PKG_DIR}/etc/systemd/system/harboros-beacon.service
 
+          mkdir -p ${PKG_DIR}/usr/lib/harboros-beacon
+          cp ./debian/validate-harborbeacon-service-auth ${PKG_DIR}/usr/lib/harboros-beacon/
+          chmod 0755 ${PKG_DIR}/usr/lib/harboros-beacon/validate-harborbeacon-service-auth
+          cp ./debian/ensure-harborbeacon-model-token ${PKG_DIR}/usr/lib/harboros-beacon/
+          chmod 0755 ${PKG_DIR}/usr/lib/harboros-beacon/ensure-harborbeacon-model-token
+
           cp ./debian/control ${PKG_DIR}/DEBIAN/control
           sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g" ${PKG_DIR}/DEBIAN/control
           sed -i "s/ARCH_PLACEHOLDER/amd64/g" ${PKG_DIR}/DEBIAN/control

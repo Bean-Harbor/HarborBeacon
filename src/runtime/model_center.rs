@@ -2555,7 +2555,9 @@ fn openai_compatible_config_from_endpoint(
 ) -> Option<OpenAiCompatibleConfig> {
     let base_url = metadata_string(&endpoint.metadata, "base_url")?;
     let api_key = metadata_string(&endpoint.metadata, "api_key").unwrap_or_default();
-    if endpoint.endpoint_kind == ModelEndpointKind::Cloud && api_key.trim().is_empty() {
+    let api_key_required = endpoint.endpoint_kind == ModelEndpointKind::Cloud
+        || metadata_bool(&endpoint.metadata, "api_key_required");
+    if api_key_required && api_key.trim().is_empty() {
         return None;
     }
     let model = if endpoint.model_kind == ModelKind::Embedder {
@@ -3306,6 +3308,29 @@ mod tests {
         assert_eq!(config.base_url, "http://127.0.0.1:8091/v1");
         assert_eq!(config.api_key, "");
         assert_eq!(config.model, "Qwen3-1.7B-Q8_0.gguf");
+    }
+
+    #[test]
+    fn local_endpoint_with_required_api_key_fails_closed_when_empty() {
+        let endpoint = ModelEndpoint {
+            model_endpoint_id: "llm-local-required-auth".to_string(),
+            workspace_id: Some("home-1".to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Llm,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "openai_compatible".to_string(),
+            model_name: "local-model".to_string(),
+            capability_tags: vec!["local_first".to_string()],
+            cost_policy: json!({}),
+            status: ModelEndpointStatus::Active,
+            metadata: json!({
+                "base_url": "http://127.0.0.1:4174/api/inference/v1",
+                "api_key": "",
+                "api_key_required": true,
+            }),
+        };
+
+        assert!(openai_compatible_config_from_endpoint(&endpoint).is_none());
     }
 
     #[test]

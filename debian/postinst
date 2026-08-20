@@ -49,6 +49,8 @@ ensure_harborbeacon_runtime_env() {
   append_env_if_missing "$env_file" "HARBOR_SEMANTIC_ROUTER_LOCAL_ONLY" "1"
 }
 
+/usr/lib/harboros-beacon/validate-harborbeacon-service-auth
+/usr/lib/harboros-beacon/ensure-harborbeacon-model-token
 ensure_harborbeacon_runtime_env
 install -d -o harborbeacon -g harborbeacon -m 0750 \
   /var/lib/harboros-beacon /mnt/software/harborbeacon-agent-ci

@@ -1,7 +1,8 @@
 [Unit]
 Description=HarborOS Beacon API Service
 Wants=harborlink.target
-After=network.target harborlink.target
+Requires=harboros-service-auth-recovery.service
+After=network.target harborlink.target harboros-service-auth-recovery.service
 
 [Service]
 Type=simple
