@@ -44,9 +44,8 @@ fn beacon_unit_receives_only_role_scoped_service_credentials() {
     assert!(unit.contains("LoadCredential=gate-to-beacon-accept-previous:"));
     assert!(unit.contains("LoadCredential=beacon-to-gate-send:"));
     assert!(unit.contains("Requires=harboros-service-auth-recovery.service"));
-    assert!(
-        unit.contains("After=network.target harborlink.target harboros-service-auth-recovery.service")
-    );
+    assert!(unit
+        .contains("After=network.target harborlink.target harboros-service-auth-recovery.service"));
     assert!(!unit.contains("gate-to-beacon.send"));
     assert!(!unit.contains("beacon-to-gate.accept-current"));
     assert!(!unit.contains("HARBOR_TASK_API_BEARER_TOKEN"));
@@ -91,9 +90,7 @@ fn package_includes_independent_model_token_writer() {
     assert!(workflow.contains("ensure-harborbeacon-model-token"));
     assert!(k3_builder.contains("ensure-harborbeacon-model-token"));
     assert!(k3_builder.contains("validate-harborbeacon-service-auth"));
-    assert!(
-        k3_builder.contains("harboros-im-gate, harboros-service-auth-abi (>= 1)")
-    );
+    assert!(k3_builder.contains("harboros-im-gate, harboros-service-auth-abi (>= 1)"));
     assert!(!k3_builder.contains("harboros-im-gate (>= ${debian_version})"));
     assert!(writer.contains("HARBOR_MODEL_API_TOKEN"));
     for forbidden in [
@@ -126,20 +123,19 @@ fn runtime_has_no_predictable_model_token_fallback() {
 
 #[test]
 fn ci_runs_service_auth_integration_test() {
-    let workflow = fs::read_to_string(repo_root().join(".github/workflows/contract-pr-check.yml"))
-        .unwrap();
+    let workflow =
+        fs::read_to_string(repo_root().join(".github/workflows/contract-pr-check.yml")).unwrap();
     assert!(workflow.contains("cargo test --locked --bin harboros-beacon -- --test-threads=1"));
-    assert!(workflow.contains(
-        "cargo test --locked --test service_auth_hardening -- --test-threads=1"
-    ));
+    assert!(
+        workflow.contains("cargo test --locked --test service_auth_hardening -- --test-threads=1")
+    );
     assert!(workflow.contains("bash tests/test_harbornavi_k3_gate_companion.sh"));
 }
 
 #[test]
 fn k3_builder_validates_companion_gate_before_build_and_records_evidence() {
     let root = repo_root();
-    let builder =
-        fs::read_to_string(root.join("scripts/build_harbornavi_k3_deb.sh")).unwrap();
+    let builder = fs::read_to_string(root.join("scripts/build_harbornavi_k3_deb.sh")).unwrap();
     let validator =
         fs::read_to_string(root.join("scripts/validate_harbornavi_k3_gate_deb.sh")).unwrap();
     let focused_test =
@@ -157,9 +153,8 @@ fn k3_builder_validates_companion_gate_before_build_and_records_evidence() {
     assert!(required_input < first_cargo_build);
     assert!(validation < first_cargo_build);
     assert!(builder.contains("-L \"$gate_companion_source\""));
-    assert!(builder.contains(
-        "cp --no-dereference -- \"$gate_companion_source\" \"$gate_companion_deb\""
-    ));
+    assert!(builder
+        .contains("cp --no-dereference -- \"$gate_companion_source\" \"$gate_companion_deb\""));
 
     for contract in [
         "-L \"$gate_deb\"",
@@ -246,7 +241,11 @@ fn service_auth_preflight_accepts_rotation_state_and_rejects_invalid_current() {
         .env("HARBOR_SERVICE_AUTH_DIR", &auth_dir)
         .output()
         .expect("run credential preflight");
-    assert!(valid.status.success(), "{}", String::from_utf8_lossy(&valid.stderr));
+    assert!(
+        valid.status.success(),
+        "{}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
 
     write_mode_0600(&auth_dir.join("gate-to-beacon.accept-current"), "short");
     let invalid = Command::new("bash")
@@ -260,10 +259,7 @@ fn service_auth_preflight_accepts_rotation_state_and_rejects_invalid_current() {
         &auth_dir.join("gate-to-beacon.accept-current"),
         gate_to_beacon,
     );
-    write_mode_0600(
-        &auth_dir.join("beacon-to-gate.send"),
-        gate_to_beacon,
-    );
+    write_mode_0600(&auth_dir.join("beacon-to-gate.send"), gate_to_beacon);
     let reused_domain = Command::new("bash")
         .arg(&validator)
         .env("HARBOR_SERVICE_AUTH_DIR", &auth_dir)
@@ -286,7 +282,11 @@ fn model_token_writer_is_idempotent_private_and_atomic() {
         .env("HARBORBEACON_RUNTIME_ENV_FILE", &env_file)
         .output()
         .expect("run model token writer");
-    assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
     let first_bytes = fs::read(&env_file).expect("read generated env");
     let first_text = String::from_utf8_lossy(&first_bytes);
     let token = first_text
@@ -297,7 +297,10 @@ fn model_token_writer_is_idempotent_private_and_atomic() {
     assert!(token
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')));
-    assert_eq!(fs::metadata(&env_file).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        fs::metadata(&env_file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 
     let second = Command::new("bash")
         .arg(&writer)
@@ -337,10 +340,7 @@ fn model_token_writer_parses_safe_environment_syntax_and_rejects_invalid_known_k
             "single-quoted",
             format!("\tHARBOR_MODEL_API_TOKEN\t=\t'{token}'\t\n"),
         ),
-        (
-            "unquoted",
-            format!("HARBOR_MODEL_API_TOKEN={token}\n"),
-        ),
+        ("unquoted", format!("HARBOR_MODEL_API_TOKEN={token}\n")),
     ] {
         let env_file = dir.join(name);
         let original = format!("OTHER=value\n{assignment}");
@@ -350,7 +350,11 @@ fn model_token_writer_parses_safe_environment_syntax_and_rejects_invalid_known_k
             .env("HARBORBEACON_RUNTIME_ENV_FILE", &env_file)
             .output()
             .expect("run model token parser");
-        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
         assert_eq!(fs::read_to_string(&env_file).unwrap(), original);
     }
 
