@@ -25246,6 +25246,12 @@ mod tests {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
+
+    fn model_api_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
     use tiny_http::{Header, Method, Server, StatusCode};
 
     #[test]
@@ -33553,6 +33559,11 @@ mod tests {
 
     #[test]
     fn runtime_overlay_promotes_live_local_llm_and_embedder_rows() {
+        let _env_lock = model_api_env_lock().lock().expect("model API env lock");
+        let _model_token = EnvGuard::set(
+            "HARBOR_MODEL_API_TOKEN",
+            "test_model_api_token_0123456789abcdef0123456789abcdef",
+        );
         let mut endpoints =
             harborbeacon_local_agent::runtime::admin_console::default_model_endpoints();
         for endpoint in &mut endpoints {
@@ -33623,6 +33634,11 @@ mod tests {
 
     #[test]
     fn runtime_probe_falls_back_to_builtin_local_endpoint_urls() {
+        let _env_lock = model_api_env_lock().lock().expect("model API env lock");
+        let _model_token = EnvGuard::set(
+            "HARBOR_MODEL_API_TOKEN",
+            "test_model_api_token_0123456789abcdef0123456789abcdef",
+        );
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let addr = listener.local_addr().expect("local addr");
         let server = thread::spawn(move || {
