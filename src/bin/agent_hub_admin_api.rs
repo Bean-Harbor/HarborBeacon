@@ -173,9 +173,12 @@ use harborbeacon_local_agent::runtime::vision_event::{
     local_vision_event_store_stats_default, LocalVisionEvent, StoredLocalVisionEvent,
     MAX_LOCAL_VISION_EVENT_JSON_BYTES,
 };
+use harborbeacon_local_agent::service_auth::{
+    beacon_to_gate_sender_token, gate_to_beacon_verifier_tokens, validate_required_service_auth,
+    VerifierTokens, GATE_TO_BEACON_TOKEN_ENV,
+};
 
 const DEFAULT_HF_ENDPOINT: &str = "https://hf-mirror.com";
-const HARBORBEACON_WEB_API_TOKEN_ENV: &str = "HARBORBEACON_WEB_API_TOKEN";
 const KNOWLEDGE_EMBEDDING_WARMUP_TIMEOUT_MS_ENV: &str =
     "HARBORBEACON_KNOWLEDGE_EMBEDDING_WARMUP_TIMEOUT_MS";
 const DEFAULT_KNOWLEDGE_EMBEDDING_WARMUP_TIMEOUT_MS: u64 = 120_000;
@@ -3694,9 +3697,10 @@ impl AdminApi {
         raw_url: &str,
         headers: &[Header],
     ) -> Result<GateAuthenticatedPrincipal, GatePrincipalAuthError> {
-        let configured_token = env::var(HARBORBEACON_WEB_API_TOKEN_ENV).ok();
-        authenticate_gate_principal_with_workspace_loader(
-            configured_token.as_deref(),
+        let configured_tokens = gate_to_beacon_verifier_tokens()
+            .map_err(|error| GatePrincipalAuthError::new(StatusCode(503), error))?;
+        authenticate_gate_principal_with_workspace_loader_tokens(
+            Some(&configured_tokens),
             raw_url,
             headers,
             || {
@@ -11745,6 +11749,10 @@ fn principal_skips_manual_camera_connect_approval(principal: &AccessPrincipal) -
 
 fn main() {
     let cli = Cli::parse();
+    if let Err(error) = validate_required_service_auth() {
+        eprintln!("service authentication configuration failed: {error}");
+        std::process::exit(1);
+    }
     let device_registry_path = resolve_state_path(&cli.device_registry);
     let admin_state_path = resolve_state_path(&cli.admin_state);
     std::env::set_var(ADMIN_STATE_PATH_ENV, &admin_state_path);
@@ -12018,22 +12026,39 @@ fn authenticate_gate_principal_with_workspace_loader(
     headers: &[Header],
     load_active_workspace: impl FnOnce() -> Result<String, GatePrincipalAuthError>,
 ) -> Result<GateAuthenticatedPrincipal, GatePrincipalAuthError> {
-    validate_gate_service_bearer(configured_token, headers)?;
+    let configured_tokens = configured_token.map(|current| VerifierTokens {
+        current: current.to_string(),
+        previous: None,
+    });
+    authenticate_gate_principal_with_workspace_loader_tokens(
+        configured_tokens.as_ref(),
+        raw_url,
+        headers,
+        load_active_workspace,
+    )
+}
+
+fn authenticate_gate_principal_with_workspace_loader_tokens(
+    configured_tokens: Option<&VerifierTokens>,
+    raw_url: &str,
+    headers: &[Header],
+    load_active_workspace: impl FnOnce() -> Result<String, GatePrincipalAuthError>,
+) -> Result<GateAuthenticatedPrincipal, GatePrincipalAuthError> {
+    validate_gate_service_bearer(configured_tokens, headers)?;
     let active_workspace_id = load_active_workspace()?;
     authenticate_gate_principal_identity(raw_url, headers, &active_workspace_id)
 }
 
 fn validate_gate_service_bearer(
-    configured_token: Option<&str>,
+    configured_tokens: Option<&VerifierTokens>,
     headers: &[Header],
 ) -> Result<(), GatePrincipalAuthError> {
-    let expected_token = configured_token
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+    let configured_tokens = configured_tokens
+        .filter(|tokens| !tokens.current.trim().is_empty())
         .ok_or_else(|| {
             GatePrincipalAuthError::new(
                 StatusCode(503),
-                format!("{HARBORBEACON_WEB_API_TOKEN_ENV} is not configured"),
+                format!("{GATE_TO_BEACON_TOKEN_ENV} is not configured"),
             )
         })?;
     let actual_token = header_value(headers, "Authorization")
@@ -12041,7 +12066,7 @@ fn validate_gate_service_bearer(
         .ok_or_else(|| {
             GatePrincipalAuthError::new(StatusCode(401), "missing or invalid bearer token")
         })?;
-    if actual_token != expected_token {
+    if !configured_tokens.matches(&actual_token) {
         return Err(GatePrincipalAuthError::new(
             StatusCode(401),
             "missing or invalid bearer token",
@@ -15113,16 +15138,11 @@ fn deprecated_im_binding_response_html(manage_url: &str) -> Response<std::io::Cu
 }
 
 fn authorize_gateway_service_request(headers: &[Header]) -> Result<(), String> {
-    let expected =
-        env_var_with_legacy_alias("HARBORGATE_BEARER_TOKEN", "HARBOR_IM_GATEWAY_BEARER_TOKEN")
-            .or_else(|| env::var("IM_AGENT_SERVICE_TOKEN").ok())
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| "gateway service token is not configured".to_string())?;
+    let expected = gate_to_beacon_verifier_tokens()?;
     let actual = header_value(headers, "Authorization")
         .and_then(|value| parse_bearer_token(&value))
         .ok_or_else(|| "missing or invalid bearer token".to_string())?;
-    if actual != expected {
+    if !expected.matches(&actual) {
         return Err("missing or invalid bearer token".to_string());
     }
     Ok(())
@@ -22954,8 +22974,6 @@ fn live_bridge_provider_from_setup_status(payload: &Value) -> Option<BridgeProvi
 fn fetch_remote_gateway_status() -> Result<Value, String> {
     const PRIMARY_BASE_URL: &str = "HARBORGATE_BASE_URL";
     const LEGACY_BASE_URL: &str = "HARBOR_IM_GATEWAY_BASE_URL";
-    const PRIMARY_TOKEN: &str = "HARBORGATE_BEARER_TOKEN";
-    const LEGACY_TOKEN: &str = "HARBOR_IM_GATEWAY_BEARER_TOKEN";
 
     let base_url = env_var_with_legacy_alias(PRIMARY_BASE_URL, LEGACY_BASE_URL)
         .ok_or_else(|| format!("missing required env var {PRIMARY_BASE_URL}"))?;
@@ -22965,10 +22983,11 @@ fn fetch_remote_gateway_status() -> Result<Value, String> {
         .build()
         .map_err(|error| format!("failed to build HarborGate status client: {error}"))?;
 
-    let mut request = client.get(endpoint).header("X-Contract-Version", "2.0");
-    if let Some(token) = env_var_with_legacy_alias(PRIMARY_TOKEN, LEGACY_TOKEN) {
-        request = request.header("Authorization", format!("Bearer {token}"));
-    }
+    let token = beacon_to_gate_sender_token()?;
+    let request = client
+        .get(endpoint)
+        .header("X-Contract-Version", "2.0")
+        .header("Authorization", format!("Bearer {token}"));
 
     let response = request
         .send()
@@ -25140,7 +25159,7 @@ mod tests {
         HomeGuardianEvaluationQueue, KnowledgeSearchApiRequest, LocalModelRuntimeProjection,
         ManualAddRequest, ModelRuntimeActivationRequest, ModelRuntimeActivationResult,
         OutreachDeliveryRecipientRequest, OutreachDeliveryRequest, VisionIngestLimiter,
-        DEFAULT_HF_ENDPOINT, HARBORBEACON_WEB_API_TOKEN_ENV, HARBOR_ASSISTANT_SEARCH_SURFACE,
+        DEFAULT_HF_ENDPOINT, GATE_TO_BEACON_TOKEN_ENV, HARBOR_ASSISTANT_SEARCH_SURFACE,
         HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS, HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS,
         MAX_DETECTION_JOB_HISTORY, MAX_VISION_EVENT_INGEST_INFLIGHT, PRIVACY_GATEWAY_AUDIT_ACTION,
     };
@@ -34371,7 +34390,7 @@ mod tests {
         let _env_lock = gate_principal_env_lock()
             .lock()
             .expect("gate principal env lock");
-        let _token = EnvGuard::set(HARBORBEACON_WEB_API_TOKEN_ENV, "service-token");
+        let _token = EnvGuard::set(GATE_TO_BEACON_TOKEN_ENV, "service-token");
         let job_id = "yolo-gate-auth-http";
         let (api, paths) = build_test_admin_api("detection-gate-auth-http");
         api.detection_jobs.lock().expect("detection jobs").insert(
@@ -34457,7 +34476,7 @@ mod tests {
         let _env_lock = gate_principal_env_lock()
             .lock()
             .expect("gate principal env lock");
-        let _token = EnvGuard::set(HARBORBEACON_WEB_API_TOKEN_ENV, "service-token");
+        let _token = EnvGuard::set(GATE_TO_BEACON_TOKEN_ENV, "service-token");
         let job_id = "yolo-direct-observation";
         let (api, paths) = build_test_admin_api("detection-direct-observation");
         let mut runtime = sample_running_detection_job(job_id, "camera.252", false, None);
@@ -34663,14 +34682,24 @@ mod tests {
 
     #[test]
     fn gateway_service_request_requires_matching_bearer_token() {
-        let headers = vec![Header::from_bytes(
+        let current_headers = vec![Header::from_bytes(
             b"Authorization".as_slice(),
-            b"Bearer shared-token".as_slice(),
+            b"Bearer gate-to-beacon-current".as_slice(),
         )
         .expect("header")];
-        let _guard = EnvGuard::set("HARBORGATE_BEARER_TOKEN", "shared-token");
+        let previous_headers = vec![Header::from_bytes(
+            b"Authorization".as_slice(),
+            b"Bearer gate-to-beacon-previous".as_slice(),
+        )
+        .expect("header")];
+        let _current = EnvGuard::set(GATE_TO_BEACON_TOKEN_ENV, "gate-to-beacon-current");
+        let _previous = EnvGuard::set(
+            "HARBOR_GATE_TO_BEACON_TOKEN_PREVIOUS",
+            "gate-to-beacon-previous",
+        );
 
-        assert!(authorize_gateway_service_request(&headers).is_ok());
+        assert!(authorize_gateway_service_request(&current_headers).is_ok());
+        assert!(authorize_gateway_service_request(&previous_headers).is_ok());
         assert!(authorize_gateway_service_request(&[]).is_err());
     }
 

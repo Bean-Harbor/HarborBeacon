@@ -8,12 +8,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::service_auth::beacon_to_gate_sender_token;
+
 pub const CONTRACT_VERSION: &str = "2.0";
 const IM_GATEWAY_BASE_URL_ENV: &str = "HARBORGATE_BASE_URL";
-const IM_GATEWAY_BEARER_TOKEN_ENV: &str = "HARBORGATE_BEARER_TOKEN";
 const LEGACY_IM_GATEWAY_BASE_URL_ENV: &str = "HARBOR_IM_GATEWAY_BASE_URL";
-const LEGACY_IM_GATEWAY_BEARER_TOKEN_ENV: &str = "HARBOR_IM_GATEWAY_BEARER_TOKEN";
-const SHARED_IM_AGENT_SERVICE_TOKEN_ENV: &str = "IM_AGENT_SERVICE_TOKEN";
 const DEFAULT_LOCAL_IM_GATEWAY_BASE_URL: &str = "http://127.0.0.1:8787";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,12 +197,7 @@ impl NotificationGatewayConfig {
         let base_url =
             env_var_with_legacy_alias(IM_GATEWAY_BASE_URL_ENV, LEGACY_IM_GATEWAY_BASE_URL_ENV)
                 .unwrap_or_else(|| DEFAULT_LOCAL_IM_GATEWAY_BASE_URL.to_string());
-        let bearer_token = env_var_with_legacy_alias(
-            IM_GATEWAY_BEARER_TOKEN_ENV,
-            LEGACY_IM_GATEWAY_BEARER_TOKEN_ENV,
-        )
-        .or_else(|| env_var(SHARED_IM_AGENT_SERVICE_TOKEN_ENV))
-        .ok_or_else(|| format!("missing required env var {IM_GATEWAY_BEARER_TOKEN_ENV}"))?;
+        let bearer_token = beacon_to_gate_sender_token()?;
         Self::new(base_url, bearer_token)
     }
 
@@ -391,9 +385,7 @@ mod tests {
         NotificationDestinationKind, NotificationErrorDetail, NotificationGatewayConfig,
         NotificationMetadata, NotificationPayloadFormat, NotificationRequest, NotificationSource,
         SharedHttpErrorDetail, SharedHttpErrorEnvelope, CONTRACT_VERSION,
-        DEFAULT_LOCAL_IM_GATEWAY_BASE_URL, IM_GATEWAY_BASE_URL_ENV, IM_GATEWAY_BEARER_TOKEN_ENV,
-        LEGACY_IM_GATEWAY_BASE_URL_ENV, LEGACY_IM_GATEWAY_BEARER_TOKEN_ENV,
-        SHARED_IM_AGENT_SERVICE_TOKEN_ENV,
+        DEFAULT_LOCAL_IM_GATEWAY_BASE_URL, IM_GATEWAY_BASE_URL_ENV, LEGACY_IM_GATEWAY_BASE_URL_ENV,
     };
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -505,19 +497,21 @@ mod tests {
     }
 
     #[test]
-    fn notification_gateway_config_accepts_shared_gate_defaults() {
+    fn notification_gateway_config_accepts_directional_gate_token() {
         let _env = EnvGuard::scoped(&[
             (IM_GATEWAY_BASE_URL_ENV, None),
             (LEGACY_IM_GATEWAY_BASE_URL_ENV, None),
-            (IM_GATEWAY_BEARER_TOKEN_ENV, None),
-            (LEGACY_IM_GATEWAY_BEARER_TOKEN_ENV, None),
-            (SHARED_IM_AGENT_SERVICE_TOKEN_ENV, Some("shared-gate-token")),
+            ("HARBOR_BEACON_TO_GATE_TOKEN_FILE", None),
+            ("HARBOR_BEACON_TO_GATE_TOKEN", Some("beacon-to-gate-token")),
+            ("HARBORGATE_BEARER_TOKEN", None),
+            ("HARBOR_IM_GATEWAY_BEARER_TOKEN", None),
+            ("IM_AGENT_SERVICE_TOKEN", None),
         ]);
 
         let config = NotificationGatewayConfig::from_env().expect("config");
 
         assert_eq!(config.base_url, DEFAULT_LOCAL_IM_GATEWAY_BASE_URL);
-        assert_eq!(config.bearer_token, "shared-gate-token");
+        assert_eq!(config.bearer_token, "beacon-to-gate-token");
     }
 
     #[test]

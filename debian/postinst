@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 if ! getent group harborbeacon >/dev/null 2>&1; then
   addgroup --system harborbeacon
@@ -7,23 +7,6 @@ fi
 if ! id harborbeacon >/dev/null 2>&1; then
   adduser --system --ingroup harborbeacon --home /var/lib/harboros-beacon --no-create-home harborbeacon
 fi
-
-ensure_shared_token_env() {
-  local env_file="/etc/default/harboros-beacon-gate"
-  if [ -f "$env_file" ]; then
-    return
-  fi
-
-  local token
-  token="$(openssl rand -hex 32 2>/dev/null || tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48)"
-  install -d -m 0755 /etc/default
-  umask 077
-  cat > "$env_file" <<EOF
-HARBOR_TASK_API_BEARER_TOKEN=$token
-HARBORBEACON_WEB_API_TOKEN=$token
-IM_AGENT_SERVICE_TOKEN=$token
-EOF
-}
 
 append_env_if_missing() {
   local env_file="$1"
@@ -45,32 +28,19 @@ upsert_env_value() {
   fi
 }
 
-shared_token() {
-  local env_file="/etc/default/harboros-beacon-gate"
-  if [ ! -f "$env_file" ]; then
-    return
-  fi
-  sed -n 's/^HARBOR_TASK_API_BEARER_TOKEN=//p' "$env_file" | tail -n 1
-}
-
 ensure_harborbeacon_runtime_env() {
   local env_file="/etc/default/harboros-beacon"
   local writable_root="/mnt/software/harborbeacon-agent-ci"
   local candle_root="${writable_root}/model-store/runtimes/harbor-candle"
-  local token
 
   install -d -m 0755 /etc/default
   install -d -m 0755 "${candle_root}/cache"
   install -d -m 0755 "${candle_root}/bootstrap-llm"
   touch "$env_file"
-  chmod 0644 "$env_file"
+  chmod 0600 "$env_file"
 
   append_env_if_missing "$env_file" "HARBOR_HARBOROS_WRITABLE_ROOT" "$writable_root"
   append_env_if_missing "$env_file" "HARBOR_MODEL_API_BASE_URL" "http://127.0.0.1:4174/api/inference/v1"
-  token="$(shared_token || true)"
-  if [ -n "$token" ]; then
-    append_env_if_missing "$env_file" "HARBOR_MODEL_API_TOKEN" "$token"
-  fi
   append_env_if_missing "$env_file" "HARBOR_MODEL_API_BACKEND" "candle"
   append_env_if_missing "$env_file" "HARBOR_MODEL_API_CHAT_MODEL" "Qwen/Qwen2.5-0.5B-Instruct"
   append_env_if_missing "$env_file" "HARBOR_MODEL_API_CANDLE_CHAT_MODEL_ID" "${candle_root}/bootstrap-llm"
@@ -79,7 +49,6 @@ ensure_harborbeacon_runtime_env() {
   append_env_if_missing "$env_file" "HARBOR_SEMANTIC_ROUTER_LOCAL_ONLY" "1"
 }
 
-ensure_shared_token_env
 ensure_harborbeacon_runtime_env
 install -d -o harborbeacon -g harborbeacon -m 0750 \
   /var/lib/harboros-beacon /mnt/software/harborbeacon-agent-ci

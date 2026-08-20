@@ -28,7 +28,12 @@ Environment=HARBOR_AI_RESOURCE_LEASE_WAIT_TIMEOUT_MS=60000
 LoadCredential=harborlink-local-api-token:/etc/harborlink/local-api.token
 Environment=HARBORLINK_LOCAL_API_TOKEN_FILE=%d/harborlink-local-api-token
 Environment=HARBOR_VISION_EVENT_STORE_PATH=/var/lib/harboros-beacon/vision-events.jsonl
-EnvironmentFile=-/etc/default/harboros-beacon-gate
+LoadCredential=gate-to-beacon-accept-current:/etc/harboros/service-auth/gate-to-beacon.accept-current
+LoadCredential=gate-to-beacon-accept-previous:/etc/harboros/service-auth/gate-to-beacon.accept-previous
+LoadCredential=beacon-to-gate-send:/etc/harboros/service-auth/beacon-to-gate.send
+Environment=HARBOR_GATE_TO_BEACON_TOKEN_FILE=%d/gate-to-beacon-accept-current
+Environment=HARBOR_GATE_TO_BEACON_TOKEN_PREVIOUS_FILE=%d/gate-to-beacon-accept-previous
+Environment=HARBOR_BEACON_TO_GATE_TOKEN_FILE=%d/beacon-to-gate-send
 EnvironmentFile=-/etc/default/harboros-beacon
 ExecStart=/usr/bin/harboros-beacon --bind 127.0.0.1:4174 --admin-state /var/lib/harboros-beacon/admin-console.json --device-registry /var/lib/harboros-beacon/device-registry.json --conversations /var/lib/harboros-beacon/task-api-conversations.json --harbor-assistant-dist /usr/share/truenas/webui --public-origin http://127.0.0.1:4174
 Restart=always

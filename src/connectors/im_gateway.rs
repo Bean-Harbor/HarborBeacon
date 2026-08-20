@@ -6,11 +6,11 @@ use std::time::Duration;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 
+use crate::service_auth::beacon_to_gate_sender_token;
+
 pub const CONTRACT_VERSION: &str = "2.0";
 pub const IM_GATEWAY_BASE_URL_ENV: &str = "HARBORGATE_BASE_URL";
-pub const IM_GATEWAY_BEARER_TOKEN_ENV: &str = "HARBORGATE_BEARER_TOKEN";
 pub const LEGACY_IM_GATEWAY_BASE_URL_ENV: &str = "HARBOR_IM_GATEWAY_BASE_URL";
-pub const LEGACY_IM_GATEWAY_BEARER_TOKEN_ENV: &str = "HARBOR_IM_GATEWAY_BEARER_TOKEN";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct GatewayPlatformCapabilities {
@@ -58,11 +58,7 @@ impl GatewayClientConfig {
         let base_url =
             env_var_with_legacy_alias(IM_GATEWAY_BASE_URL_ENV, LEGACY_IM_GATEWAY_BASE_URL_ENV)
                 .ok_or_else(|| format!("missing required env var {IM_GATEWAY_BASE_URL_ENV}"))?;
-        let bearer_token = env_var_with_legacy_alias(
-            IM_GATEWAY_BEARER_TOKEN_ENV,
-            LEGACY_IM_GATEWAY_BEARER_TOKEN_ENV,
-        )
-        .ok_or_else(|| format!("missing required env var {IM_GATEWAY_BEARER_TOKEN_ENV}"))?;
+        let bearer_token = beacon_to_gate_sender_token()?;
         Self::new(base_url, bearer_token)
     }
 
