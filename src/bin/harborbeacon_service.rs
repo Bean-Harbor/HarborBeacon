@@ -18,7 +18,9 @@ mod harbor_model_api_support;
 use harbor_model_api_support::{BackendKind, ModelApiConfig, ModelApiService};
 use harborbeacon_local_agent::control_plane::models::{ModelEndpointStatus, ModelKind};
 use harborbeacon_local_agent::runtime::admin_console::AdminConsoleStore;
-use harborbeacon_local_agent::runtime::model_center::ADMIN_STATE_PATH_ENV;
+use harborbeacon_local_agent::runtime::model_center::{
+    semantic_router_topology, SemanticRouterTopology, ADMIN_STATE_PATH_ENV,
+};
 use harborbeacon_local_agent::runtime::registry::DeviceRegistryStore;
 use harborbeacon_local_agent::runtime::task_api::TaskApiService;
 use harborbeacon_local_agent::runtime::task_session::TaskConversationStore;
@@ -124,10 +126,15 @@ struct HarborBeaconService {
     admin_api: agent_hub_admin_api::AdminApi,
     task_api: assistant_task_api::TaskApiHttpServer,
     model_api: Arc<RwLock<ModelApiService>>,
+    semantic_router_topology: SemanticRouterTopology,
 }
 
 impl HarborBeaconService {
-    fn new(cli: &Cli, service_token: String) -> Self {
+    fn new(
+        cli: &Cli,
+        service_token: String,
+        semantic_router_topology: SemanticRouterTopology,
+    ) -> Self {
         env::set_var(ADMIN_STATE_PATH_ENV, &cli.admin_state);
         let registry_store = DeviceRegistryStore::new(cli.device_registry.clone());
         let admin_store = AdminConsoleStore::new(cli.admin_state.clone(), registry_store);
@@ -148,6 +155,7 @@ impl HarborBeaconService {
             .with_model_runtime_activation_handler(model_runtime_activation),
             task_api: assistant_task_api::TaskApiHttpServer::new(task_service, service_token),
             model_api,
+            semantic_router_topology,
         }
     }
 
@@ -161,7 +169,11 @@ impl HarborBeaconService {
                 "admin": "/api/admin/*",
                 "web": "/api/web/*",
                 "inference": "/api/inference/*",
-                "harbor_beacon_inference": "/api/harbor-beacon/inference/*"
+                "harbor_beacon_inference": "/api/harbor-beacon/inference/*",
+                "semantic_router": {
+                    "topology": self.semantic_router_topology.as_str(),
+                    "local_only": true,
+                }
             })));
             return;
         }
@@ -391,8 +403,10 @@ fn model_backend_env_is_explicit() -> bool {
 
 fn main() {
     let cli = Cli::parse();
+    let semantic_router_topology = semantic_router_topology()
+        .unwrap_or_else(|error| fail(&format!("invalid semantic-router topology: {error}")));
     let service_token = resolve_service_token(cli.service_token.clone());
-    let service = HarborBeaconService::new(&cli, service_token);
+    let service = HarborBeaconService::new(&cli, service_token, semantic_router_topology);
     let server = Server::http(&cli.bind).unwrap_or_else(|error| {
         panic!(
             "failed to bind harborbeacon service on {}: {error}",

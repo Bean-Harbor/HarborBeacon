@@ -3,7 +3,13 @@ set -e
 
 systemctl stop harboros-beacon.service || true
 systemctl disable harboros-beacon.service || true
-systemctl stop semantic-router.service || true
-systemctl disable semantic-router.service || true
+
+case "${1:-}" in
+  remove|upgrade|deconfigure|failed-upgrade)
+    if [ -x /usr/lib/harboros-beacon/reconcile-legacy-semantic-router ]; then
+      /usr/lib/harboros-beacon/reconcile-legacy-semantic-router
+    fi
+    ;;
+esac
 
 exit 0

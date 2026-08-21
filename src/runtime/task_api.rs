@@ -14286,6 +14286,7 @@ mod tests {
         KnowledgeSearchResponse,
     };
     use crate::runtime::knowledge_index::{KnowledgeIndexConfig, KnowledgeIndexService};
+    use crate::runtime::model_center::SEMANTIC_ROUTER_TOPOLOGY_ENV;
     use crate::runtime::registry::{
         CameraCapabilities, CameraDevice, CameraStreamRef, DeviceRegistryStore, DeviceStatus,
         ResolvedCameraTarget, StreamTransport,
@@ -14301,6 +14302,7 @@ mod tests {
 
     static RETRIEVAL_GATE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static HARBOROS_TASK_API_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static SEMANTIC_ROUTER_TOPOLOGY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn cat_recording_artifact(id: &str, started_at_epoch_ms: u128) -> HarborLinkRecordingArtifact {
         HarborLinkRecordingArtifact {
@@ -16874,6 +16876,33 @@ mod tests {
                 }),
             })
             .expect("save mock llm endpoint");
+    }
+
+    struct StandaloneSemanticRouterTestEnvironment {
+        previous_topology: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for StandaloneSemanticRouterTestEnvironment {
+        fn drop(&mut self) {
+            restore_env_var(SEMANTIC_ROUTER_TOPOLOGY_ENV, self.previous_topology.take());
+        }
+    }
+
+    fn configure_mock_standalone_general_message_llm(
+        service: &TaskApiService,
+        mock_text: &str,
+    ) -> StandaloneSemanticRouterTestEnvironment {
+        let lock = SEMANTIC_ROUTER_TOPOLOGY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let environment = StandaloneSemanticRouterTestEnvironment {
+            previous_topology: std::env::var_os(SEMANTIC_ROUTER_TOPOLOGY_ENV),
+            _lock: lock,
+        };
+        std::env::set_var(SEMANTIC_ROUTER_TOPOLOGY_ENV, "standalone");
+        configure_mock_general_message_llm(service, mock_text);
+        environment
     }
 
     fn configure_mock_cloud_llm(service: &TaskApiService, mock_text: &str) {
@@ -22479,7 +22508,7 @@ mod tests {
     fn general_message_workflow_compiler_shadow_does_not_override_nsp_plan() {
         let (service, _conversation_store, admin_path, registry_path, conversation_path) =
             build_task_api_service("general-message-workflow-shadow-mismatch");
-        configure_mock_general_message_llm(
+        let _router_environment = configure_mock_standalone_general_message_llm(
             &service,
             r#"{"decision":"capability_summary","confidence":0.95,"reason":"forced mismatch"}"#,
         );
@@ -22673,7 +22702,7 @@ mod tests {
     fn general_message_nsp_routes_named_cat_without_keyword_to_bounded_query() {
         let (service, _conversation_store, admin_path, registry_path, conversation_path) =
             build_task_api_service("general-message-named-cat-query");
-        configure_mock_general_message_llm(
+        let _router_environment = configure_mock_standalone_general_message_llm(
             &service,
             r#"{
                 "decision":"cat_activity_query",
@@ -22807,7 +22836,7 @@ mod tests {
     fn general_message_evt_preflight_runs_short_guard_only() {
         let (service, _conversation_store, admin_path, registry_path, conversation_path) =
             build_task_api_service("general-message-evt-preflight");
-        configure_mock_general_message_llm(
+        let _router_environment = configure_mock_standalone_general_message_llm(
             &service,
             r#"{
                 "decision": "evt_preflight",
@@ -22845,7 +22874,7 @@ mod tests {
     fn general_message_nsp_low_confidence_tool_does_not_execute() {
         let (service, _conversation_store, admin_path, registry_path, conversation_path) =
             build_task_api_service("general-message-nsp-low-confidence");
-        configure_mock_general_message_llm(
+        let _router_environment = configure_mock_standalone_general_message_llm(
             &service,
             r#"{
                 "decision": "camera_snapshot",
@@ -22887,7 +22916,7 @@ mod tests {
         let (posts, server_thread, _harborlink_env) =
             start_mock_harborlink_server(vec![home_assistant_light_entities()], 1);
         configure_mock_harborlink_home_assistant(&service);
-        configure_mock_general_message_llm(
+        let _router_environment = configure_mock_standalone_general_message_llm(
             &service,
             r#"{
                 "decision": "ha_service_action",
@@ -22928,7 +22957,7 @@ mod tests {
     fn general_message_nsp_unsafe_home_assistant_slots_are_blocked() {
         let (service, _conversation_store, admin_path, registry_path, conversation_path) =
             build_task_api_service("general-message-nsp-ha-blocked");
-        configure_mock_general_message_llm(
+        let _router_environment = configure_mock_standalone_general_message_llm(
             &service,
             r#"{
                 "decision": "ha_service_action",
@@ -23911,7 +23940,10 @@ mod tests {
     fn general_message_router_invalid_label_falls_back_to_conversation_act() {
         let (service, _conversation_store, admin_path, registry_path, conversation_path) =
             build_task_api_service("general-message-router-invalid-label");
-        configure_mock_general_message_llm(&service, "camera_snapshot|knowledge_search");
+        let _router_environment = configure_mock_standalone_general_message_llm(
+            &service,
+            "camera_snapshot|knowledge_search",
+        );
 
         let request = TaskRequest {
             task_id: "task-general-router-invalid".to_string(),

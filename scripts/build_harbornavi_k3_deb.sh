@@ -84,7 +84,7 @@ chmod 0644 \
   "$pkg_dir/var/lib/harboros-beacon/vision-models/mobilenetv2-cat-binary-v2-20260806/runtime-contract.json"
 
 sed 's/\r$//' debian/harboros-beacon.service > "$pkg_dir/etc/systemd/system/harboros-beacon.service"
-sed 's/\r$//' debian/semantic-router.service > "$pkg_dir/etc/systemd/system/semantic-router.service"
+sed 's/\r$//' debian/harbornavi-k3/semantic-router.service > "$pkg_dir/etc/systemd/system/semantic-router.service"
 chmod 0644 \
   "$pkg_dir/etc/systemd/system/harboros-beacon.service" \
   "$pkg_dir/etc/systemd/system/semantic-router.service"
@@ -97,8 +97,8 @@ sed \
   > "$pkg_dir/DEBIAN/control"
 printf 'X-HarborNavi-Version: %s\n' "$release_label" >> "$pkg_dir/DEBIAN/control"
 
-sed 's/\r$//' debian/postinst > "$pkg_dir/DEBIAN/postinst"
-sed 's/\r$//' debian/prerm > "$pkg_dir/DEBIAN/prerm"
+sed 's/\r$//' debian/harbornavi-k3/postinst > "$pkg_dir/DEBIAN/postinst"
+sed 's/\r$//' debian/harbornavi-k3/prerm > "$pkg_dir/DEBIAN/prerm"
 chmod 0755 "$pkg_dir/DEBIAN/postinst" "$pkg_dir/DEBIAN/prerm"
 
 cat > "$pkg_dir/usr/share/doc/harboros-beacon/harbornavi-k3-package.txt" <<EOF

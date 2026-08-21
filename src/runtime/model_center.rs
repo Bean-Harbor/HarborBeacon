@@ -4,6 +4,7 @@
 use base64::Engine as _;
 use std::env;
 use std::fs;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -46,11 +47,50 @@ const DEFAULT_TESSERACT_LANGS: &str = "chi_sim+eng";
 const SEMANTIC_ROUTER_BASE_URL_ENV: &str = "HARBOR_SEMANTIC_ROUTER_BASE_URL";
 const SEMANTIC_ROUTER_HEALTHZ_URL_ENV: &str = "HARBOR_SEMANTIC_ROUTER_HEALTHZ_URL";
 const SEMANTIC_ROUTER_TOKEN_ENV: &str = "HARBOR_SEMANTIC_ROUTER_TOKEN";
+pub const SEMANTIC_ROUTER_TOPOLOGY_ENV: &str = "HARBOR_SEMANTIC_ROUTER_TOPOLOGY";
+const MODEL_API_BASE_URL_ENV: &str = "HARBOR_MODEL_API_BASE_URL";
 const MODEL_API_TOKEN_ENV: &str = "HARBOR_MODEL_API_TOKEN";
+const EMBEDDED_MODEL_API_PATH: &str = "/api/inference/v1";
+const DEFAULT_EMBEDDED_MODEL_API_BASE_URL: &str = "http://127.0.0.1:4174/api/inference/v1";
 const DEFAULT_SEMANTIC_ROUTER_BASE_URL: &str = "http://127.0.0.1:4176/v1";
 const DEFAULT_SEMANTIC_ROUTER_MODEL: &str = "Qwen/Qwen2.5-0.5B-Instruct";
 const LLM_TOKENIZER_PATH_ENV: &str = "HARBOR_LLM_TOKENIZER_PATH";
 static LLM_TOKENIZER: OnceLock<Option<Tokenizer>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticRouterTopology {
+    Embedded,
+    Standalone,
+}
+
+impl SemanticRouterTopology {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Embedded => "embedded",
+            Self::Standalone => "standalone",
+        }
+    }
+}
+
+pub fn semantic_router_topology() -> Result<SemanticRouterTopology, String> {
+    match env::var(SEMANTIC_ROUTER_TOPOLOGY_ENV) {
+        Ok(value) if value.trim().is_empty() => Ok(SemanticRouterTopology::Embedded),
+        Ok(value) if value.trim().eq_ignore_ascii_case("embedded") => {
+            Ok(SemanticRouterTopology::Embedded)
+        }
+        Ok(value) if value.trim().eq_ignore_ascii_case("standalone") => {
+            Ok(SemanticRouterTopology::Standalone)
+        }
+        Ok(value) => Err(format!(
+            "{SEMANTIC_ROUTER_TOPOLOGY_ENV} must be embedded or standalone, got {}",
+            value.trim()
+        )),
+        Err(env::VarError::NotPresent) => Ok(SemanticRouterTopology::Embedded),
+        Err(env::VarError::NotUnicode(_)) => Err(format!(
+            "{SEMANTIC_ROUTER_TOPOLOGY_ENV} must contain valid UTF-8"
+        )),
+    }
+}
 
 pub fn llm_text_token_count(text: &str) -> usize {
     let tokenizer = LLM_TOKENIZER.get_or_init(|| {
@@ -1214,7 +1254,25 @@ pub fn run_llm_text_with_state_and_options(
     let route_policy_id = llm_route_policy_id(options);
     let local_only_state;
     let effective_state = if route_policy_id == SEMANTIC_ROUTER_POLICY_ID {
-        local_only_state = semantic_router_local_only_model_state(state);
+        local_only_state = match semantic_router_local_only_model_state(state) {
+            Ok(state) => state,
+            Err(error) => {
+                return LlmTextExecution {
+                    available: false,
+                    status: "disabled".to_string(),
+                    summary: error.clone(),
+                    provider_key: String::new(),
+                    model_endpoint_id: None,
+                    text: String::new(),
+                    details: json!({
+                        "route_policy_id": SEMANTIC_ROUTER_POLICY_ID,
+                        "local_only": true,
+                        "cloud_fallback_allowed": false,
+                        "configuration_error": error,
+                    }),
+                }
+            }
+        };
         &local_only_state
     } else {
         state
@@ -1358,12 +1416,21 @@ fn merge_llm_execution_details(
     result.details = Value::Object(details);
 }
 
-fn semantic_router_local_only_model_state(state: &AdminModelCenterState) -> AdminModelCenterState {
+fn semantic_router_local_only_model_state(
+    state: &AdminModelCenterState,
+) -> Result<AdminModelCenterState, String> {
     let mut local_state = state.clone();
     local_state
         .endpoints
         .retain(|endpoint| endpoint.endpoint_kind != ModelEndpointKind::Cloud);
-    wire_semantic_router_resident_endpoint(&mut local_state);
+    match semantic_router_topology()? {
+        SemanticRouterTopology::Embedded => {
+            local_state.endpoints = vec![canonical_embedded_semantic_router_endpoint()?];
+        }
+        SemanticRouterTopology::Standalone => {
+            wire_semantic_router_resident_endpoint(&mut local_state);
+        }
+    }
     for policy in &mut local_state.route_policies {
         if policy.route_policy_id == SEMANTIC_ROUTER_POLICY_ID {
             policy.privacy_level = PrivacyLevel::StrictLocal;
@@ -1379,7 +1446,93 @@ fn semantic_router_local_only_model_state(state: &AdminModelCenterState) -> Admi
             }
         }
     }
-    local_state
+    Ok(local_state)
+}
+
+pub fn semantic_router_endpoint_for_readiness(
+    state: &AdminModelCenterState,
+) -> Result<Option<ModelEndpoint>, String> {
+    let topology = semantic_router_topology()?;
+    let local_state = semantic_router_local_only_model_state(state)?;
+    if topology == SemanticRouterTopology::Embedded {
+        return Ok(local_state
+            .endpoints
+            .into_iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "llm-local-openai-compatible"));
+    }
+    Ok(
+        resolve_endpoint_candidates(&local_state, ModelKind::Llm, SEMANTIC_ROUTER_POLICY_ID)
+            .into_iter()
+            .next(),
+    )
+}
+
+fn canonical_embedded_semantic_router_endpoint() -> Result<ModelEndpoint, String> {
+    let base_url = canonical_embedded_model_api_base_url()?;
+    let mut endpoint = default_model_endpoints()
+        .into_iter()
+        .find(|endpoint| endpoint.model_endpoint_id == "llm-local-openai-compatible")
+        .ok_or_else(|| "embedded semantic router model endpoint is unavailable".to_string())?;
+
+    // The embedded route is a Beacon-owned facade. Persisted endpoint execution
+    // metadata must never redirect it or supply credentials/mock responses.
+    set_metadata_string(&mut endpoint.metadata, "base_url", base_url.clone());
+    set_metadata_string(
+        &mut endpoint.metadata,
+        "healthz_url",
+        infer_healthz_url(&base_url),
+    );
+    set_metadata_bool(
+        &mut endpoint.metadata,
+        "semantic_router_embedded_facade",
+        true,
+    );
+    if let Some(metadata) = endpoint.metadata.as_object_mut() {
+        metadata.remove("mock_text");
+    }
+    Ok(endpoint)
+}
+
+fn canonical_embedded_model_api_base_url() -> Result<String, String> {
+    let configured = match env::var(MODEL_API_BASE_URL_ENV) {
+        Ok(value) if value.trim().is_empty() => DEFAULT_EMBEDDED_MODEL_API_BASE_URL.to_string(),
+        Ok(value) => value.trim().to_string(),
+        Err(env::VarError::NotPresent) => DEFAULT_EMBEDDED_MODEL_API_BASE_URL.to_string(),
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(format!("{MODEL_API_BASE_URL_ENV} must contain valid UTF-8"));
+        }
+    };
+    let mut url = Url::parse(&configured).map_err(|_| embedded_model_api_url_error())?;
+    let host = url.host_str().ok_or_else(embedded_model_api_url_error)?;
+    let loopback = host
+        .parse::<IpAddr>()
+        .map(|address| address.is_loopback())
+        .unwrap_or(false);
+    let facade_port = url.port_or_known_default() == Some(4174);
+    #[cfg(test)]
+    let facade_port = facade_port || url.port().is_some();
+    if url.scheme() != "http"
+        || !loopback
+        || !facade_port
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != EMBEDDED_MODEL_API_PATH
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(embedded_model_api_url_error());
+    }
+
+    // Unit tests may bind an ephemeral port. Production always uses Beacon's
+    // reserved same-process facade port above.
+    url.set_path(EMBEDDED_MODEL_API_PATH);
+    Ok(url.to_string().trim_end_matches('/').to_string())
+}
+
+fn embedded_model_api_url_error() -> String {
+    format!(
+        "{MODEL_API_BASE_URL_ENV} must use Beacon's HTTP loopback facade on port 4174 with path {EMBEDDED_MODEL_API_PATH} and no credentials, query, or fragment"
+    )
 }
 
 pub(crate) fn wire_semantic_router_resident_endpoint(state: &mut AdminModelCenterState) {
@@ -1544,7 +1697,13 @@ fn run_llm_text_on_endpoint(
         })
     });
 
-    let client = match OpenAiCompatibleTextClient::new(config) {
+    let redirects_disabled = metadata_bool(&endpoint.metadata, "semantic_router_embedded_facade");
+    let client_result = if redirects_disabled {
+        OpenAiCompatibleTextClient::new_without_redirects(config)
+    } else {
+        OpenAiCompatibleTextClient::new(config)
+    };
+    let client = match client_result {
         Ok(client) => client,
         Err(error) => {
             return LlmTextExecution {
@@ -1577,7 +1736,7 @@ fn run_llm_text_on_endpoint(
         }
     };
 
-    match client.complete_text(&TextCompletionRequest {
+    let request = TextCompletionRequest {
         system_prompt,
         user_prompt: prompt.to_string(),
         temperature: options.temperature.or(Some(0.1)),
@@ -1585,7 +1744,8 @@ fn run_llm_text_on_endpoint(
         timeout: options.timeout,
         disable_thinking: metadata_bool(&endpoint.metadata, "disable_thinking"),
         json_object_response: options.json_object_response,
-    }) {
+    };
+    match client.complete_text(&request) {
         Ok(response) => LlmTextExecution {
             available: true,
             status: "active".to_string(),
@@ -1798,6 +1958,7 @@ struct LocalRuntimeProbeTarget {
     healthz_url: String,
     api_key: String,
     api_key_configured: bool,
+    redirects_disabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1815,7 +1976,7 @@ fn local_runtime_projection_cache() -> &'static Mutex<Option<CachedLocalRuntimeP
 }
 
 #[cfg(test)]
-fn clear_local_runtime_projection_cache() {
+pub(crate) fn clear_local_runtime_projection_cache() {
     *local_runtime_projection_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
@@ -1991,16 +2152,18 @@ fn resolve_local_runtime_probe_target(
         || fallback
             .map(|endpoint| metadata_bool(&endpoint.metadata, "api_key_configured"))
             .unwrap_or(false);
+    let redirects_disabled = metadata_bool(&template.metadata, "semantic_router_embedded_facade");
 
     Some(LocalRuntimeProbeTarget {
         cache_key: format!(
-            "{}|{}|{}|{}",
-            template.model_endpoint_id, base_url, healthz_url, api_key,
+            "{}|{}|{}|{}|{}",
+            template.model_endpoint_id, base_url, healthz_url, api_key, redirects_disabled,
         ),
         base_url,
         healthz_url,
         api_key,
         api_key_configured,
+        redirects_disabled,
     })
 }
 
@@ -2017,7 +2180,11 @@ fn probe_local_runtime_target(target: &LocalRuntimeProbeTarget) -> LocalRuntimeP
         };
     }
 
-    let client = match Client::builder().timeout(Duration::from_secs(3)).build() {
+    let mut client_builder = Client::builder().timeout(Duration::from_secs(3));
+    if target.redirects_disabled {
+        client_builder = client_builder.redirect(reqwest::redirect::Policy::none());
+    }
+    let client = match client_builder.build() {
         Ok(client) => client,
         Err(_) => {
             return LocalRuntimeProjection {
@@ -2046,6 +2213,17 @@ fn probe_local_runtime_target(target: &LocalRuntimeProbeTarget) -> LocalRuntimeP
             }
         }
     };
+    if !response.status().is_success() {
+        return LocalRuntimeProjection {
+            base_url: target.base_url.clone(),
+            healthz_url: target.healthz_url.clone(),
+            api_key: target.api_key.clone(),
+            api_key_configured: target.api_key_configured,
+            ready: false,
+            backend_ready: false,
+            ..Default::default()
+        };
+    }
     let body = match response.text() {
         Ok(body) => body,
         Err(_) => {
@@ -2734,8 +2912,9 @@ mod tests {
         endpoint_uses_openai_compatible_api, openai_compatible_config_from_endpoint,
         redact_model_endpoint, run_cat_recording_validation_with_state, run_embedding_with_state,
         run_llm_text_with_state, run_llm_text_with_state_and_options, run_rerank_with_state,
-        run_vlm_summary_with_state, semantic_router_local_only_model_state, test_model_endpoint,
-        vlm_endpoint_readiness, LlmTextOptions, RERANK_POLICY_ID,
+        run_vlm_summary_with_state, semantic_router_endpoint_for_readiness,
+        semantic_router_local_only_model_state, test_model_endpoint, vlm_endpoint_readiness,
+        LlmTextOptions, RERANK_POLICY_ID, SEMANTIC_ROUTER_TOPOLOGY_ENV,
     };
     use crate::connectors::ai_provider::CatFrameVerificationResponse;
     use crate::control_plane::models::{
@@ -3749,10 +3928,11 @@ mod tests {
     }
 
     #[test]
-    fn semantic_router_local_only_state_wires_resident_endpoint() {
+    fn standalone_semantic_router_state_wires_resident_endpoint() {
         let _guard = MODEL_RUNTIME_ENV_LOCK
             .lock()
             .expect("model runtime env lock");
+        let _topology = EnvVarGuard::set(SEMANTIC_ROUTER_TOPOLOGY_ENV, "standalone");
         let _base_url = EnvVarGuard::set(
             "HARBOR_SEMANTIC_ROUTER_BASE_URL",
             "http://127.0.0.1:4176/v1",
@@ -3812,7 +3992,8 @@ mod tests {
             ..AdminModelCenterState::default()
         };
 
-        let local_state = semantic_router_local_only_model_state(&state);
+        let local_state =
+            semantic_router_local_only_model_state(&state).expect("standalone router state");
         let endpoint = local_state
             .endpoints
             .iter()
@@ -3853,7 +4034,304 @@ mod tests {
     }
 
     #[test]
+    fn embedded_semantic_router_uses_beacon_model_api_and_never_cloud() {
+        let _guard = MODEL_RUNTIME_ENV_LOCK
+            .lock()
+            .expect("model runtime env lock");
+        clear_local_runtime_projection_cache();
+        let server = Server::http("127.0.0.1:0").expect("embedded model API server");
+        let base_url = format!("http://{}/api/inference/v1", server.server_addr());
+        let _topology = EnvVarGuard::set(SEMANTIC_ROUTER_TOPOLOGY_ENV, "embedded");
+        let _base_url = EnvVarGuard::set("HARBOR_MODEL_API_BASE_URL", &base_url);
+        let _token = EnvVarGuard::set("HARBOR_MODEL_API_TOKEN", "embedded-router-token");
+        let content_header =
+            Header::from_bytes(b"Content-Type", b"application/json").expect("content header");
+
+        let server_thread = thread::spawn(move || {
+            for request_index in 0..2 {
+                let request = server
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("embedded model API receive")
+                    .unwrap_or_else(|| {
+                        panic!("timed out waiting for embedded model API request {request_index}")
+                    });
+                match (request.method(), request.url()) {
+                    (&Method::Get, "/api/inference/healthz") => request
+                        .respond(
+                            Response::from_string(
+                                r#"{"ready":true,"backend":{"ready":true,"kind":"candle"},"chat_model":"Qwen/Qwen2.5-0.5B-Instruct"}"#,
+                            )
+                            .with_header(content_header.clone()),
+                        )
+                        .expect("health response"),
+                    (&Method::Post, "/api/inference/v1/chat/completions") => {
+                        let authorization = request
+                            .headers()
+                            .iter()
+                            .find(|header| header.field.equiv("Authorization"))
+                            .map(|header| header.value.as_str());
+                        assert_eq!(authorization, Some("Bearer embedded-router-token"));
+                        request
+                            .respond(
+                                Response::from_string(
+                                    r#"{"choices":[{"message":{"content":"{\"decision\":\"evt_readiness\",\"confidence\":0.95}"}}]}"#,
+                                )
+                                .with_header(content_header.clone()),
+                            )
+                            .expect("chat response")
+                    }
+                    _ => request
+                        .respond(Response::from_string("not found").with_status_code(404))
+                        .expect("404 response"),
+                }
+            }
+        });
+
+        let state = AdminModelCenterState {
+            endpoints: vec![
+                ModelEndpoint {
+                    model_endpoint_id: "llm-local-openai-compatible".to_string(),
+                    workspace_id: Some("home-1".to_string()),
+                    provider_account_id: None,
+                    model_kind: ModelKind::Llm,
+                    endpoint_kind: ModelEndpointKind::Local,
+                    provider_key: "openai_compatible".to_string(),
+                    model_name: "persisted-attacker-model".to_string(),
+                    capability_tags: vec!["semantic_router".to_string()],
+                    cost_policy: json!({}),
+                    status: ModelEndpointStatus::Active,
+                    metadata: json!({
+                        "builtin": true,
+                        "base_url": "http://198.51.100.20/redirect/v1",
+                        "healthz_url": "http://198.51.100.20/redirect/healthz",
+                        "api_key": "persisted-attacker-token",
+                        "mock_text": "persisted-response-must-not-run",
+                        "semantic_router": true,
+                        "local_only": true,
+                    }),
+                },
+                ModelEndpoint {
+                    model_endpoint_id: "llm-cloud-should-not-run".to_string(),
+                    workspace_id: Some("home-1".to_string()),
+                    provider_account_id: None,
+                    model_kind: ModelKind::Llm,
+                    endpoint_kind: ModelEndpointKind::Cloud,
+                    provider_key: "openai_compatible".to_string(),
+                    model_name: "cloud-model".to_string(),
+                    capability_tags: vec!["semantic_router".to_string()],
+                    cost_policy: json!({}),
+                    status: ModelEndpointStatus::Active,
+                    metadata: json!({
+                        "base_url": "http://127.0.0.1:9/v1",
+                        "api_key": "must-not-be-used",
+                    }),
+                },
+            ],
+            route_policies: vec![ModelRoutePolicy {
+                route_policy_id: "semantic.router".to_string(),
+                workspace_id: "home-1".to_string(),
+                domain_scope: "semantic".to_string(),
+                modality: "text".to_string(),
+                privacy_level: PrivacyLevel::AllowRedactedCloud,
+                local_preferred: true,
+                max_cost_per_run: None,
+                fallback_order: vec!["local".to_string(), "cloud".to_string()],
+                status: "active".to_string(),
+                metadata: json!({}),
+            }],
+            ..AdminModelCenterState::default()
+        };
+        let runtime_state =
+            semantic_router_local_only_model_state(&state).expect("embedded runtime state");
+        let runtime_endpoint = runtime_state
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "llm-local-openai-compatible")
+            .expect("embedded runtime endpoint");
+        let readiness_endpoint = semantic_router_endpoint_for_readiness(&state)
+            .expect("embedded readiness endpoint")
+            .expect("configured embedded readiness endpoint");
+        assert_eq!(runtime_endpoint, &readiness_endpoint);
+        assert_eq!(
+            runtime_endpoint.metadata["base_url"],
+            json!(base_url.clone())
+        );
+        assert_eq!(
+            runtime_endpoint.metadata["healthz_url"],
+            json!(super::infer_healthz_url(&base_url))
+        );
+        assert_eq!(
+            runtime_endpoint.metadata["api_key"],
+            json!("embedded-router-token")
+        );
+        assert!(runtime_endpoint.metadata.get("mock_text").is_none());
+        assert_ne!(runtime_endpoint.model_name, "persisted-attacker-model");
+        let result = run_llm_text_with_state_and_options(
+            "User message: 压测前状态怎么样",
+            &state,
+            &LlmTextOptions {
+                purpose: Some("router".to_string()),
+                ..Default::default()
+            },
+        );
+        server_thread.join().expect("embedded model API joined");
+        clear_local_runtime_projection_cache();
+
+        assert!(result.available, "{}", result.summary);
+        assert_eq!(result.details["route_policy_id"], json!("semantic.router"));
+        assert_eq!(result.details["local_only"], json!(true));
+        assert_eq!(
+            result.details["attempted_endpoints"],
+            json!(["llm-local-openai-compatible"])
+        );
+        assert!(!result.text.contains("cloud-model"));
+        assert!(!result.text.contains("persisted-response-must-not-run"));
+    }
+
+    #[test]
+    fn embedded_semantic_router_rejects_non_loopback_and_noncanonical_paths() {
+        let _guard = MODEL_RUNTIME_ENV_LOCK
+            .lock()
+            .expect("model runtime env lock");
+        let _topology = EnvVarGuard::set(SEMANTIC_ROUTER_TOPOLOGY_ENV, "embedded");
+
+        for invalid_base_url in [
+            "http://198.51.100.20/api/inference/v1",
+            "http://127.0.0.1:4174/v1",
+        ] {
+            let _base_url = EnvVarGuard::set("HARBOR_MODEL_API_BASE_URL", invalid_base_url);
+            let state = AdminModelCenterState::default();
+            let readiness_error = semantic_router_endpoint_for_readiness(&state)
+                .expect_err("invalid facade URL must fail readiness closed");
+            let result = run_llm_text_with_state_and_options(
+                "User message: status",
+                &state,
+                &LlmTextOptions {
+                    purpose: Some("router".to_string()),
+                    ..Default::default()
+                },
+            );
+
+            assert!(!result.available);
+            assert_eq!(result.status, "disabled");
+            assert_eq!(
+                result.details["configuration_error"],
+                json!(readiness_error.clone())
+            );
+            assert!(readiness_error.contains("HTTP loopback facade on port 4174"));
+            assert!(readiness_error.contains("/api/inference/v1"));
+            assert!(!readiness_error.contains(invalid_base_url));
+        }
+    }
+
+    #[test]
+    fn embedded_semantic_router_does_not_follow_health_or_chat_redirects() {
+        let _guard = MODEL_RUNTIME_ENV_LOCK
+            .lock()
+            .expect("model runtime env lock");
+        clear_local_runtime_projection_cache();
+        let facade = Server::http("127.0.0.1:0").expect("embedded facade server");
+        let redirect_target = Server::http("127.0.0.1:0").expect("redirect sentinel server");
+        let base_url = format!("http://{}/api/inference/v1", facade.server_addr());
+        let redirect_url = format!("http://{}/redirect-target", redirect_target.server_addr());
+        let _topology = EnvVarGuard::set(SEMANTIC_ROUTER_TOPOLOGY_ENV, "embedded");
+        let _base_url = EnvVarGuard::set("HARBOR_MODEL_API_BASE_URL", &base_url);
+        let _token = EnvVarGuard::set("HARBOR_MODEL_API_TOKEN", "embedded-router-token");
+
+        let facade_thread = thread::spawn(move || {
+            for (request_index, expected_path) in [
+                "/api/inference/healthz",
+                "/api/inference/v1/chat/completions",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let request = facade
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("embedded redirect facade receive")
+                    .unwrap_or_else(|| {
+                        panic!("timed out waiting for redirect request {request_index}")
+                    });
+                assert_eq!(request.url(), expected_path);
+                let location = Header::from_bytes(b"Location", redirect_url.as_bytes())
+                    .expect("redirect location header");
+                request
+                    .respond(
+                        Response::from_string(
+                            r#"{"ready":true,"backend":{"ready":true},"chat_model":"forged-ready"}"#,
+                        )
+                            .with_status_code(302)
+                            .with_header(location),
+                    )
+                    .expect("redirect response");
+            }
+        });
+        let redirect_target_thread = thread::spawn(move || {
+            let followed = redirect_target
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("redirect sentinel receive");
+            if let Some(request) = followed {
+                request
+                    .respond(Response::from_string(
+                        r#"{"ready":true,"backend":{"ready":true},"chat_model":"redirected"}"#,
+                    ))
+                    .expect("redirect sentinel response");
+                true
+            } else {
+                false
+            }
+        });
+
+        let result = run_llm_text_with_state_and_options(
+            "User message: status",
+            &AdminModelCenterState::default(),
+            &LlmTextOptions {
+                purpose: Some("router".to_string()),
+                ..Default::default()
+            },
+        );
+        facade_thread.join().expect("redirect facade joined");
+        let redirect_followed = redirect_target_thread
+            .join()
+            .expect("redirect sentinel joined");
+        clear_local_runtime_projection_cache();
+
+        assert!(!redirect_followed, "strict-local request followed redirect");
+        assert!(!result.available);
+        assert_eq!(result.status, "degraded");
+        assert_eq!(result.details["local_only"], json!(true));
+    }
+
+    #[test]
+    fn invalid_semantic_router_topology_fails_closed() {
+        let _guard = MODEL_RUNTIME_ENV_LOCK
+            .lock()
+            .expect("model runtime env lock");
+        let _topology = EnvVarGuard::set(SEMANTIC_ROUTER_TOPOLOGY_ENV, "hybrid");
+        let result = run_llm_text_with_state_and_options(
+            "User message: 帮我看看状态",
+            &AdminModelCenterState::default(),
+            &LlmTextOptions {
+                purpose: Some("router".to_string()),
+                ..Default::default()
+            },
+        );
+
+        assert!(!result.available);
+        assert_eq!(result.status, "disabled");
+        assert_eq!(result.details["local_only"], json!(true));
+        assert_eq!(result.details["cloud_fallback_allowed"], json!(false));
+        assert!(result.details["configuration_error"]
+            .as_str()
+            .is_some_and(|value| value.contains("must be embedded or standalone")));
+    }
+
+    #[test]
     fn semantic_router_prefers_tagged_local_parser_endpoint() {
+        let _guard = MODEL_RUNTIME_ENV_LOCK
+            .lock()
+            .expect("model runtime env lock");
+        let _topology = EnvVarGuard::set(SEMANTIC_ROUTER_TOPOLOGY_ENV, "standalone");
         let state = AdminModelCenterState {
             endpoints: vec![
                 ModelEndpoint {

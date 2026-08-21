@@ -527,8 +527,19 @@ fn extract_json_object(value: &str) -> Option<&str> {
 
 impl OpenAiCompatibleTextClient {
     pub fn new(config: OpenAiCompatibleConfig) -> Result<Self, String> {
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(45))
+        Self::build(config, false)
+    }
+
+    pub fn new_without_redirects(config: OpenAiCompatibleConfig) -> Result<Self, String> {
+        Self::build(config, true)
+    }
+
+    fn build(config: OpenAiCompatibleConfig, redirects_disabled: bool) -> Result<Self, String> {
+        let mut client_builder = Client::builder().timeout(std::time::Duration::from_secs(45));
+        if redirects_disabled {
+            client_builder = client_builder.redirect(reqwest::redirect::Policy::none());
+        }
+        let client = client_builder
             .build()
             .map_err(|e| format!("failed to build OpenAI-compatible text client: {e}"))?;
         Ok(Self { client, config })
