@@ -1502,6 +1502,10 @@ fn canonical_embedded_model_api_base_url() -> Result<String, String> {
             return Err(format!("{MODEL_API_BASE_URL_ENV} must contain valid UTF-8"));
         }
     };
+    validate_embedded_model_api_base_url(&configured)
+}
+
+fn validate_embedded_model_api_base_url(configured: &str) -> Result<String, String> {
     let mut url = Url::parse(&configured).map_err(|_| embedded_model_api_url_error())?;
     let host = url.host_str().ok_or_else(embedded_model_api_url_error)?;
     let loopback = host
@@ -1509,8 +1513,6 @@ fn canonical_embedded_model_api_base_url() -> Result<String, String> {
         .map(|address| address.is_loopback())
         .unwrap_or(false);
     let facade_port = url.port_or_known_default() == Some(4174);
-    #[cfg(test)]
-    let facade_port = facade_port || url.port().is_some();
     if url.scheme() != "http"
         || !loopback
         || !facade_port
@@ -1523,8 +1525,6 @@ fn canonical_embedded_model_api_base_url() -> Result<String, String> {
         return Err(embedded_model_api_url_error());
     }
 
-    // Unit tests may bind an ephemeral port. Production always uses Beacon's
-    // reserved same-process facade port above.
     url.set_path(EMBEDDED_MODEL_API_PATH);
     Ok(url.to_string().trim_end_matches('/').to_string())
 }
@@ -2910,11 +2910,13 @@ mod tests {
         aggregate_cat_frame_verifications, clear_local_runtime_projection_cache, connectivity_url,
         embedding_endpoint_identity_with_state, embedding_query_input,
         endpoint_uses_openai_compatible_api, openai_compatible_config_from_endpoint,
-        redact_model_endpoint, run_cat_recording_validation_with_state, run_embedding_with_state,
-        run_llm_text_with_state, run_llm_text_with_state_and_options, run_rerank_with_state,
-        run_vlm_summary_with_state, semantic_router_endpoint_for_readiness,
-        semantic_router_local_only_model_state, test_model_endpoint, vlm_endpoint_readiness,
-        LlmTextOptions, RERANK_POLICY_ID, SEMANTIC_ROUTER_TOPOLOGY_ENV,
+        probe_local_runtime_target, redact_model_endpoint, resolve_local_runtime_probe_target,
+        run_cat_recording_validation_with_state, run_embedding_with_state,
+        run_llm_text_on_endpoint, run_llm_text_with_state, run_llm_text_with_state_and_options,
+        run_rerank_with_state, run_vlm_summary_with_state, semantic_router_endpoint_for_readiness,
+        semantic_router_local_only_model_state, test_model_endpoint,
+        validate_embedded_model_api_base_url, vlm_endpoint_readiness, LlmTextOptions,
+        RERANK_POLICY_ID, SEMANTIC_ROUTER_TOPOLOGY_ENV,
     };
     use crate::connectors::ai_provider::CatFrameVerificationResponse;
     use crate::control_plane::models::{
@@ -4034,58 +4036,14 @@ mod tests {
     }
 
     #[test]
-    fn embedded_semantic_router_uses_beacon_model_api_and_never_cloud() {
+    fn embedded_semantic_router_uses_canonical_beacon_facade_and_never_cloud() {
         let _guard = MODEL_RUNTIME_ENV_LOCK
             .lock()
             .expect("model runtime env lock");
-        clear_local_runtime_projection_cache();
-        let server = Server::http("127.0.0.1:0").expect("embedded model API server");
-        let base_url = format!("http://{}/api/inference/v1", server.server_addr());
+        let base_url = "http://127.0.0.1:4174/api/inference/v1";
         let _topology = EnvVarGuard::set(SEMANTIC_ROUTER_TOPOLOGY_ENV, "embedded");
-        let _base_url = EnvVarGuard::set("HARBOR_MODEL_API_BASE_URL", &base_url);
+        let _base_url = EnvVarGuard::set("HARBOR_MODEL_API_BASE_URL", base_url);
         let _token = EnvVarGuard::set("HARBOR_MODEL_API_TOKEN", "embedded-router-token");
-        let content_header =
-            Header::from_bytes(b"Content-Type", b"application/json").expect("content header");
-
-        let server_thread = thread::spawn(move || {
-            for request_index in 0..2 {
-                let request = server
-                    .recv_timeout(std::time::Duration::from_secs(5))
-                    .expect("embedded model API receive")
-                    .unwrap_or_else(|| {
-                        panic!("timed out waiting for embedded model API request {request_index}")
-                    });
-                match (request.method(), request.url()) {
-                    (&Method::Get, "/api/inference/healthz") => request
-                        .respond(
-                            Response::from_string(
-                                r#"{"ready":true,"backend":{"ready":true,"kind":"candle"},"chat_model":"Qwen/Qwen2.5-0.5B-Instruct"}"#,
-                            )
-                            .with_header(content_header.clone()),
-                        )
-                        .expect("health response"),
-                    (&Method::Post, "/api/inference/v1/chat/completions") => {
-                        let authorization = request
-                            .headers()
-                            .iter()
-                            .find(|header| header.field.equiv("Authorization"))
-                            .map(|header| header.value.as_str());
-                        assert_eq!(authorization, Some("Bearer embedded-router-token"));
-                        request
-                            .respond(
-                                Response::from_string(
-                                    r#"{"choices":[{"message":{"content":"{\"decision\":\"evt_readiness\",\"confidence\":0.95}"}}]}"#,
-                                )
-                                .with_header(content_header.clone()),
-                            )
-                            .expect("chat response")
-                    }
-                    _ => request
-                        .respond(Response::from_string("not found").with_status_code(404))
-                        .expect("404 response"),
-                }
-            }
-        });
 
         let state = AdminModelCenterState {
             endpoints: vec![
@@ -4152,10 +4110,7 @@ mod tests {
             .expect("embedded readiness endpoint")
             .expect("configured embedded readiness endpoint");
         assert_eq!(runtime_endpoint, &readiness_endpoint);
-        assert_eq!(
-            runtime_endpoint.metadata["base_url"],
-            json!(base_url.clone())
-        );
+        assert_eq!(runtime_endpoint.metadata["base_url"], json!(base_url));
         assert_eq!(
             runtime_endpoint.metadata["healthz_url"],
             json!(super::infer_healthz_url(&base_url))
@@ -4166,58 +4121,91 @@ mod tests {
         );
         assert!(runtime_endpoint.metadata.get("mock_text").is_none());
         assert_ne!(runtime_endpoint.model_name, "persisted-attacker-model");
-        let result = run_llm_text_with_state_and_options(
-            "User message: 压测前状态怎么样",
-            &state,
+        assert_eq!(runtime_state.endpoints.len(), 1);
+        let policy = runtime_state
+            .route_policies
+            .iter()
+            .find(|policy| policy.route_policy_id == "semantic.router")
+            .expect("semantic router policy");
+        assert_eq!(policy.privacy_level, PrivacyLevel::StrictLocal);
+        assert!(!policy
+            .fallback_order
+            .iter()
+            .any(|kind| kind.eq_ignore_ascii_case("cloud")));
+    }
+
+    #[test]
+    fn embedded_semantic_router_chat_uses_strict_facade_transport() {
+        let _guard = MODEL_RUNTIME_ENV_LOCK
+            .lock()
+            .expect("model runtime env lock");
+        let server = Server::http("127.0.0.1:0").expect("embedded model API server");
+        let transport_base_url = format!("http://{}/api/inference/v1", server.server_addr());
+        let _base_url = EnvVarGuard::set(
+            "HARBOR_MODEL_API_BASE_URL",
+            "http://127.0.0.1:4174/api/inference/v1",
+        );
+        let _token = EnvVarGuard::set("HARBOR_MODEL_API_TOKEN", "embedded-router-token");
+        let mut endpoint = super::canonical_embedded_semantic_router_endpoint()
+            .expect("canonical embedded endpoint");
+        super::set_metadata_string(&mut endpoint.metadata, "base_url", transport_base_url);
+        let content_header =
+            Header::from_bytes(b"Content-Type", b"application/json").expect("content header");
+        let server_thread = thread::spawn(move || {
+            let request = server
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("embedded model API receive")
+                .expect("embedded chat request");
+            assert_eq!(request.method(), &Method::Post);
+            assert_eq!(request.url(), "/api/inference/v1/chat/completions");
+            let authorization = request
+                .headers()
+                .iter()
+                .find(|header| header.field.equiv("Authorization"))
+                .map(|header| header.value.as_str());
+            assert_eq!(authorization, Some("Bearer embedded-router-token"));
+            request
+                .respond(
+                    Response::from_string(
+                        r#"{"choices":[{"message":{"content":"{\"decision\":\"evt_readiness\",\"confidence\":0.95}"}}]}"#,
+                    )
+                    .with_header(content_header),
+                )
+                .expect("chat response");
+        });
+
+        let result = run_llm_text_on_endpoint(
+            "User message: status",
+            &endpoint,
             &LlmTextOptions {
                 purpose: Some("router".to_string()),
                 ..Default::default()
             },
         );
         server_thread.join().expect("embedded model API joined");
-        clear_local_runtime_projection_cache();
 
         assert!(result.available, "{}", result.summary);
-        assert_eq!(result.details["route_policy_id"], json!("semantic.router"));
-        assert_eq!(result.details["local_only"], json!(true));
-        assert_eq!(
-            result.details["attempted_endpoints"],
-            json!(["llm-local-openai-compatible"])
-        );
-        assert!(!result.text.contains("cloud-model"));
-        assert!(!result.text.contains("persisted-response-must-not-run"));
+        assert!(result.text.contains("evt_readiness"));
     }
 
     #[test]
-    fn embedded_semantic_router_rejects_non_loopback_and_noncanonical_paths() {
-        let _guard = MODEL_RUNTIME_ENV_LOCK
-            .lock()
-            .expect("model runtime env lock");
-        let _topology = EnvVarGuard::set(SEMANTIC_ROUTER_TOPOLOGY_ENV, "embedded");
-
+    fn embedded_model_api_url_accepts_only_canonical_beacon_facade() {
+        assert_eq!(
+            validate_embedded_model_api_base_url("http://127.0.0.1:4174/api/inference/v1")
+                .expect("canonical facade URL"),
+            "http://127.0.0.1:4174/api/inference/v1"
+        );
         for invalid_base_url in [
             "http://198.51.100.20/api/inference/v1",
+            "http://127.0.0.1:4175/api/inference/v1",
+            "http://127.0.0.1/api/inference/v1",
             "http://127.0.0.1:4174/v1",
+            "https://127.0.0.1:4174/api/inference/v1",
+            "http://user@127.0.0.1:4174/api/inference/v1",
+            "http://127.0.0.1:4174/api/inference/v1?target=other",
         ] {
-            let _base_url = EnvVarGuard::set("HARBOR_MODEL_API_BASE_URL", invalid_base_url);
-            let state = AdminModelCenterState::default();
-            let readiness_error = semantic_router_endpoint_for_readiness(&state)
-                .expect_err("invalid facade URL must fail readiness closed");
-            let result = run_llm_text_with_state_and_options(
-                "User message: status",
-                &state,
-                &LlmTextOptions {
-                    purpose: Some("router".to_string()),
-                    ..Default::default()
-                },
-            );
-
-            assert!(!result.available);
-            assert_eq!(result.status, "disabled");
-            assert_eq!(
-                result.details["configuration_error"],
-                json!(readiness_error.clone())
-            );
+            let readiness_error = validate_embedded_model_api_base_url(invalid_base_url)
+                .expect_err("invalid facade URL must fail closed");
             assert!(readiness_error.contains("HTTP loopback facade on port 4174"));
             assert!(readiness_error.contains("/api/inference/v1"));
             assert!(!readiness_error.contains(invalid_base_url));
@@ -4225,18 +4213,64 @@ mod tests {
     }
 
     #[test]
+    fn embedded_semantic_router_rejects_wrong_port_in_runtime_and_readiness() {
+        let _guard = MODEL_RUNTIME_ENV_LOCK
+            .lock()
+            .expect("model runtime env lock");
+        let _topology = EnvVarGuard::set(SEMANTIC_ROUTER_TOPOLOGY_ENV, "embedded");
+        let invalid_base_url = "http://127.0.0.1:4175/api/inference/v1";
+        let _base_url = EnvVarGuard::set("HARBOR_MODEL_API_BASE_URL", invalid_base_url);
+        let state = AdminModelCenterState::default();
+
+        let readiness_error = semantic_router_endpoint_for_readiness(&state)
+            .expect_err("wrong facade port must fail readiness closed");
+        let result = run_llm_text_with_state_and_options(
+            "User message: status",
+            &state,
+            &LlmTextOptions {
+                purpose: Some("router".to_string()),
+                ..Default::default()
+            },
+        );
+
+        assert!(!result.available);
+        assert_eq!(result.status, "disabled");
+        assert_eq!(
+            result.details["configuration_error"],
+            json!(readiness_error.clone())
+        );
+        assert!(readiness_error.contains("HTTP loopback facade on port 4174"));
+        assert!(!readiness_error.contains(invalid_base_url));
+    }
+
+    #[test]
     fn embedded_semantic_router_does_not_follow_health_or_chat_redirects() {
         let _guard = MODEL_RUNTIME_ENV_LOCK
             .lock()
             .expect("model runtime env lock");
-        clear_local_runtime_projection_cache();
         let facade = Server::http("127.0.0.1:0").expect("embedded facade server");
         let redirect_target = Server::http("127.0.0.1:0").expect("redirect sentinel server");
-        let base_url = format!("http://{}/api/inference/v1", facade.server_addr());
+        let transport_base_url = format!("http://{}/api/inference/v1", facade.server_addr());
         let redirect_url = format!("http://{}/redirect-target", redirect_target.server_addr());
-        let _topology = EnvVarGuard::set(SEMANTIC_ROUTER_TOPOLOGY_ENV, "embedded");
-        let _base_url = EnvVarGuard::set("HARBOR_MODEL_API_BASE_URL", &base_url);
+        let _base_url = EnvVarGuard::set(
+            "HARBOR_MODEL_API_BASE_URL",
+            "http://127.0.0.1:4174/api/inference/v1",
+        );
         let _token = EnvVarGuard::set("HARBOR_MODEL_API_TOKEN", "embedded-router-token");
+        let mut endpoint = super::canonical_embedded_semantic_router_endpoint()
+            .expect("canonical embedded endpoint");
+        super::set_metadata_string(
+            &mut endpoint.metadata,
+            "base_url",
+            transport_base_url.clone(),
+        );
+        super::set_metadata_string(
+            &mut endpoint.metadata,
+            "healthz_url",
+            super::infer_healthz_url(&transport_base_url),
+        );
+        let probe_target = resolve_local_runtime_probe_target(std::slice::from_ref(&endpoint))
+            .expect("embedded facade probe target");
 
         let facade_thread = thread::spawn(move || {
             for (request_index, expected_path) in [
@@ -4282,9 +4316,10 @@ mod tests {
             }
         });
 
-        let result = run_llm_text_with_state_and_options(
+        let projection = probe_local_runtime_target(&probe_target);
+        let result = run_llm_text_on_endpoint(
             "User message: status",
-            &AdminModelCenterState::default(),
+            &endpoint,
             &LlmTextOptions {
                 purpose: Some("router".to_string()),
                 ..Default::default()
@@ -4294,12 +4329,12 @@ mod tests {
         let redirect_followed = redirect_target_thread
             .join()
             .expect("redirect sentinel joined");
-        clear_local_runtime_projection_cache();
 
         assert!(!redirect_followed, "strict-local request followed redirect");
+        assert!(!projection.ready);
+        assert!(!projection.backend_ready);
         assert!(!result.available);
         assert_eq!(result.status, "degraded");
-        assert_eq!(result.details["local_only"], json!(true));
     }
 
     #[test]

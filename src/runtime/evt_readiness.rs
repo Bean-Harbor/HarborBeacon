@@ -607,6 +607,16 @@ fn evt_home_assistant_readiness(state: &AdminConsoleState) -> Value {
 }
 
 fn evt_model_policy_readiness(state: &AdminConsoleState) -> Value {
+    evt_model_policy_readiness_with_health_probe(state, semantic_router_endpoint_health)
+}
+
+fn evt_model_policy_readiness_with_health_probe<F>(
+    state: &AdminConsoleState,
+    health_probe: F,
+) -> Value
+where
+    F: FnOnce(Option<&ModelEndpoint>) -> Value,
+{
     let policy = state
         .models
         .route_policies
@@ -656,7 +666,7 @@ fn evt_model_policy_readiness(state: &AdminConsoleState) -> Value {
             });
         }
     };
-    let endpoint_health = semantic_router_endpoint_health(endpoint.as_ref());
+    let endpoint_health = health_probe(endpoint.as_ref());
     let endpoint_ready = endpoint_health
         .get("ready")
         .and_then(Value::as_bool)
@@ -1300,7 +1310,7 @@ mod tests {
     use std::thread;
     use std::time::Duration as StdDuration;
 
-    use tiny_http::{Response, Server};
+    use tiny_http::{Header, Response, Server};
 
     use crate::control_plane::models::{
         ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, PrivacyLevel,
@@ -1425,25 +1435,116 @@ mod tests {
     }
 
     #[test]
+    fn embedded_router_endpoint_health_does_not_follow_redirects() {
+        let facade = Server::http("127.0.0.1:0").expect("embedded health server");
+        let redirect_target = Server::http("127.0.0.1:0").expect("redirect sentinel server");
+        let healthz_url = format!("http://{}/api/inference/healthz", facade.server_addr());
+        let redirect_url = format!("http://{}/redirect-target", redirect_target.server_addr());
+        let facade_thread = thread::spawn(move || {
+            let request = facade
+                .recv_timeout(StdDuration::from_secs(3))
+                .expect("embedded health receive")
+                .expect("embedded health request");
+            let location = Header::from_bytes(b"Location", redirect_url.as_bytes())
+                .expect("redirect location header");
+            request
+                .respond(
+                    Response::from_string("redirect")
+                        .with_status_code(302)
+                        .with_header(location),
+                )
+                .expect("redirect response");
+        });
+        let redirect_target_thread = thread::spawn(move || {
+            redirect_target
+                .recv_timeout(StdDuration::from_secs(2))
+                .expect("redirect sentinel receive")
+                .is_some()
+        });
+        let endpoint = ModelEndpoint {
+            model_endpoint_id: "llm-local-openai-compatible".to_string(),
+            workspace_id: Some("home-1".to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Llm,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "openai_compatible".to_string(),
+            model_name: "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
+            capability_tags: vec!["semantic_router".to_string()],
+            cost_policy: json!({}),
+            status: ModelEndpointStatus::Active,
+            metadata: json!({
+                "healthz_url": healthz_url,
+                "semantic_router_embedded_facade": true,
+                "local_only": true,
+            }),
+        };
+
+        let health = semantic_router_endpoint_health(Some(&endpoint));
+        facade_thread.join().expect("embedded health server joined");
+        let redirect_followed = redirect_target_thread
+            .join()
+            .expect("redirect sentinel joined");
+
+        assert!(!redirect_followed, "readiness probe followed redirect");
+        assert_eq!(health["ready"], json!(false));
+        assert_eq!(health["http_status"], json!(302));
+        assert_eq!(health["status"], json!("unavailable"));
+    }
+
+    #[test]
+    fn embedded_router_endpoint_health_parses_degraded_backend() {
+        let facade = Server::http("127.0.0.1:0").expect("embedded health server");
+        let healthz_url = format!("http://{}/api/inference/healthz", facade.server_addr());
+        let facade_thread = thread::spawn(move || {
+            let request = facade
+                .recv_timeout(StdDuration::from_secs(3))
+                .expect("embedded health receive")
+                .expect("embedded health request");
+            request
+                .respond(Response::from_string(
+                    r#"{"service":"harbor-model-api","status":"degraded","backend":{"kind":"candle","ready":false,"model_loaded":false},"chat_model":"Qwen/Qwen2.5-0.5B-Instruct","ready":false}"#,
+                ))
+                .expect("degraded health response");
+        });
+        let endpoint = ModelEndpoint {
+            model_endpoint_id: "llm-local-openai-compatible".to_string(),
+            workspace_id: Some("home-1".to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Llm,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "openai_compatible".to_string(),
+            model_name: "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
+            capability_tags: vec!["semantic_router".to_string()],
+            cost_policy: json!({}),
+            status: ModelEndpointStatus::Active,
+            metadata: json!({
+                "healthz_url": healthz_url,
+                "semantic_router_embedded_facade": true,
+                "local_only": true,
+            }),
+        };
+
+        let health = semantic_router_endpoint_health(Some(&endpoint));
+        facade_thread.join().expect("embedded health server joined");
+
+        assert_eq!(health["http_status"], json!(200));
+        assert_eq!(health["status"], json!("degraded"));
+        assert_eq!(health["ready"], json!(false));
+        assert_eq!(health["service_ready"], json!(false));
+        assert_eq!(health["backend_ready"], json!(false));
+        assert_eq!(health["chat_model_available"], json!(true));
+        assert_eq!(health["backend_kind"], json!("candle"));
+        assert_eq!(health["model_loaded"], json!(false));
+    }
+
+    #[test]
     fn embedded_router_readiness_uses_beacon_facade_and_ignores_legacy_endpoint() {
         let _env_lock = evt_test_env_lock().lock().expect("env lock");
-        crate::runtime::model_center::clear_local_runtime_projection_cache();
-        let embedded = Server::http("127.0.0.1:0").expect("embedded health server");
-        let embedded_base_url = format!("http://{}/api/inference/v1", embedded.server_addr());
-        let legacy = Server::http("127.0.0.1:0").expect("legacy health server");
-        let legacy_base_url = format!("http://{}/v1", legacy.server_addr());
-        let legacy_healthz_url = format!("http://{}/healthz", legacy.server_addr());
         let _topology = EnvVarGuard::set(SEMANTIC_ROUTER_TOPOLOGY_ENV, "embedded");
-        let _base_url = EnvVarGuard::set("HARBOR_MODEL_API_BASE_URL", &embedded_base_url);
-        let _token = EnvVarGuard::set("HARBOR_MODEL_API_TOKEN", "embedded-readiness-token");
-        let embedded_thread = thread::spawn(move || {
-            if let Ok(Some(request)) = embedded.recv_timeout(StdDuration::from_secs(3)) {
-                let _ = request.respond(Response::from_string(
-                    r#"{"service":"harbor-model-api","status":"ok","backend":{"kind":"candle","ready":true,"model_loaded":false},"chat_model":"Qwen/Qwen2.5-0.5B-Instruct","ready":true}"#,
-                ));
-            }
-        });
-
+        let _base_url = EnvVarGuard::set(
+            "HARBOR_MODEL_API_BASE_URL",
+            "http://127.0.0.1:4174/api/inference/v1",
+        );
         let mut state = AdminConsoleState::default();
         state.models.endpoints = vec![ModelEndpoint {
             model_endpoint_id: "llm-local-openai-compatible".to_string(),
@@ -1458,18 +1559,32 @@ mod tests {
             status: ModelEndpointStatus::Degraded,
             metadata: json!({
                 "builtin": true,
-                "base_url": legacy_base_url,
-                "healthz_url": legacy_healthz_url,
+                "base_url": "http://127.0.0.1:4176/v1",
+                "healthz_url": "http://127.0.0.1:4176/healthz",
                 "semantic_router": true,
                 "local_only": true,
             }),
         }];
 
-        let readiness = evt_model_policy_readiness(&state);
-        embedded_thread
-            .join()
-            .expect("embedded health server joined");
-        crate::runtime::model_center::clear_local_runtime_projection_cache();
+        let readiness = evt_model_policy_readiness_with_health_probe(&state, |endpoint| {
+            let endpoint = endpoint.expect("canonical embedded endpoint");
+            assert_eq!(
+                endpoint.metadata["base_url"],
+                json!("http://127.0.0.1:4174/api/inference/v1")
+            );
+            assert_eq!(
+                endpoint.metadata["healthz_url"],
+                json!("http://127.0.0.1:4174/api/inference/healthz")
+            );
+            json!({
+                "status": "ready",
+                "ready": true,
+                "backend_ready": true,
+                "chat_model_available": true,
+                "backend_kind": "candle",
+                "redacted": true,
+            })
+        });
 
         assert_eq!(readiness["semantic_router"]["topology"], json!("embedded"));
         assert_eq!(
@@ -1483,35 +1598,33 @@ mod tests {
             readiness["semantic_router"]["facade"]["same_process"],
             json!(true)
         );
-        assert!(legacy
-            .recv_timeout(StdDuration::from_millis(200))
-            .expect("legacy receive check")
-            .is_none());
     }
 
     #[test]
     fn embedded_router_readiness_fails_closed_when_beacon_backend_is_degraded() {
         let _env_lock = evt_test_env_lock().lock().expect("env lock");
-        crate::runtime::model_center::clear_local_runtime_projection_cache();
-        let embedded = Server::http("127.0.0.1:0").expect("embedded health server");
-        let embedded_base_url = format!("http://{}/api/inference/v1", embedded.server_addr());
         let _topology = EnvVarGuard::set(SEMANTIC_ROUTER_TOPOLOGY_ENV, "embedded");
-        let _base_url = EnvVarGuard::set("HARBOR_MODEL_API_BASE_URL", &embedded_base_url);
-        let _token = EnvVarGuard::set("HARBOR_MODEL_API_TOKEN", "embedded-readiness-token");
-        let embedded_thread = thread::spawn(move || {
-            if let Ok(Some(request)) = embedded.recv_timeout(StdDuration::from_secs(3)) {
-                let _ = request.respond(Response::from_string(
-                    r#"{"service":"harbor-model-api","status":"degraded","backend":{"kind":"candle","ready":false,"model_loaded":false},"chat_model":"Qwen/Qwen2.5-0.5B-Instruct","ready":false}"#,
-                ));
-            }
-        });
+        let _base_url = EnvVarGuard::set(
+            "HARBOR_MODEL_API_BASE_URL",
+            "http://127.0.0.1:4174/api/inference/v1",
+        );
         let state = AdminConsoleState::default();
 
-        let readiness = evt_model_policy_readiness(&state);
-        embedded_thread
-            .join()
-            .expect("embedded health server joined");
-        crate::runtime::model_center::clear_local_runtime_projection_cache();
+        let readiness = evt_model_policy_readiness_with_health_probe(&state, |endpoint| {
+            let endpoint = endpoint.expect("canonical embedded endpoint");
+            assert_eq!(
+                endpoint.metadata["base_url"],
+                json!("http://127.0.0.1:4174/api/inference/v1")
+            );
+            json!({
+                "status": "degraded",
+                "ready": false,
+                "backend_ready": false,
+                "chat_model_available": true,
+                "backend_kind": "candle",
+                "redacted": true,
+            })
+        });
 
         assert_eq!(readiness["semantic_router"]["topology"], json!("embedded"));
         assert_eq!(readiness["semantic_router"]["available"], json!(false));
