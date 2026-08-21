@@ -25,10 +25,11 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - run: cargo fmt --check
       - run: cargo clippy --lib --tests
-      - run: cargo check --bin harboros-beacon --bin agent-hub-admin-api
+      - run: cargo check --locked --bin harboros-beacon --bin agent-hub-admin-api --bin assistant-task-api --bin harbor-model-api --bin benchmark-local-model-backend
       - run: cargo test --lib -- --test-threads=1
       - run: cargo test --locked --bin harboros-beacon -- --test-threads=1
       - run: cargo test --bin agent-hub-admin-api -- --test-threads=1
+      - run: cargo test --locked --bin benchmark-local-model-backend spawned_model_api_receives_only_explicit_benchmark_api_key -- --test-threads=1
       - run: cargo test --locked --test service_auth_hardening -- --test-threads=1
 
   harborlink_package_contract:

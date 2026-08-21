@@ -720,6 +720,14 @@ fn spawn_service(binary: &Path, cli: &Cli) -> SpawnedService {
         fail(&format!("spawn binary not found: {}", binary.display()));
     }
 
+    let mut command = build_spawn_command(binary, cli);
+    let child = command
+        .spawn()
+        .unwrap_or_else(|error| fail(&format!("failed to spawn harbor-model-api: {error}")));
+    SpawnedService { child }
+}
+
+fn build_spawn_command(binary: &Path, cli: &Cli) -> Command {
     let mut command = Command::new(binary);
     command
         .arg("--bind")
@@ -744,11 +752,15 @@ fn spawn_service(binary: &Path, cli: &Cli) -> SpawnedService {
     if let Some(model_id) = cli.candle_embedding_model_id.as_deref() {
         command.arg("--candle-embedding-model-id").arg(model_id);
     }
+    if let Some(api_key) = cli
+        .api_key
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        command.env("HARBOR_MODEL_API_TOKEN", api_key);
+    }
 
-    let child = command
-        .spawn()
-        .unwrap_or_else(|error| fail(&format!("failed to spawn harbor-model-api: {error}")));
-    SpawnedService { child }
+    command
 }
 
 fn urls_from_bind(bind: &str) -> (String, String) {
@@ -802,5 +814,36 @@ impl Drop for SpawnedService {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_spawn_command, Cli};
+    use std::ffi::OsStr;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn command_env<'a>(command: &'a Command, name: &str) -> Option<Option<&'a OsStr>> {
+        command
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new(name))
+            .map(|(_, value)| value)
+    }
+
+    #[test]
+    fn spawned_model_api_receives_only_explicit_benchmark_api_key() {
+        let mut cli = Cli::default();
+        cli.api_key = None;
+        let without_key = build_spawn_command(Path::new("harbor-model-api"), &cli);
+        assert_eq!(command_env(&without_key, "HARBOR_MODEL_API_TOKEN"), None);
+
+        let explicit = "benchmark_token_0123456789abcdef0123456789abcdef";
+        cli.api_key = Some(explicit.to_string());
+        let with_key = build_spawn_command(Path::new("harbor-model-api"), &cli);
+        assert_eq!(
+            command_env(&with_key, "HARBOR_MODEL_API_TOKEN"),
+            Some(Some(OsStr::new(explicit)))
+        );
     }
 }

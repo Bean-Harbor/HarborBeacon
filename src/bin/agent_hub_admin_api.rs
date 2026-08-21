@@ -25254,6 +25254,8 @@ mod tests {
 
     use tiny_http::{Header, Method, Server, StatusCode};
 
+    const VALID_GATE_SERVICE_TOKEN: &str = "gate_service_0123456789abcdef0123456789abcdef";
+
     #[test]
     fn parse_json_body_limited_blocks_oversized_payload() {
         let payload = br#"{"ok":true}"#;
@@ -34406,7 +34408,7 @@ mod tests {
         let _env_lock = gate_principal_env_lock()
             .lock()
             .expect("gate principal env lock");
-        let _token = EnvGuard::set(GATE_TO_BEACON_TOKEN_ENV, "service-token");
+        let _token = EnvGuard::set(GATE_TO_BEACON_TOKEN_ENV, VALID_GATE_SERVICE_TOKEN);
         let job_id = "yolo-gate-auth-http";
         let (api, paths) = build_test_admin_api("detection-gate-auth-http");
         api.detection_jobs.lock().expect("detection jobs").insert(
@@ -34428,7 +34430,7 @@ mod tests {
         let gate_request = |method: reqwest::Method, path: &str| {
             client
                 .request(method, format!("{base_url}{path}"))
-                .bearer_auth("service-token")
+                .bearer_auth(VALID_GATE_SERVICE_TOKEN)
                 .header("X-Harbor-Principal-Source", "harboros")
                 .header("X-Harbor-Principal-Id", "harboros:uid:1000")
                 .header("X-Harbor-Principal-Roles", "FULL_ADMIN")
@@ -34457,12 +34459,12 @@ mod tests {
         .expect("unknown method response");
         let missing_principal = client
             .get(format!("{base_url}/api/vision/detection-jobs/{job_id}"))
-            .bearer_auth("service-token")
+            .bearer_auth(VALID_GATE_SERVICE_TOKEN)
             .send()
             .expect("missing principal response");
         let legacy_header = client
             .get(format!("{base_url}/api/vision/detection-jobs/{job_id}"))
-            .bearer_auth("service-token")
+            .bearer_auth(VALID_GATE_SERVICE_TOKEN)
             .header("X-Harbor-User-Id", "local-owner")
             .send()
             .expect("legacy header response");
@@ -34492,7 +34494,7 @@ mod tests {
         let _env_lock = gate_principal_env_lock()
             .lock()
             .expect("gate principal env lock");
-        let _token = EnvGuard::set(GATE_TO_BEACON_TOKEN_ENV, "service-token");
+        let _token = EnvGuard::set(GATE_TO_BEACON_TOKEN_ENV, VALID_GATE_SERVICE_TOKEN);
         let job_id = "yolo-direct-observation";
         let (api, paths) = build_test_admin_api("detection-direct-observation");
         let mut runtime = sample_running_detection_job(job_id, "camera.252", false, None);
@@ -34578,12 +34580,12 @@ mod tests {
 
         let missing_principal = client
             .get(&observation_url)
-            .bearer_auth("service-token")
+            .bearer_auth(VALID_GATE_SERVICE_TOKEN)
             .send()
             .expect("missing principal response");
         let observation = client
             .get(&observation_url)
-            .bearer_auth("service-token")
+            .bearer_auth(VALID_GATE_SERVICE_TOKEN)
             .header("X-Harbor-Principal-Source", "harboros")
             .header("X-Harbor-Principal-Id", "harboros:uid:1000")
             .header("X-Harbor-Principal-Roles", "FULL_ADMIN")
@@ -34596,7 +34598,7 @@ mod tests {
             .get(format!(
                 "{base_url}/api/cameras/camera.252/cat-detection/observation?stream_profile=main"
             ))
-            .bearer_auth("service-token")
+            .bearer_auth(VALID_GATE_SERVICE_TOKEN)
             .header("X-Harbor-Principal-Source", "harboros")
             .header("X-Harbor-Principal-Id", "harboros:uid:1000")
             .header("X-Harbor-Principal-Roles", "FULL_ADMIN")
@@ -34698,21 +34700,20 @@ mod tests {
 
     #[test]
     fn gateway_service_request_requires_matching_bearer_token() {
+        let current = "gate_current_0123456789abcdef0123456789abcdef";
+        let previous = "gate_previous_0123456789abcdef0123456789abcdef";
         let current_headers = vec![Header::from_bytes(
             b"Authorization".as_slice(),
-            b"Bearer gate-to-beacon-current".as_slice(),
+            format!("Bearer {current}").as_bytes(),
         )
         .expect("header")];
         let previous_headers = vec![Header::from_bytes(
             b"Authorization".as_slice(),
-            b"Bearer gate-to-beacon-previous".as_slice(),
+            format!("Bearer {previous}").as_bytes(),
         )
         .expect("header")];
-        let _current = EnvGuard::set(GATE_TO_BEACON_TOKEN_ENV, "gate-to-beacon-current");
-        let _previous = EnvGuard::set(
-            "HARBOR_GATE_TO_BEACON_TOKEN_PREVIOUS",
-            "gate-to-beacon-previous",
-        );
+        let _current = EnvGuard::set(GATE_TO_BEACON_TOKEN_ENV, current);
+        let _previous = EnvGuard::set("HARBOR_GATE_TO_BEACON_TOKEN_PREVIOUS", previous);
 
         assert!(authorize_gateway_service_request(&current_headers).is_ok());
         assert!(authorize_gateway_service_request(&previous_headers).is_ok());

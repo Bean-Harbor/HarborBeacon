@@ -498,11 +498,12 @@ mod tests {
 
     #[test]
     fn notification_gateway_config_accepts_directional_gate_token() {
+        let token = "beacon_sender_0123456789abcdef0123456789abcdef";
         let _env = EnvGuard::scoped(&[
             (IM_GATEWAY_BASE_URL_ENV, None),
             (LEGACY_IM_GATEWAY_BASE_URL_ENV, None),
             ("HARBOR_BEACON_TO_GATE_TOKEN_FILE", None),
-            ("HARBOR_BEACON_TO_GATE_TOKEN", Some("beacon-to-gate-token")),
+            ("HARBOR_BEACON_TO_GATE_TOKEN", Some(token)),
             ("HARBORGATE_BEARER_TOKEN", None),
             ("HARBOR_IM_GATEWAY_BEARER_TOKEN", None),
             ("IM_AGENT_SERVICE_TOKEN", None),
@@ -511,7 +512,7 @@ mod tests {
         let config = NotificationGatewayConfig::from_env().expect("config");
 
         assert_eq!(config.base_url, DEFAULT_LOCAL_IM_GATEWAY_BASE_URL);
-        assert_eq!(config.bearer_token, "beacon-to-gate-token");
+        assert_eq!(config.bearer_token, token);
     }
 
     #[test]
