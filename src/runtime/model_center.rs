@@ -3889,6 +3889,11 @@ mod tests {
 
     #[test]
     fn run_llm_text_with_state_keeps_router_local_only_even_when_cloud_is_configured() {
+        let _guard = MODEL_RUNTIME_ENV_LOCK
+            .lock()
+            .expect("model runtime env lock");
+        let _topology = EnvVarGuard::set(SEMANTIC_ROUTER_TOPOLOGY_ENV, "embedded");
+        let _token = EnvVarGuard::set("HARBOR_MODEL_API_TOKEN", "embedded-router-token");
         let state = AdminModelCenterState {
             endpoints: vec![
                 ModelEndpoint {
