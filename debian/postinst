@@ -2,7 +2,8 @@
 set -euo pipefail
 
 /usr/lib/harboros-beacon/validate-harborbeacon-service-auth
-/usr/lib/harboros-beacon/ensure-harborbeacon-model-token
+HARBOR_MODEL_TOKEN_FORBIDDEN_FILES="/etc/harboros/service-auth/gate-to-beacon.accept-current:/etc/harboros/service-auth/gate-to-beacon.accept-previous:/etc/harboros/service-auth/beacon-to-gate.send" \
+  /usr/lib/harboros-beacon/ensure-harborbeacon-model-token
 
 if ! getent group harborbeacon >/dev/null 2>&1; then
   addgroup --system harborbeacon

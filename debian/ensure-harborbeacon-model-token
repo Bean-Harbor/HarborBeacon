@@ -34,6 +34,67 @@ valid_token() {
   [[ "$1" =~ ^[A-Za-z0-9_-]{32,}$ ]]
 }
 
+forbidden_tokens=()
+
+load_forbidden_tokens() {
+  local configured_files="${HARBOR_MODEL_TOKEN_FORBIDDEN_FILES:-}"
+  local path
+  local metadata
+  local value
+  local line_count
+  local byte_count
+  local -a files=()
+
+  [ -n "$configured_files" ] || return 0
+  IFS=':' read -r -a files <<< "$configured_files"
+  for path in "${files[@]}"; do
+    if [ -z "$path" ] || [ -L "$path" ] || [ ! -f "$path" ]; then
+      echo "model-token isolation credential is missing or unsafe" >&2
+      return 1
+    fi
+    metadata="$(stat -c '%u:%g:%a' -- "$path")" || {
+      echo "cannot inspect model-token isolation credential metadata" >&2
+      return 1
+    }
+    if [ "$(id -u)" -eq 0 ]; then
+      if [ "$metadata" != "0:0:600" ]; then
+        echo "model-token isolation credential must be owned by root:root with mode 0600" >&2
+        return 1
+      fi
+    elif [ "${metadata##*:}" != "600" ]; then
+      echo "model-token isolation credential must have mode 0600" >&2
+      return 1
+    fi
+
+    line_count="$(wc -l < "$path")" || return 1
+    byte_count="$(wc -c < "$path")" || return 1
+    IFS= read -r value < "$path" || true
+    if [ "$line_count" -ne 1 ] || [ "$byte_count" -ne $((${#value} + 1)) ]; then
+      echo "model-token isolation credential must contain exactly one line" >&2
+      return 1
+    fi
+    if [ -n "$value" ] && ! valid_token "$value"; then
+      echo "model-token isolation credential is invalid" >&2
+      return 1
+    fi
+    if [ -n "$value" ]; then
+      forbidden_tokens+=("$value")
+    fi
+  done
+}
+
+token_is_forbidden() {
+  local candidate="$1"
+  local forbidden
+
+  for forbidden in "${forbidden_tokens[@]}"; do
+    if [ "$candidate" = "$forbidden" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 read_model_token() {
   local line
   local normalized
@@ -102,23 +163,31 @@ fi
 install -d -m 0755 "$env_dir"
 umask 077
 
+load_forbidden_tokens
 model_token="$(read_model_token)"
-if valid_token "$model_token"; then
+if valid_token "$model_token" && ! token_is_forbidden "$model_token"; then
   chmod 0600 "$env_file"
   if [ "$(id -u)" -eq 0 ]; then
     chown root:root "$env_file"
   fi
   exit 0
 fi
-model_token="$(generate_secret_token)"
+while :; do
+  model_token="$(generate_secret_token)"
+  if ! token_is_forbidden "$model_token"; then
+    break
+  fi
+done
 
 tmp_file="$(mktemp "$env_dir/.harboros-beacon.env.XXXXXX")"
 if [ -f "$env_file" ]; then
   while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in
-      HARBOR_MODEL_API_TOKEN=*) ;;
-      *) printf '%s\n' "$line" ;;
-    esac
+    normalized="${line#"${line%%[![:space:]]*}"}"
+    normalized="${normalized%"${normalized##*[![:space:]]}"}"
+    if [[ "$normalized" =~ ^HARBOR_MODEL_API_TOKEN[[:space:]]*= ]]; then
+      continue
+    fi
+    printf '%s\n' "$line"
   done < "$env_file" > "$tmp_file"
 fi
 printf 'HARBOR_MODEL_API_TOKEN=%s\n' "$model_token" >> "$tmp_file"
