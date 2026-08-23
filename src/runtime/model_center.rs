@@ -1468,6 +1468,8 @@ pub fn semantic_router_endpoint_for_readiness(
 
 fn canonical_embedded_semantic_router_endpoint() -> Result<ModelEndpoint, String> {
     let base_url = canonical_embedded_model_api_base_url()?;
+    let api_key = env_trimmed(MODEL_API_TOKEN_ENV)
+        .ok_or_else(|| format!("{MODEL_API_TOKEN_ENV} is not configured"))?;
     let mut endpoint = default_model_endpoints()
         .into_iter()
         .find(|endpoint| endpoint.model_endpoint_id == "llm-local-openai-compatible")
@@ -1481,13 +1483,26 @@ fn canonical_embedded_semantic_router_endpoint() -> Result<ModelEndpoint, String
         "healthz_url",
         infer_healthz_url(&base_url),
     );
+    set_metadata_string(&mut endpoint.metadata, "api_key", api_key);
+    set_metadata_bool(&mut endpoint.metadata, "api_key_configured", true);
+    set_metadata_bool(&mut endpoint.metadata, "api_key_required", true);
+    set_metadata_bool(&mut endpoint.metadata, "local_only", true);
+    set_metadata_bool(&mut endpoint.metadata, "cloud_fallback_allowed", false);
     set_metadata_bool(
         &mut endpoint.metadata,
         "semantic_router_embedded_facade",
         true,
     );
     if let Some(metadata) = endpoint.metadata.as_object_mut() {
-        metadata.remove("mock_text");
+        for key in [
+            "mock_text",
+            "mock_embedding",
+            "mock_embeddings",
+            "mock_embedding_dimensions",
+            "mock_rerank_scores",
+        ] {
+            metadata.remove(key);
+        }
     }
     Ok(endpoint)
 }
@@ -2555,7 +2570,9 @@ fn openai_compatible_config_from_endpoint(
 ) -> Option<OpenAiCompatibleConfig> {
     let base_url = metadata_string(&endpoint.metadata, "base_url")?;
     let api_key = metadata_string(&endpoint.metadata, "api_key").unwrap_or_default();
-    if endpoint.endpoint_kind == ModelEndpointKind::Cloud && api_key.trim().is_empty() {
+    let api_key_required = endpoint.endpoint_kind == ModelEndpointKind::Cloud
+        || metadata_bool(&endpoint.metadata, "api_key_required");
+    if api_key_required && api_key.trim().is_empty() {
         return None;
     }
     let model = if endpoint.model_kind == ModelKind::Embedder {
@@ -3309,6 +3326,29 @@ mod tests {
     }
 
     #[test]
+    fn local_endpoint_with_required_api_key_fails_closed_when_empty() {
+        let endpoint = ModelEndpoint {
+            model_endpoint_id: "llm-local-required-auth".to_string(),
+            workspace_id: Some("home-1".to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Llm,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "openai_compatible".to_string(),
+            model_name: "local-model".to_string(),
+            capability_tags: vec!["local_first".to_string()],
+            cost_policy: json!({}),
+            status: ModelEndpointStatus::Active,
+            metadata: json!({
+                "base_url": "http://127.0.0.1:4174/api/inference/v1",
+                "api_key": "",
+                "api_key_required": true,
+            }),
+        };
+
+        assert!(openai_compatible_config_from_endpoint(&endpoint).is_none());
+    }
+
+    #[test]
     fn cloud_openai_compatible_endpoint_requires_api_key() {
         let endpoint = ModelEndpoint {
             model_endpoint_id: "llm-cloud-siliconflow".to_string(),
@@ -3849,6 +3889,11 @@ mod tests {
 
     #[test]
     fn run_llm_text_with_state_keeps_router_local_only_even_when_cloud_is_configured() {
+        let _guard = MODEL_RUNTIME_ENV_LOCK
+            .lock()
+            .expect("model runtime env lock");
+        let _topology = EnvVarGuard::set(SEMANTIC_ROUTER_TOPOLOGY_ENV, "embedded");
+        let _token = EnvVarGuard::set("HARBOR_MODEL_API_TOKEN", "embedded-router-token");
         let state = AdminModelCenterState {
             endpoints: vec![
                 ModelEndpoint {
@@ -4114,6 +4159,12 @@ mod tests {
         assert_eq!(
             runtime_endpoint.metadata["api_key"],
             json!("embedded-router-token")
+        );
+        assert_eq!(runtime_endpoint.metadata["api_key_configured"], json!(true));
+        assert_eq!(runtime_endpoint.metadata["api_key_required"], json!(true));
+        assert_eq!(
+            runtime_endpoint.metadata["cloud_fallback_allowed"],
+            json!(false)
         );
         assert!(runtime_endpoint.metadata.get("mock_text").is_none());
         assert_ne!(runtime_endpoint.model_name, "persisted-attacker-model");

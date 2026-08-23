@@ -1,0 +1,61 @@
+#!/bin/bash
+set -euo pipefail
+
+auth_dir="${HARBOR_SERVICE_AUTH_DIR:-/etc/harboros/service-auth}"
+
+valid_token() {
+  [[ "$1" =~ ^[A-Za-z0-9_-]{32,}$ ]]
+}
+
+validate_credential() {
+  local name="$1"
+  local allow_empty="$2"
+  local path="$auth_dir/$name"
+  local value
+
+  if [ -L "$path" ] || [ ! -f "$path" ]; then
+    echo "required HarborGate service credential is not a regular file: $name" >&2
+    return 1
+  fi
+  if [ "$(stat -c '%a' "$path")" != "600" ]; then
+    echo "required HarborGate service credential must have mode 0600: $name" >&2
+    return 1
+  fi
+  if [ "$(id -u)" -eq 0 ] && { [ "$(stat -c '%u' "$path")" != "0" ] || [ "$(stat -c '%g' "$path")" != "0" ]; }; then
+    echo "required HarborGate service credential must be owned by root:root: $name" >&2
+    return 1
+  fi
+
+  value="$(cat -- "$path")"
+  if [ -z "$value" ] && [ "$allow_empty" = "yes" ]; then
+    return 0
+  fi
+  if ! valid_token "$value"; then
+    echo "required HarborGate service credential is invalid: $name" >&2
+    return 1
+  fi
+}
+
+if [ -L "$auth_dir" ] || [ ! -d "$auth_dir" ]; then
+  echo "HarborGate service credential directory is missing or unsafe" >&2
+  exit 1
+fi
+if [ "$(stat -c '%a' "$auth_dir")" != "700" ]; then
+  echo "HarborGate service credential directory must have mode 0700" >&2
+  exit 1
+fi
+if [ "$(id -u)" -eq 0 ] && { [ "$(stat -c '%u' "$auth_dir")" != "0" ] || [ "$(stat -c '%g' "$auth_dir")" != "0" ]; }; then
+  echo "HarborGate service credential directory must be owned by root:root" >&2
+  exit 1
+fi
+
+validate_credential gate-to-beacon.accept-current no
+validate_credential gate-to-beacon.accept-previous yes
+validate_credential beacon-to-gate.send no
+
+gate_to_beacon="$(cat -- "$auth_dir/gate-to-beacon.accept-current")"
+beacon_to_gate="$(cat -- "$auth_dir/beacon-to-gate.send")"
+if [ "$gate_to_beacon" = "$beacon_to_gate" ]; then
+  echo "Gate-to-Beacon and Beacon-to-Gate credentials must use distinct token domains" >&2
+  exit 1
+fi

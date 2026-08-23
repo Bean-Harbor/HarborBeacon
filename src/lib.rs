@@ -6,4 +6,5 @@ pub mod orchestrator;
 pub mod planner;
 pub mod runtime;
 pub mod scripts;
+pub mod service_auth;
 pub mod skills;

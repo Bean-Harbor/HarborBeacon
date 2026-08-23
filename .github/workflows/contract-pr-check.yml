@@ -25,10 +25,12 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - run: cargo fmt --check
       - run: cargo clippy --lib --tests
-      - run: cargo check --bin harboros-beacon --bin agent-hub-admin-api
+      - run: cargo check --locked --bin harboros-beacon --bin agent-hub-admin-api --bin assistant-task-api --bin harbor-model-api --bin benchmark-local-model-backend
       - run: cargo test --lib -- --test-threads=1
       - run: cargo test --locked --bin harboros-beacon -- --test-threads=1
       - run: cargo test --bin agent-hub-admin-api -- --test-threads=1
+      - run: cargo test --locked --bin benchmark-local-model-backend spawned_model_api_receives_only_explicit_benchmark_api_key -- --test-threads=1
+      - run: cargo test --locked --test service_auth_hardening -- --test-threads=1
 
   harborlink_package_contract:
     runs-on: ubuntu-latest
@@ -37,10 +39,19 @@ jobs:
       - name: Verify HarborLink dependency and lifecycle metadata
         run: |
           grep -Eq '^Depends:.*harborlink \(>= [0-9]+\.[0-9]+\.[0-9]+\)' debian/control
+          grep -F 'harboros-im-gate, harboros-service-auth-abi (>= 1)' debian/control
           grep -F 'harborlink (>= 0.1.0)' scripts/build_harbornavi_k3_deb.sh
+          grep -F 'harboros-im-gate, harboros-service-auth-abi (>= 1)' scripts/build_harbornavi_k3_deb.sh
+          grep -F 'validate-harborbeacon-service-auth' scripts/build_harbornavi_k3_deb.sh
+          grep -F 'ensure-harborbeacon-model-token' scripts/build_harbornavi_k3_deb.sh
           bash -n scripts/build_harbornavi_k3_deb.sh
+          bash -n scripts/validate_harbornavi_k3_gate_deb.sh
+          bash -n tests/test_harbornavi_k3_gate_companion.sh
+          bash tests/test_harbornavi_k3_gate_companion.sh
           grep -F 'User=harborbeacon' debian/harboros-beacon.service
           grep -F 'LoadCredential=harborlink-local-api-token:' debian/harboros-beacon.service
+          grep -F 'Requires=harboros-service-auth-recovery.service' debian/harboros-beacon.service
+          grep -F 'After=network.target harborlink.target harboros-service-auth-recovery.service' debian/harboros-beacon.service
       - name: Verify AMD64 embedded semantic-router topology
         run: |
           bash -n debian/postinst debian/prerm debian/reconcile-legacy-semantic-router

@@ -3,7 +3,7 @@ Version: VERSION_PLACEHOLDER
 Section: utils
 Priority: optional
 Architecture: ARCH_PLACEHOLDER
-Depends: libc6, openssl, ca-certificates, harborlink (>= 0.1.0)
+Depends: libc6, openssl, ca-certificates, harborlink (>= 0.1.0), harboros-im-gate, harboros-service-auth-abi (>= 1)
 Maintainer: Harborinno Ltd.
 Description: HarborNAS Beacon Service
   Background service for the HarborNAS Beacon feature.

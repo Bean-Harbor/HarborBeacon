@@ -15,6 +15,7 @@ RECONCILER_PATH = (
 RELEASE_WORKFLOW_PATH = (
     REPOSITORY_ROOT / ".github" / "workflows" / "release.yml"
 )
+UNIT_PATH = REPOSITORY_ROOT / "debian" / "harboros-beacon.service"
 
 
 def read_text(path):
@@ -47,6 +48,18 @@ class Amd64SemanticRouterTopologyTests(unittest.TestCase):
             postinst,
             "the formal package must not publish the legacy standalone endpoint",
         )
+        self.assertIn(
+            'upsert_env_value "$env_file" "HARBOR_MODEL_API_BASE_URL" '
+            '"http://127.0.0.1:4174/api/inference/v1"',
+            postinst,
+            "upgrades must replace a stale or attacker-controlled model facade URL",
+        )
+
+        gate_preflight = postinst.index("validate-harborbeacon-service-auth")
+        model_token = postinst.index("ensure-harborbeacon-model-token")
+        embedded_topology = postinst.index("\nensure_harborbeacon_runtime_env\n")
+        self.assertLess(gate_preflight, model_token)
+        self.assertLess(model_token, embedded_topology)
 
         forbidden_activation = re.compile(
             r"(?m)^\s*systemctl\s+(?:--\S+\s+)*"
@@ -337,6 +350,32 @@ esac
             "the package tree must not inherit setgid or unsafe directory modes",
         )
         self.assertIn("dpkg-deb --root-owner-group --build", workflow)
+        for helper in [
+            "validate-harborbeacon-service-auth",
+            "ensure-harborbeacon-model-token",
+            "reconcile-legacy-semantic-router",
+        ]:
+            self.assertIn(helper, workflow)
+            self.assertIn(
+                f"./usr/lib/harboros-beacon/{helper}",
+                workflow,
+                f"release packaging must assert {helper} is in the deb",
+            )
+        self.assertIn(
+            "harbor-model-api|semantic-router\\.service|etc/default/semantic-router",
+            workflow,
+        )
+
+    def test_systemd_unit_combines_auth_recovery_model_env_and_exact_bind(self):
+        unit = read_text(UNIT_PATH)
+
+        self.assertIn("Requires=harboros-service-auth-recovery.service", unit)
+        self.assertIn("LoadCredential=gate-to-beacon-accept-current:", unit)
+        self.assertIn("LoadCredential=gate-to-beacon-accept-previous:", unit)
+        self.assertIn("LoadCredential=beacon-to-gate-send:", unit)
+        self.assertIn("EnvironmentFile=-/etc/default/harboros-beacon", unit)
+        self.assertIn("--bind 127.0.0.1:4174", unit)
+        self.assertNotIn("127.0.0.1:4176", unit)
 
 
 if __name__ == "__main__":

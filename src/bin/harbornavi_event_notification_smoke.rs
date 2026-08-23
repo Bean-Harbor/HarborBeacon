@@ -8,6 +8,7 @@ use harborbeacon_local_agent::runtime::vision_event::{
     build_ha_mqtt_payload, build_local_vision_notification_intent, LocalVisionEvent,
     StoredLocalVisionEvent,
 };
+use harborbeacon_local_agent::service_auth::beacon_to_gate_sender_token;
 use serde_json::{json, Value};
 
 fn main() {
@@ -34,11 +35,8 @@ fn run() -> Result<(), String> {
         let token = args
             .bearer_token
             .clone()
-            .or_else(|| env::var("HARBORGATE_BEARER_TOKEN").ok())
-            .or_else(|| env::var("HARBOR_IM_GATEWAY_BEARER_TOKEN").ok())
-            .ok_or_else(|| {
-                "sending requires --bearer-token or HARBORGATE_BEARER_TOKEN".to_string()
-            })?;
+            .map(Ok)
+            .unwrap_or_else(beacon_to_gate_sender_token)?;
         let service = NotificationDeliveryService::from_config(
             NotificationGatewayConfig::new(gateway_url, token)
                 .map_err(|error| error.to_string())?,

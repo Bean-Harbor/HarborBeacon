@@ -1545,6 +1545,7 @@ mod tests {
             "HARBOR_MODEL_API_BASE_URL",
             "http://127.0.0.1:4174/api/inference/v1",
         );
+        let _model_token = EnvVarGuard::set("HARBOR_MODEL_API_TOKEN", "embedded-readiness-token");
         let mut state = AdminConsoleState::default();
         state.models.endpoints = vec![ModelEndpoint {
             model_endpoint_id: "llm-local-openai-compatible".to_string(),
@@ -1608,6 +1609,7 @@ mod tests {
             "HARBOR_MODEL_API_BASE_URL",
             "http://127.0.0.1:4174/api/inference/v1",
         );
+        let _model_token = EnvVarGuard::set("HARBOR_MODEL_API_TOKEN", "embedded-readiness-token");
         let state = AdminConsoleState::default();
 
         let readiness = evt_model_policy_readiness_with_health_probe(&state, |endpoint| {
@@ -1638,6 +1640,7 @@ mod tests {
     #[test]
     fn semantic_router_cloud_fallback_blocks_evt_readiness() {
         let _env_lock = evt_test_env_lock().lock().expect("env lock");
+        let _topology = EnvVarGuard::set(SEMANTIC_ROUTER_TOPOLOGY_ENV, "standalone");
         let mut state = AdminConsoleState::default();
         let router = state
             .models
