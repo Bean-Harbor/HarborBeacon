@@ -4,7 +4,6 @@
 use base64::Engine as _;
 use std::env;
 use std::fs;
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -1507,14 +1506,11 @@ fn canonical_embedded_model_api_base_url() -> Result<String, String> {
 
 fn validate_embedded_model_api_base_url(configured: &str) -> Result<String, String> {
     let mut url = Url::parse(&configured).map_err(|_| embedded_model_api_url_error())?;
-    let host = url.host_str().ok_or_else(embedded_model_api_url_error)?;
-    let loopback = host
-        .parse::<IpAddr>()
-        .map(|address| address.is_loopback())
-        .unwrap_or(false);
+    let exact_host =
+        url.host_str() == Some("127.0.0.1") && configured.starts_with("http://127.0.0.1:");
     let facade_port = url.port_or_known_default() == Some(4174);
     if url.scheme() != "http"
-        || !loopback
+        || !exact_host
         || !facade_port
         || !url.username().is_empty()
         || url.password().is_some()
@@ -4197,6 +4193,13 @@ mod tests {
         );
         for invalid_base_url in [
             "http://198.51.100.20/api/inference/v1",
+            "http://127.0.0.2:4174/api/inference/v1",
+            "http://127.255.255.254:4174/api/inference/v1",
+            "http://127.1:4174/api/inference/v1",
+            "http://2130706433:4174/api/inference/v1",
+            "http://[::1]:4174/api/inference/v1",
+            "http://[::ffff:127.0.0.1]:4174/api/inference/v1",
+            "http://localhost:4174/api/inference/v1",
             "http://127.0.0.1:4175/api/inference/v1",
             "http://127.0.0.1/api/inference/v1",
             "http://127.0.0.1:4174/v1",
