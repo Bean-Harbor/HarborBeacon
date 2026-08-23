@@ -52,30 +52,46 @@ jobs:
 
           mkdir -p ${PKG_DIR}/DEBIAN
           mkdir -p ${PKG_DIR}/usr/bin
+          mkdir -p ${PKG_DIR}/usr/lib/harboros-beacon
           mkdir -p ${PKG_DIR}/etc/systemd/system
 
           cp ./target/x86_64-unknown-linux-gnu/release/harboros-beacon ${PKG_DIR}/usr/bin/harboros-beacon
-          chmod +x ${PKG_DIR}/usr/bin/harboros-beacon
+          chmod 0755 ${PKG_DIR}/usr/bin/harboros-beacon
+
+          cp ./debian/reconcile-legacy-semantic-router ${PKG_DIR}/usr/lib/harboros-beacon/
+          chmod 0755 ${PKG_DIR}/usr/lib/harboros-beacon/reconcile-legacy-semantic-router
 
           test -f "${BOOTSTRAP_MODEL_DIR}/model.safetensors"
           mkdir -p "${BOOTSTRAP_MODEL_PKG_DIR}"
           cp -a "${BOOTSTRAP_MODEL_DIR}/." "${BOOTSTRAP_MODEL_PKG_DIR}/"
 
           cp ./debian/harboros-beacon.service ${PKG_DIR}/etc/systemd/system/
+          chmod 0644 ${PKG_DIR}/etc/systemd/system/harboros-beacon.service
 
           cp ./debian/control ${PKG_DIR}/DEBIAN/control
           sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g" ${PKG_DIR}/DEBIAN/control
           sed -i "s/ARCH_PLACEHOLDER/amd64/g" ${PKG_DIR}/DEBIAN/control
 
           cp ./debian/postinst ${PKG_DIR}/DEBIAN/postinst
-          chmod +x ${PKG_DIR}/DEBIAN/postinst
+          chmod 0755 ${PKG_DIR}/DEBIAN/postinst
 
           cp ./debian/prerm ${PKG_DIR}/DEBIAN/prerm
-          chmod +x ${PKG_DIR}/DEBIAN/prerm
+          chmod 0755 ${PKG_DIR}/DEBIAN/prerm
 
-          dpkg-deb --build ${PKG_DIR}
+          find "${PKG_DIR}" -type d -exec chmod a-s,u=rwx,go=rx {} +
+          dpkg-deb --root-owner-group --build ${PKG_DIR}
+          DEB_PATH="./deb-package/${PKG_NAME}.deb"
+          CONTENTS_PATH="./deb-package/${PKG_NAME}.contents"
+          dpkg-deb --contents "${DEB_PATH}" > "${CONTENTS_PATH}"
+          grep -F './usr/bin/harboros-beacon' "${CONTENTS_PATH}"
+          grep -F './etc/systemd/system/harboros-beacon.service' "${CONTENTS_PATH}"
+          grep -F './usr/lib/harboros-beacon/reconcile-legacy-semantic-router' "${CONTENTS_PATH}"
+          if grep -Eq 'harbor-model-api|semantic-router\.service|etc/default/semantic-router' "${CONTENTS_PATH}"; then
+            echo 'error: AMD64 package contains standalone semantic-router lifecycle artifacts' >&2
+            exit 1
+          fi
           mkdir -p ./artifacts/
-          mv ./deb-package/${PKG_NAME}.deb ./artifacts/
+          mv "${DEB_PATH}" ./artifacts/
 
       - name: Create Release
         uses: softprops/action-gh-release@v2

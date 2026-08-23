@@ -1,0 +1,121 @@
+#!/bin/bash
+set -euo pipefail
+
+unit="semantic-router.service"
+test_root=""
+systemctl_bin="systemctl"
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --test-root)
+      [ "$#" -ge 2 ] || { echo "error: --test-root requires a path" >&2; exit 64; }
+      test_root="$2"
+      shift 2
+      ;;
+    --systemctl)
+      [ "$#" -ge 2 ] || { echo "error: --systemctl requires a path" >&2; exit 64; }
+      systemctl_bin="$2"
+      shift 2
+      ;;
+    *)
+      echo "error: unsupported argument: $1" >&2
+      exit 64
+      ;;
+  esac
+done
+
+if [ -z "$test_root" ]; then
+  [ "$(id -u)" -eq 0 ] || {
+    echo "error: legacy semantic-router reconciliation requires root" >&2
+    exit 77
+  }
+  root=""
+  expected_uid=0
+  expected_gid=0
+else
+  case "$test_root" in
+    /*) ;;
+    *) echo "error: --test-root must be absolute" >&2; exit 64 ;;
+  esac
+  [ "$test_root" != "/" ] || { echo "error: --test-root cannot be /" >&2; exit 64; }
+  [ -d "$test_root" ] || { echo "error: --test-root must exist" >&2; exit 64; }
+  root="${test_root%/}"
+  expected_uid="$(id -u)"
+  expected_gid="$(id -g)"
+fi
+
+command -v "$systemctl_bin" >/dev/null 2>&1 || {
+  echo "error: systemctl command is unavailable" >&2
+  exit 69
+}
+
+legacy_env="${root}/etc/default/semantic-router"
+legacy_wants="${root}/etc/systemd/system/multi-user.target.wants/${unit}"
+
+validate_legacy_env() {
+  [ ! -L "$legacy_env" ] || {
+    echo "error: legacy semantic-router env must not be a symlink" >&2
+    return 1
+  }
+  [ -e "$legacy_env" ] || return 0
+  [ -f "$legacy_env" ] || {
+    echo "error: legacy semantic-router env must be a regular file" >&2
+    return 1
+  }
+
+  local uid gid mode
+  uid="$(stat -c '%u' -- "$legacy_env")"
+  gid="$(stat -c '%g' -- "$legacy_env")"
+  mode="$(stat -c '%a' -- "$legacy_env")"
+  [ "$uid" = "$expected_uid" ] && [ "$gid" = "$expected_gid" ] || {
+    echo "error: legacy semantic-router env has unexpected ownership" >&2
+    return 1
+  }
+  case "$mode" in
+    600|644) ;;
+    *)
+      echo "error: legacy semantic-router env has unsafe mode" >&2
+      return 1
+      ;;
+  esac
+}
+
+validate_legacy_env
+if [ -e "$legacy_env" ]; then
+  chmod 0600 -- "$legacy_env"
+fi
+
+if "$systemctl_bin" is-active --quiet "$unit"; then
+  "$systemctl_bin" stop "$unit"
+fi
+if "$systemctl_bin" is-enabled --quiet "$unit"; then
+  "$systemctl_bin" disable "$unit"
+fi
+
+if [ -L "$legacy_wants" ]; then
+  rm -f -- "$legacy_wants"
+elif [ -e "$legacy_wants" ]; then
+  echo "error: legacy semantic-router wants entry is not a symlink" >&2
+  exit 1
+fi
+
+"$systemctl_bin" daemon-reload
+
+if "$systemctl_bin" is-active --quiet "$unit"; then
+  echo "error: legacy semantic-router service remains active" >&2
+  exit 1
+fi
+if "$systemctl_bin" is-enabled --quiet "$unit"; then
+  echo "error: legacy semantic-router service remains enabled" >&2
+  exit 1
+fi
+
+if [ -e "$legacy_env" ]; then
+  validate_legacy_env
+  [ "$(stat -c '%a' -- "$legacy_env")" = "600" ] || {
+    echo "error: legacy semantic-router env was not secured" >&2
+    exit 1
+  }
+fi
+
+echo "legacy semantic-router lifecycle is inactive and disabled"

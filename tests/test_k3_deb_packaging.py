@@ -7,6 +7,7 @@ from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
 BUILD_SCRIPT = REPOSITORY_ROOT / "scripts" / "build_harbornavi_k3_deb.sh"
+K3_DEBIAN_DIRECTORY = REPOSITORY_ROOT / "debian" / "harbornavi-k3"
 
 
 class K3DebPackagingTests(unittest.TestCase):
@@ -80,6 +81,50 @@ class K3DebPackagingTests(unittest.TestCase):
                 f'"$pkg_dir/etc/systemd/system/{unit_name}"',
                 mode_block,
             )
+
+        self.assertIn(
+            "debian/harbornavi-k3/semantic-router.service",
+            unit_section,
+            "K3 must package its standalone unit from the isolated K3 lane",
+        )
+
+    def test_k3_uses_isolated_standalone_router_lifecycle(self):
+        script = BUILD_SCRIPT.read_text(encoding="utf-8")
+        expected_sources = (
+            "debian/harbornavi-k3/postinst",
+            "debian/harbornavi-k3/prerm",
+            "debian/harbornavi-k3/semantic-router.service",
+        )
+        for source in expected_sources:
+            with self.subTest(source=source):
+                self.assertIn(source, script)
+
+        self.assertNotRegex(
+            script,
+            re.compile(r"sed 's/\\r\$//' debian/(?:postinst|prerm)(?:\s|>)"),
+            "K3 must not inherit the formal AMD64 maintainer scripts",
+        )
+        self.assertNotIn(
+            "sed 's/\\r$//' debian/semantic-router.service",
+            script,
+            "K3 must not inherit a top-level standalone unit",
+        )
+
+        k3_postinst = (K3_DEBIAN_DIRECTORY / "postinst").read_text(
+            encoding="utf-8"
+        )
+        k3_prerm = (K3_DEBIAN_DIRECTORY / "prerm").read_text(encoding="utf-8")
+        self.assertRegex(
+            k3_postinst,
+            re.compile(
+                r'HARBOR_SEMANTIC_ROUTER_TOPOLOGY"\s+"standalone"'
+            ),
+            "the K3 package must explicitly select its standalone topology",
+        )
+        self.assertIn("systemctl enable semantic-router.service", k3_postinst)
+        self.assertIn("systemctl restart semantic-router.service", k3_postinst)
+        self.assertIn("systemctl stop semantic-router.service", k3_prerm)
+        self.assertIn("systemctl disable semantic-router.service", k3_prerm)
 
 
 if __name__ == "__main__":
