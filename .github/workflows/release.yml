@@ -84,6 +84,12 @@ jobs:
           cp ./debian/prerm ${PKG_DIR}/DEBIAN/prerm
           chmod 0755 ${PKG_DIR}/DEBIAN/prerm
 
+          bash -n \
+            ${PKG_DIR}/DEBIAN/postinst \
+            ${PKG_DIR}/DEBIAN/prerm \
+            ${PKG_DIR}/usr/lib/harboros-beacon/validate-harborbeacon-service-auth \
+            ${PKG_DIR}/usr/lib/harboros-beacon/ensure-harborbeacon-model-token \
+            ${PKG_DIR}/usr/lib/harboros-beacon/reconcile-legacy-semantic-router
           find "${PKG_DIR}" -type d -exec chmod a-s,u=rwx,go=rx {} +
           dpkg-deb --root-owner-group --build ${PKG_DIR}
           DEB_PATH="./deb-package/${PKG_NAME}.deb"
@@ -91,6 +97,8 @@ jobs:
           dpkg-deb --contents "${DEB_PATH}" > "${CONTENTS_PATH}"
           grep -F './usr/bin/harboros-beacon' "${CONTENTS_PATH}"
           grep -F './etc/systemd/system/harboros-beacon.service' "${CONTENTS_PATH}"
+          grep -F './usr/lib/harboros-beacon/validate-harborbeacon-service-auth' "${CONTENTS_PATH}"
+          grep -F './usr/lib/harboros-beacon/ensure-harborbeacon-model-token' "${CONTENTS_PATH}"
           grep -F './usr/lib/harboros-beacon/reconcile-legacy-semantic-router' "${CONTENTS_PATH}"
           if grep -Eq 'harbor-model-api|semantic-router\.service|etc/default/semantic-router' "${CONTENTS_PATH}"; then
             echo 'error: AMD64 package contains standalone semantic-router lifecycle artifacts' >&2

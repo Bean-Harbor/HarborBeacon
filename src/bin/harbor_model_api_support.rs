@@ -421,10 +421,7 @@ impl ModelApiService {
         headers: &[Header],
         body: &[u8],
     ) -> Response<Cursor<Vec<u8>>> {
-        if method == Method::Post
-            && matches!(path, "/v1/chat/completions" | "/v1/embeddings")
-            && !self.is_authorized(headers)
-        {
+        if method != Method::Options && path.starts_with("/v1/") && !self.is_authorized(headers) {
             return service_auth_failed();
         }
 
@@ -2989,6 +2986,29 @@ mod tests {
         ));
         assert_eq!(status, StatusCode(401));
         assert_eq!(payload["error"]["code"], "SERVICE_AUTH_FAILED");
+    }
+
+    #[test]
+    fn every_model_v1_request_requires_bearer_before_route_dispatch() {
+        let service = model_api_for(BackendKind::SemanticRouter);
+
+        for path in ["/v1/rerank", "/v1/future-inference"] {
+            for headers in [vec![], vec![auth_header("Bearer wrong-model-token")]] {
+                let (status, payload, _) =
+                    response_payload(service.route(Method::Post, path, &headers, b"{}"));
+                assert_eq!(status, StatusCode(401), "unprotected path: {path}");
+                assert_eq!(payload["error"]["code"], "SERVICE_AUTH_FAILED");
+            }
+
+            let (status, payload, _) = response_payload(service.route(
+                Method::Post,
+                path,
+                &[auth_header(&format!("Bearer {MODEL_TOKEN}"))],
+                b"{}",
+            ));
+            assert_eq!(status, StatusCode(404));
+            assert_eq!(payload["error"]["code"], "ROUTE_NOT_FOUND");
+        }
     }
 
     #[test]

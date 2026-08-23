@@ -1468,6 +1468,8 @@ pub fn semantic_router_endpoint_for_readiness(
 
 fn canonical_embedded_semantic_router_endpoint() -> Result<ModelEndpoint, String> {
     let base_url = canonical_embedded_model_api_base_url()?;
+    let api_key = env_trimmed(MODEL_API_TOKEN_ENV)
+        .ok_or_else(|| format!("{MODEL_API_TOKEN_ENV} is not configured"))?;
     let mut endpoint = default_model_endpoints()
         .into_iter()
         .find(|endpoint| endpoint.model_endpoint_id == "llm-local-openai-compatible")
@@ -1481,13 +1483,26 @@ fn canonical_embedded_semantic_router_endpoint() -> Result<ModelEndpoint, String
         "healthz_url",
         infer_healthz_url(&base_url),
     );
+    set_metadata_string(&mut endpoint.metadata, "api_key", api_key);
+    set_metadata_bool(&mut endpoint.metadata, "api_key_configured", true);
+    set_metadata_bool(&mut endpoint.metadata, "api_key_required", true);
+    set_metadata_bool(&mut endpoint.metadata, "local_only", true);
+    set_metadata_bool(&mut endpoint.metadata, "cloud_fallback_allowed", false);
     set_metadata_bool(
         &mut endpoint.metadata,
         "semantic_router_embedded_facade",
         true,
     );
     if let Some(metadata) = endpoint.metadata.as_object_mut() {
-        metadata.remove("mock_text");
+        for key in [
+            "mock_text",
+            "mock_embedding",
+            "mock_embeddings",
+            "mock_embedding_dimensions",
+            "mock_rerank_scores",
+        ] {
+            metadata.remove(key);
+        }
     }
     Ok(endpoint)
 }
@@ -4139,6 +4154,12 @@ mod tests {
         assert_eq!(
             runtime_endpoint.metadata["api_key"],
             json!("embedded-router-token")
+        );
+        assert_eq!(runtime_endpoint.metadata["api_key_configured"], json!(true));
+        assert_eq!(runtime_endpoint.metadata["api_key_required"], json!(true));
+        assert_eq!(
+            runtime_endpoint.metadata["cloud_fallback_allowed"],
+            json!(false)
         );
         assert!(runtime_endpoint.metadata.get("mock_text").is_none());
         assert_ne!(runtime_endpoint.model_name, "persisted-attacker-model");

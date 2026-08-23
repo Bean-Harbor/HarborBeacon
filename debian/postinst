@@ -1,6 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
+/usr/lib/harboros-beacon/validate-harborbeacon-service-auth
+/usr/lib/harboros-beacon/ensure-harborbeacon-model-token
+
 if ! getent group harborbeacon >/dev/null 2>&1; then
   addgroup --system harborbeacon
 fi
@@ -40,7 +43,7 @@ ensure_harborbeacon_runtime_env() {
   chmod 0600 "$env_file"
 
   append_env_if_missing "$env_file" "HARBOR_HARBOROS_WRITABLE_ROOT" "$writable_root"
-  append_env_if_missing "$env_file" "HARBOR_MODEL_API_BASE_URL" "http://127.0.0.1:4174/api/inference/v1"
+  upsert_env_value "$env_file" "HARBOR_MODEL_API_BASE_URL" "http://127.0.0.1:4174/api/inference/v1"
   append_env_if_missing "$env_file" "HARBOR_MODEL_API_BACKEND" "candle"
   append_env_if_missing "$env_file" "HARBOR_MODEL_API_CHAT_MODEL" "Qwen/Qwen2.5-0.5B-Instruct"
   append_env_if_missing "$env_file" "HARBOR_MODEL_API_CANDLE_CHAT_MODEL_ID" "${candle_root}/bootstrap-llm"
@@ -49,8 +52,6 @@ ensure_harborbeacon_runtime_env() {
   append_env_if_missing "$env_file" "HARBOR_SEMANTIC_ROUTER_LOCAL_ONLY" "1"
 }
 
-/usr/lib/harboros-beacon/validate-harborbeacon-service-auth
-/usr/lib/harboros-beacon/ensure-harborbeacon-model-token
 ensure_harborbeacon_runtime_env
 install -d -o harborbeacon -g harborbeacon -m 0750 \
   /var/lib/harboros-beacon /mnt/software/harborbeacon-agent-ci
