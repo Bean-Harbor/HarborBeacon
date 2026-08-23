@@ -373,6 +373,7 @@ esac
         self.assertIn("LoadCredential=gate-to-beacon-accept-current:", unit)
         self.assertIn("LoadCredential=gate-to-beacon-accept-previous:", unit)
         self.assertIn("LoadCredential=beacon-to-gate-send:", unit)
+        self.assertNotIn("TOKEN_FILE=%d", unit)
         self.assertIn("EnvironmentFile=-/etc/default/harboros-beacon", unit)
         self.assertIn("--bind 127.0.0.1:4174", unit)
         self.assertNotIn("127.0.0.1:4176", unit)
