@@ -89,6 +89,14 @@ fn package_includes_independent_model_token_writer() {
     let writer = fs::read_to_string(root.join("debian/ensure-harborbeacon-model-token")).unwrap();
 
     assert!(postinst.contains("/usr/lib/harboros-beacon/ensure-harborbeacon-model-token"));
+    assert!(postinst.contains("HARBOR_MODEL_TOKEN_FORBIDDEN_FILES="));
+    for credential in [
+        "gate-to-beacon.accept-current",
+        "gate-to-beacon.accept-previous",
+        "beacon-to-gate.send",
+    ] {
+        assert!(postinst.contains(credential));
+    }
     assert!(workflow.contains("ensure-harborbeacon-model-token"));
     assert!(k3_builder.contains("ensure-harborbeacon-model-token"));
     assert!(k3_builder.contains("validate-harborbeacon-service-auth"));
@@ -331,6 +339,90 @@ fn model_token_writer_is_idempotent_private_and_atomic() {
         .expect("run model token failpoint");
     assert!(!failed.status.success());
     assert_eq!(fs::read(&env_file).unwrap().as_slice(), original);
+    fs::remove_dir_all(dir).expect("remove temp dir");
+}
+
+#[cfg(unix)]
+#[test]
+fn model_token_writer_rotates_service_token_reuse_without_secret_output() {
+    let root = repo_root();
+    let writer = root.join("debian/ensure-harborbeacon-model-token");
+    let dir = temp_dir("model-token-domain-isolation");
+    let env_file = dir.join("harboros-beacon");
+    let current = dir.join("gate-to-beacon.accept-current");
+    let previous = dir.join("gate-to-beacon.accept-previous");
+    let sender = dir.join("beacon-to-gate.send");
+    let reused = "legacy_shared_token_0123456789abcdef0123456789abcdef";
+    let other = "directional_token_0123456789abcdef0123456789abcdef";
+
+    write_mode_0600(
+        &env_file,
+        &format!("OTHER=value\n  HARBOR_MODEL_API_TOKEN = \"{reused}\"  \n"),
+    );
+    write_mode_0600(&current, &format!("{other}\n"));
+    write_mode_0600(&previous, &format!("{reused}\n"));
+    write_mode_0600(&sender, &format!("{reused}\n"));
+    let forbidden_files = format!(
+        "{}:{}:{}",
+        current.display(),
+        previous.display(),
+        sender.display()
+    );
+
+    let first = Command::new("bash")
+        .arg(&writer)
+        .env("HARBORBEACON_RUNTIME_ENV_FILE", &env_file)
+        .env("HARBOR_MODEL_TOKEN_FORBIDDEN_FILES", &forbidden_files)
+        .output()
+        .expect("rotate reused model token");
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_bytes = fs::read(&env_file).expect("read rotated model token env");
+    let first_text = String::from_utf8_lossy(&first_bytes);
+    let rotated = first_text
+        .lines()
+        .find_map(|line| line.strip_prefix("HARBOR_MODEL_API_TOKEN="))
+        .expect("rotated model token assignment");
+    assert_ne!(rotated, reused);
+    assert_ne!(rotated, other);
+    assert!(!first_text.contains(reused));
+    assert_eq!(first_text.matches("HARBOR_MODEL_API_TOKEN=").count(), 1);
+    for output in [&first.stdout, &first.stderr] {
+        let output = String::from_utf8_lossy(output);
+        assert!(!output.contains(reused));
+        assert!(!output.contains(rotated));
+    }
+
+    let second = Command::new("bash")
+        .arg(&writer)
+        .env("HARBORBEACON_RUNTIME_ENV_FILE", &env_file)
+        .env("HARBOR_MODEL_TOKEN_FORBIDDEN_FILES", &forbidden_files)
+        .output()
+        .expect("rerun isolated model token writer");
+    assert!(second.status.success());
+    assert_eq!(first_bytes, fs::read(&env_file).unwrap());
+
+    fs::set_permissions(&sender, fs::Permissions::from_mode(0o644))
+        .expect("weaken sender credential mode");
+    let tampered = Command::new("bash")
+        .arg(&writer)
+        .env("HARBORBEACON_RUNTIME_ENV_FILE", &env_file)
+        .env("HARBOR_MODEL_TOKEN_FORBIDDEN_FILES", &forbidden_files)
+        .output()
+        .expect("reject weak isolation credential");
+    assert!(!tampered.status.success());
+    assert_eq!(first_bytes, fs::read(&env_file).unwrap());
+    let tampered_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&tampered.stdout),
+        String::from_utf8_lossy(&tampered.stderr)
+    );
+    assert!(!tampered_log.contains(reused));
+    assert!(!tampered_log.contains(rotated));
+
     fs::remove_dir_all(dir).expect("remove temp dir");
 }
 
