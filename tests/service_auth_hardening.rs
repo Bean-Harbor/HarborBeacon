@@ -45,6 +45,10 @@ fn beacon_unit_receives_only_role_scoped_service_credentials() {
     assert!(unit.contains("LoadCredential=gate-to-beacon-accept-current:"));
     assert!(unit.contains("LoadCredential=gate-to-beacon-accept-previous:"));
     assert!(unit.contains("LoadCredential=beacon-to-gate-send:"));
+    assert!(!unit.contains("TOKEN_FILE=%d"));
+    assert!(fs::read_to_string(root.join("src/service_auth.rs"))
+        .unwrap()
+        .contains("CREDENTIALS_DIRECTORY"));
     assert!(unit.contains("Requires=harboros-service-auth-recovery.service"));
     assert!(unit
         .contains("After=network.target harborlink.target harboros-service-auth-recovery.service"));

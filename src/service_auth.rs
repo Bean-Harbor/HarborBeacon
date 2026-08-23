@@ -2,6 +2,7 @@
 
 use std::env;
 use std::fs;
+use std::path::PathBuf;
 
 use constant_time_eq::constant_time_eq;
 
@@ -15,6 +16,10 @@ pub const BEACON_TO_GATE_TOKEN_FILE_ENV: &str = "HARBOR_BEACON_TO_GATE_TOKEN_FIL
 pub const MODEL_API_TOKEN_ENV: &str = "HARBOR_MODEL_API_TOKEN";
 
 const MIN_TOKEN_LEN: usize = 32;
+const CREDENTIALS_DIRECTORY_ENV: &str = "CREDENTIALS_DIRECTORY";
+const GATE_TO_BEACON_CURRENT_CREDENTIAL: &str = "gate-to-beacon-accept-current";
+const GATE_TO_BEACON_PREVIOUS_CREDENTIAL: &str = "gate-to-beacon-accept-previous";
+const BEACON_TO_GATE_SEND_CREDENTIAL: &str = "beacon-to-gate-send";
 
 const LEGACY_GATE_TO_BEACON_TOKEN_ENVS: &[&str] = &["HARBORBEACON_WEB_API_TOKEN"];
 const LEGACY_BEACON_TO_GATE_TOKEN_ENVS: &[&str] = &[
@@ -117,11 +122,7 @@ fn required_token(
 }
 
 fn optional_token(file_env: &str, primary_env: &str) -> Result<Option<String>, String> {
-    if let Some(path) = env::var(file_env)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
+    if let Some(path) = credential_file_path(file_env) {
         let value = fs::read_to_string(&path)
             .map_err(|error| {
                 format!("failed to read service credential configured by {file_env}: {error}")
@@ -146,10 +147,7 @@ fn required_file_token(file_env: &str) -> Result<String, String> {
 }
 
 fn optional_file_token(file_env: &str) -> Result<Option<String>, String> {
-    let path = env::var(file_env)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    let path = credential_file_path(file_env)
         .ok_or_else(|| format!("missing required service credential file setting {file_env}"))?;
     let value = fs::read_to_string(&path)
         .map_err(|error| {
@@ -165,11 +163,7 @@ fn optional_file_token(file_env: &str) -> Result<Option<String>, String> {
 }
 
 fn token_from_file_env(file_env: &str) -> Result<Option<String>, String> {
-    let Some(path) = env::var(file_env)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    else {
+    let Some(path) = credential_file_path(file_env) else {
         return Ok(None);
     };
     let value = fs::read_to_string(&path)
@@ -184,6 +178,41 @@ fn token_from_file_env(file_env: &str) -> Result<Option<String>, String> {
         ));
     }
     Ok(Some(value))
+}
+
+fn credential_file_path(file_env: &str) -> Option<PathBuf> {
+    let credential_name = match file_env {
+        GATE_TO_BEACON_TOKEN_FILE_ENV => GATE_TO_BEACON_CURRENT_CREDENTIAL,
+        GATE_TO_BEACON_TOKEN_PREVIOUS_FILE_ENV => GATE_TO_BEACON_PREVIOUS_CREDENTIAL,
+        BEACON_TO_GATE_TOKEN_FILE_ENV => BEACON_TO_GATE_SEND_CREDENTIAL,
+        _ => return configured_file_path(file_env),
+    };
+    credential_file_path_from_values(
+        &env::var(CREDENTIALS_DIRECTORY_ENV).unwrap_or_default(),
+        &env::var(file_env).unwrap_or_default(),
+        credential_name,
+    )
+}
+
+fn configured_file_path(file_env: &str) -> Option<PathBuf> {
+    env::var(file_env)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn credential_file_path_from_values(
+    credentials_directory: &str,
+    configured_file: &str,
+    credential_name: &str,
+) -> Option<PathBuf> {
+    let credentials_directory = credentials_directory.trim();
+    if !credentials_directory.is_empty() {
+        return Some(PathBuf::from(credentials_directory).join(credential_name));
+    }
+    let configured_file = configured_file.trim();
+    (!configured_file.is_empty()).then(|| PathBuf::from(configured_file))
 }
 
 fn token_from_env(key: &str) -> Option<String> {
@@ -210,9 +239,29 @@ fn constant_time_token_eq(actual: &str, expected: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::VerifierTokens;
+    use super::{credential_file_path_from_values, VerifierTokens};
+    use std::path::PathBuf;
 
     const VALID_CURRENT: &str = "gate_current_0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn systemd_credentials_directory_takes_precedence_over_configured_file() {
+        assert_eq!(
+            credential_file_path_from_values(
+                "/run/credentials/harboros-beacon.service",
+                "/tmp/explicit-token",
+                "beacon-to-gate-send",
+            ),
+            Some(PathBuf::from(
+                "/run/credentials/harboros-beacon.service/beacon-to-gate-send",
+            ))
+        );
+        assert_eq!(
+            credential_file_path_from_values("", "/tmp/explicit-token", "unused"),
+            Some(PathBuf::from("/tmp/explicit-token"))
+        );
+        assert_eq!(credential_file_path_from_values("", "", "unused"), None);
+    }
 
     #[test]
     fn verifier_accepts_current_and_previous_but_not_other_domain() {
