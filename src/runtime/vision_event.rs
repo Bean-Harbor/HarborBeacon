@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::connectors::notifications::{
-    NotificationContent, NotificationDelivery, NotificationDeliveryMode, NotificationDestination,
-    NotificationDestinationKind, NotificationMetadata, NotificationPayloadFormat,
-    NotificationRequest, NotificationSource,
+    NotificationAttachment, NotificationAttachmentKind, NotificationContent, NotificationDelivery,
+    NotificationDeliveryMode, NotificationDestination, NotificationDestinationKind,
+    NotificationMetadata, NotificationPayloadFormat, NotificationRequest, NotificationSource,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -697,6 +697,13 @@ pub fn build_local_vision_notification_request(
     }
     let event = &stored.event;
     let digest = stable_event_notification_digest(event);
+    let attachment = package_event_notification_attachment(event)?;
+    let attachments = attachment.into_iter().collect::<Vec<_>>();
+    let delivery_hints = if attachments.is_empty() {
+        Vec::new()
+    } else {
+        vec![json!({"kind": "native_image", "max_items": 1})]
+    };
     let request = NotificationRequest {
         notification_id: format!("notif_{}", &digest[..24]),
         trace_id: format!("trace_{}", event.event_id.trim()),
@@ -717,8 +724,8 @@ pub fn build_local_vision_notification_request(
             body: local_vision_notification_body(event),
             payload_format: NotificationPayloadFormat::PlainText,
             structured_payload: local_vision_notification_metadata(stored),
-            attachments: Vec::new(),
-            delivery_hints: Vec::new(),
+            attachments,
+            delivery_hints,
         },
         delivery: NotificationDelivery {
             mode: NotificationDeliveryMode::Send,
@@ -737,18 +744,99 @@ pub fn build_local_vision_notification_request(
 pub fn validate_local_vision_notification_request(
     request: &NotificationRequest,
 ) -> Result<(), String> {
-    if request.content.attachments.is_empty() {
-        let payload = serde_json::to_value(request)
-            .map_err(|error| format!("failed to inspect local vision notification: {error}"))?;
-        reject_sensitive_value(&payload)?;
-        reject_local_path_value(&payload)?;
-        Ok(())
-    } else {
-        Err(
-            "local vision notification must be text-only and cannot include attachments"
-                .to_string(),
-        )
+    let attachments = &request.content.attachments;
+    if !attachments.is_empty() {
+        let event_type = request
+            .content
+            .structured_payload
+            .pointer("/event/event_type")
+            .and_then(Value::as_str);
+        if event_type != Some("package_appeared") || attachments.len() != 1 {
+            return Err(
+                "only package_appeared notifications may include one snapshot attachment"
+                    .to_string(),
+            );
+        }
+        validate_package_notification_attachment(&attachments[0])?;
+        if request.content.delivery_hints.as_slice()
+            != [json!({"kind": "native_image", "max_items": 1})]
+        {
+            return Err("package notification requires one native_image delivery hint".to_string());
+        }
+    } else if !request.content.delivery_hints.is_empty() {
+        return Err(
+            "text-only local vision notification cannot include delivery hints".to_string(),
+        );
     }
+    let payload = serde_json::to_value(request)
+        .map_err(|error| format!("failed to inspect local vision notification: {error}"))?;
+    reject_sensitive_value(&payload)?;
+    reject_local_path_value(&payload)?;
+    Ok(())
+}
+
+fn package_event_notification_attachment(
+    event: &LocalVisionEvent,
+) -> Result<Option<NotificationAttachment>, String> {
+    if event.event_type != "package_appeared" {
+        return Ok(None);
+    }
+    let artifact_id = event
+        .snapshot_artifact
+        .artifact_id
+        .as_deref()
+        .ok_or_else(|| "package event requires a snapshot artifact_id".to_string())?;
+    validate_media_artifact_id(artifact_id)?;
+    if event.snapshot_artifact.path.is_some() {
+        return Err("package event snapshot must not expose a local path".to_string());
+    }
+    if event.snapshot_artifact.mime_type.as_deref() != Some("image/jpeg") {
+        return Err("package event snapshot must be image/jpeg".to_string());
+    }
+    Ok(Some(NotificationAttachment {
+        kind: NotificationAttachmentKind::Image,
+        label: "包裹抓拍".to_string(),
+        artifact_id: Some(artifact_id.to_string()),
+        mime_type: "image/jpeg".to_string(),
+        path: None,
+        url: Some(format!("/api/cameras/recordings/artifacts/{artifact_id}")),
+        metadata: json!({"harborlink_artifact_id": artifact_id}),
+    }))
+}
+
+fn validate_package_notification_attachment(
+    attachment: &NotificationAttachment,
+) -> Result<(), String> {
+    if attachment.kind != NotificationAttachmentKind::Image
+        || attachment.mime_type != "image/jpeg"
+        || attachment.path.is_some()
+    {
+        return Err("package notification attachment must be a path-free JPEG image".to_string());
+    }
+    let artifact_id = attachment
+        .artifact_id
+        .as_deref()
+        .ok_or_else(|| "package notification attachment requires artifact_id".to_string())?;
+    validate_media_artifact_id(artifact_id)?;
+    let expected_url = format!("/api/cameras/recordings/artifacts/{artifact_id}");
+    if attachment.url.as_deref() != Some(expected_url.as_str()) {
+        return Err(
+            "package notification attachment URL is not a trusted media artifact".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_media_artifact_id(artifact_id: &str) -> Result<(), String> {
+    if artifact_id.is_empty()
+        || artifact_id.len() > 256
+        || !artifact_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
+    {
+        return Err("package notification artifact_id is invalid".to_string());
+    }
+    Ok(())
 }
 
 pub fn validate_local_vision_event(event: &LocalVisionEvent) -> Result<(), String> {
@@ -870,6 +958,7 @@ fn build_local_vision_notification_audit(
     stored: &StoredLocalVisionEvent,
     request: &NotificationRequest,
 ) -> Value {
+    let attachments_included = !request.content.attachments.is_empty();
     json!({
         "audit_kind": "local_vision_event.notification_intent_built",
         "event_id": stored.event.event_id,
@@ -879,8 +968,8 @@ fn build_local_vision_notification_audit(
         "trace_id": request.trace_id,
         "delivery_mode": "send",
         "destination_route_bound": !request.destination.route_key.trim().is_empty(),
-        "text_only": true,
-        "attachments_included": false,
+        "text_only": !attachments_included,
+        "attachments_included": attachments_included,
         "raw_image_included": false,
         "local_paths_included": false,
         "vlm_status": stored.event.vlm.as_ref().map(|vlm| vlm.status.clone()).unwrap_or_else(|| "not_sampled".to_string()),
@@ -924,6 +1013,7 @@ fn build_local_vision_family_summary_audit(
 
 fn local_vision_notification_title(event: &LocalVisionEvent) -> String {
     match event.event_type.as_str() {
+        "package_appeared" => "HarborNavi 包裹提醒".to_string(),
         "person_detected" => "HarborNavi 人员事件".to_string(),
         "pet_detected" => "HarborNavi 宠物事件".to_string(),
         "vehicle_detected" => "HarborNavi 车辆事件".to_string(),
@@ -1005,6 +1095,7 @@ pub(crate) fn local_vision_vlm_status(event: &LocalVisionEvent) -> String {
 
 fn local_vision_event_type_label(event_type: &str) -> &'static str {
     match event_type {
+        "package_appeared" => "检测到包裹",
         "person_detected" => "检测到人员活动",
         "pet_detected" => "检测到宠物活动",
         "vehicle_detected" => "检测到车辆相关目标",
@@ -1015,6 +1106,7 @@ fn local_vision_event_type_label(event_type: &str) -> &'static str {
 
 fn local_vision_notification_metadata(stored: &StoredLocalVisionEvent) -> Value {
     let event = &stored.event;
+    let attachments_included = event.event_type == "package_appeared";
     json!({
         "kind": "harbornavi.local_vision_event_notification",
         "event": {
@@ -1032,8 +1124,8 @@ fn local_vision_notification_metadata(stored: &StoredLocalVisionEvent) -> Value 
             "vlm_summary_present": event.vlm.as_ref().map(|vlm| !vlm.summary.trim().is_empty()).unwrap_or(false),
         },
         "privacy": {
-            "text_only": true,
-            "attachments_included": false,
+            "text_only": !attachments_included,
+            "attachments_included": attachments_included,
             "raw_image_included": false,
             "local_paths_included": false,
         },
@@ -1992,6 +2084,47 @@ mod tests {
             json!("local_vision_event.notification_intent_built")
         );
         assert_eq!(intent.audit_record["text_only"], json!(true));
+    }
+
+    #[test]
+    fn package_notification_includes_one_trusted_native_image() {
+        let mut event = sample_event();
+        event.event_type = "package_appeared".to_string();
+        event.summary = "门口可能出现了一个包裹。".to_string();
+        event.snapshot_artifact.artifact_id = Some("snapshots~camera.252~frame.jpg".to_string());
+        event.snapshot_artifact.source = Some("harborlink_snapshot".to_string());
+        let stored = sample_stored_event(event);
+
+        let intent = build_local_vision_notification_intent(&stored, "gw_route_harbornavi_dev")
+            .expect("package notification intent");
+        let request = intent.notification_request;
+
+        assert_eq!(request.content.attachments.len(), 1);
+        assert_eq!(
+            request.content.attachments[0].url.as_deref(),
+            Some("/api/cameras/recordings/artifacts/snapshots~camera.252~frame.jpg")
+        );
+        assert_eq!(
+            request.content.delivery_hints,
+            vec![json!({"kind": "native_image", "max_items": 1})]
+        );
+        assert_eq!(intent.audit_record["text_only"], json!(false));
+        assert_eq!(intent.audit_record["attachments_included"], json!(true));
+    }
+
+    #[test]
+    fn package_notification_rejects_untrusted_artifact_contract() {
+        let mut event = sample_event();
+        event.event_type = "package_appeared".to_string();
+        event.snapshot_artifact.artifact_id = Some("../../private.jpg".to_string());
+
+        let error = build_local_vision_notification_intent(
+            &sample_stored_event(event),
+            "gw_route_harbornavi_dev",
+        )
+        .expect_err("unsafe artifact id must fail");
+
+        assert!(error.contains("artifact_id"));
     }
 
     #[test]

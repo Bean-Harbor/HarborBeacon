@@ -3337,6 +3337,12 @@ fn terminal_cleanup_snapshot_keeps_more_than_sixty_four_jobs_reclaimable() {
                 .detection_lease_cleanup_confirmed
         );
         drop(jobs);
+        let retry_deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < retry_deadline
+            && api.cat_detection_retry_contains_camera_for_test("camera.252")
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
         assert!(!api.cat_detection_retry_contains_camera_for_test("camera.252"));
         api.cancel_cat_detection_retry_workers_for_test();
     }

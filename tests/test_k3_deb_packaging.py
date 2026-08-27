@@ -16,16 +16,28 @@ class K3DebPackagingTests(unittest.TestCase):
             / "config"
             / "harbornavi-k3"
             / "vision-models"
-            / "package-roboflow-v1-320x320-fp32"
+            / "package-cardboard-v8-320x320-int8-20260826"
         )
-        model_path = model_directory / "yolov8n-package-roboflow-v1-320x320.onnx"
+        model_path = model_directory / "yolov8n-package-cardboard-v8-320x320.q.onnx"
         labels_path = model_directory / "label.txt"
+        rollback_model_path = (
+            REPOSITORY_ROOT
+            / "config"
+            / "harbornavi-k3"
+            / "vision-models"
+            / "package-roboflow-v1-320x320-fp32"
+            / "yolov8n-package-roboflow-v1-320x320.onnx"
+        )
         self.assertTrue(
             (model_directory / "runtime-contract.json").is_file(),
             "package detector runtime contract must be packaged",
         )
         self.assertTrue(model_path.is_file(), "package detector model must be packaged")
         self.assertTrue(labels_path.is_file(), "package detector labels must be packaged")
+        self.assertTrue(
+            rollback_model_path.is_file(),
+            "previous package detector model must remain available for rollback",
+        )
         runtime_contract = json.loads(
             (model_directory / "runtime-contract.json").read_text(encoding="utf-8")
         )
@@ -37,26 +49,30 @@ class K3DebPackagingTests(unittest.TestCase):
 
         self.assertEqual(
             actual_sha256,
-            "c9df4e5e872f2857b3bcad1910121dee7358b1625cf32620938cb54dcc985568",
+            "0bfb59702f7968fb6c6c7d61e41876b0d3caafdb9533ff08d476e3874091d158",
         )
         self.assertEqual(runtime_contract["model_sha256"], actual_sha256)
         self.assertEqual(labels_path.read_text(encoding="utf-8").strip(), "package")
         self.assertEqual(runtime_contract["runtime"]["provider"], "SpaceMITExecutionProvider")
-        self.assertEqual(runtime_contract["model"]["precision"], "fp32")
+        self.assertEqual(runtime_contract["model"]["precision"], "int8")
         self.assertIn(
             "Environment=HARBOR_K3_PACKAGE_YOLO_MODEL="
-            "/var/lib/harboros-beacon/vision-models/package-roboflow-v1-320x320-fp32/"
-            "yolov8n-package-roboflow-v1-320x320.onnx",
+            "/var/lib/harboros-beacon/vision-models/"
+            "package-cardboard-v8-320x320-int8-20260826/"
+            "yolov8n-package-cardboard-v8-320x320.q.onnx",
             systemd_unit,
         )
         self.assertIn(
             "Environment=HARBOR_K3_PACKAGE_YOLO_LABELS="
-            "/var/lib/harboros-beacon/vision-models/package-roboflow-v1-320x320-fp32/"
-            "label.txt",
+            "/var/lib/harboros-beacon/vision-models/"
+            "package-cardboard-v8-320x320-int8-20260826/label.txt",
             systemd_unit,
         )
         self.assertIn(model_path.relative_to(REPOSITORY_ROOT).as_posix(), build_script)
         self.assertIn(labels_path.relative_to(REPOSITORY_ROOT).as_posix(), build_script)
+        self.assertIn(
+            rollback_model_path.relative_to(REPOSITORY_ROOT).as_posix(), build_script
+        )
         self.assertIn("package_yolo_model_sha256=" + actual_sha256, build_script)
 
     def test_classifier_model_contract_is_consistent_across_runtime_and_package(self):
@@ -125,6 +141,11 @@ class K3DebPackagingTests(unittest.TestCase):
         self.assertIn(
             "Environment=HARBOR_K3_PACKAGE_DETECTION_CONTROL_PATH="
             "/var/lib/harboros-beacon/package-detection-controls.json",
+            unit,
+        )
+        self.assertIn(
+            "Environment=HARBOR_K3_PACKAGE_EVENT_STORE_PATH="
+            "/var/lib/harboros-beacon/package-events.json",
             unit,
         )
 

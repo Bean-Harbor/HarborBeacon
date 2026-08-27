@@ -156,11 +156,12 @@ def annotate(image: np.ndarray, detections: list[dict[str, Any]]) -> np.ndarray:
         y1 = int(round(float(detection["y1"])))
         x2 = int(round(float(detection["x2"])))
         y2 = int(round(float(detection["y2"])))
+        label = str(detection["label"]).strip()
         confidence = float(detection["confidence"])
         cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 220, 80), 2)
         cv2.putText(
             annotated,
-            f"cat {confidence:.2f}",
+            f"{label} {confidence:.2f}",
             (x1, max(18, y1 - 6)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
@@ -316,9 +317,10 @@ def run_worker(args: argparse.Namespace) -> int:
     frame_interval = 1.0 / args.max_fps
     inference_samples: deque[int] = deque(maxlen=1000)
     started_monotonic = time.monotonic()
+    worker_started_epoch_ms = int(time.time() * 1000)
     sequence = 0
     processed = 0
-    cat_frames = 0
+    target_frames = 0
     reader = LatestFrameReader(args.source)
     reader.start()
     last_processed_started = 0.0
@@ -361,13 +363,15 @@ def run_worker(args: argparse.Namespace) -> int:
             )
             target_detections = filter_target_detections(detections, args.target_label)
             processed += 1
-            cat_frames += int(bool(target_detections))
+            target_frames += int(bool(target_detections))
             inference_samples.append(inference_ms)
             processed_epoch_ms = int(time.time() * 1000)
+            frame_height, frame_width = image.shape[:2]
             result = {
                 "schema": "harbornavi.k3.yoloDetectionResult.v1",
                 "ok": True,
                 "sequence": processed,
+                "worker_started_epoch_ms": worker_started_epoch_ms,
                 "source_kind": source_kind(args.source),
                 "target_label": args.target_label.strip().lower(),
                 "provider": provider,
@@ -376,6 +380,8 @@ def run_worker(args: argparse.Namespace) -> int:
                 "frame_epoch_ms": frame_epoch_ms,
                 "processed_epoch_ms": processed_epoch_ms,
                 "result_age_ms": max(0, processed_epoch_ms - frame_epoch_ms),
+                "frame_width": int(frame_width),
+                "frame_height": int(frame_height),
                 "inference_ms": inference_ms,
                 "detection_count": len(target_detections),
                 "detections": target_detections,
@@ -399,7 +405,7 @@ def run_worker(args: argparse.Namespace) -> int:
                 "provider": provider,
                 "confidence_threshold": confidence_threshold,
                 "frames_processed": processed,
-                "cat_frames": cat_frames,
+                "target_frames": target_frames,
                 "average_inference_ms": int(sum(ordered) / len(ordered)),
                 "p95_inference_ms": ordered[p95_index],
                 "uptime_ms": int((time.monotonic() - started_monotonic) * 1000),

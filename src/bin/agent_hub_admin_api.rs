@@ -173,6 +173,11 @@ use harborbeacon_local_agent::runtime::package_detection_control::{
     validate_package_detection_control_camera_id, PackageDetectionControlPolicy,
     PackageDetectionControlStore,
 };
+use harborbeacon_local_agent::runtime::package_event::{
+    default_package_event_store_path, PackageDeliveryZone, PackageDetectionBox,
+    PackageDetectionObservation, PackageEventArtifact, PackageEventConfig, PackageEventState,
+    PackageEventStore, PackagePresencePhase,
+};
 use harborbeacon_local_agent::runtime::privacy_gateway::PRIVACY_GATEWAY_POLICY_VERSION;
 use harborbeacon_local_agent::runtime::registry::{
     CameraCapabilities, CameraDevice, DeviceRegistryStore, DeviceStatus,
@@ -187,8 +192,8 @@ use harborbeacon_local_agent::runtime::task_session::TaskConversationStore;
 use harborbeacon_local_agent::runtime::vision_event::{
     attach_vlm_summary_to_event, build_local_vision_notification_intent,
     ingest_local_vision_event_default, list_recent_local_vision_events_default,
-    local_vision_event_store_stats_default, LocalVisionEvent, StoredLocalVisionEvent,
-    MAX_LOCAL_VISION_EVENT_JSON_BYTES,
+    local_vision_event_store_stats_default, LocalVisionEvent, SnapshotArtifact,
+    StoredLocalVisionEvent, MAX_LOCAL_VISION_EVENT_JSON_BYTES,
 };
 
 const DEFAULT_HF_ENDPOINT: &str = "https://hf-mirror.com";
@@ -206,6 +211,8 @@ const ADMIN_HTTP_WORKER_COUNT: usize = 32;
 const ADMIN_HTTP_REQUEST_QUEUE_CAPACITY: usize = 256;
 const MAX_VISION_EVENT_INGEST_INFLIGHT: usize = 8;
 const DETECTION_JOB_MONITOR_INTERVAL: Duration = Duration::from_secs(1);
+const PACKAGE_EVENT_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
+const PACKAGE_EVENT_RETRY_DELAY_MS: u64 = 30_000;
 const DETECTION_LEASE_CLEANUP_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const DETECTION_LEASE_CLEANUP_RETRY_MAX: Duration = Duration::from_secs(60);
 const CAT_RECORDING_VALIDATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -246,13 +253,13 @@ const DEFAULT_DETECTION_WORKER: &str =
     "/usr/lib/harboros-beacon/harbornavi_k3_yolo_stream_worker.py";
 const DEFAULT_DETECTION_MODEL: &str = "/var/lib/harboros-beacon/models/yolov8n_192x320.q.onnx";
 const DEFAULT_DETECTION_LABELS: &str = "/var/lib/harboros-beacon/models/label.txt";
-const DEFAULT_PACKAGE_DETECTION_MODEL: &str = "/var/lib/harboros-beacon/vision-models/package-roboflow-v1-320x320-fp32/yolov8n-package-roboflow-v1-320x320.onnx";
+const DEFAULT_PACKAGE_DETECTION_MODEL: &str = "/var/lib/harboros-beacon/vision-models/package-cardboard-v8-320x320-int8-20260826/yolov8n-package-cardboard-v8-320x320.q.onnx";
 const DEFAULT_PACKAGE_DETECTION_LABELS: &str =
-    "/var/lib/harboros-beacon/vision-models/package-roboflow-v1-320x320-fp32/label.txt";
+    "/var/lib/harboros-beacon/vision-models/package-cardboard-v8-320x320-int8-20260826/label.txt";
 const PACKAGE_DETECTION_MODEL_ENV: &str = "HARBOR_K3_PACKAGE_YOLO_MODEL";
 const PACKAGE_DETECTION_LABELS_ENV: &str = "HARBOR_K3_PACKAGE_YOLO_LABELS";
 const DEFAULT_PACKAGE_DETECTION_MAX_FPS: f64 = 5.0;
-const DEFAULT_PACKAGE_DETECTION_CONFIDENCE: f64 = 0.25;
+const DEFAULT_PACKAGE_DETECTION_CONFIDENCE: f64 = 0.45;
 const DEFAULT_DETECTION_OUTPUT_ROOT: &str = "/run/harboros-beacon/detection-jobs";
 const CAT_AUTO_RECORD_ENABLED_ENV: &str = "HARBOR_K3_CAT_AUTO_RECORD_ENABLED";
 const CAT_AUTO_RECORD_START_FRAMES_ENV: &str = "HARBOR_K3_CAT_AUTO_RECORD_START_CONSECUTIVE_FRAMES";
@@ -533,6 +540,8 @@ pub struct AdminApi {
         Arc<Mutex<HashMap<String, CatDetectionControlReconciliation>>>,
     package_detection_retry_scheduler: Option<CatDetectionRetryScheduler>,
     package_detection_retry_scheduling_context: CatDetectionRetrySchedulingContext,
+    package_event_store: Option<PackageEventStore>,
+    package_event_store_load_error: Arc<Mutex<Option<String>>>,
     cat_auto_recording: Arc<Mutex<HashMap<String, CatAutoRecordingState>>>,
     cat_recording_reconciliation_store: CatRecordingReconciliationStore,
     cat_recording_validation_mode: CatRecordingValidationMode,
@@ -2228,11 +2237,17 @@ struct CatDetectionObservationResult {
     schema: String,
     ok: bool,
     sequence: u64,
+    #[serde(default)]
+    worker_started_epoch_ms: u64,
     target_label: String,
     provider: String,
     frame_epoch_ms: u64,
     processed_epoch_ms: u64,
     result_age_ms: u64,
+    #[serde(default)]
+    frame_width: u32,
+    #[serde(default)]
+    frame_height: u32,
     inference_ms: f64,
     detection_count: u64,
     detections: Vec<CatDetectionObservationDetection>,
@@ -2243,7 +2258,8 @@ struct CatDetectionObservationMetrics {
     status: String,
     provider: String,
     frames_processed: u64,
-    cat_frames: u64,
+    #[serde(alias = "cat_frames")]
+    target_frames: u64,
     average_inference_ms: f64,
     p95_inference_ms: f64,
     uptime_ms: u64,
@@ -2286,6 +2302,29 @@ struct CatDetectionControlResponse {
 struct CatDetectionControlRequest {
     enabled: bool,
     stream_profile: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PackageEventConfigRequest {
+    enabled: bool,
+    zone: PackageDeliveryZone,
+}
+
+#[derive(Debug, Serialize)]
+struct PackageEventConfigResponse {
+    camera_id: String,
+    explicit: bool,
+    enabled: bool,
+    zone: PackageDeliveryZone,
+    confirm_frames: u32,
+    confirm_window_ms: u64,
+    max_result_age_ms: u64,
+    revision: u128,
+    phase: PackagePresencePhase,
+    event_id: Option<String>,
+    delivered: bool,
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2668,6 +2707,14 @@ impl AdminApi {
             },
             Err(error) => (None, BTreeMap::new(), Some(error)),
         };
+        let (package_event_store, package_event_store_error) =
+            match PackageEventStore::try_new(default_package_event_store_path()) {
+                Ok(store) => match store.load() {
+                    Ok(_) => (Some(store), None),
+                    Err(error) => (Some(store), Some(error)),
+                },
+                Err(error) => (None, Some(error)),
+            };
         let cat_detection_retry_scheduler =
             if background_workers == AdminApiBackgroundWorkers::Enabled {
                 match CatDetectionRetryScheduler::new(CatDetectionRetrySchedulerConfig {
@@ -2749,6 +2796,8 @@ impl AdminApi {
             package_detection_retry_scheduler,
             package_detection_retry_scheduling_context:
                 CatDetectionRetrySchedulingContext::External,
+            package_event_store,
+            package_event_store_load_error: Arc::new(Mutex::new(package_event_store_error)),
             cat_auto_recording: Arc::new(Mutex::new(cat_auto_recording)),
             cat_recording_reconciliation_store,
             cat_recording_validation_mode,
@@ -2764,6 +2813,7 @@ impl AdminApi {
             api.start_cat_recording_validation_worker();
             api.start_cat_detection_control_recovery();
             api.start_package_detection_control_recovery();
+            api.start_package_event_worker();
         }
         api
     }
@@ -2852,12 +2902,222 @@ impl AdminApi {
             });
     }
 
+    fn start_package_event_worker(&self) {
+        let worker = self.clone();
+        let _ = thread::Builder::new()
+            .name("package-event-publisher".to_string())
+            .spawn(move || loop {
+                if let Err(error) = worker.process_pending_package_events_once() {
+                    eprintln!(
+                        "HarborBeacon package event publisher pass failed: {}",
+                        redact_admin_string(&error)
+                    );
+                }
+                thread::sleep(PACKAGE_EVENT_PUBLISH_INTERVAL);
+            });
+    }
+
+    fn process_package_detection_result(
+        &self,
+        camera_id: &str,
+        value: &Value,
+    ) -> Result<(), String> {
+        let result: CatDetectionObservationResult = serde_json::from_value(value.clone())
+            .map_err(|error| format!("package detection result is invalid: {error}"))?;
+        if !result.ok || !result.target_label.eq_ignore_ascii_case("package") {
+            return Ok(());
+        }
+        let observation = PackageDetectionObservation {
+            sequence: result.sequence,
+            worker_started_epoch_ms: result.worker_started_epoch_ms,
+            frame_epoch_ms: result.frame_epoch_ms,
+            processed_epoch_ms: result.processed_epoch_ms,
+            observed_epoch_ms: u64::try_from(cat_auto_recording_epoch_ms()).unwrap_or(u64::MAX),
+            result_age_ms: result.result_age_ms,
+            frame_width: result.frame_width,
+            frame_height: result.frame_height,
+            detections: result
+                .detections
+                .into_iter()
+                .map(|detection| PackageDetectionBox {
+                    label: detection.label,
+                    confidence: detection.confidence,
+                    x1: detection.x1,
+                    y1: detection.y1,
+                    x2: detection.x2,
+                    y2: detection.y2,
+                })
+                .collect(),
+        };
+        self.package_event_store()?
+            .observe(camera_id, &observation)
+            .map(|_| ())
+    }
+
+    fn process_pending_package_events_once(&self) -> Result<(), String> {
+        let store = self.package_event_store()?;
+        let now_epoch_ms = u64::try_from(cat_auto_recording_epoch_ms()).unwrap_or(u64::MAX);
+        let mut first_error = None;
+        for state in store.pending_states()? {
+            if state.last_delivery_attempt_epoch_ms > 0
+                && now_epoch_ms.saturating_sub(state.last_delivery_attempt_epoch_ms)
+                    < PACKAGE_EVENT_RETRY_DELAY_MS
+            {
+                continue;
+            }
+            if let Err(error) = self.publish_package_event(state, now_epoch_ms) {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn publish_package_event(
+        &self,
+        mut state: PackageEventState,
+        now_epoch_ms: u64,
+    ) -> Result<(), String> {
+        let event_id = state
+            .event_id
+            .clone()
+            .ok_or_else(|| "confirmed package state requires event_id".to_string())?;
+        if state.artifact.is_none() {
+            let artifact = match self.harborlink_media.archive_snapshot(&state.camera_id) {
+                Ok(artifact) => validate_package_snapshot_artifact(&state.camera_id, artifact),
+                Err(error) => Err(error),
+            };
+            let artifact = match artifact {
+                Ok(artifact) => artifact,
+                Err(error) => {
+                    self.record_package_event_attempt(
+                        &event_id,
+                        now_epoch_ms,
+                        false,
+                        Some(redact_admin_string(&error)),
+                    )?;
+                    return Err(error);
+                }
+            };
+            self.package_event_store()?
+                .update_pending_state(&event_id, |current| {
+                    current.artifact = Some(artifact.clone());
+                    current.last_error = None;
+                    Ok(())
+                })?;
+            state.artifact = Some(artifact);
+        }
+        let artifact = state
+            .artifact
+            .clone()
+            .ok_or_else(|| "confirmed package state requires snapshot artifact".to_string())?;
+        let stored = match find_recent_local_vision_event(&event_id)? {
+            Some(stored) => stored,
+            None if state.event_persisted => {
+                let error = "persisted package event is missing from the recent event store";
+                self.record_package_event_attempt(
+                    &event_id,
+                    now_epoch_ms,
+                    false,
+                    Some(error.to_string()),
+                )?;
+                return Err(error.to_string());
+            }
+            None => {
+                let config = self
+                    .package_event_store()?
+                    .load()?
+                    .configs
+                    .get(&state.camera_id)
+                    .cloned()
+                    .ok_or_else(|| "package event config is unavailable".to_string())?;
+                let stored = ingest_local_vision_event_default(LocalVisionEvent {
+                    event_id: event_id.clone(),
+                    camera_id: state.camera_id.clone(),
+                    event_type: "package_appeared".to_string(),
+                    confidence: state.confidence.clamp(0.0, 1.0) as f32,
+                    labels: vec!["package".to_string(), "delivery_zone".to_string()],
+                    summary: "门口可能出现了一个包裹。".to_string(),
+                    snapshot_artifact: SnapshotArtifact {
+                        artifact_id: Some(artifact.artifact_id.clone()),
+                        path: None,
+                        mime_type: Some(artifact.mime_type.clone()),
+                        byte_size: Some(artifact.byte_size),
+                        sha256: None,
+                        source: Some("harborlink_snapshot".to_string()),
+                    },
+                    started_at: format_epoch_millis(u128::from(state.confirmed_frame_epoch_ms))
+                        .unwrap_or_else(current_rfc3339_timestamp),
+                    analyzer: "yolo-package".to_string(),
+                    latency_ms: 0,
+                    metrics: json!({
+                        "instance_id": state.instance_id,
+                        "config_revision": state.config_revision,
+                        "confirm_frames": config.confirm_frames,
+                        "confirm_window_ms": config.confirm_window_ms,
+                        "delivery_zone": config.zone,
+                        "threshold": DEFAULT_PACKAGE_DETECTION_CONFIDENCE,
+                    }),
+                    vlm: None,
+                })?;
+                self.package_event_store()?
+                    .update_pending_state(&event_id, |current| {
+                        current.event_persisted = true;
+                        Ok(())
+                    })?;
+                stored
+            }
+        };
+
+        let result =
+            self.execute_home_guardian_notify_action(&stored, &format!("package-event:{event_id}"));
+        let delivered = result.get("status").and_then(Value::as_str) == Some("delivered");
+        let error = (!delivered).then(|| {
+            result
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("package notification delivery is pending")
+                .to_string()
+        });
+        self.record_package_event_attempt(&event_id, now_epoch_ms, delivered, error)?;
+        Ok(())
+    }
+
+    fn record_package_event_attempt(
+        &self,
+        event_id: &str,
+        now_epoch_ms: u64,
+        delivered: bool,
+        error: Option<String>,
+    ) -> Result<(), String> {
+        self.package_event_store()?
+            .update_pending_state(event_id, |state| {
+                state.last_delivery_attempt_epoch_ms = now_epoch_ms;
+                state.delivered = delivered;
+                state.last_error = error;
+                Ok(())
+            })
+    }
+
+    fn package_event_store(&self) -> Result<&PackageEventStore, String> {
+        let load_error = self
+            .package_event_store_load_error
+            .lock()
+            .map_err(|_| "package event store load state is unavailable".to_string())?
+            .clone();
+        if let Some(error) = load_error {
+            return Err(error);
+        }
+        self.package_event_store
+            .as_ref()
+            .ok_or_else(|| "package event store is unavailable".to_string())
+    }
+
     fn monitor_detection_jobs_once(&self) -> Result<(), String> {
         self.monitor_detection_jobs_once_at(Instant::now())
     }
 
     fn monitor_detection_jobs_once_at(&self, now: Instant) -> Result<(), String> {
-        let (camera_ids, all_cleanup_intents) = {
+        let (camera_ids, all_cleanup_intents, package_samples) = {
             let mut jobs = self
                 .detection_jobs
                 .lock()
@@ -2870,8 +3130,28 @@ impl AdminApi {
                 self.refresh_detection_job(runtime);
             }
             let cleanup_intents = terminal_detection_lease_cleanup_intents(&jobs);
-            (camera_ids, cleanup_intents)
+            let package_samples = jobs
+                .values()
+                .filter(|runtime| {
+                    runtime.projection.status == "running"
+                        && detection_projection_targets(&runtime.projection, "package")
+                })
+                .filter_map(|runtime| {
+                    runtime
+                        .projection
+                        .latest_result
+                        .clone()
+                        .map(|result| (runtime.projection.camera_id.clone(), result))
+                })
+                .collect::<Vec<_>>();
+            (camera_ids, cleanup_intents, package_samples)
         };
+        let mut first_error = None;
+        for (camera_id, result) in package_samples {
+            if let Err(error) = self.process_package_detection_result(&camera_id, &result) {
+                first_error.get_or_insert(error);
+            }
+        }
         let current_cleanup_keys = all_cleanup_intents
             .iter()
             .map(DetectionLeaseCleanupRetryKey::from)
@@ -2910,7 +3190,6 @@ impl AdminApi {
                 })
                 .collect::<Vec<_>>()
         };
-        let mut first_error = None;
         for intent in cleanup_intents {
             if let Err(error) = self.cleanup_terminal_detection_lease(intent, now) {
                 first_error.get_or_insert(error);
@@ -5050,9 +5329,31 @@ impl AdminApi {
                 self.handle_feature_availability(&identity_hints).boxed()
             }
             Method::Get if is_cat_detection_observation_path(&path) => self
-                .handle_cat_detection_observation(
+                .handle_detection_observation(
                     &path,
                     &raw_url,
+                    gate_principal.as_ref().expect("gate principal"),
+                    "cat",
+                )
+                .boxed(),
+            Method::Get if is_package_detection_observation_path(&path) => self
+                .handle_detection_observation(
+                    &path,
+                    &raw_url,
+                    gate_principal.as_ref().expect("gate principal"),
+                    "package",
+                )
+                .boxed(),
+            Method::Get if parse_package_event_config_camera_id(&path).is_some() => self
+                .handle_get_package_event_config(
+                    &path,
+                    gate_principal.as_ref().expect("gate principal"),
+                )
+                .boxed(),
+            Method::Put if parse_package_event_config_camera_id(&path).is_some() => self
+                .handle_put_package_event_config(
+                    &path,
+                    &mut request,
                     gate_principal.as_ref().expect("gate principal"),
                 )
                 .boxed(),
@@ -8170,6 +8471,120 @@ impl AdminApi {
             Ok(response) => ok_json(&response),
             Err(error) => error_json(StatusCode(503), &error),
         }
+    }
+
+    fn handle_get_package_event_config(
+        &self,
+        path: &str,
+        gate_principal: &GateAuthenticatedPrincipal,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let camera_id = match parse_package_event_config_camera_id(path) {
+            Some(camera_id) => camera_id,
+            None => return error_json(StatusCode(400), "invalid package event config path"),
+        };
+        if let Err((status, error)) = self.authorize_detection_camera_action(
+            gate_principal,
+            &camera_id,
+            AccessAction::CameraView,
+        ) {
+            return error_json(status, &error);
+        }
+        if let Err(error) = self.load_camera_device(&camera_id) {
+            return error_json(
+                if error.contains("device not found") {
+                    StatusCode(404)
+                } else {
+                    StatusCode(422)
+                },
+                &error,
+            );
+        }
+        match self.package_event_config_response(&camera_id) {
+            Ok(response) => ok_json(&response),
+            Err(error) => error_json(StatusCode(503), &error),
+        }
+    }
+
+    fn handle_put_package_event_config(
+        &self,
+        path: &str,
+        request: &mut Request,
+        gate_principal: &GateAuthenticatedPrincipal,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let camera_id = match parse_package_event_config_camera_id(path) {
+            Some(camera_id) => camera_id,
+            None => return error_json(StatusCode(400), "invalid package event config path"),
+        };
+        let body = match read_json_body_limited::<PackageEventConfigRequest>(request, 4 * 1024) {
+            Ok(body) => body,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        if let Err((status, error)) = self.authorize_detection_camera_action(
+            gate_principal,
+            &camera_id,
+            AccessAction::CameraOperate,
+        ) {
+            return error_json(status, &error);
+        }
+        if let Err(error) = self.load_camera_device(&camera_id) {
+            return error_json(
+                if error.contains("device not found") {
+                    StatusCode(404)
+                } else {
+                    StatusCode(422)
+                },
+                &error,
+            );
+        }
+        let previous_revision = self
+            .package_event_store()
+            .and_then(PackageEventStore::load)
+            .ok()
+            .and_then(|ledger| ledger.configs.get(&camera_id).map(|config| config.revision))
+            .unwrap_or(0);
+        let revision = cat_auto_recording_epoch_ms().max(previous_revision.saturating_add(1));
+        let config = match PackageEventConfig::new(&camera_id, body.enabled, body.zone, revision) {
+            Ok(config) => config,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let store = match self.package_event_store() {
+            Ok(store) => store,
+            Err(error) => return error_json(StatusCode(503), &error),
+        };
+        if let Err(error) = store.upsert_config(config) {
+            return error_json(StatusCode(503), &error);
+        }
+        match self.package_event_config_response(&camera_id) {
+            Ok(response) => ok_json(&response),
+            Err(error) => error_json(StatusCode(503), &error),
+        }
+    }
+
+    fn package_event_config_response(
+        &self,
+        camera_id: &str,
+    ) -> Result<PackageEventConfigResponse, String> {
+        let ledger = self.package_event_store()?.load()?;
+        let config = ledger.configs.get(camera_id);
+        let state = ledger.states.get(camera_id);
+        Ok(PackageEventConfigResponse {
+            camera_id: camera_id.to_string(),
+            explicit: config.is_some(),
+            enabled: config.is_some_and(|config| config.enabled),
+            zone: config.map(|config| config.zone).unwrap_or_default(),
+            confirm_frames: config.map(|config| config.confirm_frames).unwrap_or(3),
+            confirm_window_ms: config
+                .map(|config| config.confirm_window_ms)
+                .unwrap_or(3_000),
+            max_result_age_ms: config
+                .map(|config| config.max_result_age_ms)
+                .unwrap_or(3_000),
+            revision: config.map(|config| config.revision).unwrap_or(0),
+            phase: state.map(|state| state.phase).unwrap_or_default(),
+            event_id: state.and_then(|state| state.event_id.clone()),
+            delivered: state.is_some_and(|state| state.delivered),
+            last_error: state.and_then(|state| state.last_error.clone()),
+        })
     }
 
     fn handle_put_package_detection_control(
@@ -11351,13 +11766,14 @@ impl AdminApi {
         ok_json(&runtime.projection)
     }
 
-    fn handle_cat_detection_observation(
+    fn handle_detection_observation(
         &self,
         path: &str,
         raw_url: &str,
         gate_principal: &GateAuthenticatedPrincipal,
+        target_label: &str,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
-        let camera_id = match parse_cat_detection_observation_camera_id(path) {
+        let camera_id = match parse_detection_observation_camera_id(path, target_label) {
             Some(camera_id) => camera_id,
             None => return error_json(StatusCode(400), "invalid camera observation path"),
         };
@@ -11383,7 +11799,7 @@ impl AdminApi {
         for runtime in jobs.values_mut().filter(|runtime| {
             runtime.projection.camera_id == camera_id
                 && runtime.projection.stream_profile == stream_profile
-                && detection_projection_targets(&runtime.projection, "cat")
+                && detection_projection_targets(&runtime.projection, target_label)
         }) {
             self.refresh_detection_job(runtime);
             if runtime.projection.status != "running" {
@@ -11406,7 +11822,10 @@ impl AdminApi {
             };
             return ok_json(&observation);
         }
-        error_json(StatusCode(404), "running cat detection was not found")
+        error_json(
+            StatusCode(404),
+            &format!("running {target_label} detection was not found"),
+        )
     }
 
     fn handle_find_detection_job(
@@ -16108,11 +16527,15 @@ fn is_gate_principal_knowledge_endpoint(method: &Method, path: &str) -> bool {
 
 fn is_gate_principal_endpoint(method: &Method, path: &str) -> bool {
     is_gate_principal_knowledge_endpoint(method, path)
-        || (method == &Method::Get && is_cat_detection_observation_path(path))
+        || (method == &Method::Get
+            && (is_cat_detection_observation_path(path)
+                || is_package_detection_observation_path(path)))
         || (matches!(method, &Method::Get | &Method::Put)
             && parse_cat_detection_control_camera_id(path).is_some())
         || (matches!(method, &Method::Get | &Method::Put)
             && parse_package_detection_control_camera_id(path).is_some())
+        || (matches!(method, &Method::Get | &Method::Put)
+            && parse_package_event_config_camera_id(path).is_some())
         || path == "/api/vision/detection-jobs"
         || path.starts_with("/api/vision/detection-jobs/")
 }
@@ -16280,16 +16703,18 @@ fn authenticate_harbornavi_device_principal(
     let path = raw_url.split('?').next().unwrap_or(raw_url);
     let (camera_id, required_role, role_kind) = if let Some(camera_id) =
         parse_cat_detection_observation_camera_id(path)
+            .or_else(|| parse_package_detection_observation_camera_id(path))
     {
         (camera_id, "CAMERA_VIEW", RoleKind::Viewer)
     } else if let Some(camera_id) = parse_cat_detection_control_camera_id(path)
         .or_else(|| parse_package_detection_control_camera_id(path))
+        .or_else(|| parse_package_event_config_camera_id(path))
     {
         (camera_id, "CAMERA_CONTROL", RoleKind::Operator)
     } else {
         return Err(GatePrincipalAuthError::new(
             StatusCode(403),
-            "HarborNavi device principals are limited to camera observation and cat detection control",
+            "HarborNavi device principals are limited to camera observation and detection control",
         ));
     };
     let session_id = principal_id
@@ -16334,16 +16759,18 @@ fn authenticate_harbornavi_lan_principal(
 ) -> Result<GateAuthenticatedPrincipal, GatePrincipalAuthError> {
     let path = raw_url.split('?').next().unwrap_or(raw_url);
     let (camera_id, required_role, role_kind) = parse_cat_detection_observation_camera_id(path)
+        .or_else(|| parse_package_detection_observation_camera_id(path))
         .map(|camera_id| (camera_id, "CAMERA_VIEW", RoleKind::Viewer))
         .or_else(|| {
             parse_cat_detection_control_camera_id(path)
                 .or_else(|| parse_package_detection_control_camera_id(path))
+                .or_else(|| parse_package_event_config_camera_id(path))
                 .map(|camera_id| (camera_id, "CAMERA_CONTROL", RoleKind::Operator))
         })
         .ok_or_else(|| {
             GatePrincipalAuthError::new(
                 StatusCode(403),
-                "HarborNavi LAN principals are limited to camera observation and cat detection control",
+                "HarborNavi LAN principals are limited to camera observation and detection control",
             )
         })?;
     if principal_id != "harbornavi-lan:anonymous" {
@@ -17957,9 +18384,23 @@ fn is_cat_detection_observation_path(path: &str) -> bool {
 }
 
 fn parse_cat_detection_observation_camera_id(path: &str) -> Option<String> {
-    let encoded = path
-        .strip_prefix("/api/cameras/")?
-        .strip_suffix("/cat-detection/observation")?;
+    parse_detection_observation_camera_id(path, "cat")
+}
+
+fn is_package_detection_observation_path(path: &str) -> bool {
+    parse_package_detection_observation_camera_id(path).is_some()
+}
+
+fn parse_package_detection_observation_camera_id(path: &str) -> Option<String> {
+    parse_detection_observation_camera_id(path, "package")
+}
+
+fn parse_detection_observation_camera_id(path: &str, target_label: &str) -> Option<String> {
+    if !matches!(target_label, "cat" | "package") {
+        return None;
+    }
+    let suffix = format!("/{target_label}-detection/observation");
+    let encoded = path.strip_prefix("/api/cameras/")?.strip_suffix(&suffix)?;
     if encoded.is_empty() || encoded.contains('/') {
         return None;
     }
@@ -17994,6 +18435,23 @@ fn parse_package_detection_control_camera_id(path: &str) -> Option<String> {
     let encoded = path
         .strip_prefix("/api/cameras/")?
         .strip_suffix("/package-detection/control")?;
+    if encoded.is_empty() || encoded.contains('/') {
+        return None;
+    }
+    let camera_id = percent_decode_path_segment(encoded).ok()?;
+    (!camera_id.is_empty()
+        && camera_id.len() <= 128
+        && !camera_id.chars().any(char::is_control)
+        && !camera_id
+            .chars()
+            .any(|character| matches!(character, '\\' | '?' | '#')))
+    .then_some(camera_id)
+}
+
+fn parse_package_event_config_camera_id(path: &str) -> Option<String> {
+    let encoded = path
+        .strip_prefix("/api/cameras/")?
+        .strip_suffix("/package-detection/event-config")?;
     if encoded.is_empty() || encoded.contains('/') {
         return None;
     }
@@ -29146,6 +29604,31 @@ fn url_encode_path_segment(value: &str) -> String {
     encoded
 }
 
+fn validate_package_snapshot_artifact(
+    camera_id: &str,
+    artifact: HarborLinkRecordingArtifact,
+) -> Result<PackageEventArtifact, String> {
+    if artifact.media_contract_version != "1.0"
+        || artifact.camera_id != camera_id
+        || artifact.kind != "snapshot"
+        || artifact.mime_type != "image/jpeg"
+        || artifact.byte_size == 0
+        || artifact.artifact_id.is_empty()
+        || artifact.artifact_id.len() > 256
+        || !artifact
+            .artifact_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
+    {
+        return Err("HarborLink returned an invalid package snapshot contract".to_string());
+    }
+    Ok(PackageEventArtifact {
+        artifact_id: artifact.artifact_id,
+        mime_type: artifact.mime_type,
+        byte_size: artifact.byte_size,
+    })
+}
+
 fn current_rfc3339_timestamp() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
@@ -31259,7 +31742,7 @@ mod tests {
         .expect("package request");
         assert_eq!(package.target_label, "package");
         assert_eq!(package.max_fps, 5.0);
-        assert_eq!(package.confidence, 0.25);
+        assert_eq!(package.confidence, 0.45);
         assert_eq!(config.stream_profile, "sub");
 
         let config = normalize_detection_job_start(DetectionJobStartRequest {
@@ -31410,7 +31893,7 @@ mod tests {
         assert_eq!(profile.labels_env, "HARBOR_K3_PACKAGE_YOLO_LABELS");
         assert!(profile
             .default_model
-            .contains("package-roboflow-v1-320x320-fp32"));
+            .contains("package-cardboard-v8-320x320-int8-20260826"));
         assert!(profile.default_model.ends_with(".onnx"));
         assert!(profile.default_labels.ends_with("/label.txt"));
 
@@ -39572,6 +40055,14 @@ mod tests {
         )
         .expect("camera-scoped device control principal");
         assert_eq!(principal.0.role_kind, RoleKind::Operator);
+        let event_config_principal = authenticate_gate_principal_headers(
+            Some("service-token"),
+            "/api/cameras/camera.252/package-detection/event-config",
+            &trusted_harbornavi_device_control_headers("camera.252"),
+            "home-1",
+        )
+        .expect("camera-scoped device event config principal");
+        assert_eq!(event_config_principal.0.role_kind, RoleKind::Operator);
         let (api, paths) = build_test_admin_api("device-control-principal");
         assert!(api
             .authorize_detection_camera_action(
@@ -39667,6 +40158,14 @@ mod tests {
         .expect("camera-scoped LAN control principal");
         assert_eq!(principal.0.role_kind, RoleKind::Operator);
         assert_eq!(principal.0.user_id, "harbornavi-lan:anonymous");
+        let event_config_principal = authenticate_gate_principal_headers(
+            Some("service-token"),
+            "/api/cameras/camera.252/package-detection/event-config",
+            &headers,
+            "home-1",
+        )
+        .expect("camera-scoped LAN event config principal");
+        assert_eq!(event_config_principal.0.role_kind, RoleKind::Operator);
 
         let (api, paths) = build_test_admin_api("lan-control-principal");
         assert!(api
@@ -39751,6 +40250,10 @@ mod tests {
         assert!(is_gate_principal_endpoint(
             &Method::Get,
             "/api/cameras/camera.252/cat-detection/observation"
+        ));
+        assert!(is_gate_principal_endpoint(
+            &Method::Get,
+            "/api/cameras/camera.252/package-detection/observation"
         ));
     }
 
@@ -39849,7 +40352,7 @@ mod tests {
     }
 
     #[test]
-    fn cat_detection_observation_requires_gate_principal_and_is_read_only_and_sanitized() {
+    fn detection_observation_requires_gate_principal_and_is_read_only_and_sanitized() {
         let _env_lock = gate_principal_env_lock()
             .lock()
             .expect("gate principal env lock");
@@ -39919,12 +40422,79 @@ mod tests {
             .lock()
             .expect("detection jobs")
             .insert(job_id.to_string(), runtime);
+        let package_job_id = "yolo-direct-package-observation";
+        let mut package_runtime =
+            sample_running_detection_job(package_job_id, "camera.252", false, None);
+        package_runtime.projection.target_labels = vec!["package".to_string()];
+        package_runtime.projection.latest_result = Some(json!({
+            "schema": "harborbeacon.detection-result.v1",
+            "ok": true,
+            "sequence": 43,
+            "target_label": "package",
+            "provider": "SpaceMITExecutionProvider",
+            "frame_epoch_ms": 1_786_060_800_223_u64,
+            "processed_epoch_ms": 1_786_060_800_240_u64,
+            "result_age_ms": 17,
+            "inference_ms": 97,
+            "detection_count": 1,
+            "detections": [{
+                "label": "package",
+                "confidence": 0.88,
+                "x1": 12.0,
+                "y1": 22.0,
+                "x2": 112.0,
+                "y2": 222.0,
+                "debug_path": "/run/harboros-beacon/private-package-frame.jpg"
+            }],
+            "debug_path": "/run/harboros-beacon/private-package-latest.json"
+        }));
+        package_runtime.projection.metrics = Some(json!({
+            "status": "running",
+            "provider": "SpaceMITExecutionProvider",
+            "frames_processed": 121,
+            "cat_frames": 9,
+            "average_inference_ms": 97.0,
+            "p95_inference_ms": 101.0,
+            "uptime_ms": 5_100,
+            "updated_at_epoch_ms": 1_786_060_800_240_u64,
+            "output_dir": "/run/harboros-beacon/detection-jobs/private-package"
+        }));
+        fs::create_dir_all(&package_runtime.output_dir)
+            .expect("create package detection output directory");
+        fs::write(
+            package_runtime.output_dir.join("latest.json"),
+            serde_json::to_vec(
+                package_runtime
+                    .projection
+                    .latest_result
+                    .as_ref()
+                    .expect("latest package detection result"),
+            )
+            .expect("serialize latest package detection result"),
+        )
+        .expect("write latest package detection result");
+        fs::write(
+            package_runtime.output_dir.join("metrics.json"),
+            serde_json::to_vec(
+                package_runtime
+                    .projection
+                    .metrics
+                    .as_ref()
+                    .expect("package detection metrics"),
+            )
+            .expect("serialize package detection metrics"),
+        )
+        .expect("write package detection metrics");
+        api.detection_jobs
+            .lock()
+            .expect("detection jobs")
+            .insert(package_job_id.to_string(), package_runtime);
         let api = Arc::new(api);
         let server = Server::http("127.0.0.1:0").expect("admin test server");
         let base_url = format!("http://{}", server.server_addr());
         let server_api = api.clone();
         let server_thread = thread::spawn(move || {
-            for _ in 0..5 {
+            for _ in 0..6 {
                 let request = server
                     .recv_timeout(Duration::from_secs(3))
                     .expect("receive admin request")
@@ -39953,6 +40523,21 @@ mod tests {
             .expect("observation response");
         let observation_status = observation.status();
         let observation_body: Value = observation.json().expect("observation json");
+        let package_observation = client
+            .get(format!(
+                "{base_url}/api/cameras/camera.252/package-detection/observation?stream_profile=sub"
+            ))
+            .bearer_auth("service-token")
+            .header("X-Harbor-Principal-Source", "harboros")
+            .header("X-Harbor-Principal-Id", "harboros:uid:1000")
+            .header("X-Harbor-Principal-Roles", "FULL_ADMIN")
+            .header("X-Harbor-Workspace-Id", "home-1")
+            .send()
+            .expect("package observation response");
+        let package_observation_status = package_observation.status();
+        let package_observation_body: Value = package_observation
+            .json()
+            .expect("package observation json");
         let wrong_profile = client
             .get(format!(
                 "{base_url}/api/cameras/camera.252/cat-detection/observation?stream_profile=main"
@@ -39979,6 +40564,7 @@ mod tests {
             reqwest::StatusCode::UNAUTHORIZED
         );
         assert_eq!(observation_status, reqwest::StatusCode::OK);
+        assert_eq!(package_observation_status, reqwest::StatusCode::OK);
         assert_eq!(observation_body["camera_id"], "camera.252");
         assert_eq!(observation_body["stream_profile"], "sub");
         assert_eq!(observation_body["status"], "running");
@@ -39991,32 +40577,44 @@ mod tests {
             observation_body["metrics"]["provider"],
             "SpaceMITExecutionProvider"
         );
-        for forbidden in [
-            "job_id",
-            "lease_id",
-            "expires_at",
-            "managed_by_live",
-            "target_labels",
-            "message",
-        ] {
-            assert!(
-                observation_body.get(forbidden).is_none(),
-                "field={forbidden}"
-            );
+        assert_eq!(observation_body["metrics"]["target_frames"], 8);
+        assert!(observation_body["metrics"].get("cat_frames").is_none());
+        assert_eq!(package_observation_body["camera_id"], "camera.252");
+        assert_eq!(package_observation_body["stream_profile"], "sub");
+        assert_eq!(package_observation_body["status"], "running");
+        assert_eq!(package_observation_body["latest_result"]["sequence"], 43);
+        assert_eq!(
+            package_observation_body["latest_result"]["detections"][0]["label"],
+            "package"
+        );
+        assert_eq!(package_observation_body["metrics"]["target_frames"], 9);
+        assert!(package_observation_body["metrics"]
+            .get("cat_frames")
+            .is_none());
+        for body in [&observation_body, &package_observation_body] {
+            for forbidden in [
+                "job_id",
+                "lease_id",
+                "expires_at",
+                "managed_by_live",
+                "target_labels",
+                "message",
+            ] {
+                assert!(body.get(forbidden).is_none(), "field={forbidden}");
+            }
+            assert!(body["latest_result"].get("debug_path").is_none());
+            assert!(body["latest_result"]["detections"][0]
+                .get("debug_path")
+                .is_none());
+            assert!(body["metrics"].get("output_dir").is_none());
         }
-        assert!(observation_body["latest_result"]
-            .get("debug_path")
-            .is_none());
-        assert!(observation_body["latest_result"]["detections"][0]
-            .get("debug_path")
-            .is_none());
-        assert!(observation_body["metrics"].get("output_dir").is_none());
         assert_eq!(wrong_profile.status(), reqwest::StatusCode::NOT_FOUND);
         assert_eq!(mutation.status(), reqwest::StatusCode::NOT_FOUND);
         assert_eq!(protected_job.status(), reqwest::StatusCode::UNAUTHORIZED);
         let jobs = api.detection_jobs.lock().expect("detection jobs");
-        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs.len(), 2);
         assert_eq!(jobs[job_id].projection.status, "running");
+        assert_eq!(jobs[package_job_id].projection.status, "running");
         drop(jobs);
         cleanup_test_paths(&paths);
     }

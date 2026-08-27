@@ -14,8 +14,9 @@ Environment=HARBORBEACON_SOUTHBOUND_MODE=harborlink
 Environment=HARBOR_K3_CAT_AUTO_RECORD_ENABLED=true
 Environment=HARBOR_K3_CAT_DETECTION_CONTROL_PATH=/var/lib/harboros-beacon/cat-detection-controls.json
 Environment=HARBOR_K3_PACKAGE_DETECTION_CONTROL_PATH=/var/lib/harboros-beacon/package-detection-controls.json
-Environment=HARBOR_K3_PACKAGE_YOLO_MODEL=/var/lib/harboros-beacon/vision-models/package-roboflow-v1-320x320-fp32/yolov8n-package-roboflow-v1-320x320.onnx
-Environment=HARBOR_K3_PACKAGE_YOLO_LABELS=/var/lib/harboros-beacon/vision-models/package-roboflow-v1-320x320-fp32/label.txt
+Environment=HARBOR_K3_PACKAGE_EVENT_STORE_PATH=/var/lib/harboros-beacon/package-events.json
+Environment=HARBOR_K3_PACKAGE_YOLO_MODEL=/var/lib/harboros-beacon/vision-models/package-cardboard-v8-320x320-int8-20260826/yolov8n-package-cardboard-v8-320x320.q.onnx
+Environment=HARBOR_K3_PACKAGE_YOLO_LABELS=/var/lib/harboros-beacon/vision-models/package-cardboard-v8-320x320-int8-20260826/label.txt
 Environment=HARBOR_K3_CAT_RECORDING_RECONCILIATION_PATH=/var/lib/harboros-beacon/cat-recording-reconciliation.json
 Environment=HARBOR_K3_CAT_RECORDING_VALIDATION_MODE=enforce
 Environment=HARBOR_K3_CAT_RECORDING_VALIDATION_STORE_PATH=/var/lib/harboros-beacon/cat-recording-validations.jsonl

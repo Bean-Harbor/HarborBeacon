@@ -15,6 +15,10 @@ def load_worker_module():
     cv2.CAP_FFMPEG = 0
     cv2.CAP_PROP_BUFFERSIZE = 0
     cv2.CAP_PROP_FPS = 0
+    cv2.FONT_HERSHEY_SIMPLEX = 0
+    cv2.LINE_AA = 0
+    cv2.rectangle = mock.Mock()
+    cv2.putText = mock.Mock()
     numpy = types.ModuleType("numpy")
     numpy.ndarray = object
     onnxruntime = types.ModuleType("onnxruntime")
@@ -232,6 +236,28 @@ class K3YoloStreamWorkerTests(unittest.TestCase):
             worker.should_write_snapshot([{"label": "cat"}], 11.0, 10.0)
         )
 
+    def test_annotate_uses_the_detection_label(self):
+        worker = load_worker_module()
+        image = mock.Mock()
+        image.copy.return_value = "annotated"
+
+        annotated = worker.annotate(
+            image,
+            [
+                {
+                    "label": "package",
+                    "confidence": 0.88,
+                    "x1": 10,
+                    "y1": 20,
+                    "x2": 110,
+                    "y2": 220,
+                }
+            ],
+        )
+
+        self.assertEqual(annotated, "annotated")
+        self.assertEqual(worker.cv2.putText.call_args.args[1], "package 0.88")
+
     def test_consecutive_detection_state_resets_the_opposite_streak(self):
         worker = load_worker_module()
         state = worker.ConsecutiveDetectionState()
@@ -328,6 +354,7 @@ class K3YoloStreamWorkerTests(unittest.TestCase):
         session.get_inputs.return_value = [types.SimpleNamespace(name="images")]
         session.get_outputs.return_value = [types.SimpleNamespace(name="output")]
         latest_results = []
+        metrics_results = []
         clock = {"now": 100.0}
 
         def run_inference(*_args):
@@ -337,6 +364,9 @@ class K3YoloStreamWorkerTests(unittest.TestCase):
         session.run.side_effect = run_inference
 
         def record_json(path, payload):
+            if path.name == "metrics.json":
+                metrics_results.append(payload)
+                return
             if path.name != "latest.json":
                 return
             latest_results.append(payload)
@@ -388,6 +418,15 @@ class K3YoloStreamWorkerTests(unittest.TestCase):
         self.assertEqual(
             [result["frame_epoch_ms"] for result in latest_results], [1000, 3000]
         )
+        self.assertTrue(
+            all(result["frame_width"] == 1280 for result in latest_results)
+        )
+        self.assertTrue(
+            all(result["frame_height"] == 720 for result in latest_results)
+        )
+        self.assertTrue(
+            all(result["worker_started_epoch_ms"] == 3000 for result in latest_results)
+        )
         self.assertEqual(
             [result["consecutive_absent_frames"] for result in latest_results],
             [1, 2],
@@ -395,6 +434,9 @@ class K3YoloStreamWorkerTests(unittest.TestCase):
         self.assertTrue(
             all(result["consecutive_present_frames"] == 0 for result in latest_results)
         )
+        self.assertTrue(metrics_results)
+        self.assertTrue(all("target_frames" in metrics for metrics in metrics_results))
+        self.assertTrue(all("cat_frames" not in metrics for metrics in metrics_results))
         stop_requested.wait.assert_called_once_with(0.75)
 
     def test_run_worker_releases_inference_resources_before_closing_reader(self):

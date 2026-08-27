@@ -29,6 +29,7 @@ pub mod media_tools;
 pub mod model_center;
 pub mod node_runtime;
 pub mod package_detection_control;
+pub mod package_event;
 pub mod privacy_gateway;
 pub mod registry;
 pub mod remote_view;
