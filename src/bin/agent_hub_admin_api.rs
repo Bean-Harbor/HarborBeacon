@@ -175,8 +175,8 @@ use harborbeacon_local_agent::runtime::package_detection_control::{
 };
 use harborbeacon_local_agent::runtime::package_event::{
     default_package_event_store_path, PackageDeliveryZone, PackageDetectionBox,
-    PackageDetectionObservation, PackageEventArtifact, PackageEventConfig, PackageEventState,
-    PackageEventStore, PackagePresencePhase,
+    PackageDetectionObservation, PackageEventArtifact, PackageEventConfig, PackageEventStore,
+    PackageLifecycleEvent, PackageLifecycleEventKind, PackagePresencePhase,
 };
 use harborbeacon_local_agent::runtime::privacy_gateway::PRIVACY_GATEWAY_POLICY_VERSION;
 use harborbeacon_local_agent::runtime::registry::{
@@ -2321,10 +2321,16 @@ struct PackageEventConfigResponse {
     confirm_window_ms: u64,
     max_result_age_ms: u64,
     revision: u128,
-    phase: PackagePresencePhase,
+    phase: String,
     event_id: Option<String>,
     delivered: bool,
     last_error: Option<String>,
+    removal_event_id: Option<String>,
+    removal_instance_id: Option<String>,
+    removal_appeared_event_id: Option<String>,
+    removed_frame_epoch_ms: Option<u64>,
+    removal_delivered: bool,
+    removal_last_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2958,14 +2964,14 @@ impl AdminApi {
         let store = self.package_event_store()?;
         let now_epoch_ms = u64::try_from(cat_auto_recording_epoch_ms()).unwrap_or(u64::MAX);
         let mut first_error = None;
-        for state in store.pending_states()? {
-            if state.last_delivery_attempt_epoch_ms > 0
-                && now_epoch_ms.saturating_sub(state.last_delivery_attempt_epoch_ms)
+        for event in store.pending_events()? {
+            if event.last_delivery_attempt_epoch_ms > 0
+                && now_epoch_ms.saturating_sub(event.last_delivery_attempt_epoch_ms)
                     < PACKAGE_EVENT_RETRY_DELAY_MS
             {
                 continue;
             }
-            if let Err(error) = self.publish_package_event(state, now_epoch_ms) {
+            if let Err(error) = self.publish_package_event(event, now_epoch_ms) {
                 first_error.get_or_insert(error);
             }
         }
@@ -2974,16 +2980,13 @@ impl AdminApi {
 
     fn publish_package_event(
         &self,
-        mut state: PackageEventState,
+        mut event: PackageLifecycleEvent,
         now_epoch_ms: u64,
     ) -> Result<(), String> {
-        let event_id = state
-            .event_id
-            .clone()
-            .ok_or_else(|| "confirmed package state requires event_id".to_string())?;
-        if state.artifact.is_none() {
-            let artifact = match self.harborlink_media.archive_snapshot(&state.camera_id) {
-                Ok(artifact) => validate_package_snapshot_artifact(&state.camera_id, artifact),
+        let event_id = event.event_id.clone();
+        if event.artifact.is_none() {
+            let artifact = match self.harborlink_media.archive_snapshot(&event.camera_id) {
+                Ok(artifact) => validate_package_snapshot_artifact(&event.camera_id, artifact),
                 Err(error) => Err(error),
             };
             let artifact = match artifact {
@@ -2999,20 +3002,20 @@ impl AdminApi {
                 }
             };
             self.package_event_store()?
-                .update_pending_state(&event_id, |current| {
+                .update_event(&event_id, |current| {
                     current.artifact = Some(artifact.clone());
                     current.last_error = None;
                     Ok(())
                 })?;
-            state.artifact = Some(artifact);
+            event.artifact = Some(artifact);
         }
-        let artifact = state
+        let artifact = event
             .artifact
             .clone()
-            .ok_or_else(|| "confirmed package state requires snapshot artifact".to_string())?;
+            .ok_or_else(|| "package lifecycle event requires snapshot artifact".to_string())?;
         let stored = match find_recent_local_vision_event(&event_id)? {
             Some(stored) => stored,
-            None if state.event_persisted => {
+            None if event.event_persisted => {
                 let error = "persisted package event is missing from the recent event store";
                 self.record_package_event_attempt(
                     &event_id,
@@ -3023,20 +3026,29 @@ impl AdminApi {
                 return Err(error.to_string());
             }
             None => {
-                let config = self
-                    .package_event_store()?
-                    .load()?
-                    .configs
-                    .get(&state.camera_id)
-                    .cloned()
-                    .ok_or_else(|| "package event config is unavailable".to_string())?;
+                let (event_type, labels, summary) = match event.kind {
+                    PackageLifecycleEventKind::Appeared => (
+                        "package_appeared",
+                        vec!["package".to_string(), "delivery_zone".to_string()],
+                        "门口可能出现了一个包裹。",
+                    ),
+                    PackageLifecycleEventKind::Removed => (
+                        "package_removed",
+                        vec![
+                            "package".to_string(),
+                            "delivery_zone".to_string(),
+                            "removed".to_string(),
+                        ],
+                        "包裹已从投递区域移除。",
+                    ),
+                };
                 let stored = ingest_local_vision_event_default(LocalVisionEvent {
                     event_id: event_id.clone(),
-                    camera_id: state.camera_id.clone(),
-                    event_type: "package_appeared".to_string(),
-                    confidence: state.confidence.clamp(0.0, 1.0) as f32,
-                    labels: vec!["package".to_string(), "delivery_zone".to_string()],
-                    summary: "门口可能出现了一个包裹。".to_string(),
+                    camera_id: event.camera_id.clone(),
+                    event_type: event_type.to_string(),
+                    confidence: event.confidence.clamp(0.0, 1.0) as f32,
+                    labels,
+                    summary: summary.to_string(),
                     snapshot_artifact: SnapshotArtifact {
                         artifact_id: Some(artifact.artifact_id.clone()),
                         path: None,
@@ -3045,22 +3057,23 @@ impl AdminApi {
                         sha256: None,
                         source: Some("harborlink_snapshot".to_string()),
                     },
-                    started_at: format_epoch_millis(u128::from(state.confirmed_frame_epoch_ms))
+                    started_at: format_epoch_millis(u128::from(event.observed_frame_epoch_ms))
                         .unwrap_or_else(current_rfc3339_timestamp),
                     analyzer: "yolo-package".to_string(),
                     latency_ms: 0,
                     metrics: json!({
-                        "instance_id": state.instance_id,
-                        "config_revision": state.config_revision,
-                        "confirm_frames": config.confirm_frames,
-                        "confirm_window_ms": config.confirm_window_ms,
-                        "delivery_zone": config.zone,
+                        "instance_id": event.instance_id,
+                        "related_event_id": event.related_event_id,
+                        "config_revision": event.config_revision,
+                        "confirm_frames": event.confirm_frames,
+                        "confirm_window_ms": event.confirm_window_ms,
+                        "delivery_zone": event.zone,
                         "threshold": DEFAULT_PACKAGE_DETECTION_CONFIDENCE,
                     }),
                     vlm: None,
                 })?;
                 self.package_event_store()?
-                    .update_pending_state(&event_id, |current| {
+                    .update_event(&event_id, |current| {
                         current.event_persisted = true;
                         Ok(())
                     })?;
@@ -3089,13 +3102,12 @@ impl AdminApi {
         delivered: bool,
         error: Option<String>,
     ) -> Result<(), String> {
-        self.package_event_store()?
-            .update_pending_state(event_id, |state| {
-                state.last_delivery_attempt_epoch_ms = now_epoch_ms;
-                state.delivered = delivered;
-                state.last_error = error;
-                Ok(())
-            })
+        self.package_event_store()?.update_event(event_id, |event| {
+            event.last_delivery_attempt_epoch_ms = now_epoch_ms;
+            event.delivered = delivered;
+            event.last_error = error;
+            Ok(())
+        })
     }
 
     fn package_event_store(&self) -> Result<&PackageEventStore, String> {
@@ -8567,6 +8579,13 @@ impl AdminApi {
         let ledger = self.package_event_store()?.load()?;
         let config = ledger.configs.get(camera_id);
         let state = ledger.states.get(camera_id);
+        let latest_removal = ledger
+            .events
+            .values()
+            .filter(|event| {
+                event.camera_id == camera_id && event.kind == PackageLifecycleEventKind::Removed
+            })
+            .max_by_key(|event| (event.observed_frame_epoch_ms, event.event_id.as_str()));
         Ok(PackageEventConfigResponse {
             camera_id: camera_id.to_string(),
             explicit: config.is_some(),
@@ -8580,10 +8599,30 @@ impl AdminApi {
                 .map(|config| config.max_result_age_ms)
                 .unwrap_or(3_000),
             revision: config.map(|config| config.revision).unwrap_or(0),
-            phase: state.map(|state| state.phase).unwrap_or_default(),
+            phase: state
+                .map(|state| {
+                    if state.removal_confirmation_active() {
+                        "removing"
+                    } else {
+                        match state.phase {
+                            PackagePresencePhase::Idle => "idle",
+                            PackagePresencePhase::Candidate => "candidate",
+                            PackagePresencePhase::Present => "present",
+                        }
+                    }
+                })
+                .unwrap_or("idle")
+                .to_string(),
             event_id: state.and_then(|state| state.event_id.clone()),
             delivered: state.is_some_and(|state| state.delivered),
             last_error: state.and_then(|state| state.last_error.clone()),
+            removal_event_id: latest_removal.map(|event| event.event_id.clone()),
+            removal_instance_id: latest_removal.map(|event| event.instance_id.clone()),
+            removal_appeared_event_id: latest_removal
+                .and_then(|event| event.related_event_id.clone()),
+            removed_frame_epoch_ms: latest_removal.map(|event| event.observed_frame_epoch_ms),
+            removal_delivered: latest_removal.is_some_and(|event| event.delivered),
+            removal_last_error: latest_removal.and_then(|event| event.last_error.clone()),
         })
     }
 

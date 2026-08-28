@@ -1,4 +1,4 @@
-//! Durable package-arrival confirmation state for a configured delivery zone.
+//! Durable package lifecycle confirmation state for a configured delivery zone.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -17,6 +17,7 @@ pub const PACKAGE_EVENT_STORE_PATH_ENV: &str = "HARBOR_K3_PACKAGE_EVENT_STORE_PA
 const DEFAULT_STORE_PATH: &str = ".harborbeacon/package-events.json";
 const MAX_STORE_BYTES: u64 = 1024 * 1024;
 const MAX_CAMERAS: usize = 256;
+const MAX_LIFECYCLE_EVENTS: usize = 2_048;
 pub const DEFAULT_CONFIRM_FRAMES: u32 = 3;
 pub const DEFAULT_CONFIRM_WINDOW_MS: u64 = 3_000;
 pub const DEFAULT_MAX_RESULT_AGE_MS: u64 = 3_000;
@@ -90,6 +91,39 @@ pub struct PackageEventArtifact {
     pub byte_size: u64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageLifecycleEventKind {
+    Appeared,
+    Removed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PackageLifecycleEvent {
+    pub event_id: String,
+    pub kind: PackageLifecycleEventKind,
+    pub camera_id: String,
+    pub instance_id: String,
+    #[serde(default)]
+    pub related_event_id: Option<String>,
+    pub config_revision: u128,
+    pub observed_frame_epoch_ms: u64,
+    pub confidence: f64,
+    pub zone: PackageDeliveryZone,
+    pub confirm_frames: u32,
+    pub confirm_window_ms: u64,
+    #[serde(default)]
+    pub artifact: Option<PackageEventArtifact>,
+    #[serde(default)]
+    pub event_persisted: bool,
+    #[serde(default)]
+    pub delivered: bool,
+    #[serde(default)]
+    pub last_delivery_attempt_epoch_ms: u64,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct PackageClearCandidate {
     count: u32,
@@ -154,6 +188,10 @@ impl PackageEventState {
             last_error: None,
         }
     }
+
+    pub fn removal_confirmation_active(&self) -> bool {
+        self.phase == PackagePresencePhase::Present && self.clear_candidate.count > 0
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -179,13 +217,14 @@ pub struct PackageDetectionObservation {
     pub detections: Vec<PackageDetectionBox>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PackageObservationOutcome {
     Ignored,
     Idle,
     Candidate,
     Confirmed,
     Present,
+    Removed,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -194,6 +233,8 @@ pub struct PackageEventLedger {
     pub configs: BTreeMap<String, PackageEventConfig>,
     #[serde(default)]
     pub states: BTreeMap<String, PackageEventState>,
+    #[serde(default)]
+    pub events: BTreeMap<String, PackageLifecycleEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -262,6 +303,22 @@ impl PackageEventStore {
                 .entry(camera_id.to_string())
                 .or_insert_with(|| PackageEventState::idle(camera_id, config.revision));
             let outcome = apply_observation(&config, state, observation);
+            match &outcome {
+                PackageObservationOutcome::Confirmed => {
+                    let event = appearance_event_from_state(&config, state)?;
+                    ledger.events.insert(event.event_id.clone(), event);
+                    prune_delivered_events(&mut ledger.events);
+                }
+                PackageObservationOutcome::Removed => {
+                    let previous_state = previous_state.as_ref().ok_or_else(|| {
+                        "removed package requires the previous present state".to_string()
+                    })?;
+                    let event = removal_event_from_state(&config, previous_state, observation)?;
+                    ledger.events.insert(event.event_id.clone(), event);
+                    prune_delivered_events(&mut ledger.events);
+                }
+                _ => {}
+            }
             if ledger.states.get(camera_id) != previous_state.as_ref() {
                 validate_ledger(&ledger)?;
                 self.write_unlocked(&ledger)?;
@@ -270,30 +327,70 @@ impl PackageEventStore {
         })
     }
 
-    pub fn pending_states(&self) -> Result<Vec<PackageEventState>, String> {
-        Ok(self
-            .load()?
-            .states
-            .into_values()
-            .filter(|state| state.phase == PackagePresencePhase::Present && !state.delivered)
-            .collect())
+    pub fn pending_events(&self) -> Result<Vec<PackageLifecycleEvent>, String> {
+        self.with_lock(|| {
+            let mut ledger = self.load_unlocked()?;
+            let mut migrated = false;
+            for (camera_id, state) in &ledger.states {
+                if state.phase != PackagePresencePhase::Present {
+                    continue;
+                }
+                let Some(config) = ledger.configs.get(camera_id) else {
+                    continue;
+                };
+                let Some(event_id) = state.event_id.as_deref() else {
+                    continue;
+                };
+                if ledger.events.contains_key(event_id) {
+                    continue;
+                }
+                let event = appearance_event_from_state(config, state)?;
+                ledger.events.insert(event.event_id.clone(), event);
+                migrated = true;
+            }
+            if migrated {
+                prune_delivered_events(&mut ledger.events);
+                validate_ledger(&ledger)?;
+                self.write_unlocked(&ledger)?;
+            }
+            Ok(ledger
+                .events
+                .into_values()
+                .filter(|event| !event.delivered)
+                .collect())
+        })
     }
 
-    pub fn update_pending_state(
+    pub fn update_event(
         &self,
         event_id: &str,
-        update: impl FnOnce(&mut PackageEventState) -> Result<(), String>,
+        update: impl FnOnce(&mut PackageLifecycleEvent) -> Result<(), String>,
     ) -> Result<(), String> {
         self.mutate(|ledger| {
-            let state = ledger
-                .states
-                .values_mut()
-                .find(|state| state.event_id.as_deref() == Some(event_id))
-                .ok_or_else(|| "package event state was not found".to_string())?;
-            if state.phase != PackagePresencePhase::Present {
-                return Err("package event is not pending publication".to_string());
+            let (kind, camera_id) = {
+                let event = ledger
+                    .events
+                    .get_mut(event_id)
+                    .ok_or_else(|| "package lifecycle event was not found".to_string())?;
+                update(event)?;
+                (event.kind, event.camera_id.clone())
+            };
+            if kind == PackageLifecycleEventKind::Appeared {
+                if let Some(state) = ledger.states.get_mut(&camera_id) {
+                    if state.event_id.as_deref() == Some(event_id) {
+                        let event = ledger
+                            .events
+                            .get(event_id)
+                            .expect("updated package lifecycle event");
+                        state.artifact = event.artifact.clone();
+                        state.event_persisted = event.event_persisted;
+                        state.delivered = event.delivered;
+                        state.last_delivery_attempt_epoch_ms = event.last_delivery_attempt_epoch_ms;
+                        state.last_error = event.last_error.clone();
+                    }
+                }
             }
-            update(state)
+            Ok(())
         })
     }
 
@@ -422,6 +519,90 @@ pub fn default_package_event_store_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_STORE_PATH))
 }
 
+fn appearance_event_from_state(
+    config: &PackageEventConfig,
+    state: &PackageEventState,
+) -> Result<PackageLifecycleEvent, String> {
+    let event_id = state
+        .event_id
+        .clone()
+        .ok_or_else(|| "confirmed package state requires event_id".to_string())?;
+    let instance_id = state
+        .instance_id
+        .clone()
+        .ok_or_else(|| "confirmed package state requires instance_id".to_string())?;
+    Ok(PackageLifecycleEvent {
+        event_id,
+        kind: PackageLifecycleEventKind::Appeared,
+        camera_id: state.camera_id.clone(),
+        instance_id,
+        related_event_id: None,
+        config_revision: state.config_revision,
+        observed_frame_epoch_ms: state.confirmed_frame_epoch_ms,
+        confidence: state.confidence,
+        zone: config.zone,
+        confirm_frames: config.confirm_frames,
+        confirm_window_ms: config.confirm_window_ms,
+        artifact: state.artifact.clone(),
+        event_persisted: state.event_persisted,
+        delivered: state.delivered,
+        last_delivery_attempt_epoch_ms: state.last_delivery_attempt_epoch_ms,
+        last_error: state.last_error.clone(),
+    })
+}
+
+fn removal_event_from_state(
+    config: &PackageEventConfig,
+    previous_state: &PackageEventState,
+    observation: &PackageDetectionObservation,
+) -> Result<PackageLifecycleEvent, String> {
+    let appeared_event_id = previous_state
+        .event_id
+        .clone()
+        .ok_or_else(|| "removed package requires appeared event_id".to_string())?;
+    let instance_id = previous_state
+        .instance_id
+        .clone()
+        .ok_or_else(|| "removed package requires instance_id".to_string())?;
+    Ok(PackageLifecycleEvent {
+        event_id: format!("package_removed_{}", Uuid::new_v4().simple()),
+        kind: PackageLifecycleEventKind::Removed,
+        camera_id: previous_state.camera_id.clone(),
+        instance_id,
+        related_event_id: Some(appeared_event_id),
+        config_revision: previous_state.config_revision,
+        observed_frame_epoch_ms: observation.frame_epoch_ms,
+        confidence: previous_state.confidence,
+        zone: config.zone,
+        confirm_frames: PACKAGE_CLEAR_CONFIRM_FRAMES,
+        confirm_window_ms: PACKAGE_CLEAR_CONFIRM_DURATION_MS,
+        artifact: None,
+        event_persisted: false,
+        delivered: false,
+        last_delivery_attempt_epoch_ms: 0,
+        last_error: None,
+    })
+}
+
+fn prune_delivered_events(events: &mut BTreeMap<String, PackageLifecycleEvent>) {
+    let mut latest_delivered = BTreeMap::new();
+    for event in events.values().filter(|event| event.delivered) {
+        let key = (event.camera_id.clone(), event.kind);
+        let replace = latest_delivered.get(&key).map_or(true, |current: &String| {
+            let current = &events[current];
+            (event.observed_frame_epoch_ms, &event.event_id)
+                > (current.observed_frame_epoch_ms, &current.event_id)
+        });
+        if replace {
+            latest_delivered.insert(key, event.event_id.clone());
+        }
+    }
+    events.retain(|event_id, event| {
+        !event.delivered
+            || latest_delivered.get(&(event.camera_id.clone(), event.kind)) == Some(event_id)
+    });
+}
+
 fn apply_observation(
     config: &PackageEventConfig,
     state: &mut PackageEventState,
@@ -494,7 +675,7 @@ fn apply_observation(
             return PackageObservationOutcome::Present;
         }
         reset_to_consumed_idle(config, state);
-        return PackageObservationOutcome::Idle;
+        return PackageObservationOutcome::Removed;
     }
 
     let Some(confidence) = confidence else {
@@ -557,6 +738,9 @@ fn validate_ledger(ledger: &PackageEventLedger) -> Result<(), String> {
     if ledger.configs.len() > MAX_CAMERAS || ledger.states.len() > MAX_CAMERAS {
         return Err("package event store exceeds camera limit".to_string());
     }
+    if ledger.events.len() > MAX_LIFECYCLE_EVENTS {
+        return Err("package event store exceeds lifecycle event limit".to_string());
+    }
     for (camera_id, config) in &ledger.configs {
         validate_config(config)?;
         if camera_id != &config.camera_id {
@@ -568,6 +752,48 @@ fn validate_ledger(ledger: &PackageEventLedger) -> Result<(), String> {
         if camera_id != &state.camera_id {
             return Err("package event state key does not match camera_id".to_string());
         }
+    }
+    for (event_id, event) in &ledger.events {
+        validate_lifecycle_event(event)?;
+        if event_id != &event.event_id {
+            return Err("package lifecycle event key does not match event_id".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_lifecycle_event(event: &PackageLifecycleEvent) -> Result<(), String> {
+    validate_camera_id(&event.camera_id)?;
+    if event.event_id.trim() != event.event_id
+        || event.event_id.is_empty()
+        || event.event_id.len() > 128
+        || event.event_id.chars().any(char::is_control)
+    {
+        return Err("package lifecycle event_id is invalid".to_string());
+    }
+    if event.instance_id.trim() != event.instance_id
+        || event.instance_id.is_empty()
+        || event.instance_id.len() > 128
+        || event.instance_id.chars().any(char::is_control)
+    {
+        return Err("package lifecycle instance_id is invalid".to_string());
+    }
+    match event.kind {
+        PackageLifecycleEventKind::Appeared if event.related_event_id.is_some() => {
+            return Err("package appeared event cannot reference another event".to_string());
+        }
+        PackageLifecycleEventKind::Removed
+            if event
+                .related_event_id
+                .as_deref()
+                .map_or(true, |event_id| event_id.trim().is_empty()) =>
+        {
+            return Err("package removed event requires appeared event_id".to_string());
+        }
+        _ => {}
+    }
+    if event.observed_frame_epoch_ms == 0 || !event.confidence.is_finite() {
+        return Err("package lifecycle observation is invalid".to_string());
     }
     Ok(())
 }
@@ -630,6 +856,8 @@ fn lock_path_for(path: &Path) -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     fn config() -> PackageEventConfig {
@@ -645,6 +873,14 @@ mod tests {
             1,
         )
         .expect("valid config")
+    }
+
+    fn temporary_test_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "harborbeacon-package-event-{name}-{}-{}",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ))
     }
 
     fn observation(
@@ -784,18 +1020,20 @@ mod tests {
             PackageObservationOutcome::Present
         );
         assert_eq!(state.clear_candidate.count, 1);
+        assert!(state.removal_confirmation_active());
         assert_eq!(
             apply_observation(&config, &mut state, &observation(5, 3_000, 500.0)),
             PackageObservationOutcome::Present
         );
 
         assert_eq!(state.phase, PackagePresencePhase::Present);
+        assert!(!state.removal_confirmation_active());
         assert_eq!(state.event_id.as_deref(), Some(event_id.as_str()));
         assert_eq!(state.clear_candidate, PackageClearCandidate::default());
     }
 
     #[test]
-    fn ten_negative_observations_under_five_seconds_do_not_rearm() {
+    fn ten_negative_observations_under_five_seconds_remain_in_removal_confirmation() {
         let config = config();
         let mut state = PackageEventState::idle(&config.camera_id, config.revision);
         let event_id = confirm_package(&config, &mut state);
@@ -812,12 +1050,17 @@ mod tests {
         }
 
         assert_eq!(state.phase, PackagePresencePhase::Present);
+        assert!(state.removal_confirmation_active());
         assert_eq!(state.event_id.as_deref(), Some(event_id.as_str()));
         assert_eq!(state.clear_candidate.count, PACKAGE_CLEAR_CONFIRM_FRAMES);
+        assert_eq!(
+            serde_json::to_value(&state).expect("serialize removal confirmation state")["phase"],
+            "present"
+        );
     }
 
     #[test]
-    fn ten_negative_observations_spanning_five_seconds_rearm_to_clean_idle() {
+    fn ten_negative_observations_spanning_five_seconds_confirm_removal_and_rearm() {
         let config = config();
         let mut state = PackageEventState::idle(&config.camera_id, config.revision);
         confirm_package(&config, &mut state);
@@ -840,7 +1083,7 @@ mod tests {
             );
         }
 
-        assert_eq!(outcome, PackageObservationOutcome::Idle);
+        assert_eq!(outcome, PackageObservationOutcome::Removed);
         assert_eq!(state.phase, PackagePresencePhase::Idle);
         assert_eq!(state.last_worker_started_epoch_ms, 100);
         assert_eq!(state.last_sequence, Some(13));
@@ -895,6 +1138,7 @@ mod tests {
         );
 
         assert_eq!(state.phase, PackagePresencePhase::Present);
+        assert!(state.removal_confirmation_active());
         assert_eq!(state.last_sequence, Some(4));
         assert_eq!(state.clear_candidate.count, 1);
         assert_eq!(state.clear_candidate.first_frame_epoch_ms, 2_500);
@@ -970,6 +1214,121 @@ mod tests {
             .event_id
             .as_deref()
             .is_some_and(|event_id| event_id != first_event_id.as_str()));
+    }
+
+    #[test]
+    fn removal_event_links_to_the_appeared_event_and_preserves_the_instance() {
+        let config = config();
+        let mut state = PackageEventState::idle(&config.camera_id, config.revision);
+        confirm_package(&config, &mut state);
+        let appeared = appearance_event_from_state(&config, &state).expect("appeared event");
+        let present_state = state.clone();
+        let mut outcome = PackageObservationOutcome::Present;
+        let mut removal_observation = empty_observation(4, 3_000);
+        for index in 0..PACKAGE_CLEAR_CONFIRM_FRAMES {
+            removal_observation =
+                empty_observation(4 + u64::from(index), 3_000 + u64::from(index) * 600);
+            outcome = apply_observation(&config, &mut state, &removal_observation);
+        }
+        let removed = removal_event_from_state(&config, &present_state, &removal_observation)
+            .expect("removed event");
+
+        assert_eq!(outcome, PackageObservationOutcome::Removed);
+        assert_eq!(removed.kind, PackageLifecycleEventKind::Removed);
+        assert_eq!(removed.instance_id, appeared.instance_id);
+        assert_eq!(
+            removed.related_event_id.as_deref(),
+            Some(appeared.event_id.as_str())
+        );
+        assert_eq!(
+            removed.observed_frame_epoch_ms,
+            removal_observation.frame_epoch_ms
+        );
+        assert!(!removed.delivered);
+        assert_eq!(state.phase, PackagePresencePhase::Idle);
+    }
+
+    #[test]
+    fn store_keeps_removal_retryable_while_rearming_for_the_next_package() {
+        let root = temporary_test_root("removal-retry");
+        fs::create_dir_all(&root).expect("create package event test root");
+        let path = root.join("package-events.json");
+        let store = PackageEventStore::try_new(path.clone()).expect("package event store");
+        let config = config();
+        store
+            .upsert_config(config.clone())
+            .expect("package event config");
+
+        for sequence in 1..=3 {
+            store
+                .observe(
+                    &config.camera_id,
+                    &observation(sequence, sequence * 500 + 500, 500.0),
+                )
+                .expect("package appearance observation");
+        }
+        let appeared = store
+            .pending_events()
+            .expect("pending appearance")
+            .into_iter()
+            .next()
+            .expect("appeared event");
+        store
+            .update_event(&appeared.event_id, |event| {
+                event.delivered = true;
+                Ok(())
+            })
+            .expect("mark appeared event delivered");
+
+        for index in 0..PACKAGE_CLEAR_CONFIRM_FRAMES {
+            store
+                .observe(
+                    &config.camera_id,
+                    &empty_observation(4 + u64::from(index), 3_000 + u64::from(index) * 600),
+                )
+                .expect("package removal observation");
+        }
+
+        let removal = store
+            .pending_events()
+            .expect("pending removal")
+            .into_iter()
+            .find(|event| event.kind == PackageLifecycleEventKind::Removed)
+            .expect("removed event");
+        assert_eq!(removal.instance_id, appeared.instance_id);
+        assert_eq!(
+            removal.related_event_id.as_deref(),
+            Some(appeared.event_id.as_str())
+        );
+        assert!(!removal.delivered);
+        assert_eq!(
+            store.load().expect("package event ledger").states[&config.camera_id].phase,
+            PackagePresencePhase::Idle
+        );
+
+        let restored = PackageEventStore::try_new(path).expect("restored package event store");
+        assert!(restored
+            .pending_events()
+            .expect("restored pending events")
+            .iter()
+            .any(|event| event.event_id == removal.event_id));
+
+        for (sequence, frame_epoch_ms) in [(14, 9_000), (15, 9_500), (16, 10_000)] {
+            restored
+                .observe(
+                    &config.camera_id,
+                    &observation(sequence, frame_epoch_ms, 500.0),
+                )
+                .expect("next package observation");
+        }
+        let pending = restored.pending_events().expect("rearmed pending events");
+        assert!(pending
+            .iter()
+            .any(|event| event.event_id == removal.event_id));
+        assert!(pending.iter().any(|event| {
+            event.kind == PackageLifecycleEventKind::Appeared
+                && event.instance_id != removal.instance_id
+        }));
     }
 
     #[test]

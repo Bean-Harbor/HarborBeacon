@@ -751,9 +751,9 @@ pub fn validate_local_vision_notification_request(
             .structured_payload
             .pointer("/event/event_type")
             .and_then(Value::as_str);
-        if event_type != Some("package_appeared") || attachments.len() != 1 {
+        if !event_type.is_some_and(is_package_lifecycle_event) || attachments.len() != 1 {
             return Err(
-                "only package_appeared notifications may include one snapshot attachment"
+                "only package lifecycle notifications may include one snapshot attachment"
                     .to_string(),
             );
         }
@@ -778,7 +778,7 @@ pub fn validate_local_vision_notification_request(
 fn package_event_notification_attachment(
     event: &LocalVisionEvent,
 ) -> Result<Option<NotificationAttachment>, String> {
-    if event.event_type != "package_appeared" {
+    if !is_package_lifecycle_event(&event.event_type) {
         return Ok(None);
     }
     let artifact_id = event
@@ -795,13 +795,21 @@ fn package_event_notification_attachment(
     }
     Ok(Some(NotificationAttachment {
         kind: NotificationAttachmentKind::Image,
-        label: "包裹抓拍".to_string(),
+        label: if event.event_type == "package_removed" {
+            "包裹移除抓拍".to_string()
+        } else {
+            "包裹到达抓拍".to_string()
+        },
         artifact_id: Some(artifact_id.to_string()),
         mime_type: "image/jpeg".to_string(),
         path: None,
         url: Some(format!("/api/cameras/recordings/artifacts/{artifact_id}")),
         metadata: json!({"harborlink_artifact_id": artifact_id}),
     }))
+}
+
+fn is_package_lifecycle_event(event_type: &str) -> bool {
+    matches!(event_type, "package_appeared" | "package_removed")
 }
 
 fn validate_package_notification_attachment(
@@ -1014,6 +1022,7 @@ fn build_local_vision_family_summary_audit(
 fn local_vision_notification_title(event: &LocalVisionEvent) -> String {
     match event.event_type.as_str() {
         "package_appeared" => "HarborNavi 包裹提醒".to_string(),
+        "package_removed" => "HarborNavi 包裹移除提醒".to_string(),
         "person_detected" => "HarborNavi 人员事件".to_string(),
         "pet_detected" => "HarborNavi 宠物事件".to_string(),
         "vehicle_detected" => "HarborNavi 车辆事件".to_string(),
@@ -1096,6 +1105,7 @@ pub(crate) fn local_vision_vlm_status(event: &LocalVisionEvent) -> String {
 fn local_vision_event_type_label(event_type: &str) -> &'static str {
     match event_type {
         "package_appeared" => "检测到包裹",
+        "package_removed" => "确认包裹已移除",
         "person_detected" => "检测到人员活动",
         "pet_detected" => "检测到宠物活动",
         "vehicle_detected" => "检测到车辆相关目标",
@@ -1106,7 +1116,7 @@ fn local_vision_event_type_label(event_type: &str) -> &'static str {
 
 fn local_vision_notification_metadata(stored: &StoredLocalVisionEvent) -> Value {
     let event = &stored.event;
-    let attachments_included = event.event_type == "package_appeared";
+    let attachments_included = is_package_lifecycle_event(&event.event_type);
     json!({
         "kind": "harbornavi.local_vision_event_notification",
         "event": {
@@ -2109,6 +2119,30 @@ mod tests {
             vec![json!({"kind": "native_image", "max_items": 1})]
         );
         assert_eq!(intent.audit_record["text_only"], json!(false));
+        assert_eq!(intent.audit_record["attachments_included"], json!(true));
+    }
+
+    #[test]
+    fn package_removed_notification_includes_one_trusted_native_image() {
+        let mut event = sample_event();
+        event.event_type = "package_removed".to_string();
+        event.summary = "包裹已从投递区域移除。".to_string();
+        event.snapshot_artifact.artifact_id = Some("snapshots~camera.252~removed.jpg".to_string());
+        event.snapshot_artifact.source = Some("harborlink_snapshot".to_string());
+        let stored = sample_stored_event(event);
+
+        let intent = build_local_vision_notification_intent(&stored, "gw_route_harbornavi_dev")
+            .expect("package removed notification intent");
+        let request = intent.notification_request;
+
+        assert_eq!(request.content.title, "HarborNavi 包裹移除提醒");
+        assert!(request.content.body.contains("确认包裹已移除"));
+        assert_eq!(request.content.attachments.len(), 1);
+        assert_eq!(request.content.attachments[0].label, "包裹移除抓拍");
+        assert_eq!(
+            request.content.delivery_hints,
+            vec![json!({"kind": "native_image", "max_items": 1})]
+        );
         assert_eq!(intent.audit_record["attachments_included"], json!(true));
     }
 
