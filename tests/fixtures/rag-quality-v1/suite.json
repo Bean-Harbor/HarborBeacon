@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "suite_id": "harborbeacon-rag-quality-v1",
+  "description": "Frozen G3.0 safety and determinism baseline for the HarborBeacon offline RAG task path.",
+  "thresholds": {
+    "min_schema_validity_rate": 1.0,
+    "min_citation_whitelist_rate": 1.0,
+    "min_citation_support_precision": 1.0,
+    "min_required_evidence_coverage": 1.0,
+    "min_claim_coverage_rate": 1.0,
+    "min_fallback_preservation_rate": 1.0,
+    "min_cold_warm_consistency_rate": 1.0,
+    "min_idempotent_replay_rate": 1.0,
+    "max_exact_document_violations": 0,
+    "max_duplicate_citation_violations": 0
+  },
+  "files": [
+    {
+      "document_id": "red-cup",
+      "relative_path": "documents/red-cup.md",
+      "content": "# 红色杯子检查记录\n\n目标杯子的颜色是红色。杯身没有黄色标记。"
+    },
+    {
+      "document_id": "yellow-cup",
+      "relative_path": "documents/yellow-cup.md",
+      "content": "# 黄色杯子检查记录\n\n另一个杯子的颜色是黄色。它不是本次检查目标。"
+    },
+    {
+      "document_id": "packing-video",
+      "relative_path": "videos/packing-measurement.mp4",
+      "content": "fixture-video-placeholder"
+    },
+    {
+      "document_id": "packing-video-sidecar",
+      "relative_path": "videos/packing-measurement.json",
+      "content": "{\"summary\":\"包装测量视频最终确认：纸箱长度 42 厘米，宽度 30 厘米。早期口述的 40 厘米已经作废。\",\"timestamp\":\"00:00:18\"}"
+    },
+    {
+      "document_id": "season-notes",
+      "relative_path": "documents/season-notes.md",
+      "content": "春天的花园记录也比较了夏天的养护安排。"
+    }
+  ],
+  "cases": [
+    {
+      "case_id": "exact-red-cup-color",
+      "query": "这个目标杯子是什么颜色？",
+      "focus_document_ids": ["red-cup"],
+      "allowed_document_ids": ["red-cup"],
+      "required_document_ids": ["red-cup"],
+      "required_answer_terms": ["颜色是红色"],
+      "forbidden_answer_terms": ["颜色是黄色"],
+      "expected_task_status": "completed",
+      "expected_degraded_reason": "full_answer_model_not_promoted",
+      "min_citations": 1,
+      "max_citations": 1,
+      "exact_document": true,
+      "fallback_expected": true,
+      "include_documents": true,
+      "include_images": false,
+      "include_videos": false
+    },
+    {
+      "case_id": "video-final-measurement",
+      "query": "视频中最终确认的纸箱长度和宽度是多少？",
+      "focus_document_ids": ["packing-video"],
+      "allowed_document_ids": ["packing-video"],
+      "required_document_ids": ["packing-video"],
+      "required_answer_terms": ["42 厘米", "30 厘米"],
+      "forbidden_answer_terms": ["长度 40 厘米"],
+      "expected_task_status": "completed",
+      "expected_degraded_reason": "full_answer_model_not_promoted",
+      "min_citations": 1,
+      "max_citations": 1,
+      "exact_document": true,
+      "fallback_expected": true,
+      "include_documents": false,
+      "include_images": false,
+      "include_videos": true
+    },
+    {
+      "case_id": "negative-constraint-fail-closed",
+      "query": "找春天的文档，不要出现夏天的内容",
+      "focus_document_ids": [],
+      "allowed_document_ids": [],
+      "required_document_ids": [],
+      "required_answer_terms": [],
+      "forbidden_answer_terms": ["夏天的养护安排"],
+      "expected_task_status": "completed",
+      "expected_degraded_reason": "full_answer_model_not_promoted",
+      "min_citations": 0,
+      "max_citations": 0,
+      "exact_document": false,
+      "fallback_expected": true,
+      "include_documents": true,
+      "include_images": false,
+      "include_videos": false
+    },
+    {
+      "case_id": "missing-query-fail-closed",
+      "query": "",
+      "focus_document_ids": [],
+      "allowed_document_ids": [],
+      "required_document_ids": [],
+      "required_answer_terms": [],
+      "forbidden_answer_terms": [],
+      "expected_task_status": "failed",
+      "expected_degraded_reason": "missing_query",
+      "min_citations": 0,
+      "max_citations": 0,
+      "exact_document": false,
+      "fallback_expected": true,
+      "include_documents": true,
+      "include_images": false,
+      "include_videos": false
+    }
+  ]
+}

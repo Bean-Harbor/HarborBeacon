@@ -37,6 +37,10 @@ name = "evaluate-privacy-gateway"
 path = "src/bin/evaluate_privacy_gateway.rs"
 
 [[bin]]
+name = "evaluate-rag-quality"
+path = "src/bin/evaluate_rag_quality.rs"
+
+[[bin]]
 name = "agent-hub-admin-api"
 path = "src/bin/agent_hub_admin_api.rs"
 
