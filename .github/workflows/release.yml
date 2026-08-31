@@ -39,7 +39,7 @@ jobs:
         run: |
           python3 scripts/fetch_hf_bootstrap_model.py \
             --model-id Qwen/Qwen2.5-0.5B-Instruct \
-            --revision main \
+            --revision 7ae557604adf67be50417f59c2c2f167def9a775 \
             --output ./dist/bootstrap-models/qwen2.5-0.5b-instruct
 
       - name: Create deb package

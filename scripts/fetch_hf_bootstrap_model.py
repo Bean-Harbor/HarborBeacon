@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import time
 from urllib.parse import quote
@@ -16,6 +17,7 @@ from urllib.request import Request, urlopen
 
 
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
+DEFAULT_REVISION = "7ae557604adf67be50417f59c2c2f167def9a775"
 DEFAULT_FILES = [
     "config.json",
     "generation_config.json",
@@ -27,6 +29,13 @@ DEFAULT_FILES = [
     "tokenizer.json",
     "vocab.json",
 ]
+
+
+def validate_immutable_revision(revision: str) -> str:
+    revision = revision.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ValueError("model revision must be an immutable 40-hex commit")
+    return revision
 
 
 def request_json(url: str, token: str | None) -> dict:
@@ -84,7 +93,7 @@ def download_file(url: str, target: Path, token: str | None, retries: int) -> di
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
-    parser.add_argument("--revision", default="main")
+    parser.add_argument("--revision", default=DEFAULT_REVISION)
     parser.add_argument("--output", required=True)
     parser.add_argument(
         "--endpoint",
@@ -101,11 +110,24 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
+    try:
+        revision = validate_immutable_revision(args.revision)
+    except ValueError as error:
+        parser.error(str(error))
+
     endpoint = args.endpoint.rstrip("/")
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
     model_api_path = quote(args.model_id, safe="/")
-    metadata_url = f"{endpoint}/api/models/{model_api_path}"
+    metadata_url = (
+        f"{endpoint}/api/models/{model_api_path}/revision/"
+        f"{quote(revision, safe='')}"
+    )
     metadata = request_json(metadata_url, token)
+    resolved_sha = str(metadata.get("sha", "")).strip().lower()
+    if resolved_sha != revision:
+        raise SystemExit(
+            f"model revision mismatch: requested {revision}, resolved {resolved_sha or 'missing'}"
+        )
     siblings = {
         item.get("rfilename")
         for item in metadata.get("siblings", [])
@@ -120,8 +142,8 @@ def main() -> int:
 
     output = Path(args.output)
     print(f"model_id={args.model_id}")
-    print(f"revision={args.revision}")
-    print(f"resolved_sha={metadata.get('sha', '')}")
+    print(f"revision={revision}")
+    print(f"resolved_sha={resolved_sha}")
     print(f"output={output}")
     print("files=" + ",".join(files))
     if args.dry_run:
@@ -132,14 +154,14 @@ def main() -> int:
     for name in files:
         file_url = (
             f"{endpoint}/{model_api_path}/resolve/"
-            f"{quote(args.revision, safe='')}/{quote(name, safe='/')}"
+            f"{quote(revision, safe='')}/{quote(name, safe='/')}"
         )
         downloaded.append(download_file(file_url, output / name, token, args.retries))
 
     manifest = {
         "model_id": args.model_id,
-        "revision": args.revision,
-        "resolved_sha": metadata.get("sha", ""),
+        "revision": revision,
+        "resolved_sha": resolved_sha,
         "source": f"{endpoint}/{model_api_path}",
         "runtime_profile": "harbor-candle",
         "model_store_target": (
