@@ -23,6 +23,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Verify bootstrap model provenance
+        run: python3 -m unittest discover -s tests -p 'test_bootstrap_model_provenance.py' -v
       - run: cargo fmt --check
       - run: cargo clippy --lib --tests
       - run: cargo check --locked --bin harboros-beacon --bin agent-hub-admin-api --bin assistant-task-api --bin harbor-model-api --bin benchmark-local-model-backend

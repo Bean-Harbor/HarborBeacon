@@ -43,6 +43,7 @@ class BootstrapModelProvenanceTests(unittest.TestCase):
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         revisions = re.findall(r"--revision\s+([^\s\\]+)", workflow)
 
+        self.assertEqual(self.fetch.DEFAULT_REVISION, EXPECTED_REVISION)
         self.assertEqual(revisions, [EXPECTED_REVISION])
         self.assertRegex(revisions[0], r"^[0-9a-f]{40}$")
 
