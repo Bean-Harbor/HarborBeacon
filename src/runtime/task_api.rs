@@ -116,7 +116,7 @@ use crate::runtime::knowledge::{
 use crate::runtime::media::ClipCaptureResult;
 use crate::runtime::model_center::{
     llm_text_token_count, run_llm_text_with_state_and_options, truncate_llm_text_to_tokens,
-    LlmTextExecution, LlmTextOptions,
+    LlmTextOptions,
 };
 use crate::runtime::privacy_gateway::{PrivacyGateway, PrivacyGatewayEvaluation};
 use crate::runtime::registry::ResolvedCameraTarget;
@@ -140,13 +140,9 @@ const RAG_DOMAIN: &str = "rag";
 const RAG_OP_ANSWER: &str = "answer";
 const RAG_DEFAULT_RESULT_LIMIT: usize = 5;
 const RAG_MAX_ANSWER_CONTEXT_LIMIT: usize = 10;
-const RAG_ANSWER_CONTEXT_CHAR_BUDGET: usize = 4_800;
 const RAG_DOCUMENT_LIST_ABSOLUTE_MIN_SCORE: u32 = 350;
 const RAG_DOCUMENT_LIST_RELATIVE_MIN_SCORE: f32 = 0.20;
 const RAG_DOCUMENT_LIST_RERANK_MIN_SCORE: f32 = 0.10;
-const RAG_ANSWER_BUDGET_MS: u64 = 6_000;
-const RAG_ANSWER_MAX_TOKENS: u32 = 512;
-const RAG_ANSWER_SOFT_TARGET_TOKENS: u32 = 300;
 const RAG_QUERY_UNDERSTANDING_BUDGET_MS: u64 = 8_000;
 #[allow(dead_code)]
 const RAG_QUERY_UNDERSTANDING_MAX_TOKENS: u32 = 512;
@@ -159,10 +155,11 @@ const RAG_CONTEXT_SAFETY_TOKENS: usize = 256;
 const RAG_MIN_CONTEXT_TOKEN_LIMIT: usize = 4_096;
 const RAG_MAX_CONTEXT_TOKEN_LIMIT: usize = 8_192;
 const RAG_QUERY_HISTORY_TOKEN_BUDGET: usize = 384;
+#[cfg(test)]
 const RAG_ANSWER_HISTORY_TOKEN_BUDGET: usize = 640;
-const RAG_ANSWER_BUDGET_MS_ENV: &str = "HARBOR_RAG_ANSWER_BUDGET_MS";
-const RAG_ANSWER_MAX_TOKENS_ENV: &str = "HARBOR_RAG_ANSWER_MAX_TOKENS";
-const RAG_ANSWER_CONTEXT_CHAR_BUDGET_ENV: &str = "HARBOR_RAG_ANSWER_CONTEXT_CHAR_BUDGET";
+#[cfg(test)]
+const RAG_ANSWER_SOFT_TARGET_TOKENS: u32 = 300;
+const RAG_FULL_ANSWER_MODEL_NOT_PROMOTED: &str = "full_answer_model_not_promoted";
 const RECENT_CLIP_PLAYBACK_WINDOW_MS: u128 = 15 * 60 * 1000;
 const RECENT_FAMILY_MEMORY_EVENT_WINDOW_MS: u128 = 24 * 60 * 60 * 1000;
 const DEFAULT_TURN_INTENT_DOMAIN: &str = "general";
@@ -4326,11 +4323,13 @@ impl TaskApiService {
             &request.task_id,
             request.source.user_id.as_str(),
         );
-        let cloud_profile_requested = resource_profile == RagResourceProfile::CloudAllowed;
-        let mut capsule_prompt_used = false;
         let mut warnings = search_result.warnings.clone();
-        let mut degraded_reason = search_result.degraded_reason.clone();
-        let mut model = Value::Null;
+        if let Some(reason) = search_result.degraded_reason.as_deref() {
+            warnings.push(format!("检索链路已降级：{reason}"));
+        }
+        warnings
+            .push("当前 RC 未 promotion 最终 RAG answer 模型，已返回确定性引用摘要。".to_string());
+        let mut degraded_reason = Some(RAG_FULL_ANSWER_MODEL_NOT_PROMOTED.to_string());
         let deterministic_answer = if query_understanding.negative_constraints.is_empty() {
             build_requested_result_overview_rag_answer(
                 &query_understanding,
@@ -4343,161 +4342,13 @@ impl TaskApiService {
         } else {
             None
         };
-        let mut skip_model = deterministic_answer.is_some();
-        let mut answer_generation_status = if skip_model {
-            "deterministic_answer"
-        } else {
-            "evidence_summary_fallback"
-        };
         let mut answer =
             deterministic_answer.unwrap_or_else(|| build_limited_rag_answer(&query, &citations));
-        let mut prompt = build_budgeted_rag_answer_prompt_with_history(
-            &query,
-            &conversation_turns,
-            &citations,
-            Some(&query_understanding),
-            context_token_limit,
-            rag_answer_max_tokens(),
-        );
-        append_rag_review_scope_instruction(
-            &mut prompt,
-            visible_citations.len(),
-            reviewed_citation_count,
-        );
 
-        if cloud_profile_requested && privacy_level == PrivacyLevel::AllowRedactedCloud {
-            if !privacy_gateway_evaluation.decision.cloud_allowed {
-                degraded_reason.get_or_insert_with(|| "privacy_gateway_blocked".to_string());
-                warnings.extend(privacy_gateway_evaluation.decision.warnings.clone());
-                warnings.push(format!(
-                    "Privacy Gateway 已阻断云端回答：{}",
-                    privacy_gateway_evaluation.decision.reason
-                ));
-                answer = build_limited_rag_answer(&query, &citations);
-                answer_generation_status = "privacy_gateway_blocked";
-                skip_model = true;
-            } else if let Some(capsule) = privacy_gateway_evaluation.semantic_capsule.as_ref() {
-                prompt = capsule.to_cloud_prompt();
-                capsule_prompt_used = true;
-            } else {
-                degraded_reason.get_or_insert_with(|| "privacy_gateway_blocked".to_string());
-                warnings.push(
-                    "Privacy Gateway 未能生成 semantic capsule，已跳过云端模型。".to_string(),
-                );
-                answer = build_limited_rag_answer(&query, &citations);
-                answer_generation_status = "privacy_gateway_blocked";
-                skip_model = true;
-            }
-        }
-
-        if !skip_model {
-            match self.admin_store.load_or_create_state() {
-                Ok(admin_state) => {
-                    match rag_answer_model_state_for_policy(
-                        &admin_state.models,
-                        privacy_level,
-                        resource_profile,
-                    ) {
-                        Ok(model_state) => {
-                            let options = LlmTextOptions {
-                                purpose: Some("rag.answer".to_string()),
-                                system_prompt: Some(build_rag_answer_system_prompt()),
-                                temperature: Some(0.0),
-                                max_tokens: Some(rag_answer_max_tokens()),
-                                timeout: Some(Duration::from_millis(rag_answer_budget_ms())),
-                                json_object_response: false,
-                            };
-                            let mut llm_result = run_llm_text_with_state_and_options(
-                                &prompt,
-                                &model_state,
-                                &options,
-                            );
-                            if !llm_result.available
-                                && llm_context_overflow(&llm_result)
-                                && !capsule_prompt_used
-                            {
-                                prompt = build_budgeted_rag_answer_prompt_with_history(
-                                    &query,
-                                    &[],
-                                    &citations,
-                                    Some(&query_understanding),
-                                    context_token_limit.saturating_mul(4) / 5,
-                                    rag_answer_max_tokens(),
-                                );
-                                append_rag_review_scope_instruction(
-                                    &mut prompt,
-                                    visible_citations.len(),
-                                    reviewed_citation_count,
-                                );
-                                llm_result = run_llm_text_with_state_and_options(
-                                    &prompt,
-                                    &model_state,
-                                    &options,
-                                );
-                                if llm_result.available {
-                                    warnings.push(
-                                        "当前资料较多，已自动压缩较早的对话和证据后完成回答。"
-                                            .to_string(),
-                                    );
-                                }
-                            }
-                            let output_truncated = llm_output_truncated(&llm_result);
-                            model = llm_execution_model_json(&llm_result);
-                            if llm_result.available {
-                                if output_truncated {
-                                    answer = build_limited_rag_answer(&query, &citations);
-                                    answer_generation_status = "length_fallback";
-                                    warnings.push(
-                                        "模型回答达到长度上限，已舍弃残缺文本并返回完整的简洁证据摘要。"
-                                            .to_string(),
-                                    );
-                                } else {
-                                    let generated = normalize_rag_answer_text(&llm_result.text);
-                                    if generated.is_empty() {
-                                        degraded_reason
-                                            .get_or_insert_with(|| "empty_llm_answer".to_string());
-                                        answer_generation_status = "empty_output_fallback";
-                                        warnings.push(
-                                            "LLM 请求成功但未生成有效答案，已返回检索证据摘要。"
-                                                .to_string(),
-                                        );
-                                    } else {
-                                        answer = generated;
-                                        answer_generation_status = "generated_once";
-                                    }
-                                }
-                            } else {
-                                answer_generation_status = "model_unavailable_fallback";
-                                degraded_reason
-                                    .get_or_insert_with(|| "llm_unavailable".to_string());
-                                warnings.push(format!(
-                                    "LLM 不可用，已降级为引用片段摘要：{}",
-                                    friendly_llm_failure_summary(&llm_result)
-                                ));
-                            }
-                        }
-                        Err(error) => {
-                            degraded_reason.get_or_insert_with(|| "llm_policy_blocked".to_string());
-                            warnings.push(error);
-                        }
-                    }
-                }
-                Err(error) => {
-                    degraded_reason.get_or_insert_with(|| "model_settings_unavailable".to_string());
-                    warnings.push(format!("模型设置不可用，已降级为引用片段摘要：{error}"));
-                }
-            }
-        }
-
-        let privacy_gateway = privacy_gateway_evaluation.evidence_value(capsule_prompt_used);
-        self.record_privacy_gateway_audit(
-            request,
-            &privacy_gateway_evaluation,
-            capsule_prompt_used,
-        );
+        let privacy_gateway = privacy_gateway_evaluation.evidence_value(false);
+        self.record_privacy_gateway_audit(request, &privacy_gateway_evaluation, false);
         let citation_count = citations.len();
-        let citation_finalization =
-            finalize_rag_answer_citations(&query, &answer, answer_generation_status, &citations);
+        let citation_finalization = finalize_rag_answer_citations(&query, &answer, &citations);
         answer = citation_finalization.answer;
         if let Some(reason) = citation_finalization.degraded_reason {
             degraded_reason.get_or_insert_with(|| reason.to_string());
@@ -4513,12 +4364,6 @@ impl TaskApiService {
                 .map(|(_, citation)| citation)
                 .collect();
         }
-        if let Some(model_object) = model.as_object_mut() {
-            model_object.insert(
-                "answer_review".to_string(),
-                citation_finalization.answer_review,
-            );
-        }
         let degraded = search_result.degraded || degraded_reason.is_some();
         let status = if degraded { "degraded" } else { "completed" };
         let reason = degraded_reason.as_deref().unwrap_or("none");
@@ -4533,7 +4378,7 @@ impl TaskApiService {
             &citations,
             &visible_citations,
             reviewed_citation_count,
-            model,
+            Value::Null,
             warnings,
             privacy_gateway,
             Some(&query_understanding),
@@ -4553,89 +4398,26 @@ impl TaskApiService {
         &self,
         request: &TaskRequest,
         query: &str,
-        conversation_turns: &[RagConversationTurn],
+        _conversation_turns: &[RagConversationTurn],
         query_understanding: &RagQueryUnderstanding,
-        context_token_limit: usize,
+        _context_token_limit: usize,
     ) -> TaskResponse {
         let search_result = empty_rag_conversation_search_response(query);
-        let mut warnings = Vec::new();
-        let mut model = Value::Null;
-        let mut degraded_reason = None;
-        let mut answer = "我现在无法进行对话，请稍后再试。".to_string();
-
-        match self.admin_store.load_or_create_state() {
-            Ok(admin_state) => match rag_answer_model_state_for_policy(
-                &admin_state.models,
-                PrivacyLevel::StrictLocal,
-                RagResourceProfile::CpuOnly,
-            ) {
-                Ok(model_state) => {
-                    let options = LlmTextOptions {
-                        purpose: Some("rag.conversation".to_string()),
-                        system_prompt: Some(build_rag_conversation_system_prompt()),
-                        temperature: Some(0.4),
-                        max_tokens: Some(rag_answer_max_tokens()),
-                        timeout: Some(Duration::from_millis(rag_answer_budget_ms())),
-                        json_object_response: false,
-                    };
-                    let prompt = build_budgeted_rag_conversation_prompt(
-                        query,
-                        conversation_turns,
-                        context_token_limit,
-                    );
-                    let mut llm_result =
-                        run_llm_text_with_state_and_options(&prompt, &model_state, &options);
-                    if !llm_result.available
-                        && llm_context_overflow(&llm_result)
-                        && !conversation_turns.is_empty()
-                    {
-                        llm_result = run_llm_text_with_state_and_options(
-                            &build_budgeted_rag_conversation_prompt(
-                                query,
-                                &[],
-                                context_token_limit,
-                            ),
-                            &model_state,
-                            &options,
-                        );
-                    }
-                    model = llm_execution_model_json(&llm_result);
-                    let generated = normalize_rag_answer_text(&llm_result.text);
-                    if llm_result.available && !generated.is_empty() {
-                        answer = generated;
-                    } else {
-                        degraded_reason = Some("llm_unavailable".to_string());
-                        warnings.push(format!(
-                            "本地对话模型不可用：{}",
-                            friendly_llm_failure_summary(&llm_result)
-                        ));
-                    }
-                }
-                Err(error) => {
-                    degraded_reason = Some("llm_policy_blocked".to_string());
-                    warnings.push(error);
-                }
-            },
-            Err(error) => {
-                degraded_reason = Some("model_settings_unavailable".to_string());
-                warnings.push(format!("模型设置不可用：{error}"));
-            }
-        }
-
-        let degraded = degraded_reason.is_some();
-        let status = if degraded { "degraded" } else { "completed" };
-        let reason = degraded_reason.as_deref().unwrap_or("none");
+        let answer = "当前 RC 未启用最终回答模型，暂不生成开放式对话回答。".to_string();
+        let warnings = vec![
+            "当前 RC 未 promotion 最终 RAG answer 模型，已阻止 0.5B 生成对话回答。".to_string(),
+        ];
         let data = build_rag_answer_data(
             query,
             &answer,
-            status,
-            degraded,
-            reason,
+            "degraded",
+            true,
+            RAG_FULL_ANSWER_MODEL_NOT_PROMOTED,
             &search_result,
             &[],
             &[],
             0,
-            model,
+            Value::Null,
             warnings,
             Value::Null,
             Some(query_understanding),
@@ -7427,19 +7209,6 @@ fn rag_answer_candidate_citations(
     }
 }
 
-fn append_rag_review_scope_instruction(
-    prompt: &mut String,
-    returned_count: usize,
-    reviewed_count: usize,
-) {
-    if returned_count <= reviewed_count {
-        return;
-    }
-    prompt.push_str(&format!(
-        "\n\n结果范围说明：系统会向用户返回 {returned_count} 个合格文件，但本次只提供排名最高的 {reviewed_count} 个文件供你阅读。回答中必须明确说明只分析了前 {reviewed_count} 个，不得声称已经检查全部 {returned_count} 个文件。"
-    ));
-}
-
 fn rag_answer_eligible_citations(
     understanding: &RagQueryUnderstanding,
     candidates: &[KnowledgeSearchCitation],
@@ -8529,21 +8298,6 @@ fn build_budgeted_rag_query_understanding_prompt(
     }
 }
 
-fn llm_context_overflow(execution: &LlmTextExecution) -> bool {
-    let summary = execution.summary.to_ascii_lowercase();
-    summary.contains("maximum context length")
-        || summary.contains("context length")
-        || summary.contains("input tokens")
-}
-
-fn friendly_llm_failure_summary(execution: &LlmTextExecution) -> String {
-    if llm_context_overflow(execution) {
-        "当前资料和对话较多，自动压缩后仍超过本地模型容量；已使用检索片段生成有限回答。".to_string()
-    } else {
-        execution.summary.clone()
-    }
-}
-
 fn rag_conversation_evidence_from_step_output(step_output: &Value) -> Vec<RagConversationEvidence> {
     let citations = [
         "/data/citations",
@@ -8692,26 +8446,6 @@ fn build_rag_conversation_prompt(
         format_rag_conversation_context(conversation_turns),
         query
     )
-}
-
-fn build_budgeted_rag_conversation_prompt(
-    query: &str,
-    conversation_turns: &[RagConversationTurn],
-    context_token_limit: usize,
-) -> String {
-    let system_prompt = build_rag_conversation_system_prompt();
-    let input_budget = rag_prompt_input_token_budget(context_token_limit, rag_answer_max_tokens());
-    let base = format!("Current user message:\n{query}");
-    let base_tokens = rag_chat_prompt_token_count(&system_prompt, &base);
-    let history_budget = input_budget
-        .saturating_sub(base_tokens)
-        .min(RAG_ANSWER_HISTORY_TOKEN_BUDGET);
-    let history = format_compact_rag_conversation_context(conversation_turns, history_budget);
-    if history.is_empty() {
-        base
-    } else {
-        format!("{history}\n\n{base}")
-    }
 }
 
 fn parse_rag_query_understanding(query: &str, raw: &str) -> Option<RagQueryUnderstanding> {
@@ -9411,11 +9145,6 @@ fn apply_rag_requested_modality_constraint(
         understanding.target_modality = requested[0];
         understanding.target_modalities = requested;
     }
-}
-
-fn build_rag_conversation_system_prompt() -> String {
-    "你是 HarborOS 中友善、耐心的本地对话助手。请直接回应用户当前的话，保持自然、关心和简洁；可以用一个温和的问题继续对话。不要声称搜索了知识库，不要输出 citation 标记。如果用户表达可能立即伤害自己或他人的意图，应优先鼓励其联系当地紧急服务和可信赖的人。"
-        .to_string()
 }
 
 fn empty_rag_conversation_search_response(query: &str) -> KnowledgeSearchResponse {
@@ -10267,6 +9996,7 @@ fn cleaned_citation_preview(citation: &KnowledgeSearchCitation) -> String {
     truncate_chars(&preview, 220)
 }
 
+#[cfg(test)]
 fn citation_answer_context(citation: &KnowledgeSearchCitation) -> String {
     let context = if citation.answer_context.trim().is_empty() {
         citation.preview.as_deref().unwrap_or_default()
@@ -10276,6 +10006,7 @@ fn citation_answer_context(citation: &KnowledgeSearchCitation) -> String {
     context.trim().to_string()
 }
 
+#[cfg(test)]
 fn build_rag_answer_prompt(
     query: &str,
     citations: &[KnowledgeSearchCitation],
@@ -10372,7 +10103,7 @@ fn build_rag_answer_prompt(
     }
     lines.push(String::new());
     lines.push("引用：".to_string());
-    let mut remaining_context_chars = rag_answer_context_char_budget();
+    let mut remaining_context_chars = 4_800;
     for (index, citation) in citations.iter().enumerate() {
         let citations_left = citations.len().saturating_sub(index).max(1);
         let per_citation_limit = remaining_context_chars / citations_left;
@@ -10397,6 +10128,7 @@ fn build_rag_answer_prompt(
     lines.join("\n")
 }
 
+#[cfg(test)]
 fn build_budgeted_rag_answer_prompt_with_history(
     query: &str,
     conversation_turns: &[RagConversationTurn],
@@ -10449,12 +10181,15 @@ fn build_budgeted_rag_answer_prompt_with_history(
     }
 }
 
+#[cfg(test)]
 fn build_rag_answer_system_prompt() -> String {
     format!(
         "You are HarborBeacon's evidence-grounded RAG answer composer. Answer once using only the supplied evidence objects. Obey the requested target modality and every negative constraint; never substitute another source type merely to produce an answer. Cite only evidence that positively supports the final answer. Every factual sentence and list item MUST end with one or more in-range citation markers such as [1] or [1][2]. If the evidence is insufficient, say so directly. Never invent or rewrite document titles. Keep the answer within about {RAG_ANSWER_SOFT_TARGET_TOKENS} output tokens, prioritize the conclusion, and finish every sentence before stopping. Do not enumerate filenames when result cards already carry the complete list; summarize the result and direct the user to those cards instead. Return only the user-facing answer, not JSON, a review, or the judging process."
     )
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn normalize_rag_answer_text(text: &str) -> String {
     text.trim()
         .trim_matches(|ch: char| ch == '`' || ch.is_whitespace())
@@ -10492,7 +10227,6 @@ fn validate_rag_answer_citations(
 struct RagCitationFinalization {
     answer: String,
     cited_indices: Option<HashSet<usize>>,
-    answer_review: Value,
     degraded_reason: Option<&'static str>,
     warning: Option<String>,
 }
@@ -10500,55 +10234,32 @@ struct RagCitationFinalization {
 fn finalize_rag_answer_citations(
     query: &str,
     answer: &str,
-    generation_status: &'static str,
     citations: &[KnowledgeSearchCitation],
 ) -> RagCitationFinalization {
     match validate_rag_answer_citations(answer, citations.len()) {
         Ok(cited_indices) => RagCitationFinalization {
             answer: answer.to_string(),
-            cited_indices: Some(cited_indices.clone()),
-            answer_review: json!({
-                "mode": "deterministic_citation_validation",
-                "status": "passed",
-                "generation_status": generation_status,
-                "used_citation_ids": cited_indices,
-            }),
+            cited_indices: Some(cited_indices),
             degraded_reason: None,
             warning: None,
         },
         Err(validation_reason) => {
             debug_assert!(!citations.is_empty());
             let fallback_candidate = build_limited_rag_answer(query, citations);
-            let (fallback_answer, fallback_indices, fallback_validation_reason) =
+            let (fallback_answer, fallback_indices) =
                 match validate_rag_answer_citations(&fallback_candidate, citations.len()) {
-                    Ok(indices) => (fallback_candidate, indices, None),
-                    Err(reason) => (
+                    Ok(indices) => (fallback_candidate, indices),
+                    Err(_) => (
                         "已找到匹配来源，但暂时无法生成完整的证据摘要。[1]".to_string(),
                         HashSet::from([1]),
-                        Some(reason),
                     ),
                 };
-            let warning_subject = if generation_status == "generated_once" {
-                "模型回答"
-            } else {
-                "回答"
-            };
             RagCitationFinalization {
                 answer: fallback_answer,
-                cited_indices: Some(fallback_indices.clone()),
-                answer_review: json!({
-                    "mode": "deterministic_citation_validation",
-                    "status": "fallback",
-                    "generation_status": "citation_validation_fallback",
-                    "reason": "citation_validation_failed",
-                    "validation_reason": validation_reason,
-                    "fallback_validation_reason": fallback_validation_reason,
-                    "source_generation_status": generation_status,
-                    "used_citation_ids": fallback_indices,
-                }),
+                cited_indices: Some(fallback_indices),
                 degraded_reason: Some("citation_validation_failed"),
                 warning: Some(format!(
-                    "{warning_subject}的引用校验未通过（{validation_reason}），已舍弃不合规文本并返回确定性证据摘要。"
+                    "回答的引用校验未通过（{validation_reason}），已舍弃不合规文本并返回确定性证据摘要。"
                 )),
             }
         }
@@ -10654,36 +10365,6 @@ fn rag_answer_allowed_endpoint_kinds(
             }
         }
     }
-}
-
-fn llm_execution_model_json(result: &LlmTextExecution) -> Value {
-    json!({
-        "available": result.available,
-        "status": result.status,
-        "summary": result.summary,
-        "provider_key": result.provider_key,
-        "model_endpoint_id": result.model_endpoint_id,
-        "selected_endpoint": result.details.get("selected_endpoint").cloned().unwrap_or(Value::Null),
-        "selected_endpoint_kind": result.details.get("selected_endpoint_kind").cloned().unwrap_or(Value::Null),
-        "attempted_endpoints": result.details.get("attempted_endpoints").cloned().unwrap_or_else(|| json!([])),
-        "fallback_reason": result.details.get("fallback_reason").cloned().unwrap_or(Value::Null),
-        "fallback_used": result.details.get("fallback_used").cloned().unwrap_or(Value::Bool(false)),
-        "finish_reason": llm_finish_reason(result),
-    })
-}
-
-fn llm_finish_reason(result: &LlmTextExecution) -> Option<&str> {
-    result
-        .details
-        .pointer("/raw_response/choices/0/finish_reason")
-        .and_then(Value::as_str)
-}
-
-fn llm_output_truncated(result: &LlmTextExecution) -> bool {
-    matches!(
-        llm_finish_reason(result).map(|reason| reason.trim().to_ascii_lowercase()),
-        Some(reason) if matches!(reason.as_str(), "length" | "max_tokens")
-    )
 }
 
 fn llm_model_state_without_cloud(model_state: &AdminModelCenterState) -> AdminModelCenterState {
@@ -13565,43 +13246,6 @@ fn knowledge_latency_budget_ms(request: &TaskRequest) -> Option<u64> {
     )
 }
 
-fn rag_answer_budget_ms() -> u64 {
-    positive_env_u64(RAG_ANSWER_BUDGET_MS_ENV, RAG_ANSWER_BUDGET_MS)
-}
-
-fn rag_answer_max_tokens() -> u32 {
-    positive_env_u32(RAG_ANSWER_MAX_TOKENS_ENV, RAG_ANSWER_MAX_TOKENS)
-}
-
-fn rag_answer_context_char_budget() -> usize {
-    positive_env_u64(
-        RAG_ANSWER_CONTEXT_CHAR_BUDGET_ENV,
-        RAG_ANSWER_CONTEXT_CHAR_BUDGET as u64,
-    ) as usize
-}
-
-fn positive_env_u64(name: &str, default: u64) -> u64 {
-    positive_u64_value(std::env::var(name).ok().as_deref(), default)
-}
-
-fn positive_env_u32(name: &str, default: u32) -> u32 {
-    positive_u32_value(std::env::var(name).ok().as_deref(), default)
-}
-
-fn positive_u64_value(value: Option<&str>, default: u64) -> u64 {
-    value
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .filter(|parsed| *parsed > 0)
-        .unwrap_or(default)
-}
-
-fn positive_u32_value(value: Option<&str>, default: u32) -> u32 {
-    value
-        .and_then(|raw| raw.trim().parse::<u32>().ok())
-        .filter(|parsed| *parsed > 0)
-        .unwrap_or(default)
-}
-
 fn parse_privacy_level(value: &str) -> Option<PrivacyLevel> {
     match value.trim().to_lowercase().as_str() {
         "strict_local" | "strict-local" | "local" => Some(PrivacyLevel::StrictLocal),
@@ -14683,16 +14327,6 @@ mod tests {
     }
 
     #[test]
-    fn rag_review_scope_separates_returned_results_from_model_context() {
-        let mut prompt = "基础提示".to_string();
-        super::append_rag_review_scope_instruction(&mut prompt, 20, 10);
-
-        assert!(prompt.contains("返回 20 个合格文件"));
-        assert!(prompt.contains("排名最高的 10 个文件"));
-        assert!(prompt.contains("不得声称已经检查全部 20 个文件"));
-    }
-
-    #[test]
     fn explicit_result_list_uses_a_complete_compact_overview() {
         let mut understanding = super::fallback_rag_query_understanding("我想要20张狗狗图片");
         understanding.intent = super::RagQueryIntent::FactualAnswer;
@@ -14708,35 +14342,6 @@ mod tests {
         assert!(answer.contains("只分析了排名最高的 10 个"));
         assert!(!answer.contains("dog.jpg"));
         assert!(answer.lines().all(|line| line.ends_with("[1]")));
-    }
-
-    #[test]
-    fn rag_answer_detects_length_finish_reason() {
-        let truncated = crate::runtime::model_center::LlmTextExecution {
-            available: true,
-            details: json!({
-                "raw_response": {
-                    "choices": [{"finish_reason": "length"}]
-                }
-            }),
-            ..Default::default()
-        };
-        let completed = crate::runtime::model_center::LlmTextExecution {
-            available: true,
-            details: json!({
-                "raw_response": {
-                    "choices": [{"finish_reason": "stop"}]
-                }
-            }),
-            ..Default::default()
-        };
-
-        assert!(super::llm_output_truncated(&truncated));
-        assert!(!super::llm_output_truncated(&completed));
-        assert_eq!(
-            super::llm_execution_model_json(&truncated)["finish_reason"],
-            json!("length")
-        );
     }
 
     #[test]
@@ -15490,6 +15095,42 @@ mod tests {
         assert_eq!(visible.total_matches, 0);
         assert_eq!(visible.empty_reason, None);
         assert_eq!(visible.empty_guidance, None);
+    }
+
+    #[test]
+    fn rag_conversation_does_not_use_unpromoted_answer_model() {
+        let (service, _conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("rag-conversation-model-boundary");
+        configure_mock_general_message_llm(&service, "this model output must not be used");
+        let request = general_message_test_request(
+            "rag-conversation-model-boundary",
+            "陪我聊聊天",
+            json!({}),
+        );
+        let understanding = super::fallback_rag_query_understanding("陪我聊聊天");
+
+        let response = service.handle_rag_conversation_answer(
+            &request,
+            "陪我聊聊天",
+            &[],
+            &understanding,
+            8_192,
+        );
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.result.data["status"], "degraded");
+        assert_eq!(response.result.data["degraded"], true);
+        assert_eq!(
+            response.result.data["degraded_reason"],
+            "full_answer_model_not_promoted"
+        );
+        assert!(response.result.data["model"].is_null());
+        assert!(!response
+            .result
+            .message
+            .contains("this model output must not be used"));
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
     }
 
     #[test]
@@ -16418,21 +16059,12 @@ mod tests {
         let invalid_generated = super::finalize_rag_answer_citations(
             "文章讲了什么？",
             "这是没有引用的模型幻觉。",
-            "generated_once",
             &citations,
         );
         assert!(!invalid_generated.answer.contains("模型幻觉"));
         assert_eq!(
             invalid_generated.degraded_reason,
             Some("citation_validation_failed")
-        );
-        assert_eq!(
-            invalid_generated.answer_review["generation_status"],
-            "citation_validation_fallback"
-        );
-        assert_eq!(
-            invalid_generated.answer_review["reason"],
-            "citation_validation_failed"
         );
         assert_eq!(
             invalid_generated.cited_indices,
@@ -16456,7 +16088,6 @@ mod tests {
         let invalid_deterministic = super::finalize_rag_answer_citations(
             "文章讲了什么？",
             "未引用的标题\n有证据的条目。[1]",
-            "deterministic_answer",
             &[citation_without_preview],
         );
         assert_eq!(
@@ -16503,19 +16134,6 @@ mod tests {
         assert!(!prompt.contains(&second.answer_context));
         assert!(prompt.contains(&"a".repeat(2_300)));
         assert!(prompt.contains(&"b".repeat(2_300)));
-    }
-
-    #[test]
-    fn rag_answer_env_overrides_accept_only_positive_numbers() {
-        assert_eq!(super::positive_u64_value(Some("9000"), 6_000), 9_000);
-        assert_eq!(super::positive_u64_value(Some("0"), 6_000), 6_000);
-        assert_eq!(super::positive_u64_value(Some("nope"), 6_000), 6_000);
-        assert_eq!(super::positive_u64_value(None, 6_000), 6_000);
-
-        assert_eq!(super::positive_u32_value(Some("64"), 256), 64);
-        assert_eq!(super::positive_u32_value(Some("0"), 256), 256);
-        assert_eq!(super::positive_u32_value(Some("4294967296"), 256), 256);
-        assert_eq!(super::positive_u32_value(None, 256), 256);
     }
 
     #[test]
@@ -21031,7 +20649,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_rag_answer_returns_cited_answer_from_search_context() {
+    fn handle_rag_answer_without_promoted_model_returns_deterministic_cited_summary() {
         let admin_path = unique_path("harborbeacon-admin-state");
         let registry_path = unique_path("harborbeacon-device-registry");
         let conversation_path = unique_path("harborbeacon-task-runtime");
@@ -21053,7 +20671,10 @@ mod tests {
             admin_store,
             TaskConversationStore::new(conversation_path.clone()),
         );
-        configure_mock_general_message_llm(&service, "樱花计划是春季花园归档安排。[1]");
+        configure_mock_general_message_llm(
+            &service,
+            "MODEL_TEXT_MUST_NOT_BE_USED_FOR_FINAL_RAG_ANSWER [1]",
+        );
         let request = TaskRequest {
             task_id: "task-rag-answer".to_string(),
             trace_id: "trace-rag-answer".to_string(),
@@ -21078,6 +20699,12 @@ mod tests {
         assert_eq!(response.status, TaskStatus::Completed);
         assert_eq!(response.executor_used, "rag_answer_service");
         assert_eq!(response.result.data["kind"], "rag.answer");
+        assert_eq!(response.result.data["status"], "degraded");
+        assert_eq!(response.result.data["degraded"], true);
+        assert_eq!(
+            response.result.data["degraded_reason"],
+            "full_answer_model_not_promoted"
+        );
         assert_eq!(
             response.result.data["answer_citation_policy"],
             "cited_context_only"
@@ -21086,7 +20713,10 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("[1]"));
-        assert_eq!(response.result.data["model"]["available"], true);
+        assert!(response.result.data["model"].is_null());
+        let answer = response.result.data["answer"].as_str().unwrap_or_default();
+        assert!(answer.contains("樱花计划是春季花园归档安排"));
+        assert!(!answer.contains("MODEL_TEXT_MUST_NOT_BE_USED"));
         assert_eq!(
             response.result.data["citations"].as_array().map(Vec::len),
             Some(1)
@@ -21136,7 +20766,8 @@ mod tests {
             entity_refs: Value::Null,
             args: json!({
                 "query": "车库门禁密码",
-                "roots": [knowledge_root.to_string_lossy().to_string()]
+                "roots": [knowledge_root.to_string_lossy().to_string()],
+                "require_embeddings": true
             }),
             autonomy: Default::default(),
             message: None,
@@ -21144,7 +20775,7 @@ mod tests {
 
         let response = service.handle_task(request);
 
-        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.status, TaskStatus::Failed);
         assert_eq!(response.executor_used, "rag_answer_service");
         assert_eq!(response.result.data["status"], "degraded");
         assert_eq!(response.result.data["degraded"], true);
@@ -21156,7 +20787,8 @@ mod tests {
             response.result.data["citations"].as_array().map(Vec::len),
             Some(0)
         );
-        assert!(response.result.message.contains("没有找到与"));
+        assert!(response.result.message.contains("embedding"));
+        assert!(response.result.message.contains("不可用"));
 
         let _ = fs::remove_file(admin_path);
         let _ = fs::remove_file(registry_path);
@@ -21222,7 +20854,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_rag_answer_redacted_cloud_uses_privacy_capsule() {
+    fn handle_rag_answer_redacted_cloud_audits_capsule_without_using_cloud_model() {
         let _guard = RETRIEVAL_GATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -21290,11 +20922,13 @@ mod tests {
         );
         assert_eq!(
             response.result.data["privacy_gateway"]["capsule_prompt_used"],
-            true
+            false
         );
+        assert!(response.result.data["model"].is_null());
+        assert_eq!(response.result.data["status"], "degraded");
         assert_eq!(
-            response.result.data["model"]["selected_endpoint_kind"],
-            "cloud"
+            response.result.data["degraded_reason"],
+            "full_answer_model_not_promoted"
         );
         assert_eq!(
             response.result.data["privacy_gateway"]["capsule_fact_count"],
@@ -21376,7 +21010,7 @@ mod tests {
         assert_eq!(response.result.data["status"], "degraded");
         assert_eq!(
             response.result.data["degraded_reason"],
-            "privacy_gateway_blocked"
+            "full_answer_model_not_promoted"
         );
         assert_eq!(
             response.result.data["privacy_gateway"]["decision"],
@@ -21392,7 +21026,7 @@ mod tests {
             .is_some_and(|warnings| warnings
                 .iter()
                 .filter_map(Value::as_str)
-                .any(|warning| { warning.contains("Privacy Gateway 已阻断云端回答") })));
+                .any(|warning| warning.contains("未 promotion 最终 RAG answer 模型"))));
         assert_eq!(
             response.result.data["citations"].as_array().map(Vec::len),
             Some(1)
@@ -21408,7 +21042,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_rag_answer_allow_cloud_records_privacy_gateway_evidence() {
+    fn handle_rag_answer_allow_cloud_audits_policy_without_using_cloud_model() {
         let _guard = RETRIEVAL_GATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -21478,15 +21112,16 @@ mod tests {
             response.result.data["privacy_gateway"]["capsule_prompt_used"],
             false
         );
+        assert!(response.result.data["model"].is_null());
+        assert_eq!(response.result.data["degraded"], true);
         assert_eq!(
-            response.result.data["model"]["selected_endpoint_kind"],
-            "cloud"
+            response.result.data["degraded_reason"],
+            "full_answer_model_not_promoted"
         );
-        assert_eq!(
-            response.result.data["degraded"], false,
-            "{}",
-            response.result.data
-        );
+        let audits = service.admin_store.audit_records().expect("audit records");
+        assert!(audits
+            .iter()
+            .any(|record| record.action == "privacy_gateway.rag_answer.evaluate"));
 
         let _ = fs::remove_file(admin_path);
         let _ = fs::remove_file(registry_path);
