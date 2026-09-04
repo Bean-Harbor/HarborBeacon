@@ -20,6 +20,47 @@ fn package_detection_control_path_is_distinct_and_strict() {
 }
 
 #[test]
+fn package_runtime_zone_match_rejects_missing_or_stale_worker_contract() {
+    let zone = PackageDeliveryZone {
+        left: 0.1,
+        top: 0.2,
+        right: 0.8,
+        bottom: 0.9,
+    };
+    let mut runtime = sample_running_detection_job("package-zone", "camera.252", false, None);
+    runtime.projection.target_labels = vec!["package".to_string()];
+
+    assert!(package_worker_observability_zone_matches(
+        &runtime.projection,
+        zone
+    ));
+    runtime.projection.latest_result = Some(json!({
+        "frame_observability_zone": zone,
+    }));
+    assert!(package_worker_observability_zone_matches(
+        &runtime.projection,
+        zone
+    ));
+    runtime.projection.latest_result = Some(json!({
+        "frame_observability_zone": {
+            "left": 0.0,
+            "top": 0.0,
+            "right": 1.0,
+            "bottom": 1.0,
+        },
+    }));
+    assert!(!package_worker_observability_zone_matches(
+        &runtime.projection,
+        zone
+    ));
+    runtime.projection.latest_result = Some(json!({"ok": true}));
+    assert!(!package_worker_observability_zone_matches(
+        &runtime.projection,
+        zone
+    ));
+}
+
+#[test]
 fn persisted_detector_controls_reject_both_enable_directions() {
     let cat_enabled = CatDetectionControlPolicy::new("camera.252", true, "sub", 1)
         .expect("cat policy");

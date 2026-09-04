@@ -1526,6 +1526,11 @@ mod tests {
             event_id: Some("cat-activity-1".to_string()),
             labels: vec!["cat".to_string()],
             source: Some("yolo_cat_activity".to_string()),
+            coverage_start_epoch_ms: None,
+            coverage_end_epoch_ms: None,
+            coverage_verified: false,
+            gap_free: false,
+            coverage_segment_duration_ms: None,
         }
     }
 

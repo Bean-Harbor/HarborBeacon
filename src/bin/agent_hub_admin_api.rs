@@ -175,8 +175,10 @@ use harborbeacon_local_agent::runtime::package_detection_control::{
 };
 use harborbeacon_local_agent::runtime::package_event::{
     default_package_event_store_path, PackageDeliveryZone, PackageDetectionBox,
-    PackageDetectionObservation, PackageEventArtifact, PackageEventConfig, PackageEventStore,
-    PackageLifecycleEvent, PackageLifecycleEventKind, PackagePresencePhase,
+    PackageDetectionObservation, PackageEventArtifact, PackageEventConfig,
+    PackageEventRecordingArtifact, PackageEventStore, PackageLifecycleEvent,
+    PackageLifecycleEventKind, PackageObservability, PackageObservationOutcome,
+    PackagePresencePhase,
 };
 use harborbeacon_local_agent::runtime::privacy_gateway::PRIVACY_GATEWAY_POLICY_VERSION;
 use harborbeacon_local_agent::runtime::registry::{
@@ -213,6 +215,16 @@ const MAX_VISION_EVENT_INGEST_INFLIGHT: usize = 8;
 const DETECTION_JOB_MONITOR_INTERVAL: Duration = Duration::from_secs(1);
 const PACKAGE_EVENT_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 const PACKAGE_EVENT_RETRY_DELAY_MS: u64 = 30_000;
+const PACKAGE_APPEARANCE_RECORDING_TTL_SECONDS: u64 = 15;
+const PACKAGE_APPEARANCE_RECORDING_PRE_ROLL_SECONDS: u32 = 5;
+const PACKAGE_APPEARANCE_RECORDING_CONFIRMATION_MS: u64 = 5_000;
+const PACKAGE_APPEARANCE_RECORDING_POST_ROLL_MS: u64 = 5_000;
+const PACKAGE_APPEARANCE_RECORDING_AFTER_TRIGGER_MS: u64 =
+    PACKAGE_APPEARANCE_RECORDING_CONFIRMATION_MS + PACKAGE_APPEARANCE_RECORDING_POST_ROLL_MS;
+const PACKAGE_REMOVAL_RECORDING_TTL_SECONDS: u64 = 20;
+const PACKAGE_REMOVAL_RECORDING_PRE_ROLL_SECONDS: u32 = 5;
+const PACKAGE_REMOVAL_RECORDING_POST_ROLL_MS: u64 = 15_000;
+const PACKAGE_REMOVAL_RECORDING_RETRY_INTERVAL_MS: u64 = 5_000;
 const DETECTION_LEASE_CLEANUP_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const DETECTION_LEASE_CLEANUP_RETRY_MAX: Duration = Duration::from_secs(60);
 const CAT_RECORDING_VALIDATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -2245,6 +2257,12 @@ struct CatDetectionObservationResult {
     processed_epoch_ms: u64,
     result_age_ms: u64,
     #[serde(default)]
+    camera_healthy: bool,
+    #[serde(default)]
+    frame_observable: bool,
+    #[serde(default)]
+    frame_observability_zone: Option<PackageDeliveryZone>,
+    #[serde(default)]
     frame_width: u32,
     #[serde(default)]
     frame_height: u32,
@@ -2320,8 +2338,10 @@ struct PackageEventConfigResponse {
     confirm_frames: u32,
     confirm_window_ms: u64,
     max_result_age_ms: u64,
+    max_observation_gap_ms: u64,
     revision: u128,
     phase: String,
+    observability: String,
     event_id: Option<String>,
     delivered: bool,
     last_error: Option<String>,
@@ -2331,6 +2351,8 @@ struct PackageEventConfigResponse {
     removed_frame_epoch_ms: Option<u64>,
     removal_delivered: bool,
     removal_last_error: Option<String>,
+    removal_recording_artifacts: Vec<PackageEventRecordingArtifact>,
+    removal_recording_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2855,6 +2877,12 @@ impl AdminApi {
         harbor_assistant_dist: PathBuf,
         public_origin: String,
     ) -> Self {
+        let reconciliation_path = admin_store
+            .path()
+            .with_extension("cat-recording-reconciliation.json");
+        let validation_path = admin_store
+            .path()
+            .with_extension("cat-recording-validations.jsonl");
         Self::new_with_dependencies_for_test(
             admin_store,
             task_service,
@@ -2863,8 +2891,8 @@ impl AdminApi {
             HarborLinkMediaClient::new("http://127.0.0.1:9")
                 .expect("fixed test HarborLink endpoint must be valid"),
             CatRecordingValidationMode::Off,
-            CatRecordingReconciliationStore::default(),
-            CatRecordingValidationStore::default(),
+            CatRecordingReconciliationStore::new(reconciliation_path),
+            CatRecordingValidationStore::new(validation_path),
         )
     }
 
@@ -2926,20 +2954,48 @@ impl AdminApi {
     fn process_package_detection_result(
         &self,
         camera_id: &str,
+        stream_profile: &str,
         value: &Value,
-    ) -> Result<(), String> {
+    ) -> Result<PackageObservationOutcome, String> {
         let result: CatDetectionObservationResult = serde_json::from_value(value.clone())
             .map_err(|error| format!("package detection result is invalid: {error}"))?;
-        if !result.ok || !result.target_label.eq_ignore_ascii_case("package") {
-            return Ok(());
+        if !result.target_label.eq_ignore_ascii_case("package") {
+            return Ok(PackageObservationOutcome::Ignored);
         }
+        if !result.ok {
+            self.mark_package_state_unknown(camera_id, PackageObservability::Offline)?;
+            return Ok(PackageObservationOutcome::Unknown);
+        }
+        let now_epoch_ms = u64::try_from(cat_auto_recording_epoch_ms()).unwrap_or(u64::MAX);
+        let store = self.package_event_store()?;
+        let event_config = store.load()?.configs.get(camera_id).cloned();
+        let max_result_age_ms = event_config
+            .as_ref()
+            .map(|config| config.max_result_age_ms)
+            .unwrap_or_default();
+        if max_result_age_ms > 0
+            && now_epoch_ms.saturating_sub(result.processed_epoch_ms) > max_result_age_ms
+        {
+            self.mark_package_state_unknown(camera_id, PackageObservability::Discontinuous)?;
+            return Ok(PackageObservationOutcome::Unknown);
+        }
+        if event_config
+            .as_ref()
+            .is_some_and(|config| result.frame_observability_zone != Some(config.zone))
+        {
+            self.mark_package_state_unknown(camera_id, PackageObservability::Discontinuous)?;
+            return Ok(PackageObservationOutcome::Unknown);
+        }
+        let previous_state = store.state(camera_id)?;
         let observation = PackageDetectionObservation {
             sequence: result.sequence,
             worker_started_epoch_ms: result.worker_started_epoch_ms,
             frame_epoch_ms: result.frame_epoch_ms,
             processed_epoch_ms: result.processed_epoch_ms,
-            observed_epoch_ms: u64::try_from(cat_auto_recording_epoch_ms()).unwrap_or(u64::MAX),
+            observed_epoch_ms: now_epoch_ms,
             result_age_ms: result.result_age_ms,
+            camera_healthy: result.camera_healthy,
+            frame_observable: result.frame_observable,
             frame_width: result.frame_width,
             frame_height: result.frame_height,
             detections: result
@@ -2955,15 +3011,262 @@ impl AdminApi {
                 })
                 .collect(),
         };
-        self.package_event_store()?
-            .observe(camera_id, &observation)
-            .map(|_| ())
+        let outcome = store.observe(camera_id, &observation)?;
+        let current_state = store.state(camera_id)?;
+        self.reconcile_package_appearance_recording(
+            camera_id,
+            stream_profile,
+            previous_state.as_ref(),
+            current_state.as_ref(),
+            &outcome,
+            now_epoch_ms,
+        )?;
+        self.reconcile_package_removal_recording(
+            camera_id,
+            stream_profile,
+            previous_state.as_ref(),
+            current_state.as_ref(),
+            &outcome,
+            now_epoch_ms,
+        )?;
+        Ok(outcome)
+    }
+
+    fn mark_package_state_unknown(
+        &self,
+        camera_id: &str,
+        observability: PackageObservability,
+    ) -> Result<(), String> {
+        let store = self.package_event_store()?;
+        let previous = store.state(camera_id)?;
+        store.mark_unknown(camera_id, observability)?;
+        if let Some(lease_id) = previous
+            .as_ref()
+            .and_then(|state| state.removal_recording_context())
+            .and_then(|context| context.lease_id)
+        {
+            self.harborlink_media
+                .stop_event_recording(camera_id, &lease_id)?;
+        }
+        Ok(())
+    }
+
+    fn reconcile_package_appearance_recording(
+        &self,
+        camera_id: &str,
+        stream_profile: &str,
+        previous_state: Option<
+            &harborbeacon_local_agent::runtime::package_event::PackageEventState,
+        >,
+        current_state: Option<&harborbeacon_local_agent::runtime::package_event::PackageEventState>,
+        _outcome: &PackageObservationOutcome,
+        now_epoch_ms: u64,
+    ) -> Result<(), String> {
+        let store = self.package_event_store()?;
+        let previous_event_id = previous_state.and_then(|state| state.event_id.clone());
+        let current_event_id = current_state.and_then(|state| state.event_id.clone());
+        if previous_event_id != current_event_id {
+            if let Some(event_id) = previous_event_id {
+                if let Some(event) = store.load()?.events.get(&event_id).cloned() {
+                    self.finalize_package_recording_event(&event)?;
+                }
+            }
+        }
+        let Some(event_id) = current_event_id else {
+            return Ok(());
+        };
+        let Some(event) = store.load()?.events.get(&event_id).cloned() else {
+            return Ok(());
+        };
+        if event.kind != PackageLifecycleEventKind::Appeared || event.recording_finalized {
+            return Ok(());
+        }
+        if event.recording_trigger_epoch_ms > 0
+            && now_epoch_ms.saturating_sub(event.recording_trigger_epoch_ms)
+                >= PACKAGE_APPEARANCE_RECORDING_AFTER_TRIGGER_MS
+        {
+            return Ok(());
+        }
+        if now_epoch_ms.saturating_sub(event.recording_last_renewed_epoch_ms)
+            < PACKAGE_REMOVAL_RECORDING_RETRY_INTERVAL_MS
+        {
+            return Ok(());
+        }
+        let lease = match event.recording_lease_id.as_deref() {
+            Some(lease_id) => self.harborlink_media.renew_event_recording(
+                camera_id,
+                lease_id,
+                PACKAGE_APPEARANCE_RECORDING_TTL_SECONDS,
+            ),
+            None => self
+                .harborlink_media
+                .start_package_appearance_event_recording(
+                    camera_id,
+                    &event.event_id,
+                    stream_profile,
+                    PACKAGE_APPEARANCE_RECORDING_TTL_SECONDS,
+                    PACKAGE_APPEARANCE_RECORDING_PRE_ROLL_SECONDS,
+                    event.recording_trigger_epoch_ms,
+                ),
+        };
+        match lease.and_then(|lease| {
+            validate_package_event_recording_lease(camera_id, &event.event_id, lease)
+        }) {
+            Ok(lease) => store.set_recording_lease(
+                &event.event_id,
+                &lease.lease_id,
+                event.recording_trigger_epoch_ms,
+                now_epoch_ms,
+            ),
+            Err(error) => {
+                let error = redact_admin_string(&error);
+                store.set_recording_error(&event.event_id, now_epoch_ms, error.clone())?;
+                Err(error)
+            }
+        }
+    }
+
+    fn reconcile_package_removal_recording(
+        &self,
+        camera_id: &str,
+        stream_profile: &str,
+        previous_state: Option<
+            &harborbeacon_local_agent::runtime::package_event::PackageEventState,
+        >,
+        current_state: Option<&harborbeacon_local_agent::runtime::package_event::PackageEventState>,
+        outcome: &PackageObservationOutcome,
+        now_epoch_ms: u64,
+    ) -> Result<(), String> {
+        let store = self.package_event_store()?;
+        let previous = previous_state.and_then(|state| state.removal_recording_context());
+        let current = current_state.and_then(|state| state.removal_recording_context());
+
+        if let Some(previous) = previous.as_ref() {
+            if current
+                .as_ref()
+                .is_none_or(|current| current.event_id != previous.event_id)
+            {
+                if !matches!(outcome, PackageObservationOutcome::Removed) {
+                    if let Some(lease_id) = previous.lease_id.as_deref() {
+                        self.harborlink_media
+                            .stop_event_recording(camera_id, lease_id)?;
+                    }
+                }
+            }
+        }
+
+        let Some(current) = current else {
+            return Ok(());
+        };
+        if now_epoch_ms.saturating_sub(current.last_renewed_epoch_ms)
+            < PACKAGE_REMOVAL_RECORDING_RETRY_INTERVAL_MS
+        {
+            return Ok(());
+        }
+        let lease = match current.lease_id.as_deref() {
+            Some(lease_id) => self.harborlink_media.renew_event_recording(
+                camera_id,
+                lease_id,
+                PACKAGE_REMOVAL_RECORDING_TTL_SECONDS,
+            ),
+            None => self.harborlink_media.start_package_event_recording(
+                camera_id,
+                &current.event_id,
+                stream_profile,
+                PACKAGE_REMOVAL_RECORDING_TTL_SECONDS,
+                PACKAGE_REMOVAL_RECORDING_PRE_ROLL_SECONDS,
+                current.trigger_epoch_ms,
+            ),
+        };
+        match lease.and_then(|lease| {
+            validate_package_event_recording_lease(camera_id, &current.event_id, lease)
+        }) {
+            Ok(lease) => store.set_removal_recording_lease(
+                camera_id,
+                &current.event_id,
+                &lease.lease_id,
+                now_epoch_ms,
+            ),
+            Err(error) => {
+                let error = redact_admin_string(&error);
+                store.set_removal_recording_error(
+                    camera_id,
+                    &current.event_id,
+                    now_epoch_ms,
+                    error.clone(),
+                )?;
+                Err(error)
+            }
+        }
+    }
+
+    fn finalize_package_recording_event(
+        &self,
+        event: &PackageLifecycleEvent,
+    ) -> Result<(), String> {
+        let store = self.package_event_store()?;
+        let Some(lease_id) = event.recording_lease_id.as_deref() else {
+            return store.finalize_recording(
+                &event.event_id,
+                Vec::new(),
+                Some(
+                    event
+                        .recording_error
+                        .clone()
+                        .unwrap_or_else(|| "package event recording was unavailable".to_string()),
+                ),
+            );
+        };
+        let recording_result = self
+            .harborlink_media
+            .stop_event_recording(&event.camera_id, lease_id)
+            .and_then(|stopped| {
+                validate_package_recording_artifacts(
+                    &event.camera_id,
+                    &event.event_id,
+                    event.recording_trigger_epoch_ms,
+                    event
+                        .recording_trigger_epoch_ms
+                        .saturating_add(match event.kind {
+                            PackageLifecycleEventKind::Appeared => {
+                                PACKAGE_APPEARANCE_RECORDING_AFTER_TRIGGER_MS
+                            }
+                            PackageLifecycleEventKind::Removed => {
+                                PACKAGE_REMOVAL_RECORDING_POST_ROLL_MS
+                            }
+                        }),
+                    stopped.artifacts,
+                )
+            });
+        match recording_result {
+            Ok(artifacts) => store.finalize_recording(&event.event_id, artifacts, None),
+            Err(error) => {
+                let error = redact_admin_string(&error);
+                if event.recording_error.is_some() {
+                    store.finalize_recording(&event.event_id, Vec::new(), Some(error))
+                } else {
+                    store.update_event(&event.event_id, |pending| {
+                        pending.recording_error = Some(error.clone());
+                        Ok(())
+                    })?;
+                    Err(error)
+                }
+            }
+        }
     }
 
     fn process_pending_package_events_once(&self) -> Result<(), String> {
         let store = self.package_event_store()?;
         let now_epoch_ms = u64::try_from(cat_auto_recording_epoch_ms()).unwrap_or(u64::MAX);
         let mut first_error = None;
+        for event in store.pending_recording_events()? {
+            if !package_recording_post_roll_complete(&event, now_epoch_ms) {
+                continue;
+            }
+            if let Err(error) = self.finalize_package_recording_event(&event) {
+                first_error.get_or_insert(error);
+            }
+        }
         for event in store.pending_events()? {
             if event.last_delivery_attempt_epoch_ms > 0
                 && now_epoch_ms.saturating_sub(event.last_delivery_attempt_epoch_ms)
@@ -3037,9 +3340,9 @@ impl AdminApi {
                         vec![
                             "package".to_string(),
                             "delivery_zone".to_string(),
-                            "removed".to_string(),
+                            "no_longer_visible".to_string(),
                         ],
-                        "包裹已从投递区域移除。",
+                        "该包裹目前已不在原位置，可能被移动。",
                     ),
                 };
                 let stored = ingest_local_vision_event_default(LocalVisionEvent {
@@ -3069,6 +3372,8 @@ impl AdminApi {
                         "confirm_window_ms": event.confirm_window_ms,
                         "delivery_zone": event.zone,
                         "threshold": DEFAULT_PACKAGE_DETECTION_CONFIDENCE,
+                        "recording_artifacts": event.recording_artifacts,
+                        "recording_error": event.recording_error,
                     }),
                     vlm: None,
                 })?;
@@ -3149,19 +3454,44 @@ impl AdminApi {
                         && detection_projection_targets(&runtime.projection, "package")
                 })
                 .filter_map(|runtime| {
-                    runtime
-                        .projection
-                        .latest_result
-                        .clone()
-                        .map(|result| (runtime.projection.camera_id.clone(), result))
+                    runtime.projection.latest_result.clone().map(|result| {
+                        (
+                            runtime.projection.camera_id.clone(),
+                            runtime.projection.stream_profile.clone(),
+                            result,
+                        )
+                    })
                 })
                 .collect::<Vec<_>>();
             (camera_ids, cleanup_intents, package_samples)
         };
         let mut first_error = None;
-        for (camera_id, result) in package_samples {
-            if let Err(error) = self.process_package_detection_result(&camera_id, &result) {
+        let package_sample_cameras = package_samples
+            .iter()
+            .map(|(camera_id, _, _)| camera_id.clone())
+            .collect::<HashSet<_>>();
+        for (camera_id, stream_profile, result) in package_samples {
+            if let Err(error) =
+                self.process_package_detection_result(&camera_id, &stream_profile, &result)
+            {
                 first_error.get_or_insert(error);
+            }
+        }
+        if let Ok(ledger) = self.package_event_store()?.load() {
+            for (camera_id, config) in &ledger.configs {
+                if config.enabled
+                    && ledger
+                        .states
+                        .get(camera_id)
+                        .is_some_and(|state| state.phase == PackagePresencePhase::Present)
+                    && !package_sample_cameras.contains(camera_id)
+                {
+                    if let Err(error) =
+                        self.mark_package_state_unknown(camera_id, PackageObservability::Offline)
+                    {
+                        first_error.get_or_insert(error);
+                    }
+                }
             }
         }
         let current_cleanup_keys = all_cleanup_intents
@@ -3300,12 +3630,19 @@ impl AdminApi {
         let Ok(Some(policy)) = self.package_detection_explicit_policy(camera_id) else {
             return;
         };
+        let Ok(observability_zone) = self.package_observability_zone(camera_id) else {
+            return;
+        };
         let running = self.detection_jobs.lock().ok().is_some_and(|jobs| {
             jobs.values().any(|runtime| {
                 runtime.projection.camera_id == camera_id
                     && runtime.projection.status == "running"
                     && detection_projection_targets(&runtime.projection, "package")
                     && runtime.projection.stream_profile == policy.stream_profile
+                    && package_worker_observability_zone_matches(
+                        &runtime.projection,
+                        observability_zone,
+                    )
             })
         });
         let needs_reconciliation = if policy.desired_enabled {
@@ -8566,6 +8903,7 @@ impl AdminApi {
         if let Err(error) = store.upsert_config(config) {
             return error_json(StatusCode(503), &error);
         }
+        self.schedule_package_detection_runtime_drift(&camera_id);
         match self.package_event_config_response(&camera_id) {
             Ok(response) => ok_json(&response),
             Err(error) => error_json(StatusCode(503), &error),
@@ -8598,11 +8936,18 @@ impl AdminApi {
             max_result_age_ms: config
                 .map(|config| config.max_result_age_ms)
                 .unwrap_or(3_000),
+            max_observation_gap_ms: config
+                .map(|config| config.max_observation_gap_ms)
+                .unwrap_or(2_000),
             revision: config.map(|config| config.revision).unwrap_or(0),
             phase: state
                 .map(|state| {
                     if state.removal_confirmation_active() {
                         "removing"
+                    } else if state.phase == PackagePresencePhase::Present
+                        && state.observability != PackageObservability::Healthy
+                    {
+                        "unknown"
                     } else {
                         match state.phase {
                             PackagePresencePhase::Idle => "idle",
@@ -8612,6 +8957,16 @@ impl AdminApi {
                     }
                 })
                 .unwrap_or("idle")
+                .to_string(),
+            observability: state
+                .map(|state| match state.observability {
+                    PackageObservability::Unknown => "unknown",
+                    PackageObservability::Healthy => "healthy",
+                    PackageObservability::Offline => "offline",
+                    PackageObservability::Occluded => "occluded",
+                    PackageObservability::Discontinuous => "discontinuous",
+                })
+                .unwrap_or("unknown")
                 .to_string(),
             event_id: state.and_then(|state| state.event_id.clone()),
             delivered: state.is_some_and(|state| state.delivered),
@@ -8623,7 +8978,21 @@ impl AdminApi {
             removed_frame_epoch_ms: latest_removal.map(|event| event.observed_frame_epoch_ms),
             removal_delivered: latest_removal.is_some_and(|event| event.delivered),
             removal_last_error: latest_removal.and_then(|event| event.last_error.clone()),
+            removal_recording_artifacts: latest_removal
+                .map(|event| event.recording_artifacts.clone())
+                .unwrap_or_default(),
+            removal_recording_error: latest_removal.and_then(|event| event.recording_error.clone()),
         })
+    }
+
+    fn package_observability_zone(&self, camera_id: &str) -> Result<PackageDeliveryZone, String> {
+        Ok(self
+            .package_event_store()?
+            .load()?
+            .configs
+            .get(camera_id)
+            .map(|config| config.zone)
+            .unwrap_or_default())
     }
 
     fn handle_put_package_detection_control(
@@ -8862,7 +9231,7 @@ impl AdminApi {
             camera_id,
             &stream_profile,
             LIVE_MANAGED_DETECTION_TTL_SECONDS,
-            CAT_AUTO_RECORD_PRE_ROLL_SECONDS,
+            PACKAGE_REMOVAL_RECORDING_PRE_ROLL_SECONDS,
         ) {
             Ok(lease) => {
                 validate_detection_lease_create_response(&lease, camera_id, &stream_profile)?;
@@ -10170,6 +10539,7 @@ impl AdminApi {
                     .to_string(),
             );
         }
+        let observability_zone = self.package_observability_zone(camera_id)?;
         let reusable = {
             let mut jobs = self
                 .detection_jobs
@@ -10183,6 +10553,9 @@ impl AdminApi {
             }
             reusable_detection_job_projection(&jobs, camera_id, "package", &policy.stream_profile)?
         };
+        let reusable = reusable.filter(|projection| {
+            package_worker_observability_zone_matches(projection, observability_zone)
+        });
         let projection = if let Some(projection) = reusable {
             projection
         } else {
@@ -11041,6 +11414,10 @@ impl AdminApi {
         use_control_attempt: bool,
         request_scope_override: Option<String>,
     ) -> Result<DetectionJobStartResponse, (StatusCode, String)> {
+        let package_observability_zone = (config.target_label == "package")
+            .then(|| self.package_observability_zone(&config.camera_id))
+            .transpose()
+            .map_err(|error| (StatusCode(503), error))?;
         let provider =
             match normalize_detection_provider(env::var("HARBOR_K3_YOLO_PROVIDER").ok().as_deref())
             {
@@ -11067,11 +11444,21 @@ impl AdminApi {
                 config.target_label.as_str(),
                 config.stream_profile.as_str(),
             ) {
-                Ok(Some(projection)) => {
+                Ok(Some(projection))
+                    if package_observability_zone.is_none_or(|zone| {
+                        package_worker_observability_zone_matches(&projection, zone)
+                    }) =>
+                {
                     return Ok(DetectionJobStartResponse {
                         projection,
                         reused: true,
                     });
+                }
+                Ok(Some(_)) => {
+                    return Err((
+                        StatusCode(409),
+                        "package detection worker uses a stale observability zone".to_string(),
+                    ));
                 }
                 Ok(None) => {}
                 Err(error) => return Err((StatusCode(409), error)),
@@ -11196,7 +11583,7 @@ impl AdminApi {
             &config.camera_id,
             &config.stream_profile,
             config.ttl_seconds,
-            CAT_AUTO_RECORD_PRE_ROLL_SECONDS,
+            package_detection_pre_roll_seconds(&config.target_label),
         ) {
             Ok(lease) => lease,
             Err(error) => {
@@ -11287,7 +11674,8 @@ impl AdminApi {
             .unwrap_or_else(|_| model_profile.default_model.to_string());
         let labels = env::var(model_profile.labels_env)
             .unwrap_or_else(|_| model_profile.default_labels.to_string());
-        let child = Command::new(python)
+        let mut command = Command::new(python);
+        command
             .arg(worker)
             .arg("--source")
             .arg(source)
@@ -11304,7 +11692,14 @@ impl AdminApi {
             .arg("--max-fps")
             .arg(config.max_fps.to_string())
             .arg("--conf-threshold")
-            .arg(config.confidence.to_string())
+            .arg(config.confidence.to_string());
+        if let Some(zone) = package_observability_zone {
+            command.arg("--observability-zone").arg(format!(
+                "{},{},{},{}",
+                zone.left, zone.top, zone.right, zone.bottom
+            ));
+        }
+        let child = command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr))
@@ -16273,6 +16668,7 @@ fn classify_detection_lease_create_failure(error: &str) -> DetectionLeaseCreateF
         "REQUEST_IN_PROGRESS" | "HARBORLINK_INVALID_RESPONSE" => {
             DetectionLeaseCreateFailureDisposition::RetrySameAttempt
         }
+        "EVENT_PRE_ROLL_UNAVAILABLE" => DetectionLeaseCreateFailureDisposition::ConfirmedNotCreated,
         "DETECTION_LEASE_ACTIVE" | "REQUEST_ID_CONFLICT" => {
             DetectionLeaseCreateFailureDisposition::Conflict
         }
@@ -18760,6 +19156,20 @@ fn reusable_detection_job_projection(
         "a detection job is already running with stream profile {}; stop it before switching to {stream_profile}",
         projection.stream_profile
     ))
+}
+
+fn package_worker_observability_zone_matches(
+    projection: &DetectionJobProjection,
+    expected: PackageDeliveryZone,
+) -> bool {
+    let Some(result) = projection.latest_result.as_ref() else {
+        return true;
+    };
+    result
+        .get("frame_observability_zone")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<PackageDeliveryZone>(value).ok())
+        == Some(expected)
 }
 
 fn detection_job_matches_stream_profile(
@@ -29668,6 +30078,126 @@ fn validate_package_snapshot_artifact(
     })
 }
 
+fn validate_package_event_recording_lease(
+    camera_id: &str,
+    event_id: &str,
+    lease: HarborLinkEventRecordingLease,
+) -> Result<HarborLinkEventRecordingLease, String> {
+    if lease.camera_id != camera_id
+        || lease.event_id != event_id
+        || lease.owner != "harborbeacon"
+        || !matches!(lease.status.as_str(), "pending" | "running")
+        || !lease.labels.iter().any(|label| label == "package")
+        || lease.pre_roll_seconds < PACKAGE_REMOVAL_RECORDING_PRE_ROLL_SECONDS
+    {
+        return Err("HarborLink returned an invalid package event recording lease".to_string());
+    }
+    Ok(lease)
+}
+
+fn package_detection_pre_roll_seconds(target_label: &str) -> u32 {
+    if target_label == "package" {
+        PACKAGE_REMOVAL_RECORDING_PRE_ROLL_SECONDS
+    } else {
+        CAT_AUTO_RECORD_PRE_ROLL_SECONDS
+    }
+}
+
+fn package_removal_recording_post_roll_complete(
+    observed_frame_epoch_ms: u64,
+    now_epoch_ms: u64,
+) -> bool {
+    now_epoch_ms.saturating_sub(observed_frame_epoch_ms) >= PACKAGE_REMOVAL_RECORDING_POST_ROLL_MS
+}
+
+fn package_recording_post_roll_complete(event: &PackageLifecycleEvent, now_epoch_ms: u64) -> bool {
+    match event.kind {
+        PackageLifecycleEventKind::Appeared => {
+            now_epoch_ms.saturating_sub(event.recording_trigger_epoch_ms)
+                >= PACKAGE_APPEARANCE_RECORDING_AFTER_TRIGGER_MS
+        }
+        PackageLifecycleEventKind::Removed => package_removal_recording_post_roll_complete(
+            event.recording_trigger_epoch_ms,
+            now_epoch_ms,
+        ),
+    }
+}
+
+fn validate_package_recording_artifacts(
+    camera_id: &str,
+    event_id: &str,
+    trigger_epoch_ms: u64,
+    required_end_epoch_ms: u64,
+    artifacts: Vec<HarborLinkRecordingArtifact>,
+) -> Result<Vec<PackageEventRecordingArtifact>, String> {
+    let mut artifacts = artifacts
+        .into_iter()
+        .filter(|artifact| artifact.kind == "recording" && artifact.mime_type == "video/mp4")
+        .collect::<Vec<_>>();
+    if artifacts.len() != 1 {
+        return Err(format!(
+            "HarborLink returned {} package MP4 artifacts; expected exactly one",
+            artifacts.len()
+        ));
+    }
+    let artifact = artifacts.pop().expect("one package MP4 artifact");
+    if artifact.media_contract_version != "1.0"
+        || artifact.camera_id != camera_id
+        || artifact.event_id.as_deref() != Some(event_id)
+        || !artifact.labels.iter().any(|label| label == "package")
+        || artifact.source.as_deref() != Some("yolo_package_lifecycle")
+        || !artifact.preview_url.starts_with("/v1/dvr/artifacts/")
+        || artifact.byte_size == 0
+    {
+        return Err("HarborLink returned an untrusted package recording artifact".to_string());
+    }
+    if !artifact.coverage_verified {
+        return Err("HarborLink package recording coverage was not verified".to_string());
+    }
+    if !artifact.gap_free {
+        return Err("HarborLink package recording contains a timeline gap".to_string());
+    }
+    let coverage_start_epoch_ms = artifact
+        .coverage_start_epoch_ms
+        .ok_or_else(|| "HarborLink package recording has no coverage start".to_string())?;
+    let coverage_end_epoch_ms = artifact
+        .coverage_end_epoch_ms
+        .ok_or_else(|| "HarborLink package recording has no coverage end".to_string())?;
+    let segment_duration_ms = artifact
+        .coverage_segment_duration_ms
+        .filter(|duration_ms| *duration_ms > 0)
+        .ok_or_else(|| "HarborLink package recording has no segment duration proof".to_string())?;
+    if coverage_end_epoch_ms <= coverage_start_epoch_ms {
+        return Err("HarborLink package recording coverage window is invalid".to_string());
+    }
+    let required_start_epoch_ms = trigger_epoch_ms.saturating_sub(5_000);
+    if coverage_start_epoch_ms > required_start_epoch_ms {
+        return Err(format!(
+            "HarborLink package recording starts at {coverage_start_epoch_ms}; expected no later than {required_start_epoch_ms}"
+        ));
+    }
+    if coverage_end_epoch_ms < required_end_epoch_ms {
+        return Err(format!(
+            "HarborLink package recording ends at {coverage_end_epoch_ms}; expected at least {required_end_epoch_ms}"
+        ));
+    }
+    let coverage_duration_ms = coverage_end_epoch_ms.saturating_sub(coverage_start_epoch_ms);
+    let recorded_duration_ms = u64::from(artifact.duration_seconds).saturating_mul(1_000);
+    if recorded_duration_ms == 0
+        || recorded_duration_ms.abs_diff(coverage_duration_ms) > segment_duration_ms
+    {
+        return Err(format!(
+            "HarborLink package recording duration {recorded_duration_ms}ms does not match its {coverage_duration_ms}ms coverage window"
+        ));
+    }
+    Ok(vec![PackageEventRecordingArtifact {
+        artifact_id: artifact.artifact_id,
+        mime_type: artifact.mime_type,
+        byte_size: artifact.byte_size,
+        preview_url: artifact.preview_url,
+    }])
+}
+
 fn current_rfc3339_timestamp() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
@@ -29939,8 +30469,8 @@ mod tests {
         build_redacted_diagnostics_bundle, build_release_readiness_response,
         build_rtsp_url_from_patch, cat_auto_recording_epoch_ms, cat_auto_recording_transition,
         cat_control_owns_detection_cleanup, cat_recording_validation_retry_delay,
-        cat_recording_validation_status_for_decision, cleanup_detection_job_output_dir,
-        current_epoch_secs, default_model_download_target_path,
+        cat_recording_validation_status_for_decision, classify_detection_lease_create_failure,
+        cleanup_detection_job_output_dir, current_epoch_secs, default_model_download_target_path,
         default_model_download_target_path_in_root, default_model_endpoints,
         detection_job_matches_stream_profile, detection_lease_responsibility_ids_for_target,
         detection_model_profile, dvr_timeline_segment_from_harborlink, ensure_local_admin_access,
@@ -29959,7 +30489,9 @@ mod tests {
         normalize_detection_provider, normalize_harbor_assistant_conversation_id,
         normalize_unified_admin_path, normalize_unified_admin_url,
         notification_delivery_error_to_harbor_app_error,
-        overlay_model_endpoints_with_runtime_truth, parse_approval_decision_path,
+        overlay_model_endpoints_with_runtime_truth, package_detection_pre_roll_seconds,
+        package_recording_post_roll_complete, package_removal_recording_post_roll_complete,
+        package_worker_observability_zone_matches, parse_approval_decision_path,
         parse_camera_analyze_path, parse_camera_hls_live_renew_path,
         parse_camera_hls_live_start_path, parse_camera_hls_live_status_path,
         parse_camera_hls_live_stop_path, parse_camera_live_page_path,
@@ -29996,17 +30528,19 @@ mod tests {
         terminal_detection_lease_cleanup_intents, url_encode_path_segment,
         validate_detection_job_renewal_policy, validate_detection_target_policy,
         validate_detector_control_enable_conflict, validate_home_assistant_service_fields,
-        validate_home_assistant_service_smoke, validate_outreach_delivery_request, AdminApi,
-        CameraLiveSessionProjection, CameraStreamProfile, CatAutoRecordingConfig,
-        CatAutoRecordingTransition, CatDetectionControlCoordination, CatDetectionStreakSample,
-        CatRecordingFrameProfile, CatRecordingFrameSeekStrategy, CatRecordingSampleTarget,
-        DetectionJobConfig, DetectionJobProjection, DetectionJobRuntime, DetectionJobStartRequest,
-        GateAuthenticatedPrincipal, HarborLinkEventRecordingLease, HarborLinkHomeAssistantStatus,
-        HarborLinkLiveSession, HarborLinkMediaClient, HarborLinkRecordingArtifact,
-        HarborLinkRecordingStatus, HomeAssistantServiceSmokeRequest, HomeGuardianEvaluationQueue,
-        KnowledgeSearchApiRequest, LocalModelRuntimeProjection, ManualAddRequest,
-        ModelRuntimeActivationRequest, ModelRuntimeActivationResult,
-        OutreachDeliveryRecipientRequest, OutreachDeliveryRequest, VisionIngestLimiter,
+        validate_home_assistant_service_smoke, validate_outreach_delivery_request,
+        validate_package_recording_artifacts, AdminApi, CameraLiveSessionProjection,
+        CameraStreamProfile, CatAutoRecordingConfig, CatAutoRecordingTransition,
+        CatDetectionControlCoordination, CatDetectionStreakSample, CatRecordingFrameProfile,
+        CatRecordingFrameSeekStrategy, CatRecordingSampleTarget, DetectionJobConfig,
+        DetectionJobProjection, DetectionJobRuntime, DetectionJobStartRequest,
+        DetectionLeaseCreateFailureDisposition, GateAuthenticatedPrincipal,
+        HarborLinkEventRecordingLease, HarborLinkHomeAssistantStatus, HarborLinkLiveSession,
+        HarborLinkMediaClient, HarborLinkRecordingArtifact, HarborLinkRecordingStatus,
+        HomeAssistantServiceSmokeRequest, HomeGuardianEvaluationQueue, KnowledgeSearchApiRequest,
+        LocalModelRuntimeProjection, ManualAddRequest, ModelRuntimeActivationRequest,
+        ModelRuntimeActivationResult, OutreachDeliveryRecipientRequest, OutreachDeliveryRequest,
+        PackageDeliveryZone, PackageLifecycleEvent, PackageLifecycleEventKind, VisionIngestLimiter,
         DEFAULT_DETECTION_MODEL, DEFAULT_HF_ENDPOINT, HARBORBEACON_WEB_API_TOKEN_ENV,
         HARBOR_ASSISTANT_SEARCH_SURFACE, HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS,
         HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS, MAX_DETECTION_JOB_HISTORY,
@@ -30174,6 +30708,37 @@ mod tests {
         assert!(error.contains("exceeds"));
     }
 
+    #[test]
+    fn pre_roll_unavailable_is_confirmed_not_created() {
+        let pre_roll_unavailable = json!({
+            "statusCode": 503,
+            "code": "EVENT_PRE_ROLL_UNAVAILABLE",
+            "message": "HarborLink event pre-roll is not ready",
+            "retryable": true,
+            "dependency": "mediamtx",
+            "requestId": "package-detection-start-attempt-camera"
+        })
+        .to_string();
+        assert_eq!(
+            classify_detection_lease_create_failure(&pre_roll_unavailable),
+            DetectionLeaseCreateFailureDisposition::ConfirmedNotCreated
+        );
+
+        let request_in_progress = json!({
+            "statusCode": 409,
+            "code": "REQUEST_IN_PROGRESS",
+            "message": "request is still in progress",
+            "retryable": true,
+            "dependency": "media_session",
+            "requestId": "package-detection-start-attempt-camera"
+        })
+        .to_string();
+        assert_eq!(
+            classify_detection_lease_create_failure(&request_in_progress),
+            DetectionLeaseCreateFailureDisposition::RetrySameAttempt
+        );
+    }
+
     fn unique_store_path(prefix: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -30202,6 +30767,44 @@ mod tests {
             event_id: Some(event_id.to_string()),
             labels: vec!["cat".to_string()],
             source: Some("yolo_cat_activity".to_string()),
+            coverage_start_epoch_ms: None,
+            coverage_end_epoch_ms: None,
+            coverage_verified: false,
+            gap_free: false,
+            coverage_segment_duration_ms: None,
+        }
+    }
+
+    fn sample_package_recording_artifact(
+        artifact_id: &str,
+        event_id: &str,
+        coverage_start_epoch_ms: u64,
+        coverage_end_epoch_ms: u64,
+    ) -> HarborLinkRecordingArtifact {
+        HarborLinkRecordingArtifact {
+            media_contract_version: "1.0".to_string(),
+            artifact_id: artifact_id.to_string(),
+            camera_id: "camera.252".to_string(),
+            kind: "recording".to_string(),
+            mime_type: "video/mp4".to_string(),
+            byte_size: 1_024,
+            started_at_epoch_ms: u128::from(coverage_start_epoch_ms),
+            ended_at_epoch_ms: u128::from(coverage_end_epoch_ms),
+            duration_seconds: u32::try_from(
+                coverage_end_epoch_ms.saturating_sub(coverage_start_epoch_ms) / 1_000,
+            )
+            .expect("test duration seconds"),
+            stream_kind: "substream".to_string(),
+            modified_at_epoch_ms: u128::from(coverage_end_epoch_ms),
+            preview_url: format!("/v1/dvr/artifacts/{artifact_id}"),
+            event_id: Some(event_id.to_string()),
+            labels: vec!["package".to_string()],
+            source: Some("yolo_package_lifecycle".to_string()),
+            coverage_start_epoch_ms: Some(coverage_start_epoch_ms),
+            coverage_end_epoch_ms: Some(coverage_end_epoch_ms),
+            coverage_verified: true,
+            gap_free: true,
+            coverage_segment_duration_ms: Some(2_000),
         }
     }
 
@@ -33284,6 +33887,179 @@ mod tests {
     }
 
     #[test]
+    fn package_recording_uses_five_second_pre_and_post_roll() {
+        assert_eq!(package_detection_pre_roll_seconds("package"), 5);
+        assert_eq!(package_detection_pre_roll_seconds("cat"), 3);
+        assert!(!package_removal_recording_post_roll_complete(
+            10_000, 24_999
+        ));
+        assert!(package_removal_recording_post_roll_complete(10_000, 25_000));
+    }
+
+    #[test]
+    fn package_recording_artifact_validation_accepts_complete_event_windows() {
+        let appeared = sample_package_recording_artifact(
+            "recording-appeared",
+            "package-appeared-test",
+            95_000,
+            110_000,
+        );
+        assert!(validate_package_recording_artifacts(
+            "camera.252",
+            "package-appeared-test",
+            100_000,
+            110_000,
+            vec![appeared],
+        )
+        .is_ok());
+
+        let removed = sample_package_recording_artifact(
+            "recording-removed",
+            "package-removed-test",
+            95_000,
+            115_000,
+        );
+        assert!(validate_package_recording_artifacts(
+            "camera.252",
+            "package-removed-test",
+            100_000,
+            115_000,
+            vec![removed],
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn package_recording_artifact_validation_rejects_incomplete_timeline_coverage() {
+        let mut late_start = sample_package_recording_artifact(
+            "recording-late",
+            "package-removed-test",
+            96_000,
+            116_000,
+        );
+        assert!(validate_package_recording_artifacts(
+            "camera.252",
+            "package-removed-test",
+            100_000,
+            115_000,
+            vec![late_start.clone()],
+        )
+        .is_err());
+
+        late_start.coverage_start_epoch_ms = Some(95_000);
+        late_start.coverage_end_epoch_ms = Some(114_000);
+        assert!(validate_package_recording_artifacts(
+            "camera.252",
+            "package-removed-test",
+            100_000,
+            115_000,
+            vec![late_start],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn package_recording_artifact_validation_rejects_unverified_or_gapped_timeline() {
+        let mut artifact = sample_package_recording_artifact(
+            "recording-unverified",
+            "package-removed-test",
+            95_000,
+            115_000,
+        );
+        artifact.coverage_verified = false;
+        assert!(validate_package_recording_artifacts(
+            "camera.252",
+            "package-removed-test",
+            100_000,
+            115_000,
+            vec![artifact.clone()],
+        )
+        .is_err());
+
+        artifact.coverage_verified = true;
+        artifact.gap_free = false;
+        assert!(validate_package_recording_artifacts(
+            "camera.252",
+            "package-removed-test",
+            100_000,
+            115_000,
+            vec![artifact],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn package_recording_artifact_validation_rejects_duration_mismatch_and_multiple_mp4s() {
+        let mut artifact = sample_package_recording_artifact(
+            "recording-mismatch",
+            "package-removed-test",
+            95_000,
+            115_000,
+        );
+        artifact.duration_seconds = 30;
+        assert!(validate_package_recording_artifacts(
+            "camera.252",
+            "package-removed-test",
+            100_000,
+            115_000,
+            vec![artifact],
+        )
+        .is_err());
+
+        let first = sample_package_recording_artifact(
+            "recording-first",
+            "package-removed-test",
+            95_000,
+            115_000,
+        );
+        let second = sample_package_recording_artifact(
+            "recording-second",
+            "package-removed-test",
+            95_000,
+            115_000,
+        );
+        assert!(validate_package_recording_artifacts(
+            "camera.252",
+            "package-removed-test",
+            100_000,
+            115_000,
+            vec![first, second],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn package_appearance_recording_waits_for_five_second_post_roll_after_confirm_window() {
+        let event = PackageLifecycleEvent {
+            event_id: "package-appeared-test".to_string(),
+            kind: PackageLifecycleEventKind::Appeared,
+            camera_id: "camera.252".to_string(),
+            instance_id: "package-instance-test".to_string(),
+            related_event_id: None,
+            config_revision: 1,
+            observed_frame_epoch_ms: 105_000,
+            confidence: 0.9,
+            zone: PackageDeliveryZone::default(),
+            confirm_frames: 3,
+            confirm_window_ms: 3_000,
+            artifact: None,
+            recording_artifacts: Vec::new(),
+            recording_lease_id: Some("lease-1".to_string()),
+            recording_trigger_epoch_ms: 100_000,
+            recording_last_renewed_epoch_ms: 100_000,
+            recording_finalized: false,
+            recording_error: None,
+            event_persisted: false,
+            delivered: false,
+            last_delivery_attempt_epoch_ms: 0,
+            last_error: None,
+        };
+
+        assert!(!package_recording_post_roll_complete(&event, 109_999));
+        assert!(package_recording_post_roll_complete(&event, 110_000));
+    }
+
+    #[test]
     fn cat_recording_reconciliation_state_survives_restart_with_evidence() {
         let path = unique_store_path("cat-recording-reconciliation");
         let store = CatRecordingReconciliationStore::new(path.clone());
@@ -35966,6 +36742,11 @@ mod tests {
             event_id: None,
             labels: Vec::new(),
             source: None,
+            coverage_start_epoch_ms: None,
+            coverage_end_epoch_ms: None,
+            coverage_verified: false,
+            gap_free: false,
+            coverage_segment_duration_ms: None,
         };
         let task_response = TaskResponse {
             task_id: "task-snapshot".to_string(),
@@ -40680,6 +41461,14 @@ mod tests {
             task_service,
             PathBuf::from("frontend/harbor-assistant/dist/harbor-assistant"),
             "http://harborbeacon.local:4174".to_string(),
+        );
+        assert_eq!(
+            api.cat_recording_reconciliation_store.path(),
+            admin_path.with_extension("cat-recording-reconciliation.json")
+        );
+        assert_eq!(
+            api.cat_recording_validation_store.path(),
+            admin_path.with_extension("cat-recording-validations.jsonl")
         );
 
         let qr_response = api.handle_binding_qr_svg(&AccessIdentityHints::default());

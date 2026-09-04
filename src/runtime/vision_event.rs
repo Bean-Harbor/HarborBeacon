@@ -697,13 +697,8 @@ pub fn build_local_vision_notification_request(
     }
     let event = &stored.event;
     let digest = stable_event_notification_digest(event);
-    let attachment = package_event_notification_attachment(event)?;
-    let attachments = attachment.into_iter().collect::<Vec<_>>();
-    let delivery_hints = if attachments.is_empty() {
-        Vec::new()
-    } else {
-        vec![json!({"kind": "native_image", "max_items": 1})]
-    };
+    let attachments = package_event_notification_attachments(event)?;
+    let delivery_hints = package_event_delivery_hints(&attachments);
     let request = NotificationRequest {
         notification_id: format!("notif_{}", &digest[..24]),
         trace_id: format!("trace_{}", event.event_id.trim()),
@@ -746,22 +741,29 @@ pub fn validate_local_vision_notification_request(
 ) -> Result<(), String> {
     let attachments = &request.content.attachments;
     if !attachments.is_empty() {
-        let event_type = request
+        let is_package_event = request
             .content
             .structured_payload
             .pointer("/event/event_type")
             .and_then(Value::as_str);
-        if !event_type.is_some_and(is_package_lifecycle_event) || attachments.len() != 1 {
+        if !is_package_event.is_some_and(is_package_lifecycle_event) {
             return Err(
-                "only package lifecycle notifications may include one snapshot attachment"
-                    .to_string(),
+                "only package lifecycle notifications may include media attachments".to_string(),
             );
         }
-        validate_package_notification_attachment(&attachments[0])?;
-        if request.content.delivery_hints.as_slice()
-            != [json!({"kind": "native_image", "max_items": 1})]
-        {
-            return Err("package notification requires one native_image delivery hint".to_string());
+        if attachments.len() != 1 {
+            return Err("package notification requires exactly one video attachment".to_string());
+        }
+        if attachments.len() > MAX_LOCAL_VISION_ARTIFACTS {
+            return Err(format!(
+                "package notification attachments exceed {MAX_LOCAL_VISION_ARTIFACTS} entries"
+            ));
+        }
+        for attachment in attachments {
+            validate_package_recording_attachment(attachment)?;
+        }
+        if request.content.delivery_hints != package_event_delivery_hints(attachments) {
+            return Err("package notification delivery hints do not match attachments".to_string());
         }
     } else if !request.content.delivery_hints.is_empty() {
         return Err(
@@ -775,62 +777,146 @@ pub fn validate_local_vision_notification_request(
     Ok(())
 }
 
-fn package_event_notification_attachment(
+fn package_event_notification_attachments(
     event: &LocalVisionEvent,
-) -> Result<Option<NotificationAttachment>, String> {
+) -> Result<Vec<NotificationAttachment>, String> {
     if !is_package_lifecycle_event(&event.event_type) {
-        return Ok(None);
+        return Ok(Vec::new());
     }
-    let artifact_id = event
-        .snapshot_artifact
-        .artifact_id
-        .as_deref()
-        .ok_or_else(|| "package event requires a snapshot artifact_id".to_string())?;
-    validate_media_artifact_id(artifact_id)?;
-    if event.snapshot_artifact.path.is_some() {
-        return Err("package event snapshot must not expose a local path".to_string());
+    let mut attachments = Vec::new();
+    append_package_recording_attachments(event, &mut attachments)?;
+    if attachments.len() != 1 {
+        return Err("package event requires exactly one finalized recording artifact".to_string());
     }
-    if event.snapshot_artifact.mime_type.as_deref() != Some("image/jpeg") {
-        return Err("package event snapshot must be image/jpeg".to_string());
+    Ok(attachments)
+}
+
+fn append_package_recording_attachments(
+    event: &LocalVisionEvent,
+    attachments: &mut Vec<NotificationAttachment>,
+) -> Result<(), String> {
+    let Some(recordings) = event.metrics.get("recording_artifacts") else {
+        return Ok(());
+    };
+    let recordings = recordings
+        .as_array()
+        .ok_or_else(|| "package recording_artifacts must be an array".to_string())?;
+    if recordings.len() > MAX_LOCAL_VISION_ARTIFACTS {
+        return Err(format!(
+            "package recording_artifacts exceed {MAX_LOCAL_VISION_ARTIFACTS} entries"
+        ));
     }
-    Ok(Some(NotificationAttachment {
-        kind: NotificationAttachmentKind::Image,
-        label: if event.event_type == "package_removed" {
-            "包裹移除抓拍".to_string()
+    for recording in recordings {
+        if recording.get("path").is_some_and(|path| !path.is_null()) {
+            return Err("package recording artifact must not expose a local path".to_string());
+        }
+        let artifact_id = recording
+            .get("artifact_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "package recording artifact requires artifact_id".to_string())?;
+        validate_media_artifact_id(artifact_id)?;
+        if recording.get("mime_type").and_then(Value::as_str) != Some("video/mp4") {
+            return Err("package recording artifact must be video/mp4".to_string());
+        }
+        let byte_size = recording
+            .get("byte_size")
+            .and_then(Value::as_u64)
+            .filter(|byte_size| *byte_size > 0)
+            .ok_or_else(|| {
+                "package recording artifact requires a positive byte_size".to_string()
+            })?;
+        let expected_preview_url = format!(
+            "/v1/dvr/artifacts/{}",
+            encode_harborlink_artifact_id(artifact_id)
+        );
+        if recording.get("preview_url").and_then(Value::as_str)
+            != Some(expected_preview_url.as_str())
+        {
+            return Err("package recording artifact preview_url is not trusted".to_string());
+        }
+        attachments.push(NotificationAttachment {
+            kind: NotificationAttachmentKind::Video,
+            label: if is_package_removed_event(&event.event_type) {
+                "包裹移除录像".to_string()
+            } else {
+                "包裹到达录像".to_string()
+            },
+            artifact_id: Some(artifact_id.to_string()),
+            mime_type: "video/mp4".to_string(),
+            path: None,
+            url: Some(format!("/api/cameras/recordings/artifacts/{artifact_id}")),
+            metadata: json!({
+                "harborlink_artifact_id": artifact_id,
+                "byte_size": byte_size,
+            }),
+        });
+    }
+    Ok(())
+}
+
+fn encode_harborlink_artifact_id(artifact_id: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(artifact_id.len() * 3);
+    for byte in artifact_id.bytes() {
+        if byte.is_ascii_alphanumeric() {
+            encoded.push(char::from(byte));
         } else {
-            "包裹到达抓拍".to_string()
-        },
-        artifact_id: Some(artifact_id.to_string()),
-        mime_type: "image/jpeg".to_string(),
-        path: None,
-        url: Some(format!("/api/cameras/recordings/artifacts/{artifact_id}")),
-        metadata: json!({"harborlink_artifact_id": artifact_id}),
-    }))
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    encoded
+}
+
+fn package_event_delivery_hints(attachments: &[NotificationAttachment]) -> Vec<Value> {
+    let mut hints = Vec::new();
+    if attachments
+        .iter()
+        .any(|attachment| attachment.kind == NotificationAttachmentKind::Image)
+    {
+        hints.push(json!({"kind": "native_image", "max_items": 1}));
+    }
+    for attachment in attachments
+        .iter()
+        .filter(|attachment| attachment.kind == NotificationAttachmentKind::Video)
+    {
+        if let Some(artifact_id) = attachment.artifact_id.as_deref() {
+            hints.push(json!({
+                "kind": "native_video",
+                "artifact_id": artifact_id,
+                "fallback": "file",
+            }));
+        }
+    }
+    hints
 }
 
 fn is_package_lifecycle_event(event_type: &str) -> bool {
-    matches!(event_type, "package_appeared" | "package_removed")
+    event_type == "package_appeared" || is_package_removed_event(event_type)
 }
 
-fn validate_package_notification_attachment(
+fn is_package_removed_event(event_type: &str) -> bool {
+    matches!(event_type, "package_removed" | "package_no_longer_visible")
+}
+
+fn validate_package_recording_attachment(
     attachment: &NotificationAttachment,
 ) -> Result<(), String> {
-    if attachment.kind != NotificationAttachmentKind::Image
-        || attachment.mime_type != "image/jpeg"
+    if attachment.kind != NotificationAttachmentKind::Video
+        || attachment.mime_type != "video/mp4"
         || attachment.path.is_some()
     {
-        return Err("package notification attachment must be a path-free JPEG image".to_string());
+        return Err("package recording attachment must be a path-free MP4 video".to_string());
     }
     let artifact_id = attachment
         .artifact_id
         .as_deref()
-        .ok_or_else(|| "package notification attachment requires artifact_id".to_string())?;
+        .ok_or_else(|| "package recording attachment requires artifact_id".to_string())?;
     validate_media_artifact_id(artifact_id)?;
     let expected_url = format!("/api/cameras/recordings/artifacts/{artifact_id}");
     if attachment.url.as_deref() != Some(expected_url.as_str()) {
-        return Err(
-            "package notification attachment URL is not a trusted media artifact".to_string(),
-        );
+        return Err("package recording attachment URL is not a trusted media artifact".to_string());
     }
     Ok(())
 }
@@ -1022,7 +1108,7 @@ fn build_local_vision_family_summary_audit(
 fn local_vision_notification_title(event: &LocalVisionEvent) -> String {
     match event.event_type.as_str() {
         "package_appeared" => "HarborNavi 包裹提醒".to_string(),
-        "package_removed" => "HarborNavi 包裹移除提醒".to_string(),
+        event_type if is_package_removed_event(event_type) => "HarborNavi 包裹移除提醒".to_string(),
         "person_detected" => "HarborNavi 人员事件".to_string(),
         "pet_detected" => "HarborNavi 宠物事件".to_string(),
         "vehicle_detected" => "HarborNavi 车辆事件".to_string(),
@@ -1105,7 +1191,7 @@ pub(crate) fn local_vision_vlm_status(event: &LocalVisionEvent) -> String {
 fn local_vision_event_type_label(event_type: &str) -> &'static str {
     match event_type {
         "package_appeared" => "检测到包裹",
-        "package_removed" => "确认包裹已移除",
+        event_type if is_package_removed_event(event_type) => "包裹不再可见",
         "person_detected" => "检测到人员活动",
         "pet_detected" => "检测到宠物活动",
         "vehicle_detected" => "检测到车辆相关目标",
@@ -2097,12 +2183,20 @@ mod tests {
     }
 
     #[test]
-    fn package_notification_includes_one_trusted_native_image() {
+    fn package_notification_includes_one_trusted_native_video() {
         let mut event = sample_event();
         event.event_type = "package_appeared".to_string();
         event.summary = "门口可能出现了一个包裹。".to_string();
         event.snapshot_artifact.artifact_id = Some("snapshots~camera.252~frame.jpg".to_string());
         event.snapshot_artifact.source = Some("harborlink_snapshot".to_string());
+        event.metrics = json!({
+            "recording_artifacts": [{
+                "artifact_id": "recordings~camera.252~appearance.mp4",
+                "mime_type": "video/mp4",
+                "byte_size": 1_241_287,
+                "preview_url": "/v1/dvr/artifacts/recordings%7Ecamera%2E252%7Eappearance%2Emp4"
+            }]
+        });
         let stored = sample_stored_event(event);
 
         let intent = build_local_vision_notification_intent(&stored, "gw_route_harbornavi_dev")
@@ -2111,24 +2205,41 @@ mod tests {
 
         assert_eq!(request.content.attachments.len(), 1);
         assert_eq!(
+            request.content.attachments[0].kind,
+            NotificationAttachmentKind::Video
+        );
+        assert_eq!(request.content.attachments[0].label, "包裹到达录像");
+        assert_eq!(
             request.content.attachments[0].url.as_deref(),
-            Some("/api/cameras/recordings/artifacts/snapshots~camera.252~frame.jpg")
+            Some("/api/cameras/recordings/artifacts/recordings~camera.252~appearance.mp4")
         );
         assert_eq!(
             request.content.delivery_hints,
-            vec![json!({"kind": "native_image", "max_items": 1})]
+            vec![json!({
+                "kind": "native_video",
+                "artifact_id": "recordings~camera.252~appearance.mp4",
+                "fallback": "file"
+            })]
         );
         assert_eq!(intent.audit_record["text_only"], json!(false));
         assert_eq!(intent.audit_record["attachments_included"], json!(true));
     }
 
     #[test]
-    fn package_removed_notification_includes_one_trusted_native_image() {
+    fn package_removed_notification_includes_video_only() {
         let mut event = sample_event();
         event.event_type = "package_removed".to_string();
-        event.summary = "包裹已从投递区域移除。".to_string();
+        event.summary = "该包裹目前已不在原位置，可能被移动。".to_string();
         event.snapshot_artifact.artifact_id = Some("snapshots~camera.252~removed.jpg".to_string());
         event.snapshot_artifact.source = Some("harborlink_snapshot".to_string());
+        event.metrics = json!({
+            "recording_artifacts": [{
+                "artifact_id": "recordings~camera.252~removal.mp4",
+                "mime_type": "video/mp4",
+                "byte_size": 1_241_287,
+                "preview_url": "/v1/dvr/artifacts/recordings%7Ecamera%2E252%7Eremoval%2Emp4"
+            }]
+        });
         let stored = sample_stored_event(event);
 
         let intent = build_local_vision_notification_intent(&stored, "gw_route_harbornavi_dev")
@@ -2136,21 +2247,135 @@ mod tests {
         let request = intent.notification_request;
 
         assert_eq!(request.content.title, "HarborNavi 包裹移除提醒");
-        assert!(request.content.body.contains("确认包裹已移除"));
+        assert!(request.content.body.contains("包裹不再可见"));
+        assert!(!request.content.body.contains("确认包裹已移除"));
         assert_eq!(request.content.attachments.len(), 1);
-        assert_eq!(request.content.attachments[0].label, "包裹移除抓拍");
+        assert_eq!(
+            request.content.attachments[0].kind,
+            NotificationAttachmentKind::Video
+        );
+        assert_eq!(request.content.attachments[0].label, "包裹移除录像");
         assert_eq!(
             request.content.delivery_hints,
-            vec![json!({"kind": "native_image", "max_items": 1})]
+            vec![json!({
+                "kind": "native_video",
+                "artifact_id": "recordings~camera.252~removal.mp4",
+                "fallback": "file"
+            })]
         );
         assert_eq!(intent.audit_record["attachments_included"], json!(true));
+    }
+
+    #[test]
+    fn package_notification_rejects_multiple_recording_attachments() {
+        let mut event = sample_event();
+        event.event_type = "package_appeared".to_string();
+        event.metrics = json!({
+            "recording_artifacts": [
+                {
+                    "artifact_id": "recordings~camera.252~first.mp4",
+                    "mime_type": "video/mp4",
+                    "byte_size": 1_241_287,
+                    "preview_url": "/v1/dvr/artifacts/recordings%7Ecamera%2E252%7Efirst%2Emp4"
+                },
+                {
+                    "artifact_id": "recordings~camera.252~second.mp4",
+                    "mime_type": "video/mp4",
+                    "byte_size": 1_241_287,
+                    "preview_url": "/v1/dvr/artifacts/recordings%7Ecamera%2E252%7Esecond%2Emp4"
+                }
+            ]
+        });
+
+        let error = build_local_vision_notification_intent(
+            &sample_stored_event(event),
+            "gw_route_harbornavi_dev",
+        )
+        .expect_err("multiple package recordings must fail");
+
+        assert!(error.contains("exactly one"));
+    }
+
+    #[test]
+    fn package_no_longer_visible_notification_includes_recording_video() {
+        let mut event = sample_event();
+        event.event_type = "package_no_longer_visible".to_string();
+        event.summary = "该包裹目前已不在原位置，可能被移动。".to_string();
+        event.snapshot_artifact.artifact_id = Some("snapshots~camera.252~removed.jpg".to_string());
+        event.snapshot_artifact.source = Some("harborlink_snapshot".to_string());
+        event.metrics = json!({
+            "recording_artifacts": [{
+                "artifact_id": "recordings~camera.252~removal.mp4",
+                "mime_type": "video/mp4",
+                "byte_size": 1_241_287,
+                "preview_url": "/v1/dvr/artifacts/recordings%7Ecamera%2E252%7Eremoval%2Emp4"
+            }]
+        });
+        let stored = sample_stored_event(event);
+
+        let intent = build_local_vision_notification_intent(&stored, "gw_route_harbornavi_dev")
+            .expect("package removal notification intent");
+        let request = intent.notification_request;
+
+        assert_eq!(request.content.title, "HarborNavi 包裹移除提醒");
+        assert!(request.content.body.contains("包裹不再可见"));
+        assert!(!request.content.body.contains("确认包裹已移除"));
+        assert_eq!(request.content.attachments.len(), 1);
+        assert_eq!(
+            request.content.attachments[0].kind,
+            NotificationAttachmentKind::Video
+        );
+        assert_eq!(request.content.attachments[0].label, "包裹移除录像");
+        assert_eq!(
+            request.content.attachments[0].url.as_deref(),
+            Some("/api/cameras/recordings/artifacts/recordings~camera.252~removal.mp4")
+        );
+        assert_eq!(
+            request.content.delivery_hints,
+            vec![json!({
+                "kind": "native_video",
+                "artifact_id": "recordings~camera.252~removal.mp4",
+                "fallback": "file"
+            })]
+        );
+        assert_eq!(intent.audit_record["attachments_included"], json!(true));
+    }
+
+    #[test]
+    fn package_removal_notification_rejects_untrusted_recording_url() {
+        let mut event = sample_event();
+        event.event_type = "package_removed".to_string();
+        event.snapshot_artifact.artifact_id = Some("snapshots~camera.252~removed.jpg".to_string());
+        event.metrics = json!({
+            "recording_artifacts": [{
+                "artifact_id": "recordings~camera.252~removal.mp4",
+                "mime_type": "video/mp4",
+                "byte_size": 1_241_287,
+                "preview_url": "/v1/dvr/artifacts/another-recording.mp4"
+            }]
+        });
+
+        let error = build_local_vision_notification_intent(
+            &sample_stored_event(event),
+            "gw_route_harbornavi_dev",
+        )
+        .expect_err("untrusted recording URL must fail");
+
+        assert!(error.contains("preview_url is not trusted"));
     }
 
     #[test]
     fn package_notification_rejects_untrusted_artifact_contract() {
         let mut event = sample_event();
         event.event_type = "package_appeared".to_string();
-        event.snapshot_artifact.artifact_id = Some("../../private.jpg".to_string());
+        event.metrics = json!({
+            "recording_artifacts": [{
+                "artifact_id": "../../private.mp4",
+                "mime_type": "video/mp4",
+                "byte_size": 1_241_287,
+                "preview_url": "/v1/dvr/artifacts/../../private.mp4"
+            }]
+        });
 
         let error = build_local_vision_notification_intent(
             &sample_stored_event(event),

@@ -1,4 +1,5 @@
 *.sh text eol=lf
 *.py text eol=lf
+*.rs text eol=lf
 debian/postinst text eol=lf
 debian/prerm text eol=lf

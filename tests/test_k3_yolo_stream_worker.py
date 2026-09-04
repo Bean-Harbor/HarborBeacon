@@ -17,10 +17,21 @@ def load_worker_module():
     cv2.CAP_PROP_FPS = 0
     cv2.FONT_HERSHEY_SIMPLEX = 0
     cv2.LINE_AA = 0
+    cv2.COLOR_BGR2GRAY = 0
+    cv2.CMP_GT = 0
+    cv2.INTER_AREA = 0
     cv2.rectangle = mock.Mock()
     cv2.putText = mock.Mock()
+    cv2.cvtColor = mock.Mock(side_effect=lambda image, _conversion: image)
+    cv2.meanStdDev = mock.Mock(return_value=([[128.0]], [[20.0]]))
+    cv2.resize = mock.Mock()
+    cv2.absdiff = mock.Mock()
+    cv2.compare = mock.Mock()
+    cv2.countNonZero = mock.Mock()
+    cv2.phaseCorrelate = mock.Mock()
     numpy = types.ModuleType("numpy")
     numpy.ndarray = object
+    numpy.isfinite = lambda value: value == value and abs(value) != float("inf")
     onnxruntime = types.ModuleType("onnxruntime")
 
     class SessionOptions:
@@ -75,6 +86,13 @@ def load_worker_module():
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = value
+
+
+def scene_frame(name):
+    frame = mock.Mock(name=name)
+    frame.shape = (100, 100, 3)
+    frame.copy.return_value = frame
+    return frame
 
 
 class K3YoloStreamWorkerTests(unittest.TestCase):
@@ -224,6 +242,219 @@ class K3YoloStreamWorkerTests(unittest.TestCase):
             worker.source_kind("rtsp://user:secret@camera.local/stream"), "rtsp"
         )
         self.assertEqual(worker.source_kind("/data/cat.mp4"), "file")
+
+    def test_frame_observability_rejects_dark_or_low_information_frames(self):
+        worker = load_worker_module()
+        image = types.SimpleNamespace(shape=(720, 1280, 3))
+
+        worker.cv2.meanStdDev.return_value = ([[4.0]], [[20.0]])
+        self.assertEqual(worker.frame_observability(image), (False, "underexposed"))
+        worker.cv2.meanStdDev.return_value = ([[128.0]], [[2.0]])
+        self.assertEqual(worker.frame_observability(image), (False, "low_information"))
+
+    def test_frame_observability_accepts_a_detailed_exposed_frame(self):
+        worker = load_worker_module()
+        image = types.SimpleNamespace(shape=(720, 1280, 3))
+        worker.cv2.meanStdDev.return_value = ([[128.0]], [[20.0]])
+
+        self.assertEqual(worker.frame_observability(image), (True, "observable"))
+
+    def test_frame_observability_uses_only_the_configured_delivery_zone(self):
+        worker = load_worker_module()
+
+        class Image:
+            shape = (100, 200, 3)
+
+            def __init__(self):
+                self.requested_slice = None
+                self.cropped = types.SimpleNamespace(shape=(50, 100, 3))
+
+            def __getitem__(self, requested_slice):
+                self.requested_slice = requested_slice
+                return self.cropped
+
+        image = Image()
+        worker.cv2.meanStdDev.return_value = ([[128.0]], [[2.0]])
+
+        self.assertEqual(
+            worker.frame_observability(image, (0.25, 0.25, 0.75, 0.75)),
+            (False, "low_information"),
+        )
+        self.assertEqual(
+            image.requested_slice,
+            (slice(25, 75), slice(50, 150)),
+        )
+        self.assertIs(worker.cv2.cvtColor.call_args.args[0], image.cropped)
+
+    def test_frame_continuity_gate_accepts_stable_absence_without_background(self):
+        worker = load_worker_module()
+        gate = worker.FrameContinuityGate()
+        present = scene_frame("present")
+        absent = scene_frame("absent")
+        detection = [{"x1": 30, "y1": 30, "x2": 70, "y2": 70}]
+
+        with (
+            mock.patch.object(
+                worker,
+                "frame_observability",
+                return_value=(True, "observable"),
+            ),
+            mock.patch.object(
+                worker,
+                "camera_motion_observability",
+                return_value=(True, "observable_stable_view"),
+            ) as motion,
+        ):
+            self.assertEqual(gate.observe(present, detection), (True, "observable"))
+            self.assertEqual(
+                gate.observe(absent, []),
+                (True, "observable_stable_view"),
+            )
+
+        motion.assert_called_once()
+
+    def test_frame_continuity_gate_rejects_camera_movement(self):
+        worker = load_worker_module()
+        gate = worker.FrameContinuityGate()
+        present = scene_frame("present")
+        moved = scene_frame("moved")
+        detection = [{"x1": 30, "y1": 30, "x2": 70, "y2": 70}]
+
+        with (
+            mock.patch.object(
+                worker,
+                "frame_observability",
+                return_value=(True, "observable"),
+            ),
+            mock.patch.object(
+                worker,
+                "camera_motion_observability",
+                return_value=(False, "camera_moved"),
+            ),
+        ):
+            gate.observe(present, detection)
+            self.assertEqual(gate.observe(moved, []), (False, "camera_moved"))
+
+    def test_frame_continuity_gate_reanchors_when_package_is_visible(self):
+        worker = load_worker_module()
+        gate = worker.FrameContinuityGate()
+        first = scene_frame("first")
+        moved_with_package = scene_frame("moved_with_package")
+        absent = scene_frame("absent")
+        detection = [{"x1": 30, "y1": 30, "x2": 70, "y2": 70}]
+
+        with (
+            mock.patch.object(
+                worker,
+                "frame_observability",
+                return_value=(True, "observable"),
+            ),
+            mock.patch.object(
+                worker,
+                "camera_motion_observability",
+                return_value=(True, "observable_stable_view"),
+            ) as motion,
+        ):
+            gate.observe(first, detection)
+            gate.observe(moved_with_package, detection)
+            gate.observe(absent, [])
+
+        self.assertIs(motion.call_args.args[0], moved_with_package)
+
+    def test_frame_continuity_gate_allows_idle_frames_without_an_anchor(self):
+        worker = load_worker_module()
+        gate = worker.FrameContinuityGate()
+
+        with mock.patch.object(
+            worker,
+            "frame_observability",
+            return_value=(True, "observable"),
+        ):
+            self.assertEqual(
+                gate.observe(scene_frame("idle"), []),
+                (True, "observable_no_target_anchor"),
+            )
+
+    def test_camera_motion_observability_accepts_a_small_translation(self):
+        worker = load_worker_module()
+        sample = types.SimpleNamespace(shape=(128, 160))
+        worker.cv2.phaseCorrelate.return_value = ((1.0, 1.0), 0.8)
+
+        with (
+            mock.patch.object(worker, "camera_motion_sample", return_value=sample),
+            mock.patch.object(worker, "mask_motion_region", return_value=sample),
+        ):
+            self.assertEqual(
+                worker.camera_motion_observability("before", "after", None),
+                (True, "observable_stable_view"),
+            )
+
+    def test_camera_motion_observability_rejects_a_large_translation(self):
+        worker = load_worker_module()
+        sample = types.SimpleNamespace(shape=(128, 160))
+        worker.cv2.phaseCorrelate.return_value = ((5.0, 0.0), 0.8)
+
+        with (
+            mock.patch.object(worker, "camera_motion_sample", return_value=sample),
+            mock.patch.object(worker, "mask_motion_region", return_value=sample),
+        ):
+            self.assertEqual(
+                worker.camera_motion_observability("before", "after", None),
+                (False, "camera_moved"),
+            )
+
+    def test_camera_motion_observability_rejects_an_ambiguous_frame(self):
+        worker = load_worker_module()
+        sample = types.SimpleNamespace(shape=(128, 160))
+        worker.cv2.phaseCorrelate.return_value = ((0.0, 0.0), 0.1)
+
+        with (
+            mock.patch.object(worker, "camera_motion_sample", return_value=sample),
+            mock.patch.object(worker, "mask_motion_region", return_value=sample),
+        ):
+            self.assertEqual(
+                worker.camera_motion_observability("before", "after", None),
+                (False, "frame_discontinuous"),
+            )
+
+    def test_target_reference_zone_expands_valid_boxes_and_rejects_outside_boxes(self):
+        worker = load_worker_module()
+        image = types.SimpleNamespace(shape=(100, 100, 3))
+
+        self.assertEqual(
+            worker.target_reference_zone(
+                image,
+                [{"x1": 30, "y1": 30, "x2": 70, "y2": 70}],
+                (0.2, 0.2, 0.8, 0.8),
+            ),
+            (0.24, 0.24, 0.76, 0.76),
+        )
+        self.assertIsNone(
+            worker.target_reference_zone(
+                image,
+                [{"x1": 0, "y1": 0, "x2": 10, "y2": 10}],
+                (0.2, 0.2, 0.8, 0.8),
+            )
+        )
+        self.assertIsNone(
+            worker.target_reference_zone(
+                image,
+                [{"x1": 50, "y1": 50, "x2": 50, "y2": 70}],
+                None,
+            )
+        )
+
+    def test_parse_observability_zone_validates_normalized_coordinates(self):
+        worker = load_worker_module()
+
+        self.assertEqual(
+            worker.parse_observability_zone("0.1,0.2,0.8,0.9"),
+            (0.1, 0.2, 0.8, 0.9),
+        )
+        for invalid in ["", "0,0,1", "-0.1,0,1,1", "0.5,0,0.5,1"]:
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    worker.parse_observability_zone(invalid)
 
     def test_snapshot_writes_are_cat_only_and_rate_limited(self):
         worker = load_worker_module()

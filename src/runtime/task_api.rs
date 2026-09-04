@@ -14319,6 +14319,11 @@ mod tests {
             event_id: Some(format!("event-{id}")),
             labels: vec!["cat".to_string()],
             source: Some("yolo_cat_activity".to_string()),
+            coverage_start_epoch_ms: None,
+            coverage_end_epoch_ms: None,
+            coverage_verified: false,
+            gap_free: false,
+            coverage_segment_duration_ms: None,
         }
     }
 
@@ -17915,6 +17920,11 @@ mod tests {
             event_id: None,
             labels: Vec::new(),
             source: None,
+            coverage_start_epoch_ms: None,
+            coverage_end_epoch_ms: None,
+            coverage_verified: false,
+            gap_free: false,
+            coverage_segment_duration_ms: None,
         };
         let expected_captured_at = snapshot.started_at_epoch_ms.to_string();
 

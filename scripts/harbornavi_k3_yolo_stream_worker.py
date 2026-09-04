@@ -7,6 +7,7 @@ import argparse
 import gc
 import hashlib
 import json
+import math
 import os
 import signal
 import sys
@@ -34,6 +35,13 @@ DEFAULT_MODEL = "/var/lib/harboros-beacon/models/yolov8n_192x320.q.onnx"
 DEFAULT_LABELS = "/var/lib/harboros-beacon/models/label.txt"
 DEFAULT_TARGET_LABEL = "cat"
 CONFIDENCE_OVERRIDE_ENV = "HARBOR_K3_YOLO_CONFIDENCE_OVERRIDE"
+MIN_OBSERVABLE_LUMA = 8.0
+MAX_OBSERVABLE_LUMA = 247.0
+MIN_OBSERVABLE_LUMA_STDDEV = 5.0
+TARGET_REGION_PADDING_FRACTION = 0.15
+CAMERA_MOTION_SAMPLE_SIZE = (160, 128)
+MIN_CAMERA_MOTION_RESPONSE = 0.20
+MAX_CAMERA_TRANSLATION_FRACTION = 0.025
 STOP_REQUESTED = threading.Event()
 
 
@@ -53,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--conf-threshold", type=float, default=0.35)
     parser.add_argument("--iou-threshold", type=float, default=0.45)
     parser.add_argument("--max-detections", type=int, default=20)
+    parser.add_argument("--observability-zone", type=parse_observability_zone)
     return parser.parse_args()
 
 
@@ -95,6 +104,206 @@ def source_kind(source: str) -> str:
     if lowered.startswith("rtsp://") or lowered.startswith("rtsps://"):
         return "rtsp"
     return "file"
+
+
+def parse_observability_zone(value: str) -> tuple[float, float, float, float]:
+    try:
+        coordinates = tuple(float(part.strip()) for part in value.split(","))
+    except ValueError as error:
+        raise ValueError("observability-zone coordinates must be numbers") from error
+    if len(coordinates) != 4:
+        raise ValueError("observability-zone requires left,top,right,bottom")
+    left, top, right, bottom = coordinates
+    if not all(np.isfinite(coordinate) for coordinate in coordinates):
+        raise ValueError("observability-zone coordinates must be finite")
+    if not all(0.0 <= coordinate <= 1.0 for coordinate in coordinates):
+        raise ValueError("observability-zone coordinates must be between 0 and 1")
+    if left >= right or top >= bottom:
+        raise ValueError("observability-zone must have positive width and height")
+    return left, top, right, bottom
+
+
+def observability_zone_payload(
+    zone: tuple[float, float, float, float] | None,
+) -> dict[str, float] | None:
+    if zone is None:
+        return None
+    left, top, right, bottom = zone
+    return {"left": left, "top": top, "right": right, "bottom": bottom}
+
+
+def frame_observability(
+    image: np.ndarray,
+    zone: tuple[float, float, float, float] | None = None,
+) -> tuple[bool, str]:
+    shape = getattr(image, "shape", ())
+    if len(shape) < 2 or int(shape[0]) <= 0 or int(shape[1]) <= 0:
+        return False, "invalid_frame"
+    observed_image = image
+    if zone is not None:
+        height, width = int(shape[0]), int(shape[1])
+        left, top, right, bottom = zone
+        left_px = min(width - 1, max(0, int(left * width)))
+        top_px = min(height - 1, max(0, int(top * height)))
+        right_px = min(width, max(left_px + 1, math.ceil(right * width)))
+        bottom_px = min(height, max(top_px + 1, math.ceil(bottom * height)))
+        observed_image = image[top_px:bottom_px, left_px:right_px]
+    grayscale = cv2.cvtColor(observed_image, cv2.COLOR_BGR2GRAY)
+    mean, stddev = cv2.meanStdDev(grayscale)
+    luma = float(mean[0][0])
+    luma_stddev = float(stddev[0][0])
+    if not np.isfinite(luma) or not np.isfinite(luma_stddev):
+        return False, "invalid_frame"
+    if luma < MIN_OBSERVABLE_LUMA:
+        return False, "underexposed"
+    if luma > MAX_OBSERVABLE_LUMA:
+        return False, "overexposed"
+    if luma_stddev < MIN_OBSERVABLE_LUMA_STDDEV:
+        return False, "low_information"
+    return True, "observable"
+
+
+def target_reference_zone(
+    image: np.ndarray,
+    detections: list[dict[str, Any]],
+    observability_zone: tuple[float, float, float, float] | None,
+) -> tuple[float, float, float, float] | None:
+    height, width = image.shape[:2]
+    if height <= 0 or width <= 0:
+        return None
+    zone_left, zone_top, zone_right, zone_bottom = observability_zone or (
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+    )
+    boxes = []
+    for detection in detections:
+        try:
+            x1 = float(detection["x1"])
+            y1 = float(detection["y1"])
+            x2 = float(detection["x2"])
+            y2 = float(detection["y2"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not all(np.isfinite(value) for value in (x1, y1, x2, y2)):
+            continue
+        if x1 >= x2 or y1 >= y2:
+            continue
+        center_x = ((x1 + x2) / 2.0) / width
+        center_y = ((y1 + y2) / 2.0) / height
+        if not (
+            zone_left <= center_x <= zone_right
+            and zone_top <= center_y <= zone_bottom
+        ):
+            continue
+        boxes.append((x1, y1, x2, y2))
+    if not boxes:
+        return None
+    left = min(box[0] for box in boxes)
+    top = min(box[1] for box in boxes)
+    right = max(box[2] for box in boxes)
+    bottom = max(box[3] for box in boxes)
+    padding_x = (right - left) * TARGET_REGION_PADDING_FRACTION
+    padding_y = (bottom - top) * TARGET_REGION_PADDING_FRACTION
+    left = max(zone_left, (left - padding_x) / width)
+    top = max(zone_top, (top - padding_y) / height)
+    right = min(zone_right, (right + padding_x) / width)
+    bottom = min(zone_bottom, (bottom + padding_y) / height)
+    if left >= right or top >= bottom:
+        return None
+    return left, top, right, bottom
+
+
+def camera_motion_sample(image: np.ndarray) -> np.ndarray:
+    grayscale = (
+        image
+        if len(image.shape) == 2
+        else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    )
+    resized = cv2.resize(
+        grayscale,
+        CAMERA_MOTION_SAMPLE_SIZE,
+        interpolation=cv2.INTER_AREA,
+    )
+    return resized.astype(np.float32)
+
+
+def mask_motion_region(
+    sample: np.ndarray,
+    region: tuple[float, float, float, float] | None,
+) -> np.ndarray:
+    masked = sample.copy()
+    if region is None:
+        return masked
+    height, width = masked.shape[:2]
+    left, top, right, bottom = region
+    left_px = min(width - 1, max(0, int(left * width)))
+    top_px = min(height - 1, max(0, int(top * height)))
+    right_px = min(width, max(left_px + 1, math.ceil(right * width)))
+    bottom_px = min(height, max(top_px + 1, math.ceil(bottom * height)))
+    masked[top_px:bottom_px, left_px:right_px] = 0.0
+    return masked
+
+
+def camera_motion_observability(
+    reference: np.ndarray,
+    current: np.ndarray,
+    ignored_region: tuple[float, float, float, float] | None,
+) -> tuple[bool, str]:
+    reference_sample = mask_motion_region(
+        camera_motion_sample(reference),
+        ignored_region,
+    )
+    current_sample = mask_motion_region(
+        camera_motion_sample(current),
+        ignored_region,
+    )
+    (shift_x, shift_y), response = cv2.phaseCorrelate(
+        reference_sample,
+        current_sample,
+    )
+    if not all(np.isfinite(value) for value in (shift_x, shift_y, response)):
+        return False, "frame_discontinuous"
+    if response < MIN_CAMERA_MOTION_RESPONSE:
+        return False, "frame_discontinuous"
+    height, width = reference_sample.shape[:2]
+    if (
+        abs(shift_x) / width > MAX_CAMERA_TRANSLATION_FRACTION
+        or abs(shift_y) / height > MAX_CAMERA_TRANSLATION_FRACTION
+    ):
+        return False, "camera_moved"
+    return True, "observable_stable_view"
+
+
+class FrameContinuityGate:
+    def __init__(self) -> None:
+        self._target_anchor: np.ndarray | None = None
+        self._target_region: tuple[float, float, float, float] | None = None
+
+    def observe(
+        self,
+        image: np.ndarray,
+        target_detections: list[dict[str, Any]],
+        zone: tuple[float, float, float, float] | None = None,
+    ) -> tuple[bool, str]:
+        observable, reason = frame_observability(image, zone)
+        if not observable:
+            return observable, reason
+        if target_detections:
+            target_region = target_reference_zone(image, target_detections, zone)
+            if target_region is None:
+                return False, "invalid_target_region"
+            self._target_anchor = image.copy()
+            self._target_region = target_region
+            return True, "observable"
+        if self._target_anchor is None:
+            return True, "observable_no_target_anchor"
+        return camera_motion_observability(
+            self._target_anchor,
+            image,
+            self._target_region,
+        )
 
 
 def should_write_snapshot(
@@ -306,6 +515,7 @@ def run_worker(args: argparse.Namespace) -> int:
     if not 0 < args.max_fps <= 30:
         raise ValueError("max-fps must be greater than 0 and at most 30")
     confidence_threshold = confidence_threshold_from_env(args.conf_threshold)
+    observability_zone = getattr(args, "observability_zone", None)
     if not 0 < confidence_threshold <= 1:
         raise ValueError("conf-threshold must be greater than 0 and at most 1")
     output_dir = Path(args.output_dir)
@@ -326,6 +536,9 @@ def run_worker(args: argparse.Namespace) -> int:
     last_processed_started = 0.0
     last_snapshot_write = 0.0
     detection_state = ConsecutiveDetectionState()
+    frame_continuity_gate = (
+        FrameContinuityGate() if observability_zone is not None else None
+    )
     tensor: Any | None = None
     outputs: Any | None = None
     try:
@@ -367,6 +580,14 @@ def run_worker(args: argparse.Namespace) -> int:
             inference_samples.append(inference_ms)
             processed_epoch_ms = int(time.time() * 1000)
             frame_height, frame_width = image.shape[:2]
+            if frame_continuity_gate is None:
+                observable, observability_reason = frame_observability(image)
+            else:
+                observable, observability_reason = frame_continuity_gate.observe(
+                    image,
+                    target_detections,
+                    observability_zone,
+                )
             result = {
                 "schema": "harbornavi.k3.yoloDetectionResult.v1",
                 "ok": True,
@@ -380,6 +601,12 @@ def run_worker(args: argparse.Namespace) -> int:
                 "frame_epoch_ms": frame_epoch_ms,
                 "processed_epoch_ms": processed_epoch_ms,
                 "result_age_ms": max(0, processed_epoch_ms - frame_epoch_ms),
+                "camera_healthy": True,
+                "frame_observable": observable,
+                "frame_observability_reason": observability_reason,
+                "frame_observability_zone": observability_zone_payload(
+                    observability_zone
+                ),
                 "frame_width": int(frame_width),
                 "frame_height": int(frame_height),
                 "inference_ms": inference_ms,

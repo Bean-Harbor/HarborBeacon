@@ -19,6 +19,11 @@ const DEFAULT_HARBORLINK_LOCAL_API_TOKEN_FILE: &str =
     "/run/credentials/harboros-beacon.service/harborlink-local-api-token";
 const HARBORLINK_CONTRACT_VERSION: &str = "1.0";
 const HARBORLINK_CUTOVER_MODE: &str = "harborlink";
+const DETECTION_LEASE_START_TIMEOUT_SECONDS: u64 = 45;
+
+fn detection_lease_start_timeout() -> Duration {
+    Duration::from_secs(DETECTION_LEASE_START_TIMEOUT_SECONDS)
+}
 
 thread_local! {
     static HARBORLINK_BUSINESS_REQUEST_ID: RefCell<Option<String>> = const { RefCell::new(None) };
@@ -115,6 +120,8 @@ struct StartEventRecordingRequest<'a> {
     ttl_seconds: u64,
     pre_roll_seconds: u32,
     trigger_epoch_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    required_end_epoch_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -229,6 +236,16 @@ pub struct HarborLinkRecordingArtifact {
     pub labels: Vec<String>,
     #[serde(default)]
     pub source: Option<String>,
+    #[serde(default)]
+    pub coverage_start_epoch_ms: Option<u64>,
+    #[serde(default)]
+    pub coverage_end_epoch_ms: Option<u64>,
+    #[serde(default)]
+    pub coverage_verified: bool,
+    #[serde(default)]
+    pub gap_free: bool,
+    #[serde(default)]
+    pub coverage_segment_duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -472,7 +489,7 @@ impl HarborLinkMediaClient {
                 self.detection_lease_collection_endpoint(camera_id),
                 true,
             )
-            .timeout(Duration::from_secs(12))
+            .timeout(detection_lease_start_timeout())
             .json(&StartDetectionLeaseRequest {
                 stream_profile,
                 ttl_seconds,
@@ -635,6 +652,71 @@ impl HarborLinkMediaClient {
         pre_roll_seconds: u32,
         trigger_epoch_ms: u64,
     ) -> Result<HarborLinkEventRecordingLease, String> {
+        self.start_event_recording_with_labels(
+            camera_id,
+            event_id,
+            &["cat"],
+            stream_profile,
+            ttl_seconds,
+            pre_roll_seconds,
+            trigger_epoch_ms,
+            None,
+        )
+    }
+
+    pub fn start_package_event_recording(
+        &self,
+        camera_id: &str,
+        event_id: &str,
+        stream_profile: &str,
+        ttl_seconds: u64,
+        pre_roll_seconds: u32,
+        trigger_epoch_ms: u64,
+    ) -> Result<HarborLinkEventRecordingLease, String> {
+        self.start_event_recording_with_labels(
+            camera_id,
+            event_id,
+            &["package", "package_no_longer_visible"],
+            stream_profile,
+            ttl_seconds,
+            pre_roll_seconds,
+            trigger_epoch_ms,
+            Some(trigger_epoch_ms.saturating_add(15_000)),
+        )
+    }
+
+    pub fn start_package_appearance_event_recording(
+        &self,
+        camera_id: &str,
+        event_id: &str,
+        stream_profile: &str,
+        ttl_seconds: u64,
+        pre_roll_seconds: u32,
+        trigger_epoch_ms: u64,
+    ) -> Result<HarborLinkEventRecordingLease, String> {
+        self.start_event_recording_with_labels(
+            camera_id,
+            event_id,
+            &["package", "package_appeared"],
+            stream_profile,
+            ttl_seconds,
+            pre_roll_seconds,
+            trigger_epoch_ms,
+            Some(trigger_epoch_ms.saturating_add(10_000)),
+        )
+    }
+
+    fn start_event_recording_with_labels(
+        &self,
+        camera_id: &str,
+        event_id: &str,
+        labels: &[&str],
+        stream_profile: &str,
+        ttl_seconds: u64,
+        pre_roll_seconds: u32,
+        trigger_epoch_ms: u64,
+        required_end_epoch_ms: Option<u64>,
+    ) -> Result<HarborLinkEventRecordingLease, String> {
         let response = self
             .request(
                 reqwest::Method::POST,
@@ -645,11 +727,12 @@ impl HarborLinkMediaClient {
             .json(&StartEventRecordingRequest {
                 event_id,
                 owner: "harborbeacon",
-                labels: &["cat"],
+                labels,
                 stream_profile,
                 ttl_seconds,
                 pre_roll_seconds,
                 trigger_epoch_ms,
+                required_end_epoch_ms,
             })
             .send_harborlink()
             .map_err(unavailable_error)?;
@@ -1489,10 +1572,12 @@ fn encode_path_segment(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        encode_path_segment, harborlink_request_scope, HarborLinkContractError,
-        HarborLinkMediaClient, StartDetectionLeaseRequest, StartEventRecordingRequest,
-        StartLiveSessionRequest, StartRecordingRequest,
+        detection_lease_start_timeout, encode_path_segment, harborlink_request_scope,
+        HarborLinkContractError, HarborLinkMediaClient, HarborLinkRecordingArtifact,
+        StartDetectionLeaseRequest, StartEventRecordingRequest, StartLiveSessionRequest,
+        StartRecordingRequest,
     };
+    use std::time::Duration;
 
     #[test]
     fn endpoint_encodes_camera_and_session_identity() {
@@ -1574,6 +1659,7 @@ mod tests {
                 ttl_seconds: 45,
                 pre_roll_seconds: 3,
                 trigger_epoch_ms: 1_786_060_800_123,
+                required_end_epoch_ms: None,
             })
             .expect("serialize request");
 
@@ -1583,6 +1669,62 @@ mod tests {
             assert_eq!(body["preRollSeconds"], 3);
             assert_eq!(body["triggerEpochMs"], 1_786_060_800_123_u64);
         }
+    }
+
+    #[test]
+    fn package_event_recording_request_carries_package_lifecycle_labels() {
+        let body = serde_json::to_value(StartEventRecordingRequest {
+            event_id: "package-removed-test",
+            owner: "harborbeacon",
+            labels: &["package", "package_no_longer_visible"],
+            stream_profile: "sub",
+            ttl_seconds: 15,
+            pre_roll_seconds: 3,
+            trigger_epoch_ms: 1_786_060_800_123,
+            required_end_epoch_ms: Some(1_786_060_815_123),
+        })
+        .expect("serialize package event recording request");
+
+        assert_eq!(
+            body["labels"],
+            serde_json::json!(["package", "package_no_longer_visible"])
+        );
+        assert_eq!(body["eventId"], "package-removed-test");
+        assert_eq!(body["owner"], "harborbeacon");
+        assert_eq!(body["requiredEndEpochMs"], 1_786_060_815_123_u64);
+    }
+
+    #[test]
+    fn recording_artifact_deserializes_verified_timeline_coverage() {
+        let artifact: HarborLinkRecordingArtifact = serde_json::from_value(serde_json::json!({
+            "mediaContractVersion": "1.0",
+            "artifactId": "recording-package",
+            "cameraId": "camera.252",
+            "kind": "recording",
+            "mimeType": "video/mp4",
+            "byteSize": 1024,
+            "startedAtEpochMs": 95_000,
+            "endedAtEpochMs": 115_000,
+            "durationSeconds": 20,
+            "streamKind": "substream",
+            "modifiedAtEpochMs": 115_000,
+            "previewUrl": "/v1/dvr/artifacts/recording-package",
+            "eventId": "package-removed-test",
+            "labels": ["package", "package_no_longer_visible"],
+            "source": "yolo_package_lifecycle",
+            "coverageStartEpochMs": 95_000,
+            "coverageEndEpochMs": 115_000,
+            "coverageVerified": true,
+            "gapFree": true,
+            "coverageSegmentDurationMs": 2_000
+        }))
+        .expect("deserialize verified package recording artifact");
+
+        assert_eq!(artifact.coverage_start_epoch_ms, Some(95_000));
+        assert_eq!(artifact.coverage_end_epoch_ms, Some(115_000));
+        assert!(artifact.coverage_verified);
+        assert!(artifact.gap_free);
+        assert_eq!(artifact.coverage_segment_duration_ms, Some(2_000));
     }
 
     #[test]
@@ -1658,5 +1800,10 @@ mod tests {
         let error = HarborLinkMediaClient::new("file:///tmp/harborlink.sock")
             .expect_err("file URL must be rejected");
         assert!(error.contains("http or https"));
+    }
+
+    #[test]
+    fn detection_lease_start_timeout_covers_harborlink_pre_roll_wait() {
+        assert_eq!(detection_lease_start_timeout(), Duration::from_secs(45));
     }
 }

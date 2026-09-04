@@ -652,7 +652,7 @@ mod tests {
 
     #[test]
     fn atomic_replace_source_keeps_platform_durability_contract() {
-        let source = include_str!("secure_store_path.rs");
+        let source = include_str!("secure_store_path.rs").replace("\r\n", "\n");
         assert!(source.contains("#[cfg(windows)]"));
         assert!(source.contains("AtomicFile::new(&self.data_path, AllowOverwrite)"));
         assert!(source.contains("AtomicFile::new(self.parent_path.join(name), DisallowOverwrite)"));

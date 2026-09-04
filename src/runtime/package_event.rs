@@ -21,8 +21,18 @@ const MAX_LIFECYCLE_EVENTS: usize = 2_048;
 pub const DEFAULT_CONFIRM_FRAMES: u32 = 3;
 pub const DEFAULT_CONFIRM_WINDOW_MS: u64 = 3_000;
 pub const DEFAULT_MAX_RESULT_AGE_MS: u64 = 3_000;
+pub const DEFAULT_MAX_OBSERVATION_GAP_MS: u64 = 2_000;
 const PACKAGE_CLEAR_CONFIRM_FRAMES: u32 = 10;
 const PACKAGE_CLEAR_CONFIRM_DURATION_MS: u64 = 5_000;
+const PACKAGE_REMOVAL_RECOVERY_WINDOW_MS: u64 = 5_000;
+
+const fn default_true() -> bool {
+    true
+}
+
+const fn default_max_observation_gap_ms() -> u64 {
+    DEFAULT_MAX_OBSERVATION_GAP_MS
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct PackageDeliveryZone {
@@ -51,6 +61,8 @@ pub struct PackageEventConfig {
     pub confirm_frames: u32,
     pub confirm_window_ms: u64,
     pub max_result_age_ms: u64,
+    #[serde(default = "default_max_observation_gap_ms")]
+    pub max_observation_gap_ms: u64,
     pub revision: u128,
 }
 
@@ -68,6 +80,7 @@ impl PackageEventConfig {
             confirm_frames: DEFAULT_CONFIRM_FRAMES,
             confirm_window_ms: DEFAULT_CONFIRM_WINDOW_MS,
             max_result_age_ms: DEFAULT_MAX_RESULT_AGE_MS,
+            max_observation_gap_ms: DEFAULT_MAX_OBSERVATION_GAP_MS,
             revision,
         };
         validate_config(&config)?;
@@ -89,6 +102,25 @@ pub struct PackageEventArtifact {
     pub artifact_id: String,
     pub mime_type: String,
     pub byte_size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PackageEventRecordingArtifact {
+    pub artifact_id: String,
+    pub mime_type: String,
+    pub byte_size: u64,
+    pub preview_url: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageObservability {
+    #[default]
+    Unknown,
+    Healthy,
+    Offline,
+    Occluded,
+    Discontinuous,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -115,6 +147,18 @@ pub struct PackageLifecycleEvent {
     #[serde(default)]
     pub artifact: Option<PackageEventArtifact>,
     #[serde(default)]
+    pub recording_artifacts: Vec<PackageEventRecordingArtifact>,
+    #[serde(default)]
+    pub recording_lease_id: Option<String>,
+    #[serde(default)]
+    pub recording_trigger_epoch_ms: u64,
+    #[serde(default)]
+    pub recording_last_renewed_epoch_ms: u64,
+    #[serde(default = "default_true")]
+    pub recording_finalized: bool,
+    #[serde(default)]
+    pub recording_error: Option<String>,
+    #[serde(default)]
     pub event_persisted: bool,
     #[serde(default)]
     pub delivered: bool,
@@ -128,6 +172,25 @@ pub struct PackageLifecycleEvent {
 struct PackageClearCandidate {
     count: u32,
     first_frame_epoch_ms: u64,
+    #[serde(default)]
+    confirmed: bool,
+    #[serde(default)]
+    event_id: Option<String>,
+    #[serde(default)]
+    recording_lease_id: Option<String>,
+    #[serde(default)]
+    recording_last_renewed_epoch_ms: u64,
+    #[serde(default)]
+    recording_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PackageRemovalRecordingContext {
+    pub event_id: String,
+    pub trigger_epoch_ms: u64,
+    pub lease_id: Option<String>,
+    pub last_renewed_epoch_ms: u64,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -140,6 +203,12 @@ pub struct PackageEventState {
     pub last_sequence: Option<u64>,
     #[serde(default)]
     pub last_worker_started_epoch_ms: u64,
+    #[serde(default)]
+    pub last_frame_epoch_ms: u64,
+    #[serde(default)]
+    pub observability: PackageObservability,
+    #[serde(default)]
+    requires_presence_reconfirmation: bool,
     #[serde(default)]
     pub candidate_count: u32,
     #[serde(default)]
@@ -174,6 +243,9 @@ impl PackageEventState {
             phase: PackagePresencePhase::Idle,
             last_sequence: None,
             last_worker_started_epoch_ms: 0,
+            last_frame_epoch_ms: 0,
+            observability: PackageObservability::Unknown,
+            requires_presence_reconfirmation: false,
             candidate_count: 0,
             candidate_first_frame_epoch_ms: 0,
             clear_candidate: PackageClearCandidate::default(),
@@ -191,6 +263,19 @@ impl PackageEventState {
 
     pub fn removal_confirmation_active(&self) -> bool {
         self.phase == PackagePresencePhase::Present && self.clear_candidate.count > 0
+    }
+
+    pub fn removal_recording_context(&self) -> Option<PackageRemovalRecordingContext> {
+        if !self.removal_confirmation_active() {
+            return None;
+        }
+        Some(PackageRemovalRecordingContext {
+            event_id: self.clear_candidate.event_id.clone()?,
+            trigger_epoch_ms: self.clear_candidate.first_frame_epoch_ms,
+            lease_id: self.clear_candidate.recording_lease_id.clone(),
+            last_renewed_epoch_ms: self.clear_candidate.recording_last_renewed_epoch_ms,
+            error: self.clear_candidate.recording_error.clone(),
+        })
     }
 }
 
@@ -212,6 +297,8 @@ pub struct PackageDetectionObservation {
     pub processed_epoch_ms: u64,
     pub observed_epoch_ms: u64,
     pub result_age_ms: u64,
+    pub camera_healthy: bool,
+    pub frame_observable: bool,
     pub frame_width: u32,
     pub frame_height: u32,
     pub detections: Vec<PackageDetectionBox>,
@@ -224,6 +311,7 @@ pub enum PackageObservationOutcome {
     Candidate,
     Confirmed,
     Present,
+    Unknown,
     Removed,
 }
 
@@ -274,10 +362,15 @@ impl PackageEventStore {
                 _ => true,
             };
             if reset_state {
-                ledger.states.insert(
-                    config.camera_id.clone(),
-                    PackageEventState::idle(&config.camera_id, config.revision),
-                );
+                match ledger.states.get_mut(&config.camera_id) {
+                    Some(state) => apply_config_revision(&config, state),
+                    None => {
+                        ledger.states.insert(
+                            config.camera_id.clone(),
+                            PackageEventState::idle(&config.camera_id, config.revision),
+                        );
+                    }
+                }
             }
             ledger.configs.insert(config.camera_id.clone(), config);
             Ok(())
@@ -313,7 +406,7 @@ impl PackageEventStore {
                     let previous_state = previous_state.as_ref().ok_or_else(|| {
                         "removed package requires the previous present state".to_string()
                     })?;
-                    let event = removal_event_from_state(&config, previous_state, observation)?;
+                    let event = removal_event_from_state(&config, previous_state)?;
                     ledger.events.insert(event.event_id.clone(), event);
                     prune_delivered_events(&mut ledger.events);
                 }
@@ -356,8 +449,97 @@ impl PackageEventStore {
             Ok(ledger
                 .events
                 .into_values()
-                .filter(|event| !event.delivered)
+                .filter(|event| {
+                    !event.delivered
+                        && event.recording_finalized
+                        && event.recording_error.is_none()
+                        && event.recording_artifacts.len() == 1
+                })
                 .collect())
+        })
+    }
+
+    pub fn pending_recording_events(&self) -> Result<Vec<PackageLifecycleEvent>, String> {
+        Ok(self
+            .load()?
+            .events
+            .into_values()
+            .filter(|event| !event.recording_finalized)
+            .collect())
+    }
+
+    pub fn set_recording_lease(
+        &self,
+        event_id: &str,
+        lease_id: &str,
+        trigger_epoch_ms: u64,
+        renewed_epoch_ms: u64,
+    ) -> Result<(), String> {
+        self.update_event(event_id, |event| {
+            event.recording_lease_id = Some(lease_id.to_string());
+            event.recording_trigger_epoch_ms = trigger_epoch_ms;
+            event.recording_last_renewed_epoch_ms = renewed_epoch_ms;
+            event.recording_finalized = false;
+            event.recording_error = None;
+            Ok(())
+        })
+    }
+
+    pub fn set_recording_error(
+        &self,
+        event_id: &str,
+        attempted_epoch_ms: u64,
+        error: String,
+    ) -> Result<(), String> {
+        self.update_event(event_id, |event| {
+            event.recording_error = Some(error);
+            event.last_delivery_attempt_epoch_ms = attempted_epoch_ms;
+            Ok(())
+        })
+    }
+
+    pub fn finalize_recording(
+        &self,
+        event_id: &str,
+        artifacts: Vec<PackageEventRecordingArtifact>,
+        error: Option<String>,
+    ) -> Result<(), String> {
+        self.mutate(|ledger| {
+            let (kind, camera_id) = {
+                let event = ledger
+                    .events
+                    .get_mut(event_id)
+                    .ok_or_else(|| "package lifecycle event was not found".to_string())?;
+                event.recording_artifacts = artifacts;
+                event.recording_finalized = true;
+                event.recording_error = error;
+                (event.kind, event.camera_id.clone())
+            };
+            if kind == PackageLifecycleEventKind::Removed {
+                let config = ledger
+                    .configs
+                    .get(&camera_id)
+                    .cloned()
+                    .ok_or_else(|| "package event config was not found".to_string())?;
+                let event = ledger
+                    .events
+                    .get(event_id)
+                    .expect("finalized package removal event");
+                let recording_succeeded =
+                    event.recording_error.is_none() && event.recording_artifacts.len() == 1;
+                if let Some(state) = ledger.states.get_mut(&camera_id) {
+                    if state.clear_candidate.confirmed
+                        && state.clear_candidate.event_id.as_deref() == Some(event_id)
+                    {
+                        if recording_succeeded {
+                            reset_to_consumed_idle(&config, state);
+                        } else {
+                            state.clear_candidate = PackageClearCandidate::default();
+                        }
+                    }
+                }
+            }
+            Ok(())
         })
     }
 
@@ -392,6 +574,96 @@ impl PackageEventStore {
             }
             Ok(())
         })
+    }
+
+    pub fn state(&self, camera_id: &str) -> Result<Option<PackageEventState>, String> {
+        Ok(self.load()?.states.get(camera_id).cloned())
+    }
+
+    pub fn mark_unknown(
+        &self,
+        camera_id: &str,
+        observability: PackageObservability,
+    ) -> Result<(), String> {
+        if matches!(
+            observability,
+            PackageObservability::Healthy | PackageObservability::Unknown
+        ) {
+            return Err(
+                "package unknown transition requires a concrete unhealthy reason".to_string(),
+            );
+        }
+        self.mutate(|ledger| {
+            let Some(state) = ledger.states.get_mut(camera_id) else {
+                return Ok(());
+            };
+            if state.phase == PackagePresencePhase::Present {
+                state.observability = observability;
+                state.clear_candidate = PackageClearCandidate::default();
+            }
+            Ok(())
+        })
+    }
+
+    pub fn set_removal_recording_lease(
+        &self,
+        camera_id: &str,
+        event_id: &str,
+        lease_id: &str,
+        renewed_epoch_ms: u64,
+    ) -> Result<(), String> {
+        self.mutate(|ledger| {
+            let state = ledger
+                .states
+                .get_mut(camera_id)
+                .ok_or_else(|| "package event state was not found".to_string())?;
+            if state.clear_candidate.event_id.as_deref() != Some(event_id) {
+                return Err("package removal candidate changed before recording update".to_string());
+            }
+            state.clear_candidate.recording_lease_id = Some(lease_id.to_string());
+            state.clear_candidate.recording_last_renewed_epoch_ms = renewed_epoch_ms;
+            state.clear_candidate.recording_error = None;
+            Ok(())
+        })
+    }
+
+    pub fn set_removal_recording_error(
+        &self,
+        camera_id: &str,
+        event_id: &str,
+        attempted_epoch_ms: u64,
+        error: String,
+    ) -> Result<(), String> {
+        self.mutate(|ledger| {
+            let state = ledger
+                .states
+                .get_mut(camera_id)
+                .ok_or_else(|| "package event state was not found".to_string())?;
+            if state.clear_candidate.event_id.as_deref() != Some(event_id) {
+                return Err("package removal candidate changed before recording update".to_string());
+            }
+            state.clear_candidate.recording_last_renewed_epoch_ms = attempted_epoch_ms;
+            state.clear_candidate.recording_error = Some(error);
+            Ok(())
+        })
+    }
+
+    pub fn finalize_removal_recording(
+        &self,
+        event_id: &str,
+        artifacts: Vec<PackageEventRecordingArtifact>,
+        error: Option<String>,
+    ) -> Result<(), String> {
+        let event = self
+            .load()?
+            .events
+            .get(event_id)
+            .cloned()
+            .ok_or_else(|| "package lifecycle event was not found".to_string())?;
+        if event.kind != PackageLifecycleEventKind::Removed {
+            return Err("recording artifacts require a package removal event".to_string());
+        }
+        self.finalize_recording(event_id, artifacts, error)
     }
 
     fn mutate<T>(
@@ -544,6 +816,12 @@ fn appearance_event_from_state(
         confirm_frames: config.confirm_frames,
         confirm_window_ms: config.confirm_window_ms,
         artifact: state.artifact.clone(),
+        recording_artifacts: Vec::new(),
+        recording_lease_id: None,
+        recording_trigger_epoch_ms: state.candidate_first_frame_epoch_ms,
+        recording_last_renewed_epoch_ms: 0,
+        recording_finalized: false,
+        recording_error: None,
         event_persisted: state.event_persisted,
         delivered: state.delivered,
         last_delivery_attempt_epoch_ms: state.last_delivery_attempt_epoch_ms,
@@ -554,7 +832,6 @@ fn appearance_event_from_state(
 fn removal_event_from_state(
     config: &PackageEventConfig,
     previous_state: &PackageEventState,
-    observation: &PackageDetectionObservation,
 ) -> Result<PackageLifecycleEvent, String> {
     let appeared_event_id = previous_state
         .event_id
@@ -565,18 +842,34 @@ fn removal_event_from_state(
         .clone()
         .ok_or_else(|| "removed package requires instance_id".to_string())?;
     Ok(PackageLifecycleEvent {
-        event_id: format!("package_removed_{}", Uuid::new_v4().simple()),
+        event_id: previous_state
+            .clear_candidate
+            .event_id
+            .clone()
+            .ok_or_else(|| "removed package requires removal candidate event_id".to_string())?,
         kind: PackageLifecycleEventKind::Removed,
         camera_id: previous_state.camera_id.clone(),
         instance_id,
         related_event_id: Some(appeared_event_id),
         config_revision: previous_state.config_revision,
-        observed_frame_epoch_ms: observation.frame_epoch_ms,
+        observed_frame_epoch_ms: previous_state
+            .clear_candidate
+            .first_frame_epoch_ms
+            .saturating_add(PACKAGE_CLEAR_CONFIRM_DURATION_MS),
         confidence: previous_state.confidence,
         zone: config.zone,
         confirm_frames: PACKAGE_CLEAR_CONFIRM_FRAMES,
-        confirm_window_ms: PACKAGE_CLEAR_CONFIRM_DURATION_MS,
+        confirm_window_ms: PACKAGE_CLEAR_CONFIRM_DURATION_MS
+            .saturating_add(PACKAGE_REMOVAL_RECOVERY_WINDOW_MS),
         artifact: None,
+        recording_artifacts: Vec::new(),
+        recording_lease_id: previous_state.clear_candidate.recording_lease_id.clone(),
+        recording_trigger_epoch_ms: previous_state.clear_candidate.first_frame_epoch_ms,
+        recording_last_renewed_epoch_ms: previous_state
+            .clear_candidate
+            .recording_last_renewed_epoch_ms,
+        recording_finalized: false,
+        recording_error: previous_state.clear_candidate.recording_error.clone(),
         event_persisted: false,
         delivered: false,
         last_delivery_attempt_epoch_ms: 0,
@@ -609,7 +902,7 @@ fn apply_observation(
     observation: &PackageDetectionObservation,
 ) -> PackageObservationOutcome {
     if state.config_revision != config.revision {
-        *state = PackageEventState::idle(&config.camera_id, config.revision);
+        apply_config_revision(config, state);
     }
     if observation.worker_started_epoch_ms == 0
         || observation.processed_epoch_ms == 0
@@ -624,16 +917,24 @@ fn apply_observation(
         || observation.frame_height == 0
         || observation.result_age_ms > config.max_result_age_ms
     {
+        if state.phase == PackagePresencePhase::Present {
+            set_unknown_state(state, PackageObservability::Discontinuous);
+            return PackageObservationOutcome::Unknown;
+        }
         return PackageObservationOutcome::Ignored;
     }
     if observation.worker_started_epoch_ms < state.last_worker_started_epoch_ms {
         return PackageObservationOutcome::Ignored;
     }
+    let worker_restarted_present = observation.worker_started_epoch_ms
+        > state.last_worker_started_epoch_ms
+        && state.phase == PackagePresencePhase::Present;
     if observation.worker_started_epoch_ms > state.last_worker_started_epoch_ms {
         if state.phase == PackagePresencePhase::Present {
             state.last_sequence = None;
             state.last_worker_started_epoch_ms = observation.worker_started_epoch_ms;
-            state.clear_candidate = PackageClearCandidate::default();
+            state.last_frame_epoch_ms = 0;
+            set_unknown_state(state, PackageObservability::Discontinuous);
         } else {
             *state = PackageEventState::idle(&config.camera_id, config.revision);
             state.last_worker_started_epoch_ms = observation.worker_started_epoch_ms;
@@ -646,6 +947,32 @@ fn apply_observation(
         return PackageObservationOutcome::Ignored;
     }
     state.last_sequence = Some(observation.sequence);
+    if worker_restarted_present {
+        state.last_frame_epoch_ms = observation.frame_epoch_ms;
+        return PackageObservationOutcome::Unknown;
+    }
+    if !observation.camera_healthy {
+        state.last_frame_epoch_ms = observation.frame_epoch_ms;
+        set_unknown_state(state, PackageObservability::Offline);
+        return PackageObservationOutcome::Unknown;
+    }
+    if !observation.frame_observable {
+        state.last_frame_epoch_ms = observation.frame_epoch_ms;
+        set_unknown_state(state, PackageObservability::Occluded);
+        return PackageObservationOutcome::Unknown;
+    }
+    if state.last_frame_epoch_ms > 0
+        && observation
+            .frame_epoch_ms
+            .saturating_sub(state.last_frame_epoch_ms)
+            > config.max_observation_gap_ms
+    {
+        state.last_frame_epoch_ms = observation.frame_epoch_ms;
+        set_unknown_state(state, PackageObservability::Discontinuous);
+        return PackageObservationOutcome::Unknown;
+    }
+    state.last_frame_epoch_ms = observation.frame_epoch_ms;
+    state.observability = PackageObservability::Healthy;
     let confidence = observation
         .detections
         .iter()
@@ -660,21 +987,37 @@ fn apply_observation(
     if state.phase == PackagePresencePhase::Present {
         if confidence.is_some() {
             state.clear_candidate = PackageClearCandidate::default();
+            state.requires_presence_reconfirmation = false;
+            return PackageObservationOutcome::Present;
+        }
+        if state.requires_presence_reconfirmation {
+            state.observability = PackageObservability::Discontinuous;
+            state.clear_candidate = PackageClearCandidate::default();
+            return PackageObservationOutcome::Unknown;
+        }
+        if state.clear_candidate.confirmed {
             return PackageObservationOutcome::Present;
         }
         if state.clear_candidate.count == 0 {
             state.clear_candidate.first_frame_epoch_ms = observation.frame_epoch_ms;
+            state.clear_candidate.event_id =
+                Some(format!("package_removed_{}", Uuid::new_v4().simple()));
+        } else if state.clear_candidate.event_id.is_none() {
+            state.clear_candidate.event_id =
+                Some(format!("package_removed_{}", Uuid::new_v4().simple()));
         }
         state.clear_candidate.count = state.clear_candidate.count.saturating_add(1);
         let clear_duration_ms = observation
             .frame_epoch_ms
             .saturating_sub(state.clear_candidate.first_frame_epoch_ms);
         if state.clear_candidate.count < PACKAGE_CLEAR_CONFIRM_FRAMES
-            || clear_duration_ms < PACKAGE_CLEAR_CONFIRM_DURATION_MS
+            || clear_duration_ms
+                < PACKAGE_CLEAR_CONFIRM_DURATION_MS
+                    .saturating_add(PACKAGE_REMOVAL_RECOVERY_WINDOW_MS)
         {
             return PackageObservationOutcome::Present;
         }
-        reset_to_consumed_idle(config, state);
+        state.clear_candidate.confirmed = true;
         return PackageObservationOutcome::Removed;
     }
 
@@ -711,12 +1054,37 @@ fn apply_observation(
     PackageObservationOutcome::Confirmed
 }
 
+fn apply_config_revision(config: &PackageEventConfig, state: &mut PackageEventState) {
+    if state.config_revision == config.revision {
+        return;
+    }
+    if state.phase != PackagePresencePhase::Present {
+        *state = PackageEventState::idle(&config.camera_id, config.revision);
+        return;
+    }
+    state.config_revision = config.revision;
+    state.last_sequence = None;
+    state.last_frame_epoch_ms = 0;
+    state.observability = PackageObservability::Discontinuous;
+    state.requires_presence_reconfirmation = true;
+    state.clear_candidate = PackageClearCandidate::default();
+}
+
 fn reset_to_consumed_idle(config: &PackageEventConfig, state: &mut PackageEventState) {
     let last_sequence = state.last_sequence;
     let last_worker_started_epoch_ms = state.last_worker_started_epoch_ms;
+    let last_frame_epoch_ms = state.last_frame_epoch_ms;
     *state = PackageEventState::idle(&config.camera_id, config.revision);
     state.last_sequence = last_sequence;
     state.last_worker_started_epoch_ms = last_worker_started_epoch_ms;
+    state.last_frame_epoch_ms = last_frame_epoch_ms;
+}
+
+fn set_unknown_state(state: &mut PackageEventState, observability: PackageObservability) {
+    if state.phase == PackagePresencePhase::Present {
+        state.observability = observability;
+        state.clear_candidate = PackageClearCandidate::default();
+    }
 }
 
 fn detection_center_in_zone(
@@ -795,6 +1163,21 @@ fn validate_lifecycle_event(event: &PackageLifecycleEvent) -> Result<(), String>
     if event.observed_frame_epoch_ms == 0 || !event.confidence.is_finite() {
         return Err("package lifecycle observation is invalid".to_string());
     }
+    for artifact in &event.recording_artifacts {
+        if artifact.artifact_id.trim() != artifact.artifact_id
+            || artifact.artifact_id.is_empty()
+            || artifact.artifact_id.len() > 512
+            || artifact.artifact_id.chars().any(char::is_control)
+            || artifact.mime_type != "video/mp4"
+            || artifact.byte_size == 0
+            || !artifact.preview_url.starts_with("/v1/dvr/artifacts/")
+        {
+            return Err("package recording artifact is invalid".to_string());
+        }
+    }
+    if !event.recording_finalized && !event.recording_artifacts.is_empty() {
+        return Err("pending package recording cannot expose artifacts".to_string());
+    }
     Ok(())
 }
 
@@ -805,6 +1188,7 @@ fn same_package_event_settings(left: &PackageEventConfig, right: &PackageEventCo
         && left.confirm_frames == right.confirm_frames
         && left.confirm_window_ms == right.confirm_window_ms
         && left.max_result_age_ms == right.max_result_age_ms
+        && left.max_observation_gap_ms == right.max_observation_gap_ms
 }
 
 fn validate_config(config: &PackageEventConfig) -> Result<(), String> {
@@ -830,6 +1214,9 @@ fn validate_config(config: &PackageEventConfig) -> Result<(), String> {
     }
     if !(500..=10_000).contains(&config.max_result_age_ms) {
         return Err("package max_result_age_ms must be between 500 and 10000".to_string());
+    }
+    if !(250..=10_000).contains(&config.max_observation_gap_ms) {
+        return Err("package max_observation_gap_ms must be between 250 and 10000".to_string());
     }
     Ok(())
 }
@@ -895,6 +1282,8 @@ mod tests {
             processed_epoch_ms: frame_epoch_ms + 20,
             observed_epoch_ms: frame_epoch_ms + 40,
             result_age_ms: 20,
+            camera_healthy: true,
+            frame_observable: true,
             frame_width: 1_000,
             frame_height: 500,
             detections: vec![PackageDetectionBox {
@@ -930,6 +1319,50 @@ mod tests {
             .event_id
             .as_deref()
             .is_some_and(|value| !value.is_empty()));
+    }
+
+    #[test]
+    fn appeared_event_waits_for_recording_before_delivery() {
+        let root = temporary_test_root("appearance-recording-pending");
+        fs::create_dir_all(&root).expect("create package event test root");
+        let store = PackageEventStore::try_new(root.join("package-events.json"))
+            .expect("package event store");
+        let config = config();
+        store
+            .upsert_config(config.clone())
+            .expect("package event config");
+
+        for sequence in 1..=3 {
+            store
+                .observe(
+                    &config.camera_id,
+                    &observation(sequence, sequence * 500 + 500, 500.0),
+                )
+                .expect("package appearance observation");
+        }
+
+        let appeared = store
+            .load()
+            .expect("package event ledger")
+            .events
+            .into_values()
+            .find(|event| event.kind == PackageLifecycleEventKind::Appeared)
+            .expect("appeared event");
+        assert!(!appeared.recording_finalized);
+        assert!(store
+            .pending_recording_events()
+            .expect("pending recordings")
+            .iter()
+            .any(|event| event.event_id == appeared.event_id));
+        assert!(store.pending_events().expect("pending delivery").is_empty());
+        store
+            .finalize_recording(
+                &appeared.event_id,
+                Vec::new(),
+                Some("recording unavailable".to_string()),
+            )
+            .expect("finalize failed appearance recording");
+        assert!(store.pending_events().expect("failed delivery").is_empty());
     }
 
     #[test]
@@ -976,6 +1409,27 @@ mod tests {
             PackageObservationOutcome::Confirmed
         );
         state.event_id.clone().expect("confirmed event id")
+    }
+
+    #[test]
+    fn recording_triggers_use_the_first_healthy_transition_frame() {
+        let config = config();
+        let mut state = PackageEventState::idle(&config.camera_id, config.revision);
+        confirm_package(&config, &mut state);
+
+        let appeared = appearance_event_from_state(&config, &state).expect("appeared event");
+        assert_eq!(appeared.observed_frame_epoch_ms, 2_000);
+        assert_eq!(appeared.recording_trigger_epoch_ms, 1_000);
+
+        let mut present_state = state.clone();
+        for index in 0..=PACKAGE_CLEAR_CONFIRM_FRAMES {
+            let removal_observation =
+                empty_observation(4 + u64::from(index), 3_000 + u64::from(index) * 1_000);
+            present_state = state.clone();
+            apply_observation(&config, &mut state, &removal_observation);
+        }
+        let removed = removal_event_from_state(&config, &present_state).expect("removed event");
+        assert_eq!(removed.recording_trigger_epoch_ms, 3_000);
     }
 
     #[test]
@@ -1033,6 +1487,53 @@ mod tests {
     }
 
     #[test]
+    fn a_positive_observation_during_the_recovery_window_cancels_removal() {
+        let config = config();
+        let mut state = PackageEventState::idle(&config.camera_id, config.revision);
+        let event_id = confirm_package(&config, &mut state);
+
+        for index in 0..PACKAGE_CLEAR_CONFIRM_FRAMES {
+            assert_eq!(
+                apply_observation(
+                    &config,
+                    &mut state,
+                    &empty_observation(4 + u64::from(index), 3_000 + u64::from(index) * 700),
+                ),
+                PackageObservationOutcome::Present
+            );
+        }
+        assert!(state.removal_confirmation_active());
+        assert_eq!(
+            apply_observation(&config, &mut state, &observation(14, 10_000, 500.0)),
+            PackageObservationOutcome::Present
+        );
+
+        assert_eq!(state.phase, PackagePresencePhase::Present);
+        assert_eq!(state.event_id.as_deref(), Some(event_id.as_str()));
+        assert_eq!(state.clear_candidate, PackageClearCandidate::default());
+    }
+
+    #[test]
+    fn five_second_absence_waits_for_the_recovery_window() {
+        let config = config();
+        let mut state = PackageEventState::idle(&config.camera_id, config.revision);
+        confirm_package(&config, &mut state);
+
+        let mut outcome = PackageObservationOutcome::Present;
+        for index in 0..PACKAGE_CLEAR_CONFIRM_FRAMES {
+            outcome = apply_observation(
+                &config,
+                &mut state,
+                &empty_observation(4 + u64::from(index), 3_000 + u64::from(index) * 600),
+            );
+        }
+
+        assert_eq!(outcome, PackageObservationOutcome::Present);
+        assert_eq!(state.phase, PackagePresencePhase::Present);
+        assert!(state.removal_confirmation_active());
+    }
+
+    #[test]
     fn ten_negative_observations_under_five_seconds_remain_in_removal_confirmation() {
         let config = config();
         let mut state = PackageEventState::idle(&config.camera_id, config.revision);
@@ -1060,7 +1561,7 @@ mod tests {
     }
 
     #[test]
-    fn ten_negative_observations_spanning_five_seconds_confirm_removal_and_rearm() {
+    fn sustained_absence_confirms_removal_without_consuming_the_present_instance() {
         let config = config();
         let mut state = PackageEventState::idle(&config.camera_id, config.revision);
         confirm_package(&config, &mut state);
@@ -1075,31 +1576,38 @@ mod tests {
         state.last_error = Some("old delivery error".to_string());
 
         let mut outcome = PackageObservationOutcome::Present;
-        for index in 0..PACKAGE_CLEAR_CONFIRM_FRAMES {
+        for index in 0..=PACKAGE_CLEAR_CONFIRM_FRAMES {
             outcome = apply_observation(
                 &config,
                 &mut state,
-                &empty_observation(4 + u64::from(index), 3_000 + u64::from(index) * 600),
+                &empty_observation(4 + u64::from(index), 3_000 + u64::from(index) * 1_000),
             );
         }
 
         assert_eq!(outcome, PackageObservationOutcome::Removed);
-        assert_eq!(state.phase, PackagePresencePhase::Idle);
+        assert_eq!(state.phase, PackagePresencePhase::Present);
         assert_eq!(state.last_worker_started_epoch_ms, 100);
-        assert_eq!(state.last_sequence, Some(13));
-        assert_eq!(state.candidate_count, 0);
-        assert_eq!(state.clear_candidate, PackageClearCandidate::default());
-        assert_eq!(state.event_id, None);
-        assert_eq!(state.instance_id, None);
-        assert_eq!(state.artifact, None);
-        assert!(!state.event_persisted);
-        assert!(!state.delivered);
-        assert_eq!(state.last_delivery_attempt_epoch_ms, 0);
-        assert_eq!(state.last_error, None);
+        assert_eq!(state.last_sequence, Some(14));
+        assert_eq!(state.candidate_count, config.confirm_frames);
+        assert!(state.removal_confirmation_active());
+        assert!(state.clear_candidate.confirmed);
+        assert!(state.event_id.is_some());
+        assert!(state.instance_id.is_some());
+        assert!(state.artifact.is_some());
+        assert!(state.event_persisted);
+        assert!(state.delivered);
+        assert_eq!(state.last_delivery_attempt_epoch_ms, 2_500);
+        assert_eq!(state.last_error.as_deref(), Some("old delivery error"));
+
+        assert_eq!(
+            apply_observation(&config, &mut state, &empty_observation(15, 14_000)),
+            PackageObservationOutcome::Present
+        );
+        assert!(state.clear_candidate.confirmed);
     }
 
     #[test]
-    fn repeated_stale_and_invalid_observations_do_not_advance_clearing() {
+    fn repeated_observations_are_ignored_but_invalid_observations_reset_clearing() {
         let config = config();
         let mut state = PackageEventState::idle(&config.camera_id, config.revision);
         confirm_package(&config, &mut state);
@@ -1116,19 +1624,19 @@ mod tests {
         stale.result_age_ms = config.max_result_age_ms + 1;
         assert_eq!(
             apply_observation(&config, &mut state, &stale),
-            PackageObservationOutcome::Ignored
+            PackageObservationOutcome::Unknown
         );
         let mut invalid_size = empty_observation(6, 4_000);
         invalid_size.frame_width = 0;
         assert_eq!(
             apply_observation(&config, &mut state, &invalid_size),
-            PackageObservationOutcome::Ignored
+            PackageObservationOutcome::Unknown
         );
         let mut invalid_timestamp = empty_observation(7, 4_500);
         invalid_timestamp.observed_epoch_ms = invalid_timestamp.processed_epoch_ms - 1;
         assert_eq!(
             apply_observation(&config, &mut state, &invalid_timestamp),
-            PackageObservationOutcome::Ignored
+            PackageObservationOutcome::Unknown
         );
         let mut old_worker = empty_observation(8, 5_000);
         old_worker.worker_started_epoch_ms = 99;
@@ -1138,10 +1646,10 @@ mod tests {
         );
 
         assert_eq!(state.phase, PackagePresencePhase::Present);
-        assert!(state.removal_confirmation_active());
+        assert_eq!(state.observability, PackageObservability::Discontinuous);
+        assert!(!state.removal_confirmation_active());
         assert_eq!(state.last_sequence, Some(4));
-        assert_eq!(state.clear_candidate.count, 1);
-        assert_eq!(state.clear_candidate.first_frame_epoch_ms, 2_500);
+        assert_eq!(state.clear_candidate, PackageClearCandidate::default());
     }
 
     #[test]
@@ -1160,7 +1668,7 @@ mod tests {
         restarted.worker_started_epoch_ms = 2_500;
         assert_eq!(
             apply_observation(&config, &mut state, &restarted),
-            PackageObservationOutcome::Present
+            PackageObservationOutcome::Unknown
         );
 
         assert_eq!(state.phase, PackagePresencePhase::Present);
@@ -1169,8 +1677,8 @@ mod tests {
         assert_eq!(state.event_id.as_deref(), Some(event_id.as_str()));
         assert_eq!(state.instance_id, instance_id);
         assert!(state.delivered);
-        assert_eq!(state.clear_candidate.count, 1);
-        assert_eq!(state.clear_candidate.first_frame_epoch_ms, 3_000);
+        assert_eq!(state.observability, PackageObservability::Discontinuous);
+        assert_eq!(state.clear_candidate, PackageClearCandidate::default());
 
         let mut present_again = observation(2, 3_500, 500.0);
         present_again.worker_started_epoch_ms = 2_500;
@@ -1180,40 +1688,105 @@ mod tests {
         );
         assert_eq!(state.event_id.as_deref(), Some(event_id.as_str()));
         assert_eq!(state.clear_candidate, PackageClearCandidate::default());
+        assert_eq!(state.observability, PackageObservability::Healthy);
     }
 
     #[test]
-    fn rearmed_state_confirms_a_new_event_after_three_positive_observations() {
+    fn offline_or_occluded_frames_clear_absence_and_keep_the_instance_unknown() {
         let config = config();
         let mut state = PackageEventState::idle(&config.camera_id, config.revision);
-        let first_event_id = confirm_package(&config, &mut state);
-        for index in 0..PACKAGE_CLEAR_CONFIRM_FRAMES {
+        let event_id = confirm_package(&config, &mut state);
+        let instance_id = state.instance_id.clone();
+        assert_eq!(
+            apply_observation(&config, &mut state, &empty_observation(4, 2_500)),
+            PackageObservationOutcome::Present
+        );
+
+        let mut offline = empty_observation(5, 3_000);
+        offline.camera_healthy = false;
+        assert_eq!(
+            apply_observation(&config, &mut state, &offline),
+            PackageObservationOutcome::Unknown
+        );
+        assert_eq!(state.observability, PackageObservability::Offline);
+        assert!(!state.removal_confirmation_active());
+
+        let mut occluded = empty_observation(6, 3_500);
+        occluded.frame_observable = false;
+        assert_eq!(
+            apply_observation(&config, &mut state, &occluded),
+            PackageObservationOutcome::Unknown
+        );
+        assert_eq!(state.observability, PackageObservability::Occluded);
+        assert_eq!(state.event_id.as_deref(), Some(event_id.as_str()));
+        assert_eq!(state.instance_id, instance_id);
+        assert!(!state.removal_confirmation_active());
+    }
+
+    #[test]
+    fn unexplained_frame_gap_requires_a_fresh_absence_chain() {
+        let config = config();
+        let mut state = PackageEventState::idle(&config.camera_id, config.revision);
+        confirm_package(&config, &mut state);
+        assert_eq!(
+            apply_observation(&config, &mut state, &empty_observation(4, 2_500)),
+            PackageObservationOutcome::Present
+        );
+
+        assert_eq!(
             apply_observation(
                 &config,
                 &mut state,
-                &empty_observation(4 + u64::from(index), 3_000 + u64::from(index) * 600),
+                &empty_observation(5, 2_500 + config.max_observation_gap_ms + 1),
+            ),
+            PackageObservationOutcome::Unknown
+        );
+        assert_eq!(state.observability, PackageObservability::Discontinuous);
+        assert!(!state.removal_confirmation_active());
+    }
+
+    #[test]
+    fn invalid_observation_marks_a_confirmed_package_unknown() {
+        let config = config();
+        let mut state = PackageEventState::idle(&config.camera_id, config.revision);
+        confirm_package(&config, &mut state);
+        assert_eq!(
+            apply_observation(&config, &mut state, &empty_observation(4, 2_500)),
+            PackageObservationOutcome::Present
+        );
+
+        let mut invalid = empty_observation(5, 3_000);
+        invalid.frame_width = 0;
+        assert_eq!(
+            apply_observation(&config, &mut state, &invalid),
+            PackageObservationOutcome::Unknown
+        );
+        assert_eq!(state.observability, PackageObservability::Discontinuous);
+        assert!(!state.removal_confirmation_active());
+    }
+
+    #[test]
+    fn pending_removal_does_not_rearm_before_recording_succeeds() {
+        let config = config();
+        let mut state = PackageEventState::idle(&config.camera_id, config.revision);
+        let first_event_id = confirm_package(&config, &mut state);
+        for index in 0..=PACKAGE_CLEAR_CONFIRM_FRAMES {
+            apply_observation(
+                &config,
+                &mut state,
+                &empty_observation(4 + u64::from(index), 3_000 + u64::from(index) * 1_000),
             );
         }
-        assert_eq!(state.phase, PackagePresencePhase::Idle);
+        assert_eq!(state.phase, PackagePresencePhase::Present);
 
         assert_eq!(
-            apply_observation(&config, &mut state, &observation(14, 9_000, 500.0)),
-            PackageObservationOutcome::Candidate
-        );
-        assert_eq!(
-            apply_observation(&config, &mut state, &observation(15, 9_500, 500.0)),
-            PackageObservationOutcome::Candidate
-        );
-        assert_eq!(
-            apply_observation(&config, &mut state, &observation(16, 10_000, 500.0)),
-            PackageObservationOutcome::Confirmed
+            apply_observation(&config, &mut state, &observation(15, 14_000, 500.0)),
+            PackageObservationOutcome::Present
         );
 
         assert_eq!(state.phase, PackagePresencePhase::Present);
-        assert!(state
-            .event_id
-            .as_deref()
-            .is_some_and(|event_id| event_id != first_event_id.as_str()));
+        assert_eq!(state.event_id.as_deref(), Some(first_event_id.as_str()));
+        assert!(!state.removal_confirmation_active());
     }
 
     #[test]
@@ -1222,16 +1795,15 @@ mod tests {
         let mut state = PackageEventState::idle(&config.camera_id, config.revision);
         confirm_package(&config, &mut state);
         let appeared = appearance_event_from_state(&config, &state).expect("appeared event");
-        let present_state = state.clone();
+        let mut present_state = state.clone();
         let mut outcome = PackageObservationOutcome::Present;
-        let mut removal_observation = empty_observation(4, 3_000);
-        for index in 0..PACKAGE_CLEAR_CONFIRM_FRAMES {
-            removal_observation =
-                empty_observation(4 + u64::from(index), 3_000 + u64::from(index) * 600);
+        for index in 0..=PACKAGE_CLEAR_CONFIRM_FRAMES {
+            let removal_observation =
+                empty_observation(4 + u64::from(index), 3_000 + u64::from(index) * 1_000);
+            present_state = state.clone();
             outcome = apply_observation(&config, &mut state, &removal_observation);
         }
-        let removed = removal_event_from_state(&config, &present_state, &removal_observation)
-            .expect("removed event");
+        let removed = removal_event_from_state(&config, &present_state).expect("removed event");
 
         assert_eq!(outcome, PackageObservationOutcome::Removed);
         assert_eq!(removed.kind, PackageLifecycleEventKind::Removed);
@@ -1240,16 +1812,15 @@ mod tests {
             removed.related_event_id.as_deref(),
             Some(appeared.event_id.as_str())
         );
-        assert_eq!(
-            removed.observed_frame_epoch_ms,
-            removal_observation.frame_epoch_ms
-        );
+        assert_eq!(removed.observed_frame_epoch_ms, 8_000);
+        assert_eq!(removed.confirm_window_ms, 10_000);
         assert!(!removed.delivered);
-        assert_eq!(state.phase, PackagePresencePhase::Idle);
+        assert_eq!(state.phase, PackagePresencePhase::Present);
+        assert!(state.clear_candidate.confirmed);
     }
 
     #[test]
-    fn store_keeps_removal_retryable_while_rearming_for_the_next_package() {
+    fn store_keeps_failed_removal_for_audit_without_publishing_it() {
         let root = temporary_test_root("removal-retry");
         fs::create_dir_all(&root).expect("create package event test root");
         let path = root.join("package-events.json");
@@ -1268,10 +1839,11 @@ mod tests {
                 .expect("package appearance observation");
         }
         let appeared = store
-            .pending_events()
-            .expect("pending appearance")
-            .into_iter()
-            .next()
+            .load()
+            .expect("package event ledger")
+            .events
+            .into_values()
+            .find(|event| event.kind == PackageLifecycleEventKind::Appeared)
             .expect("appeared event");
         store
             .update_event(&appeared.event_id, |event| {
@@ -1280,55 +1852,133 @@ mod tests {
             })
             .expect("mark appeared event delivered");
 
-        for index in 0..PACKAGE_CLEAR_CONFIRM_FRAMES {
+        for index in 0..=PACKAGE_CLEAR_CONFIRM_FRAMES {
             store
                 .observe(
                     &config.camera_id,
-                    &empty_observation(4 + u64::from(index), 3_000 + u64::from(index) * 600),
+                    &empty_observation(4 + u64::from(index), 3_000 + u64::from(index) * 1_000),
                 )
                 .expect("package removal observation");
         }
 
         let removal = store
-            .pending_events()
-            .expect("pending removal")
-            .into_iter()
+            .load()
+            .expect("package event ledger")
+            .events
+            .into_values()
             .find(|event| event.kind == PackageLifecycleEventKind::Removed)
             .expect("removed event");
+        assert!(!removal.recording_finalized);
+        assert!(store
+            .pending_events()
+            .expect("pending events before recording finalization")
+            .iter()
+            .all(|event| event.event_id != removal.event_id));
+        store
+            .finalize_removal_recording(
+                &removal.event_id,
+                Vec::new(),
+                Some("recording unavailable".to_string()),
+            )
+            .expect("finalize unavailable removal recording");
         assert_eq!(removal.instance_id, appeared.instance_id);
         assert_eq!(
             removal.related_event_id.as_deref(),
             Some(appeared.event_id.as_str())
         );
         assert!(!removal.delivered);
-        assert_eq!(
-            store.load().expect("package event ledger").states[&config.camera_id].phase,
-            PackagePresencePhase::Idle
-        );
+        let state = store.load().expect("package event ledger").states[&config.camera_id].clone();
+        assert_eq!(state.phase, PackagePresencePhase::Present);
+        assert!(!state.removal_confirmation_active());
 
         let restored = PackageEventStore::try_new(path).expect("restored package event store");
         assert!(restored
             .pending_events()
-            .expect("restored pending events")
+            .expect("restored failed events")
             .iter()
-            .any(|event| event.event_id == removal.event_id));
+            .all(|event| event.event_id != removal.event_id));
 
-        for (sequence, frame_epoch_ms) in [(14, 9_000), (15, 9_500), (16, 10_000)] {
+        for (sequence, frame_epoch_ms) in [(15, 14_000), (16, 15_000), (17, 16_000)] {
             restored
                 .observe(
                     &config.camera_id,
-                    &observation(sequence, frame_epoch_ms, 500.0),
+                    &empty_observation(sequence, frame_epoch_ms),
                 )
-                .expect("next package observation");
+                .expect("retry removal observation");
         }
-        let pending = restored.pending_events().expect("rearmed pending events");
-        assert!(pending
+        let retry_state = restored
+            .state(&config.camera_id)
+            .expect("retry state")
+            .expect("state");
+        assert!(retry_state.removal_confirmation_active());
+        assert_ne!(
+            retry_state
+                .removal_recording_context()
+                .expect("retry context")
+                .event_id,
+            removal.event_id
+        );
+    }
+
+    #[test]
+    fn successful_removal_recording_consumes_the_instance_and_rearms_detection() {
+        let root = temporary_test_root("removal-success");
+        fs::create_dir_all(&root).expect("create package event test root");
+        let store = PackageEventStore::try_new(root.join("package-events.json"))
+            .expect("package event store");
+        let config = config();
+        store
+            .upsert_config(config.clone())
+            .expect("package event config");
+        for sequence in 1..=3 {
+            store
+                .observe(
+                    &config.camera_id,
+                    &observation(sequence, sequence * 500 + 500, 500.0),
+                )
+                .expect("package appearance observation");
+        }
+        for index in 0..=PACKAGE_CLEAR_CONFIRM_FRAMES {
+            store
+                .observe(
+                    &config.camera_id,
+                    &empty_observation(4 + u64::from(index), 3_000 + u64::from(index) * 1_000),
+                )
+                .expect("package removal observation");
+        }
+        let removal = store
+            .load()
+            .expect("package event ledger")
+            .events
+            .into_values()
+            .find(|event| event.kind == PackageLifecycleEventKind::Removed)
+            .expect("removed event");
+
+        store
+            .finalize_removal_recording(
+                &removal.event_id,
+                vec![PackageEventRecordingArtifact {
+                    artifact_id: "recording-1".to_string(),
+                    mime_type: "video/mp4".to_string(),
+                    byte_size: 1_024,
+                    preview_url: "/v1/dvr/artifacts/recording-1".to_string(),
+                }],
+                None,
+            )
+            .expect("finalize successful removal recording");
+
+        let state = store
+            .state(&config.camera_id)
+            .expect("state")
+            .expect("camera state");
+        assert_eq!(state.phase, PackagePresencePhase::Idle);
+        assert_eq!(state.event_id, None);
+        assert_eq!(state.instance_id, None);
+        assert!(store
+            .pending_events()
+            .expect("pending removal events")
             .iter()
             .any(|event| event.event_id == removal.event_id));
-        assert!(pending.iter().any(|event| {
-            event.kind == PackageLifecycleEventKind::Appeared
-                && event.instance_id != removal.instance_id
-        }));
     }
 
     #[test]
@@ -1345,6 +1995,26 @@ mod tests {
             serde_json::from_value(value).expect("deserialize legacy package event state");
 
         assert_eq!(restored.clear_candidate, PackageClearCandidate::default());
+    }
+
+    #[test]
+    fn legacy_clear_candidate_without_confirmed_flag_remains_unconfirmed() {
+        let config = config();
+        let mut state = PackageEventState::idle(&config.camera_id, config.revision);
+        state.phase = PackagePresencePhase::Present;
+        state.clear_candidate.count = 1;
+        state.clear_candidate.first_frame_epoch_ms = 1_000;
+        let mut value = serde_json::to_value(state).expect("serialize package event state");
+        value["clear_candidate"]
+            .as_object_mut()
+            .expect("package clear candidate object")
+            .remove("confirmed");
+
+        let restored: PackageEventState =
+            serde_json::from_value(value).expect("deserialize legacy clear candidate");
+
+        assert_eq!(restored.clear_candidate.count, 1);
+        assert!(!restored.clear_candidate.confirmed);
     }
 
     #[test]
@@ -1382,5 +2052,82 @@ mod tests {
         requested.revision += 1;
 
         assert!(same_package_event_settings(&current, &requested));
+    }
+
+    #[test]
+    fn changed_zone_preserves_present_instance_until_presence_is_reconfirmed() {
+        let root = temporary_test_root("revision-preserves-present");
+        fs::create_dir_all(&root).expect("create package event test root");
+        let path = root.join("package-events.json");
+        let store = PackageEventStore::try_new(path).expect("package event store");
+        let current = config();
+        store
+            .upsert_config(current.clone())
+            .expect("initial package event config");
+        for sequence in 1..=3 {
+            store
+                .observe(
+                    &current.camera_id,
+                    &observation(sequence, sequence * 500 + 500, 500.0),
+                )
+                .expect("package appearance observation");
+        }
+        let before = store
+            .state(&current.camera_id)
+            .expect("package state")
+            .expect("present package state");
+
+        let mut changed = current.clone();
+        changed.zone.left = 0.2;
+        changed.revision += 1;
+        store
+            .upsert_config(changed.clone())
+            .expect("changed package event config");
+
+        let revised = store
+            .state(&current.camera_id)
+            .expect("package state")
+            .expect("revised package state");
+        assert_eq!(revised.phase, PackagePresencePhase::Present);
+        assert_eq!(revised.event_id, before.event_id);
+        assert_eq!(revised.instance_id, before.instance_id);
+        assert_eq!(revised.config_revision, changed.revision);
+        assert_eq!(revised.observability, PackageObservability::Discontinuous);
+
+        for index in 0..PACKAGE_CLEAR_CONFIRM_FRAMES + 2 {
+            let outcome = store
+                .observe(
+                    &current.camera_id,
+                    &empty_observation(4 + u64::from(index), 3_000 + u64::from(index) * 600),
+                )
+                .expect("unconfirmed revised-zone observation");
+            assert_eq!(outcome, PackageObservationOutcome::Unknown);
+        }
+        let still_present = store
+            .state(&current.camera_id)
+            .expect("package state")
+            .expect("preserved package state");
+        assert_eq!(still_present.event_id, before.event_id);
+        assert!(!still_present.removal_confirmation_active());
+
+        assert_eq!(
+            store
+                .observe(&current.camera_id, &observation(20, 10_000, 500.0))
+                .expect("presence reconfirmation"),
+            PackageObservationOutcome::Present
+        );
+        assert_eq!(
+            store
+                .observe(&current.camera_id, &empty_observation(21, 10_600))
+                .expect("post-reconfirmation absence"),
+            PackageObservationOutcome::Present
+        );
+        assert!(store
+            .state(&current.camera_id)
+            .expect("package state")
+            .expect("present package state")
+            .removal_confirmation_active());
+        drop(store);
+        fs::remove_dir_all(root).expect("remove package event test root");
     }
 }
