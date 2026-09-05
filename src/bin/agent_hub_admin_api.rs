@@ -31,6 +31,10 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tiny_http::{Header, Method, Request, Response, ResponseBox, Server, StatusCode};
 use uuid::Uuid;
 
+#[path = "rules_admin_api.rs"]
+mod rules_admin_api;
+use harborbeacon_local_agent::runtime::automation::RulesStore;
+
 use harborbeacon_local_agent::connectors::harborlink_media::{
     harborlink_request_scope, HarborLinkCameraProjection, HarborLinkCredentialStatus,
     HarborLinkEventRecordingLease, HarborLinkHomeAssistantStatus, HarborLinkLiveSession,
@@ -750,6 +754,8 @@ impl Cli {
 #[derive(Clone)]
 pub struct AdminApi {
     admin_store: AdminConsoleStore,
+    rules_store: RulesStore,
+    rules_worker_lifetime: Arc<()>,
     task_service: TaskApiService,
     harborlink_media: HarborLinkMediaClient,
     harbor_assistant_dist: PathBuf,
@@ -2595,7 +2601,9 @@ impl AdminApi {
             .unwrap_or_else(|error| fail(&error))
             .into_iter()
             .collect::<HashMap<_, _>>();
-        let api = Self {
+        let mut api = Self {
+            rules_store: RulesStore::new(admin_store.path().with_extension("rules.json")),
+            rules_worker_lifetime: Arc::new(()),
             admin_store,
             task_service,
             harborlink_media,
@@ -2635,6 +2643,9 @@ impl AdminApi {
         api.start_cat_activity_supervisor();
         api.start_cat_auto_recording_worker();
         api.start_cat_recording_validation_worker();
+        // Existing background clones must not keep the independent Rules worker alive.
+        api.rules_worker_lifetime = Arc::new(());
+        api.start_rules_worker();
         api
     }
 
@@ -4429,6 +4440,12 @@ impl AdminApi {
         } else {
             None
         };
+
+        if rules_admin_api::is_rules_path(&path) {
+            let response = self.handle_rules_request(&mut request, &path, &identity_hints);
+            let _ = request.respond(response);
+            return;
+        }
 
         let response = match method {
             Method::Get if path == "/healthz" => ok_json(&json!({"status":"ok"})).boxed(),
@@ -16030,6 +16047,7 @@ fn is_admin_surface_path(path: &str) -> bool {
         || (path.starts_with("/api/access/members/") && path.ends_with("/default-delivery-surface"))
         || path == "/api/tasks/approvals"
         || path.starts_with("/api/tasks/approvals/")
+        || rules_admin_api::is_rules_path(path)
         || path == "/api/automation/reviews"
         || path.starts_with("/api/automation/reviews/")
         || path == "/api/discovery/scan"
@@ -26576,6 +26594,58 @@ mod tests {
             "http://harborbeacon.local:4174".to_string(),
         );
         (api, vec![admin_path, registry_path, conversation_path])
+    }
+
+    #[test]
+    fn rules_worker_lifetime_tracks_http_owners_not_background_clones() {
+        let (api, paths) = build_test_admin_api("rules-worker-lifetime");
+        let lifetime = std::sync::Arc::downgrade(&api.rules_worker_lifetime);
+        assert_eq!(lifetime.strong_count(), 1);
+        let http_worker = api.clone();
+        assert_eq!(lifetime.strong_count(), 2);
+        drop(api);
+        assert_eq!(lifetime.strong_count(), 1);
+        drop(http_worker);
+        assert_eq!(lifetime.strong_count(), 0);
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn rules_routes_preserve_edge_verification_before_dispatch() {
+        let (api, paths) = build_test_admin_api("rules-edge-order");
+        let api = api.with_edge_assertion_verifier(EdgeAssertionVerifier::new(EDGE_TEST_KEY));
+        let server = Server::http("127.0.0.1:0").unwrap();
+        for (index, method) in ["GET", "POST"].into_iter().enumerate() {
+            let path = "/api/harbor-beacon/automation/rules";
+            let headers = edge_headers(
+                method,
+                "/api/harbor-beacon/automation/reviews",
+                super::edge_assertion_now(),
+                [index as u8 + 1; 12],
+                "harboros:uid:1000",
+                "harbor",
+                "FULL_ADMIN",
+            );
+            let endpoint = format!("http://{}{path}", server.server_addr());
+            let client = thread::spawn(move || {
+                let mut request = reqwest::blocking::Client::new()
+                    .request(reqwest::Method::from_bytes(method.as_bytes()).unwrap(), endpoint)
+                    .timeout(Duration::from_secs(10))
+                    .json(&json!({}));
+                for header in headers {
+                    request = request.header(header.field.as_str().as_str(), header.value.as_str());
+                }
+                let response = request.send().unwrap();
+                (response.status().as_u16(), response.text().unwrap())
+            });
+            api.handle(server.recv_timeout(Duration::from_secs(10)).unwrap().unwrap());
+            let (status, body) = client.join().unwrap();
+            assert_eq!(status, 401, "{method}: {body}");
+            assert!(body.contains("URI does not match"), "{body}");
+        }
+        assert!(api.rules_store.list(super::edge_assertion_now()).unwrap().is_empty());
+        drop(api);
+        cleanup_test_paths(&paths);
     }
 
     #[test]
