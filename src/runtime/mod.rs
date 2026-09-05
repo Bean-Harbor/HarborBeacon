@@ -17,6 +17,7 @@ pub mod events;
 pub mod evt_readiness;
 pub mod family_memory;
 pub mod family_timeline;
+pub mod fixed_models;
 pub mod home_guardian;
 pub mod hub;
 pub mod knowledge;

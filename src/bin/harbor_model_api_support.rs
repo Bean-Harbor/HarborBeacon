@@ -19,11 +19,13 @@ use candle_transformers::models::qwen2::{Config as Qwen2Config, ModelForCausalLM
 use candle_transformers::models::qwen3::{Config as Qwen3Config, ModelForCausalLM as Qwen3Model};
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use reqwest::blocking::Client;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, StatusCode};
 use tokenizers::Tokenizer;
+
+use harborbeacon_local_agent::service_auth::{model_api_verifier_token, VerifierTokens};
 
 const DEFAULT_BIND: &str = "127.0.0.1:4176";
 const DEFAULT_UPSTREAM_BASE_URL: &str = "";
@@ -116,11 +118,12 @@ impl Default for CandleConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ModelApiConfig {
     pub bind: String,
     pub backend: BackendKind,
     pub upstream_base_url: String,
+    pub(crate) upstream_bearer_token: Option<String>,
     pub chat_model: String,
     pub embedding_model: String,
     pub request_timeout_ms: u64,
@@ -133,6 +136,7 @@ impl Default for ModelApiConfig {
             bind: DEFAULT_BIND.to_string(),
             backend: BackendKind::Candle,
             upstream_base_url: DEFAULT_UPSTREAM_BASE_URL.to_string(),
+            upstream_bearer_token: None,
             chat_model: DEFAULT_CHAT_MODEL.to_string(),
             embedding_model: DEFAULT_EMBEDDING_MODEL.to_string(),
             request_timeout_ms: DEFAULT_TIMEOUT_MS,
@@ -156,6 +160,10 @@ impl ModelApiConfig {
             "HARBOR_MODEL_API_UPSTREAM_BASE_URL",
             &config.upstream_base_url,
         );
+        config.upstream_bearer_token = env::var("HARBOR_MODEL_API_UPSTREAM_BEARER_TOKEN")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         config.chat_model = env_or_default("HARBOR_MODEL_API_CHAT_MODEL", &config.chat_model);
         config.embedding_model =
             env_or_default("HARBOR_MODEL_API_EMBEDDING_MODEL", &config.embedding_model);
@@ -324,32 +332,61 @@ impl ModelApiConfig {
 pub struct ModelApiService {
     config: ModelApiConfig,
     backend: BackendRuntime,
+    auth_verifier: VerifierTokens,
+}
+
+impl fmt::Debug for ModelApiConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ModelApiConfig")
+            .field("bind", &self.bind)
+            .field("backend", &self.backend)
+            .field("upstream_base_url", &self.upstream_base_url)
+            .field(
+                "upstream_bearer_token_configured",
+                &self.upstream_bearer_token.is_some(),
+            )
+            .field("chat_model", &self.chat_model)
+            .field("embedding_model", &self.embedding_model)
+            .field("request_timeout_ms", &self.request_timeout_ms)
+            .field("candle", &self.candle)
+            .finish()
+    }
 }
 
 impl ModelApiService {
-    pub fn from_env_and_args() -> Self {
+    pub fn from_env_and_args() -> Result<Self, String> {
         let config = ModelApiConfig::from_env_and_args();
-        Self::new(config)
+        let auth_verifier = model_api_verifier_token()?;
+        Ok(Self::new(config, auth_verifier))
     }
 
-    pub fn new(config: ModelApiConfig) -> Self {
+    pub fn new(config: ModelApiConfig, auth_verifier: VerifierTokens) -> Self {
         let backend = match config.backend {
             BackendKind::Candle => {
                 BackendRuntime::Candle(CandleBackend::new(config.candle.clone()))
             }
             BackendKind::OpenAIProxy => BackendRuntime::OpenAIProxy(OpenAIProxyBackend::new(
                 config.upstream_base_url.clone(),
+                config.upstream_bearer_token.clone(),
                 config.chat_model.clone(),
                 config.embedding_model.clone(),
                 config.request_timeout_ms,
             )),
             BackendKind::SemanticRouter => BackendRuntime::SemanticRouter(SemanticRouterBackend),
         };
-        Self { config, backend }
+        Self {
+            config,
+            backend,
+            auth_verifier,
+        }
     }
 
     pub fn config(&self) -> &ModelApiConfig {
         &self.config
+    }
+
+    pub fn auth_verifier(&self) -> &VerifierTokens {
+        &self.auth_verifier
     }
 
     pub fn handle_request(&self, mut request: Request) {
@@ -384,14 +421,16 @@ impl ModelApiService {
         headers: &[Header],
         body: &[u8],
     ) -> Response<Cursor<Vec<u8>>> {
+        if method != Method::Options && path.starts_with("/v1/") && !self.is_authorized(headers) {
+            return service_auth_failed();
+        }
+
         match (method, path) {
             (Method::Get, "/healthz") => self.healthz_response(),
             (Method::Post, "/v1/chat/completions") => {
-                self.backend.chat_completions(&self.config, headers, body)
+                self.backend.chat_completions(&self.config, body)
             }
-            (Method::Post, "/v1/embeddings") => {
-                self.backend.embeddings(&self.config, headers, body)
-            }
+            (Method::Post, "/v1/embeddings") => self.backend.embeddings(&self.config, body),
             (Method::Options, _) => no_content(),
             _ => error_response(
                 StatusCode(404),
@@ -400,6 +439,12 @@ impl ModelApiService {
                 "router",
             ),
         }
+    }
+
+    fn is_authorized(&self, headers: &[Header]) -> bool {
+        header_value(headers, "Authorization")
+            .and_then(|value| parse_bearer_token(&value))
+            .is_some_and(|token| self.auth_verifier.matches(&token))
     }
 
     fn healthz_response(&self) -> Response<Cursor<Vec<u8>>> {
@@ -476,31 +521,21 @@ impl BackendRuntime {
         }
     }
 
-    fn chat_completions(
-        &self,
-        config: &ModelApiConfig,
-        headers: &[Header],
-        body: &[u8],
-    ) -> Response<Cursor<Vec<u8>>> {
+    fn chat_completions(&self, config: &ModelApiConfig, body: &[u8]) -> Response<Cursor<Vec<u8>>> {
         match self {
-            Self::Candle(backend) => backend.chat_completions(config, headers, body),
+            Self::Candle(backend) => backend.chat_completions(config, body),
             Self::OpenAIProxy(backend) => {
-                backend.forward_json("/chat/completions", &config.chat_model, headers, body)
+                backend.forward_json("/chat/completions", &config.chat_model, body)
             }
             Self::SemanticRouter(backend) => backend.chat_completions(config, body),
         }
     }
 
-    fn embeddings(
-        &self,
-        config: &ModelApiConfig,
-        headers: &[Header],
-        body: &[u8],
-    ) -> Response<Cursor<Vec<u8>>> {
+    fn embeddings(&self, config: &ModelApiConfig, body: &[u8]) -> Response<Cursor<Vec<u8>>> {
         match self {
-            Self::Candle(backend) => backend.embeddings(config, headers, body),
+            Self::Candle(backend) => backend.embeddings(config, body),
             Self::OpenAIProxy(backend) => {
-                backend.forward_json("/embeddings", &config.embedding_model, headers, body)
+                backend.forward_json("/embeddings", &config.embedding_model, body)
             }
             Self::SemanticRouter(backend) => backend.embeddings(config),
         }
@@ -1350,12 +1385,7 @@ impl CandleBackend {
         }
     }
 
-    fn chat_completions(
-        &self,
-        config: &ModelApiConfig,
-        _headers: &[Header],
-        body: &[u8],
-    ) -> Response<Cursor<Vec<u8>>> {
+    fn chat_completions(&self, config: &ModelApiConfig, body: &[u8]) -> Response<Cursor<Vec<u8>>> {
         let request = match parse_candle_chat_request(body, &self.config) {
             Ok(request) => request,
             Err(error) => {
@@ -1407,12 +1437,7 @@ impl CandleBackend {
         )
     }
 
-    fn embeddings(
-        &self,
-        config: &ModelApiConfig,
-        _headers: &[Header],
-        body: &[u8],
-    ) -> Response<Cursor<Vec<u8>>> {
+    fn embeddings(&self, config: &ModelApiConfig, body: &[u8]) -> Response<Cursor<Vec<u8>>> {
         let request = match parse_candle_embedding_request(body) {
             Ok(request) => request,
             Err(error) => {
@@ -1745,10 +1770,11 @@ impl CandleBackend {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct OpenAIProxyBackend {
     client: Client,
     upstream_base_url: String,
+    upstream_bearer_token: Option<String>,
     chat_model: String,
     embedding_model: String,
     timeout_ms: u64,
@@ -1757,6 +1783,7 @@ struct OpenAIProxyBackend {
 impl OpenAIProxyBackend {
     fn new(
         upstream_base_url: String,
+        upstream_bearer_token: Option<String>,
         chat_model: String,
         embedding_model: String,
         timeout_ms: u64,
@@ -1768,6 +1795,7 @@ impl OpenAIProxyBackend {
         Self {
             client,
             upstream_base_url,
+            upstream_bearer_token,
             chat_model,
             embedding_model,
             timeout_ms,
@@ -1780,8 +1808,12 @@ impl OpenAIProxyBackend {
             join_url(&self.upstream_base_url, "/models"),
         ];
         let ready_url = probe_urls.iter().find_map(|url| {
-            self.client
-                .get(url.clone())
+            let request = self.client.get(url.clone());
+            let request = match self.upstream_bearer_token.as_deref() {
+                Some(token) => request.bearer_auth(token),
+                None => request,
+            };
+            request
                 .send()
                 .ok()
                 .and_then(|response| response.error_for_status().ok())
@@ -1842,7 +1874,6 @@ impl OpenAIProxyBackend {
         &self,
         path_suffix: &str,
         default_model: &str,
-        headers: &[Header],
         body: &[u8],
     ) -> Response<Cursor<Vec<u8>>> {
         let mut payload: Value = match serde_json::from_slice(body) {
@@ -1859,13 +1890,14 @@ impl OpenAIProxyBackend {
         normalize_model(&mut payload, default_model);
 
         let upstream_url = join_url(&self.upstream_base_url, path_suffix);
-        let mut request = self
+        let request = self
             .client
             .post(upstream_url.clone())
             .header(CONTENT_TYPE, "application/json");
-        if let Some(auth_header) = header_value(headers, "Authorization") {
-            request = request.header(AUTHORIZATION, auth_header);
-        }
+        let request = match self.upstream_bearer_token.as_deref() {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        };
 
         let response = match request.json(&payload).send() {
             Ok(response) => response,
@@ -2860,6 +2892,31 @@ fn header_value(headers: &[Header], name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn parse_bearer_token(value: &str) -> Option<String> {
+    let value = value.trim();
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = token.trim();
+    (!token.is_empty() && !token.bytes().any(|byte| byte.is_ascii_whitespace()))
+        .then(|| token.to_string())
+}
+
+fn service_auth_failed() -> Response<Cursor<Vec<u8>>> {
+    let mut response = error_response(
+        StatusCode(401),
+        "SERVICE_AUTH_FAILED",
+        "missing or invalid bearer token",
+        "auth",
+    );
+    response.add_header(
+        Header::from_bytes(b"WWW-Authenticate".as_slice(), b"Bearer".as_slice())
+            .expect("authenticate header"),
+    );
+    response
+}
+
 fn error_response(
     status: StatusCode,
     code: &'static str,
@@ -2996,6 +3053,189 @@ pub fn print_startup_banner(config: &ModelApiConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    use harborbeacon_local_agent::service_auth::VerifierTokens;
+
+    const MODEL_TOKEN: &str = "model_token_0123456789abcdef0123456789abcdef";
+
+    fn model_verifier() -> VerifierTokens {
+        VerifierTokens::current_only(MODEL_TOKEN).expect("valid model token")
+    }
+
+    fn model_api_for(backend: BackendKind) -> ModelApiService {
+        let mut config = ModelApiConfig::default();
+        config.backend = backend;
+        ModelApiService::new(config, model_verifier())
+    }
+
+    fn auth_header(value: &str) -> Header {
+        Header::from_bytes(b"Authorization", value.as_bytes()).expect("authorization header")
+    }
+
+    fn response_payload(response: Response<Cursor<Vec<u8>>>) -> (StatusCode, Value, Vec<Header>) {
+        let status = response.status_code();
+        let headers = response.headers().to_vec();
+        let payload = serde_json::from_reader(response.into_reader()).expect("response json");
+        (status, payload, headers)
+    }
+
+    #[test]
+    fn model_api_health_is_public_but_inference_requires_bearer() {
+        let service = model_api_for(BackendKind::SemanticRouter);
+        assert_eq!(
+            service
+                .route(Method::Get, "/healthz", &[], b"")
+                .status_code(),
+            StatusCode(200)
+        );
+
+        for headers in [
+            vec![],
+            vec![auth_header("Basic ignored")],
+            vec![auth_header("Bearer wrong-model-token")],
+        ] {
+            let (status, payload, response_headers) = response_payload(service.route(
+                Method::Post,
+                "/v1/chat/completions",
+                &headers,
+                br#"{"messages":[{"role":"user","content":"status"}]}"#,
+            ));
+            assert_eq!(status, StatusCode(401));
+            assert_eq!(payload["error"]["code"], "SERVICE_AUTH_FAILED");
+            assert_eq!(
+                header_value(&response_headers, "WWW-Authenticate"),
+                Some("Bearer".to_string())
+            );
+        }
+
+        let (status, _, _) = response_payload(service.route(
+            Method::Post,
+            "/v1/chat/completions",
+            &[auth_header(&format!("Bearer {MODEL_TOKEN}"))],
+            br#"{"messages":[{"role":"user","content":"status"}]}"#,
+        ));
+        assert_eq!(status, StatusCode(200));
+
+        let (status, payload, _) = response_payload(service.route(
+            Method::Post,
+            "/v1/embeddings",
+            &[],
+            br#"{"input":"status"}"#,
+        ));
+        assert_eq!(status, StatusCode(401));
+        assert_eq!(payload["error"]["code"], "SERVICE_AUTH_FAILED");
+    }
+
+    #[test]
+    fn every_model_v1_request_requires_bearer_before_route_dispatch() {
+        let service = model_api_for(BackendKind::SemanticRouter);
+
+        for path in ["/v1/rerank", "/v1/future-inference"] {
+            for headers in [vec![], vec![auth_header("Bearer wrong-model-token")]] {
+                let (status, payload, _) =
+                    response_payload(service.route(Method::Post, path, &headers, b"{}"));
+                assert_eq!(status, StatusCode(401), "unprotected path: {path}");
+                assert_eq!(payload["error"]["code"], "SERVICE_AUTH_FAILED");
+            }
+
+            let (status, payload, _) = response_payload(service.route(
+                Method::Post,
+                path,
+                &[auth_header(&format!("Bearer {MODEL_TOKEN}"))],
+                b"{}",
+            ));
+            assert_eq!(status, StatusCode(404));
+            assert_eq!(payload["error"]["code"], "ROUTE_NOT_FOUND");
+        }
+    }
+
+    #[test]
+    fn openai_proxy_does_not_forward_internal_authorization() {
+        let upstream = tiny_http::Server::http("127.0.0.1:0").expect("upstream server");
+        let upstream_url = format!("http://{}", upstream.server_addr());
+        let (sender, receiver) = mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            let request = upstream
+                .recv_timeout(Duration::from_secs(2))
+                .expect("receive upstream request")
+                .expect("upstream request");
+            sender
+                .send(header_value(request.headers(), "Authorization"))
+                .expect("send observed authorization");
+            request
+                .respond(Response::from_string("{\"ok\":true}").with_status_code(StatusCode(200)))
+                .expect("respond upstream");
+        });
+
+        let mut config = ModelApiConfig::default();
+        config.backend = BackendKind::OpenAIProxy;
+        config.upstream_base_url = upstream_url;
+        let service = ModelApiService::new(config, model_verifier());
+        let response = service.route(
+            Method::Post,
+            "/v1/chat/completions",
+            &[auth_header(&format!("Bearer {MODEL_TOKEN}"))],
+            br#"{"messages":[{"role":"user","content":"status"}]}"#,
+        );
+
+        assert_eq!(response.status_code(), StatusCode(200));
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("observed authorization"),
+            None
+        );
+        server_thread.join().expect("upstream thread");
+    }
+
+    #[test]
+    fn openai_proxy_forwards_only_explicit_upstream_authorization() {
+        const UPSTREAM_TOKEN: &str = "upstream_token_abcdef0123456789abcdef0123456789";
+
+        let upstream = tiny_http::Server::http("127.0.0.1:0").expect("upstream server");
+        let upstream_url = format!("http://{}", upstream.server_addr());
+        let (sender, receiver) = mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            let request = upstream
+                .recv_timeout(Duration::from_secs(2))
+                .expect("receive upstream request")
+                .expect("upstream request");
+            sender
+                .send(header_value(request.headers(), "Authorization"))
+                .expect("send observed authorization");
+            request
+                .respond(Response::from_string("{\"ok\":true}").with_status_code(StatusCode(200)))
+                .expect("respond upstream");
+        });
+
+        let mut config = ModelApiConfig::default();
+        config.backend = BackendKind::OpenAIProxy;
+        config.upstream_base_url = upstream_url;
+        config.upstream_bearer_token = Some(UPSTREAM_TOKEN.to_string());
+        let debug_config = format!("{config:?}");
+        assert!(!debug_config.contains(UPSTREAM_TOKEN));
+        assert!(debug_config.contains("upstream_bearer_token_configured: true"));
+
+        let service = ModelApiService::new(config, model_verifier());
+        let response = service.route(
+            Method::Post,
+            "/v1/chat/completions",
+            &[auth_header(&format!("Bearer {MODEL_TOKEN}"))],
+            br#"{"messages":[{"role":"user","content":"status"}]}"#,
+        );
+
+        assert_eq!(response.status_code(), StatusCode(200));
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("observed authorization"),
+            Some(format!("Bearer {UPSTREAM_TOKEN}"))
+        );
+        server_thread.join().expect("upstream thread");
+    }
 
     fn write_minimal_safetensor(path: &Path) {
         let mut header = br#"{"weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#.to_vec();
@@ -3321,6 +3561,7 @@ mod tests {
         assert_eq!(config.bind, DEFAULT_BIND);
         assert_eq!(config.backend, BackendKind::Candle);
         assert_eq!(config.upstream_base_url, DEFAULT_UPSTREAM_BASE_URL);
+        assert_eq!(config.upstream_bearer_token, None);
         assert_eq!(config.chat_model, DEFAULT_CHAT_MODEL);
         assert_eq!(config.embedding_model, DEFAULT_EMBEDDING_MODEL);
         assert_eq!(config.candle.chat_model_id, DEFAULT_CANDLE_CHAT_MODEL_ID);
@@ -3467,7 +3708,7 @@ mod tests {
             service_config.candle.chat_model_id = model_dir.display().to_string();
             service_config.candle.embedding_model_id = model_dir.display().to_string();
             service_config.candle.cache_dir = model_dir.join("cache").display().to_string();
-            let service = ModelApiService::new(service_config);
+            let service = ModelApiService::new(service_config, model_verifier());
             let response = service.route(Method::Get, "/healthz", &[], &[]);
             assert_eq!(response.status_code(), StatusCode(503), "missing {missing}");
             fs::remove_dir_all(model_dir).unwrap();

@@ -1487,6 +1487,7 @@ dependencies = [
  "cap-fs-ext",
  "cap-primitives",
  "cap-std",
+ "constant_time_eq",
  "fast-hnsw",
  "fs2",
  "glob",

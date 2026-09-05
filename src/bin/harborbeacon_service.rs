@@ -1,5 +1,5 @@
 use std::env;
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::path::PathBuf;
 #[cfg(not(feature = "external-model-runtime"))]
 use std::sync::{Arc, RwLock};
@@ -26,10 +26,17 @@ use harbor_model_proxy::ModelApiProxy;
 #[cfg(not(feature = "external-model-runtime"))]
 use harborbeacon_local_agent::control_plane::models::{ModelEndpointStatus, ModelKind};
 use harborbeacon_local_agent::runtime::admin_console::AdminConsoleStore;
-use harborbeacon_local_agent::runtime::model_center::ADMIN_STATE_PATH_ENV;
+use harborbeacon_local_agent::runtime::model_center::{
+    semantic_router_topology, SemanticRouterTopology, ADMIN_STATE_PATH_ENV,
+};
 use harborbeacon_local_agent::runtime::registry::DeviceRegistryStore;
 use harborbeacon_local_agent::runtime::task_api::TaskApiService;
 use harborbeacon_local_agent::runtime::task_session::TaskConversationStore;
+#[cfg(test)]
+use harborbeacon_local_agent::service_auth::MODEL_API_TOKEN_ENV;
+use harborbeacon_local_agent::service_auth::{
+    gate_to_beacon_file_verifier_tokens, model_api_verifier_token, VerifierTokens,
+};
 
 #[derive(Debug, Clone)]
 struct Cli {
@@ -135,10 +142,16 @@ struct HarborBeaconService {
     model_api: Arc<RwLock<ModelApiService>>,
     #[cfg(feature = "external-model-runtime")]
     model_api: ModelApiProxy,
+    semantic_router_topology: SemanticRouterTopology,
 }
 
 impl HarborBeaconService {
-    fn new(cli: &Cli, service_token: String) -> Self {
+    fn new(
+        cli: &Cli,
+        service_tokens: VerifierTokens,
+        model_auth_verifier: VerifierTokens,
+        semantic_router_topology: SemanticRouterTopology,
+    ) -> Self {
         env::set_var(ADMIN_STATE_PATH_ENV, &cli.admin_state);
         let registry_store = DeviceRegistryStore::new(cli.device_registry.clone());
         let admin_store = AdminConsoleStore::new(cli.admin_state.clone(), registry_store);
@@ -149,10 +162,13 @@ impl HarborBeaconService {
             let mut model_config = ModelApiConfig::from_env();
             model_config.bind = cli.bind.clone();
             apply_persisted_model_runtime_selection(&mut model_config, &admin_store);
-            Arc::new(RwLock::new(ModelApiService::new(model_config)))
+            Arc::new(RwLock::new(ModelApiService::new(
+                model_config,
+                model_auth_verifier,
+            )))
         };
         #[cfg(feature = "external-model-runtime")]
-        let model_api = ModelApiProxy::from_env().unwrap_or_else(|error| {
+        let model_api = ModelApiProxy::from_env(model_auth_verifier).unwrap_or_else(|error| {
             eprintln!("invalid external model runtime configuration: {error}");
             std::process::exit(2);
         });
@@ -177,8 +193,9 @@ impl HarborBeaconService {
         );
         Self {
             admin_api,
-            task_api: assistant_task_api::TaskApiHttpServer::new(task_service, service_token),
+            task_api: assistant_task_api::TaskApiHttpServer::new(task_service, service_tokens),
             model_api,
+            semantic_router_topology,
         }
     }
 
@@ -205,7 +222,11 @@ impl HarborBeaconService {
                 "admin": "/api/admin/*",
                 "web": "/api/web/*",
                 "inference": "/api/inference/*",
-                "harbor_beacon_inference": "/api/harbor-beacon/inference/*"
+                "harbor_beacon_inference": "/api/harbor-beacon/inference/*",
+                "semantic_router": {
+                    "topology": self.semantic_router_topology.as_str(),
+                    "local_only": true,
+                }
             })));
             return;
         }
@@ -224,7 +245,6 @@ impl HarborBeaconService {
         let method = request.method().clone();
         let path = request.url().split('?').next().unwrap_or("/");
         let model_path = inference_model_path(path);
-        #[cfg(not(feature = "external-model-runtime"))]
         let headers = request.headers().to_vec();
         let body = if method == Method::Post {
             match read_request_body(&mut request) {
@@ -251,7 +271,7 @@ impl HarborBeaconService {
             ),
         };
         #[cfg(feature = "external-model-runtime")]
-        let response = self.model_api.route(method, &model_path, &body);
+        let response = self.model_api.route(method, &model_path, &headers, &body);
         let _ = request.respond(response);
     }
 }
@@ -261,15 +281,19 @@ fn build_model_runtime_activation_handler(
     model_api: Arc<RwLock<ModelApiService>>,
 ) -> agent_hub_admin_api::ModelRuntimeActivationHandler {
     Arc::new(move |request| {
-        let current_config = model_api
-            .read()
-            .map_err(|_| "model runtime lock is poisoned".to_string())?
-            .config()
-            .clone();
+        let (current_config, auth_verifier) = {
+            let current_service = model_api
+                .read()
+                .map_err(|_| "model runtime lock is poisoned".to_string())?;
+            (
+                current_service.config().clone(),
+                current_service.auth_verifier().clone(),
+            )
+        };
         let mut next_config = current_config;
         apply_activation_request_to_model_config(&mut next_config, &request)?;
         let runtime_model_id = runtime_model_id_for_activation(&next_config, request.model_kind);
-        let next_service = ModelApiService::new(next_config);
+        let next_service = ModelApiService::new(next_config, auth_verifier);
         let mut guard = model_api
             .write()
             .map_err(|_| "model runtime lock is poisoned".to_string())?;
@@ -448,8 +472,17 @@ fn model_backend_env_is_explicit() -> bool {
 
 fn main() {
     let cli = Cli::parse();
-    let service_token = resolve_service_token(cli.service_token.clone());
-    let service = HarborBeaconService::new(&cli, service_token);
+    let semantic_router_topology = semantic_router_topology()
+        .unwrap_or_else(|error| fail(&format!("invalid semantic-router topology: {error}")));
+    let model_auth_verifier = model_api_verifier_token().unwrap_or_else(|error| fail(&error));
+    let service_tokens =
+        resolve_service_tokens(cli.service_token.clone()).unwrap_or_else(|error| fail(&error));
+    let service = HarborBeaconService::new(
+        &cli,
+        service_tokens,
+        model_auth_verifier,
+        semantic_router_topology,
+    );
     let server = Server::http(&cli.bind).unwrap_or_else(|error| {
         panic!(
             "failed to bind harborbeacon service on {}: {error}",
@@ -461,6 +494,8 @@ fn main() {
         cli.bind
     );
 
+    #[cfg(feature = "fixed-local-models")]
+    service.model_api.warm_fixed_model();
     for request in server.incoming_requests() {
         let service = service.clone();
         thread::spawn(move || service.handle(request));
@@ -494,26 +529,26 @@ fn is_inference_api_path(path: &str) -> bool {
         || path.starts_with("/api/harbor-beacon/inference/")
 }
 
-fn resolve_service_token(cli_token: Option<String>) -> String {
-    cli_token
-        .or_else(|| env::var("HARBOR_TASK_API_BEARER_TOKEN").ok())
-        .or_else(|| env::var("HARBORBEACON_SERVICE_TOKEN").ok())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| {
-            eprintln!(
-                "harborbeacon-service requires a bearer token via --service-token, HARBOR_TASK_API_BEARER_TOKEN, or HARBORBEACON_SERVICE_TOKEN"
-            );
-            std::process::exit(2);
-        })
+fn resolve_service_tokens(cli_token: Option<String>) -> Result<VerifierTokens, String> {
+    match cli_token {
+        Some(token) => VerifierTokens::current_only(token),
+        #[cfg(not(feature = "external-model-runtime"))]
+        None => gate_to_beacon_file_verifier_tokens(),
+        #[cfg(feature = "external-model-runtime")]
+        None => harborbeacon_local_agent::service_auth::gate_to_beacon_verifier_tokens(),
+    }
 }
 
 fn read_request_body(request: &mut Request) -> Result<Vec<u8>, String> {
     let mut body = Vec::new();
     request
         .as_reader()
+        .take(1024 * 1024 + 1)
         .read_to_end(&mut body)
         .map_err(|error| format!("failed to read request body: {error}"))?;
+    if body.len() > 1024 * 1024 {
+        return Err("inference request exceeds 1 MiB".to_string());
+    }
     Ok(body)
 }
 
@@ -572,7 +607,6 @@ fn print_usage() {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(feature = "external-model-runtime"))]
     use std::sync::{Mutex, OnceLock};
     #[cfg(not(feature = "external-model-runtime"))]
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -583,7 +617,6 @@ mod tests {
     #[cfg(not(feature = "external-model-runtime"))]
     use harborbeacon_local_agent::runtime::registry::DeviceRegistryStore;
 
-    #[cfg(not(feature = "external-model-runtime"))]
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -598,13 +631,11 @@ mod tests {
         std::env::temp_dir().join(format!("harborbeacon-service-{label}-{suffix}.json"))
     }
 
-    #[cfg(not(feature = "external-model-runtime"))]
     struct EnvGuard {
         key: &'static str,
         previous: Option<String>,
     }
 
-    #[cfg(not(feature = "external-model-runtime"))]
     impl EnvGuard {
         fn set(key: &'static str, value: &str) -> Self {
             let previous = env::var(key).ok();
@@ -619,7 +650,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "external-model-runtime"))]
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             if let Some(value) = self.previous.as_ref() {
@@ -679,6 +709,57 @@ mod tests {
             inference_model_path("/api/beacon/inference/v1/chat/completions"),
             "/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn model_api_token_is_required_and_validated() {
+        let _lock = env_lock().lock().expect("env lock");
+        let _token = EnvGuard::remove(MODEL_API_TOKEN_ENV);
+        assert_eq!(
+            model_api_verifier_token().unwrap_err(),
+            "HARBOR_MODEL_API_TOKEN is not configured"
+        );
+
+        env::set_var(MODEL_API_TOKEN_ENV, "predictable-short-token");
+        assert_eq!(
+            model_api_verifier_token().unwrap_err(),
+            "HARBOR_MODEL_API_TOKEN is invalid"
+        );
+
+        let valid = "model_token_0123456789abcdef0123456789abcdef";
+        env::set_var(MODEL_API_TOKEN_ENV, valid);
+        let verifier = model_api_verifier_token().unwrap();
+        assert!(verifier.matches(valid));
+        assert!(!verifier.matches("gate_token_0123456789abcdef0123456789abcdef"));
+    }
+
+    #[test]
+    fn explicit_cli_task_token_is_current_only_and_strict() {
+        let current = "dev_task_token_0123456789abcdef0123456789abcdef";
+        let verifier = resolve_service_tokens(Some(current.to_string())).unwrap();
+        assert!(verifier.matches(current));
+        assert!(verifier.previous.is_none());
+        assert!(resolve_service_tokens(Some("short".to_string())).is_err());
+    }
+
+    #[test]
+    #[cfg(not(feature = "external-model-runtime"))]
+    fn model_runtime_activation_preserves_auth_verifier() {
+        let model_token = "model_token_0123456789abcdef0123456789abcdef";
+        let verifier = VerifierTokens::current_only(model_token).unwrap();
+        let model_api = Arc::new(RwLock::new(ModelApiService::new(
+            ModelApiConfig::default(),
+            verifier,
+        )));
+        let activation = build_model_runtime_activation_handler(model_api.clone());
+
+        activation(candle_llm_activation_request()).expect("activate model runtime");
+
+        let active = model_api.read().expect("model API lock");
+        assert!(active.auth_verifier().matches(model_token));
+        assert!(!active
+            .auth_verifier()
+            .matches("wrong_model_0123456789abcdef0123456789abcdef"));
     }
 
     #[test]

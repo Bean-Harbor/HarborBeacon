@@ -1,0 +1,224 @@
+#!/bin/bash
+set -euo pipefail
+
+env_file="${HARBORBEACON_RUNTIME_ENV_FILE:-/etc/default/harboros-beacon}"
+env_dir="$(dirname "$env_file")"
+tmp_file=""
+backup_file=""
+replaced=0
+had_original=0
+
+cleanup() {
+  local status="$?"
+  trap - EXIT
+
+  [ -z "$tmp_file" ] || rm -f -- "$tmp_file"
+  if [ "$status" -ne 0 ] && [ "$replaced" -eq 1 ]; then
+    if [ "$had_original" -eq 1 ] && [ -n "$backup_file" ] && [ -f "$backup_file" ]; then
+      mv -f -- "$backup_file" "$env_file"
+      sync -f "$env_file" || true
+    else
+      rm -f -- "$env_file"
+    fi
+    sync -f "$env_dir" || true
+  elif [ -n "$backup_file" ] && [ -f "$backup_file" ]; then
+    rm -f -- "$backup_file"
+    sync -f "$env_dir" || true
+  fi
+
+  exit "$status"
+}
+trap cleanup EXIT
+
+valid_token() {
+  [[ "$1" =~ ^[A-Za-z0-9_-]{32,}$ ]]
+}
+
+forbidden_tokens=()
+
+load_forbidden_tokens() {
+  local configured_files="${HARBOR_MODEL_TOKEN_FORBIDDEN_FILES:-}"
+  local path
+  local metadata
+  local value
+  local line_count
+  local byte_count
+  local -a files=()
+
+  [ -n "$configured_files" ] || return 0
+  IFS=':' read -r -a files <<< "$configured_files"
+  for path in "${files[@]}"; do
+    if [ -z "$path" ] || [ -L "$path" ] || [ ! -f "$path" ]; then
+      echo "model-token isolation credential is missing or unsafe" >&2
+      return 1
+    fi
+    metadata="$(stat -c '%u:%g:%a' -- "$path")" || {
+      echo "cannot inspect model-token isolation credential metadata" >&2
+      return 1
+    }
+    if [ "$(id -u)" -eq 0 ]; then
+      if [ "$metadata" != "0:0:600" ]; then
+        echo "model-token isolation credential must be owned by root:root with mode 0600" >&2
+        return 1
+      fi
+    elif [ "${metadata##*:}" != "600" ]; then
+      echo "model-token isolation credential must have mode 0600" >&2
+      return 1
+    fi
+
+    line_count="$(wc -l < "$path")" || return 1
+    byte_count="$(wc -c < "$path")" || return 1
+    IFS= read -r value < "$path" || true
+    if [ "$line_count" -ne 1 ] || [ "$byte_count" -ne $((${#value} + 1)) ]; then
+      echo "model-token isolation credential must contain exactly one line" >&2
+      return 1
+    fi
+    if [ -n "$value" ] && ! valid_token "$value"; then
+      echo "model-token isolation credential is invalid" >&2
+      return 1
+    fi
+    if [ -n "$value" ]; then
+      forbidden_tokens+=("$value")
+    fi
+  done
+}
+
+token_is_forbidden() {
+  local candidate="$1"
+  local forbidden
+
+  for forbidden in "${forbidden_tokens[@]}"; do
+    if [ "$candidate" = "$forbidden" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+read_model_token() {
+  local line
+  local normalized
+  local raw
+  local value=""
+
+  [ -f "$env_file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    normalized="${line#"${line%%[![:space:]]*}"}"
+    normalized="${normalized%"${normalized##*[![:space:]]}"}"
+    case "$normalized" in
+      ""|\#*|\;*) continue ;;
+    esac
+
+    if [[ "$normalized" =~ ^export[[:space:]]+HARBOR_MODEL_API_TOKEN([[:space:]]|=) ]]; then
+      echo "invalid HARBOR_MODEL_API_TOKEN assignment in HarborBeacon environment" >&2
+      return 65
+    fi
+    if ! [[ "$normalized" =~ ^HARBOR_MODEL_API_TOKEN([[:space:]]|=) ]]; then
+      continue
+    fi
+    if ! [[ "$normalized" =~ ^HARBOR_MODEL_API_TOKEN[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+      echo "invalid HARBOR_MODEL_API_TOKEN assignment in HarborBeacon environment" >&2
+      return 65
+    fi
+
+    raw="${BASH_REMATCH[1]}"
+    raw="${raw#"${raw%%[![:space:]]*}"}"
+    raw="${raw%"${raw##*[![:space:]]}"}"
+    if [[ "$raw" =~ ^\"([A-Za-z0-9_-]{32,})\"$ ]]; then
+      value="${BASH_REMATCH[1]}"
+    elif [[ "$raw" =~ ^\'([A-Za-z0-9_-]{32,})\'$ ]]; then
+      value="${BASH_REMATCH[1]}"
+    elif valid_token "$raw"; then
+      value="$raw"
+    else
+      echo "invalid HARBOR_MODEL_API_TOKEN value in HarborBeacon environment" >&2
+      return 65
+    fi
+  done < "$env_file"
+
+  printf '%s' "$value"
+}
+
+generate_secret_token() {
+  local token=""
+  if command -v openssl >/dev/null 2>&1; then
+    token="$(openssl rand -hex 32 2>/dev/null || true)"
+  fi
+  if ! valid_token "$token"; then
+    token="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+  fi
+  valid_token "$token"
+  printf '%s' "$token"
+}
+
+if [ -L "$env_dir" ]; then
+  echo "refusing symlinked HarborBeacon environment directory" >&2
+  exit 1
+fi
+if [ -L "$env_file" ] || { [ -e "$env_file" ] && [ ! -f "$env_file" ]; }; then
+  echo "refusing unsafe HarborBeacon runtime environment target" >&2
+  exit 1
+fi
+
+install -d -m 0755 "$env_dir"
+umask 077
+
+load_forbidden_tokens
+model_token="$(read_model_token)"
+if valid_token "$model_token" && ! token_is_forbidden "$model_token"; then
+  chmod 0600 "$env_file"
+  if [ "$(id -u)" -eq 0 ]; then
+    chown root:root "$env_file"
+  fi
+  exit 0
+fi
+while :; do
+  model_token="$(generate_secret_token)"
+  if ! token_is_forbidden "$model_token"; then
+    break
+  fi
+done
+
+tmp_file="$(mktemp "$env_dir/.harboros-beacon.env.XXXXXX")"
+if [ -f "$env_file" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    normalized="${line#"${line%%[![:space:]]*}"}"
+    normalized="${normalized%"${normalized##*[![:space:]]}"}"
+    if [[ "$normalized" =~ ^HARBOR_MODEL_API_TOKEN[[:space:]]*= ]]; then
+      continue
+    fi
+    printf '%s\n' "$line"
+  done < "$env_file" > "$tmp_file"
+fi
+printf 'HARBOR_MODEL_API_TOKEN=%s\n' "$model_token" >> "$tmp_file"
+chmod 0600 "$tmp_file"
+if [ "$(id -u)" -eq 0 ]; then
+  chown root:root "$tmp_file"
+fi
+sync -f "$tmp_file"
+
+if [ "${HARBOR_MODEL_TOKEN_FAILPOINT:-}" = "before_rename" ]; then
+  exit 70
+fi
+
+if [ -f "$env_file" ]; then
+  had_original=1
+  backup_file="$(mktemp "$env_dir/.harboros-beacon.env.recovery.XXXXXX")"
+  cp -- "$env_file" "$backup_file"
+  chmod 0600 "$backup_file"
+  if [ "$(id -u)" -eq 0 ]; then
+    chown root:root "$backup_file"
+  fi
+  sync -f "$backup_file"
+fi
+
+mv -f -- "$tmp_file" "$env_file"
+tmp_file=""
+replaced=1
+
+if [ "${HARBOR_MODEL_TOKEN_FAILPOINT:-}" = "after_rename" ]; then
+  exit 71
+fi
+
+sync -f "$env_dir"
+replaced=0

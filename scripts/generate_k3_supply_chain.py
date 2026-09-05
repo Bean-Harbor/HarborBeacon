@@ -192,7 +192,11 @@ def runtime_dependency(value: str, arch: str) -> dict[str, str]:
     return {
         "name": name,
         "version": version,
-        "purl": f"pkg:deb/ubuntu/{name}@{version}?arch={arch}",
+        "purl": (
+            f"pkg:generic/spacemit-com/{name}@{version}?arch={arch}"
+            if name in {"spacemit-llama.cpp", "spine-runtime"}
+            else f"pkg:deb/ubuntu/{name}@{version}?arch={arch}"
+        ),
     }
 
 

@@ -41,9 +41,12 @@ use crate::runtime::registry::{CameraDevice, DeviceRegistryStore};
 
 const DEFAULT_BINDING_CHANNEL_LABEL: &str = "Harbor HarborGate";
 const DEFAULT_PROVIDER_ACCOUNT_DISPLAY_NAME: &str = "Harbor HarborGate";
+#[cfg(feature = "local-model-management")]
 static ADMIN_CONSOLE_MODEL_DOWNLOAD_WRITE_LOCK: Mutex<()> = Mutex::new(());
+static ADMIN_CONSOLE_KNOWLEDGE_JOB_WRITE_LOCK: Mutex<()> = Mutex::new(());
 static ADMIN_CONSOLE_STATE_FILE_LOCK: Mutex<()> = Mutex::new(());
 
+#[cfg(feature = "local-model-management")]
 fn model_download_write_guard() -> Result<MutexGuard<'static, ()>, String> {
     ADMIN_CONSOLE_MODEL_DOWNLOAD_WRITE_LOCK
         .lock()
@@ -558,12 +561,17 @@ pub struct AdminModelCenterState {
 
 impl Default for AdminModelCenterState {
     fn default() -> Self {
-        Self {
+        let state = Self {
             endpoints: default_model_endpoints(),
             route_policies: default_model_route_policies(),
             model_store_root: default_model_store_root(),
             capability_bindings: Vec::new(),
             runtimes: default_model_runtimes(),
+        };
+        if crate::runtime::fixed_models::FIXED {
+            crate::runtime::fixed_models::project(state)
+        } else {
+            state
         }
     }
 }
@@ -884,6 +892,7 @@ const DEFAULT_POLICY_RETRIEVAL_OCR: &str = "retrieval.ocr";
 const DEFAULT_POLICY_RETRIEVAL_EMBED: &str = "retrieval.embed";
 const DEFAULT_POLICY_RETRIEVAL_RERANK: &str = "retrieval.rerank";
 const DEFAULT_POLICY_RETRIEVAL_ANSWER: &str = "retrieval.answer";
+const DEFAULT_POLICY_RETRIEVAL_VISION_SUMMARY: &str = "retrieval.vision_summary";
 const DEFAULT_POLICY_SEMANTIC_ROUTER: &str = "semantic.router";
 const DEFAULT_SILICONFLOW_ENDPOINT_ID: &str = "llm-cloud-siliconflow";
 const DEFAULT_SILICONFLOW_BASE_URL: &str = "https://api.siliconflow.cn/v1";
@@ -908,7 +917,6 @@ fn default_automation_review_status() -> String {
 }
 const MODEL_API_TOKEN_ENV: &str = "HARBOR_MODEL_API_TOKEN";
 const DEFAULT_MODEL_API_BASE_URL: &str = "http://127.0.0.1:4174/api/inference/v1";
-const DEFAULT_MODEL_API_TOKEN: &str = "harbor-local-model-token";
 
 impl AdminConsoleStore {
     pub fn new(path: impl Into<PathBuf>, registry_store: DeviceRegistryStore) -> Self {
@@ -1012,6 +1020,35 @@ impl AdminConsoleStore {
             })?;
         }
 
+        let _guard = admin_console_state_file_guard()?;
+        if crate::runtime::fixed_models::FIXED && self.path.is_file() {
+            let backup = self.path.with_extension("pre-fixed-models.json");
+            if !backup.is_file() {
+                let temporary = self
+                    .path
+                    .with_extension(format!("backup-{}", uuid::Uuid::new_v4()));
+                let result = (|| -> Result<(), String> {
+                    let mut destination = fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&temporary)
+                        .map_err(|error| error.to_string())?;
+                    let mut source =
+                        fs::File::open(&self.path).map_err(|error| error.to_string())?;
+                    std::io::copy(&mut source, &mut destination)
+                        .map_err(|error| error.to_string())?;
+                    destination.sync_all().map_err(|error| error.to_string())?;
+                    drop(destination);
+                    fs::rename(&temporary, &backup).map_err(|error| error.to_string())
+                })();
+                if let Err(error) = result {
+                    let _ = fs::remove_file(&temporary);
+                    return Err(format!(
+                        "failed to preserve pre-fixed-models state: {error}"
+                    ));
+                }
+            }
+        }
         let mut sanitized = state.clone();
         sanitize_admin_state(&mut sanitized);
         let payload = serde_json::to_string_pretty(&sanitized).map_err(|e| {
@@ -1020,7 +1057,6 @@ impl AdminConsoleStore {
                 self.path.display()
             )
         })?;
-        let _guard = admin_console_state_file_guard()?;
         fs::write(&self.path, payload).map_err(|e| {
             format!(
                 "failed to write admin console state {}: {e}",
@@ -1506,6 +1542,9 @@ impl AdminConsoleStore {
         &self,
         job: KnowledgeIndexJobRecord,
     ) -> Result<KnowledgeIndexJobRecord, String> {
+        let _guard = ADMIN_CONSOLE_KNOWLEDGE_JOB_WRITE_LOCK
+            .lock()
+            .map_err(|_| "knowledge job write lock poisoned".to_string())?;
         let job = sanitize_knowledge_index_job(job)
             .ok_or_else(|| "knowledge index job requires a job_id".to_string())?;
         let mut state = self.load_or_create_state()?;
@@ -1514,6 +1553,9 @@ impl AdminConsoleStore {
             .iter_mut()
             .find(|item| item.job_id == job.job_id)
         {
+            if existing.cancel_requested && job.status != "canceled" {
+                return Ok(existing.clone());
+            }
             *existing = job.clone();
         } else {
             state.knowledge_index_jobs.push(job.clone());
@@ -1528,6 +1570,9 @@ impl AdminConsoleStore {
         job_id: &str,
         canceled_at: String,
     ) -> Result<Option<KnowledgeIndexJobRecord>, String> {
+        let _guard = ADMIN_CONSOLE_KNOWLEDGE_JOB_WRITE_LOCK
+            .lock()
+            .map_err(|_| "knowledge job write lock poisoned".to_string())?;
         let job_id = job_id.trim();
         if job_id.is_empty() {
             return Err("job_id 不能为空".to_string());
@@ -1743,6 +1788,14 @@ impl AdminConsoleStore {
     ) -> Result<AdminConsoleState, String> {
         let mut state = self.load_or_create_state()?;
         let mut endpoint = sanitize_model_endpoint(endpoint)?;
+        crate::runtime::fixed_models::validate_endpoint_write(
+            state
+                .models
+                .endpoints
+                .iter()
+                .find(|item| item.model_endpoint_id == endpoint.model_endpoint_id),
+            &endpoint,
+        )?;
         if let Some(existing) = state
             .models
             .endpoints
@@ -1778,6 +1831,10 @@ impl AdminConsoleStore {
             .find(|existing| existing.model_endpoint_id == endpoint_id)
             .ok_or_else(|| format!("未找到模型端点 {endpoint_id}"))?;
         let existing_snapshot = endpoint.clone();
+        if crate::runtime::fixed_models::FIXED && endpoint.endpoint_kind != ModelEndpointKind::Cloud
+        {
+            return Err(crate::runtime::fixed_models::LOCAL_MODELS_FIXED.to_string());
+        }
 
         if let Some(value) = patch_object.get("workspace_id") {
             endpoint.workspace_id = optional_trimmed_string(value);
@@ -1815,6 +1872,10 @@ impl AdminConsoleStore {
 
         preserve_model_endpoint_secret_metadata(&existing_snapshot, endpoint);
         let sanitized = sanitize_model_endpoint(endpoint.clone())?;
+        crate::runtime::fixed_models::validate_endpoint_write(
+            Some(&existing_snapshot),
+            &sanitized,
+        )?;
         *endpoint = sanitized;
         self.save_projected_state(state)
     }
@@ -1874,6 +1935,7 @@ impl AdminConsoleStore {
         self.save_projected_state(state)
     }
 
+    #[cfg(feature = "local-model-management")]
     pub fn create_model_download_job(
         &self,
         model_id: &str,
@@ -1893,6 +1955,7 @@ impl AdminConsoleStore {
             .job)
     }
 
+    #[cfg(feature = "local-model-management")]
     pub fn create_or_update_model_download_job(
         &self,
         model_id: &str,
@@ -1964,6 +2027,7 @@ impl AdminConsoleStore {
         })
     }
 
+    #[cfg(feature = "local-model-management")]
     pub fn save_model_store_root(&self, root: &str) -> Result<AdminConsoleState, String> {
         let root = non_empty_opt(root).ok_or_else(|| "模型保存位置不能为空".to_string())?;
         let path = Path::new(&root);
@@ -1975,6 +2039,7 @@ impl AdminConsoleStore {
         self.save_projected_state(state)
     }
 
+    #[cfg(feature = "local-model-management")]
     pub fn save_model_runtime(
         &self,
         runtime: ModelRuntimeRecord,
@@ -1994,6 +2059,7 @@ impl AdminConsoleStore {
         self.save_projected_state(state)
     }
 
+    #[cfg(feature = "local-model-management")]
     pub fn install_model_runtime(&self, runtime_id: &str) -> Result<ModelRuntimeRecord, String> {
         let runtime_id =
             non_empty_opt(runtime_id).ok_or_else(|| "runtime_id 不能为空".to_string())?;
@@ -2039,6 +2105,7 @@ impl AdminConsoleStore {
         Ok(runtime)
     }
 
+    #[cfg(feature = "local-model-management")]
     pub fn save_model_capability_assignment(
         &self,
         capability_id: &str,
@@ -2079,6 +2146,9 @@ impl AdminConsoleStore {
         &self,
         job_id: &str,
     ) -> Result<Option<ModelDownloadJobRecord>, String> {
+        if crate::runtime::fixed_models::FIXED {
+            return Ok(None);
+        }
         let job_id = job_id.trim();
         if job_id.is_empty() {
             return Ok(None);
@@ -2090,6 +2160,7 @@ impl AdminConsoleStore {
             .find(|job| job.job_id == job_id))
     }
 
+    #[cfg(feature = "local-model-management")]
     pub fn cancel_model_download_job(
         &self,
         job_id: &str,
@@ -2122,9 +2193,13 @@ impl AdminConsoleStore {
     }
 
     pub fn list_model_download_jobs(&self) -> Result<Vec<ModelDownloadJobRecord>, String> {
+        if crate::runtime::fixed_models::FIXED {
+            return Ok(Vec::new());
+        }
         Ok(self.load_state()?.model_download_jobs)
     }
 
+    #[cfg(feature = "local-model-management")]
     pub fn save_model_download_job(
         &self,
         job: ModelDownloadJobRecord,
@@ -2152,6 +2227,18 @@ impl AdminConsoleStore {
         policies: Vec<ModelRoutePolicy>,
     ) -> Result<AdminConsoleState, String> {
         let mut state = self.load_or_create_state()?;
+        if crate::runtime::fixed_models::FIXED {
+            for policy in &policies {
+                if policy.route_policy_id == "retrieval.answer" {
+                    crate::runtime::fixed_models::validate_answer_policy(policy)?;
+                }
+                if policy.route_policy_id != "retrieval.answer"
+                    && !state.models.route_policies.contains(policy)
+                {
+                    return Err(crate::runtime::fixed_models::LOCAL_MODELS_FIXED.to_string());
+                }
+            }
+        }
         let sanitized = if policies.is_empty() {
             default_model_route_policies()
         } else {
@@ -3013,11 +3100,11 @@ pub fn sanitize_remote_view_config(mut config: RemoteViewConfig) -> RemoteViewCo
 }
 
 pub fn sanitize_model_center_state(state: AdminModelCenterState) -> AdminModelCenterState {
+    if crate::runtime::fixed_models::FIXED {
+        return crate::runtime::fixed_models::project(state);
+    }
     let mut endpoints = Vec::new();
     for endpoint in state.endpoints {
-        if endpoint.model_endpoint_id == "vlm-local-openai-compatible" {
-            continue;
-        }
         if let Ok(endpoint) = sanitize_model_endpoint(endpoint) {
             endpoints.push(endpoint);
         }
@@ -3043,9 +3130,6 @@ pub fn sanitize_model_center_state(state: AdminModelCenterState) -> AdminModelCe
 
     let mut route_policies = Vec::new();
     for policy in state.route_policies {
-        if policy.route_policy_id == "retrieval.vision_summary" {
-            continue;
-        }
         if let Ok(policy) = sanitize_model_route_policy(policy) {
             route_policies.push(policy);
         }
@@ -3123,9 +3207,6 @@ pub fn sanitize_model_center_state(state: AdminModelCenterState) -> AdminModelCe
 
     let mut runtimes = Vec::new();
     for runtime in state.runtimes {
-        if runtime.runtime_id == "harbor-vlm-sidecar" {
-            continue;
-        }
         if let Ok(runtime) = sanitize_model_runtime(runtime, &model_store_root) {
             runtimes.push(runtime);
         }
@@ -3161,7 +3242,7 @@ pub fn sanitize_model_runtime(
     if runtime.runtime_id.is_empty() {
         return Err("runtime_id 不能为空".to_string());
     }
-    if runtime.runtime_id == "harbor-vlm-sidecar" {
+    if crate::runtime::fixed_models::FIXED && runtime.runtime_id == "harbor-vlm-sidecar" {
         return Err("harbor-vlm-sidecar runtime has been retired".to_string());
     }
     runtime.display_name = non_empty_opt(&runtime.display_name)
@@ -3260,7 +3341,7 @@ pub fn sanitize_model_endpoint(mut endpoint: ModelEndpoint) -> Result<ModelEndpo
     endpoint.cost_policy = normalize_json_object(endpoint.cost_policy);
     endpoint.metadata = normalize_json_object(endpoint.metadata);
     normalize_builtin_local_model_api_endpoint(&mut endpoint);
-    if endpoint.model_kind == ModelKind::Vlm {
+    if crate::runtime::fixed_models::FIXED && endpoint.model_kind == ModelKind::Vlm {
         endpoint.status = ModelEndpointStatus::Disabled;
         set_model_endpoint_metadata_bool(&mut endpoint, "external_endpoint", true);
         set_model_endpoint_metadata_bool(&mut endpoint, "qualification_eligible", false);
@@ -3317,16 +3398,37 @@ fn align_embedding_endpoint_identity_with_runtime(endpoint: &mut ModelEndpoint) 
 fn normalize_builtin_local_model_api_endpoint(endpoint: &mut ModelEndpoint) {
     if !matches!(
         endpoint.model_endpoint_id.as_str(),
-        "embed-local-openai-compatible" | "llm-local-openai-compatible"
+        "embed-local-openai-compatible"
+            | "rerank-local-compatible"
+            | "llm-local-openai-compatible"
+            | "vlm-local-openai-compatible"
     ) {
         return;
     }
-    if !endpoint
-        .provider_key
-        .eq_ignore_ascii_case("openai_compatible")
-    {
+    if !model_endpoint_metadata_bool(endpoint, "builtin") {
         return;
     }
+
+    let Some(default_endpoint) = default_model_endpoints()
+        .into_iter()
+        .find(|default| default.model_endpoint_id == endpoint.model_endpoint_id)
+    else {
+        return;
+    };
+    let api_key = default_endpoint
+        .metadata
+        .get("api_key")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    set_model_endpoint_metadata_string(endpoint, "api_key", api_key);
+    set_model_endpoint_metadata_bool(
+        endpoint,
+        "api_key_configured",
+        model_endpoint_metadata_bool(&default_endpoint, "api_key_configured"),
+    );
+    set_model_endpoint_metadata_bool(endpoint, "api_key_required", true);
+
     if endpoint.model_endpoint_id == "llm-local-openai-compatible" {
         ensure_model_endpoint_tag(endpoint, "assistant_input_parser");
         ensure_model_endpoint_tag(endpoint, "k3_nsp");
@@ -3348,23 +3450,11 @@ fn normalize_builtin_local_model_api_endpoint(endpoint: &mut ModelEndpoint) {
         return;
     }
 
-    let Some(default_endpoint) = default_model_endpoints()
-        .into_iter()
-        .find(|default| default.model_endpoint_id == endpoint.model_endpoint_id)
-    else {
-        return;
-    };
-
-    for key in ["base_url", "healthz_url", "api_key"] {
+    for key in ["base_url", "healthz_url"] {
         if let Some(value) = model_endpoint_metadata_string(&default_endpoint, key) {
             set_model_endpoint_metadata_string(endpoint, key, value);
         }
     }
-    set_model_endpoint_metadata_bool(
-        endpoint,
-        "api_key_configured",
-        model_endpoint_metadata_bool(&default_endpoint, "api_key_configured"),
-    );
     set_model_endpoint_metadata_bool(endpoint, "legacy_model_api_migrated", true);
     set_model_endpoint_metadata_string(
         endpoint,
@@ -3435,6 +3525,9 @@ pub fn default_model_runtimes() -> Vec<ModelRuntimeRecord> {
 }
 
 pub fn default_model_runtimes_for_store_root(model_store_root: &str) -> Vec<ModelRuntimeRecord> {
+    if crate::runtime::fixed_models::FIXED {
+        return Vec::new();
+    }
     let local_base_url = local_model_api_base_url();
     let local_healthz_url = local_model_api_healthz_url(&local_base_url);
     vec![
@@ -3465,6 +3558,28 @@ pub fn default_model_runtimes_for_store_root(model_store_root: &str) -> Vec<Mode
                 "default_enabled": true,
                 "lazy_load_models": true,
                 "bootstrap_model_id": "Qwen/Qwen2.5-0.5B-Instruct",
+            }),
+        },
+        ModelRuntimeRecord {
+            runtime_id: "harbor-vlm-sidecar".to_string(),
+            display_name: "Harbor Vision Runtime".to_string(),
+            runtime_kind: "managed_sidecar".to_string(),
+            provider_key: "harbor".to_string(),
+            status: "not_available".to_string(),
+            managed: true,
+            installable: false,
+            enabled: false,
+            capabilities: vec!["vlm".to_string()],
+            runtime_profiles: vec!["harbor-vlm-sidecar".to_string()],
+            bind_url: None,
+            healthz_url: None,
+            model_store_path: model_runtime_store_path(model_store_root, "harbor-vlm-sidecar"),
+            message: "Harbor Vision Runtime is reserved for managed VLM packages; use advanced OpenAI-compatible endpoint until the package is available.".to_string(),
+            installed_at: None,
+            updated_at: None,
+            metadata: json!({
+                "install_mode": "managed_sidecar_package",
+                "external_endpoint": false,
             }),
         },
         ModelRuntimeRecord {
@@ -3590,6 +3705,7 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
     let local_base_url = local_model_api_base_url();
     let local_healthz_url = local_model_api_healthz_url(&local_base_url);
     let local_api_key = local_model_api_token();
+    let local_api_key_configured = !local_api_key.is_empty();
     vec![
         ModelEndpoint {
             model_endpoint_id: "ocr-local-tesseract".to_string(),
@@ -3629,7 +3745,8 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
                 "base_url": local_base_url.clone(),
                 "healthz_url": local_healthz_url.clone(),
                 "api_key": local_api_key.clone(),
-                "api_key_configured": true,
+                "api_key_configured": local_api_key_configured,
+                "api_key_required": true,
             }),
         },
         ModelEndpoint {
@@ -3648,7 +3765,8 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
                 "base_url": local_base_url.clone(),
                 "healthz_url": local_healthz_url.clone(),
                 "api_key": local_api_key.clone(),
-                "api_key_configured": true,
+                "api_key_configured": local_api_key_configured,
+                "api_key_required": true,
                 "rerank_path": "/rerank",
                 "cloud_fallback_allowed": false,
             }),
@@ -3675,7 +3793,8 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
                 "base_url": local_base_url.clone(),
                 "healthz_url": local_healthz_url.clone(),
                 "api_key": local_api_key.clone(),
-                "api_key_configured": true,
+                "api_key_configured": local_api_key_configured,
+                "api_key_required": true,
                 "semantic_router": true,
                 "local_only": true,
                 "cloud_fallback_allowed": false,
@@ -3713,6 +3832,30 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
                 "secret_redaction": "endpoint_metadata",
             }),
         },
+        ModelEndpoint {
+            model_endpoint_id: "vlm-local-openai-compatible".to_string(),
+            workspace_id: Some(DEFAULT_MODEL_WORKSPACE_ID.to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Vlm,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "openai_compatible".to_string(),
+            model_name: "vision".to_string(),
+            capability_tags: vec![
+                "image".to_string(),
+                "local_first".to_string(),
+                "multimodal".to_string(),
+            ],
+            cost_policy: json!({"cost_hint": "local_or_sidecar"}),
+            status: ModelEndpointStatus::Disabled,
+            metadata: json!({
+                "builtin": true,
+                "base_url": local_base_url,
+                "healthz_url": local_healthz_url,
+                "api_key": local_api_key,
+                "api_key_configured": local_api_key_configured,
+                "api_key_required": true,
+            }),
+        },
     ]
 }
 
@@ -3738,7 +3881,7 @@ fn local_model_api_token() -> String {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_MODEL_API_TOKEN.to_string())
+        .unwrap_or_default()
 }
 
 pub fn default_model_route_policies() -> Vec<ModelRoutePolicy> {
@@ -3822,6 +3965,21 @@ pub fn default_model_route_policies() -> Vec<ModelRoutePolicy> {
             ],
             status: "active".to_string(),
             metadata: json!({"capability": "answer"}),
+        },
+        ModelRoutePolicy {
+            route_policy_id: DEFAULT_POLICY_RETRIEVAL_VISION_SUMMARY.to_string(),
+            workspace_id: DEFAULT_MODEL_WORKSPACE_ID.to_string(),
+            domain_scope: "retrieval".to_string(),
+            modality: "multimodal".to_string(),
+            privacy_level: PrivacyLevel::StrictLocal,
+            local_preferred: true,
+            max_cost_per_run: None,
+            fallback_order: vec!["local".to_string(), "sidecar".to_string()],
+            status: "degraded".to_string(),
+            metadata: json!({
+                "capability": "vision_summary",
+                "cloud_fallback": false,
+            }),
         },
     ]
 }
@@ -5734,6 +5892,7 @@ pub fn parse_rtsp_path(url: &str) -> Option<String> {
     }
 }
 
+#[cfg(feature = "local-model-management")]
 fn latest_model_download_job_index(
     jobs: &[ModelDownloadJobRecord],
     model_id: &str,
@@ -5747,6 +5906,7 @@ fn latest_model_download_job_index(
         .map(|(index, _)| index)
 }
 
+#[cfg(feature = "local-model-management")]
 fn model_download_job_record_sort_key(job: &ModelDownloadJobRecord) -> (u64, u64, &str) {
     (
         model_download_job_record_timestamp(&job.updated_at),
@@ -5755,10 +5915,12 @@ fn model_download_job_record_sort_key(job: &ModelDownloadJobRecord) -> (u64, u64
     )
 }
 
+#[cfg(feature = "local-model-management")]
 fn model_download_job_record_timestamp(value: &str) -> u64 {
     value.trim().parse::<u64>().unwrap_or(0)
 }
 
+#[cfg(feature = "local-model-management")]
 fn model_download_job_record_is_active(job: &ModelDownloadJobRecord) -> bool {
     matches!(
         job.status.as_str(),
@@ -6864,6 +7026,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "local-model-management")]
     fn record_model_endpoint_test_result_persists_health_and_last_test() {
         let registry_path = temp_path("registry-model-test");
         let admin_path = temp_path("admin-model-test");
@@ -6902,7 +7065,7 @@ mod tests {
             .iter()
             .find(|endpoint| endpoint.model_endpoint_id == "vlm-test")
             .expect("endpoint");
-        assert_eq!(endpoint.status, ModelEndpointStatus::Disabled);
+        assert_eq!(endpoint.status, ModelEndpointStatus::Degraded);
         assert_eq!(endpoint.metadata["health_status"], json!("degraded"));
         assert_eq!(endpoint.metadata["last_test"]["ok"], json!(false));
         assert_eq!(
@@ -6917,7 +7080,7 @@ mod tests {
             .iter()
             .find(|endpoint| endpoint.model_endpoint_id == "vlm-test")
             .expect("endpoint");
-        assert_eq!(endpoint.status, ModelEndpointStatus::Disabled);
+        assert_eq!(endpoint.status, ModelEndpointStatus::Degraded);
         assert_eq!(
             endpoint.metadata["last_test"]["details"]["http_status"],
             json!(502)
@@ -6928,6 +7091,31 @@ mod tests {
     }
 
     #[test]
+    fn knowledge_index_progress_cannot_revive_a_canceled_job() {
+        let path = temp_path("knowledge-progress-cancel");
+        let registry_path = temp_path("knowledge-progress-registry");
+        let store = AdminConsoleStore::new(&path, super::DeviceRegistryStore::new(&registry_path));
+        let job = super::KnowledgeIndexJobRecord {
+            job_id: "rebuild".into(),
+            status: "running".into(),
+            ..super::KnowledgeIndexJobRecord::default()
+        };
+        store.save_knowledge_index_job(job.clone()).unwrap();
+        store
+            .cancel_knowledge_index_job("rebuild", "2026-09-05T00:00:00Z".into())
+            .unwrap();
+        assert_eq!(
+            store.save_knowledge_index_job(job).unwrap().status,
+            "canceled"
+        );
+        assert!(store.list_knowledge_index_jobs().unwrap()[0].cancel_requested);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("pre-fixed-models.json"));
+        let _ = std::fs::remove_file(registry_path);
+    }
+
+    #[test]
+    #[cfg(feature = "local-model-management")]
     fn default_model_center_includes_siliconflow_cloud_fallback_preset() {
         let endpoints = default_model_endpoints();
         let endpoint = endpoints
@@ -6957,9 +7145,11 @@ mod tests {
             .iter()
             .any(|kind| kind == "cloud"));
 
-        assert!(!policies
+        let vlm_policy = policies
             .iter()
-            .any(|policy| policy.route_policy_id == "retrieval.vision_summary"));
+            .find(|policy| policy.route_policy_id == "retrieval.vision_summary")
+            .expect("vlm policy");
+        assert!(!vlm_policy.fallback_order.iter().any(|kind| kind == "cloud"));
 
         let runtimes = default_model_runtimes();
         let candle = runtimes
@@ -6982,16 +7172,10 @@ mod tests {
             .model_store_path
             .replace('\\', "/")
             .ends_with("runtimes/harbor-candle"));
-
-        assert!(!runtimes
-            .iter()
-            .any(|runtime| runtime.runtime_id == "harbor-vlm-sidecar"));
-        assert!(!endpoints
-            .iter()
-            .any(|endpoint| endpoint.model_endpoint_id == "vlm-local-openai-compatible"));
     }
 
     #[test]
+    #[cfg(feature = "fixed-local-models")]
     fn sanitize_model_center_keeps_external_vlm_disabled_and_non_qualification() {
         let endpoint = sanitize_model_endpoint(ModelEndpoint {
             model_endpoint_id: "vlm-user-external".to_string(),
@@ -7023,6 +7207,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "local-model-management")]
     fn install_model_runtime_enables_harbor_managed_candle() {
         let registry_path = temp_path("registry-model-runtime-install");
         let admin_path = temp_path("admin-model-runtime-install");
@@ -7094,6 +7279,53 @@ mod tests {
             json!("http://127.0.0.1:4174/api/inference/healthz")
         );
         assert_eq!(endpoint.metadata["legacy_model_api_migrated"], json!(true));
+    }
+
+    #[test]
+    fn sanitize_model_center_replaces_persisted_builtin_fixed_model_token() {
+        let previous = std::env::var("HARBOR_MODEL_API_TOKEN").ok();
+        let current_token = "current_model_token_0123456789abcdef0123456789abcdef";
+        std::env::set_var("HARBOR_MODEL_API_TOKEN", current_token);
+        let state = AdminModelCenterState {
+            endpoints: vec![ModelEndpoint {
+                model_endpoint_id: "llm-local-openai-compatible".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Llm,
+                endpoint_kind: ModelEndpointKind::Local,
+                provider_key: "openai_compatible".to_string(),
+                model_name: "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
+                capability_tags: vec!["local_first".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({
+                    "builtin": true,
+                    "base_url": "http://127.0.0.1:4174/api/inference/v1",
+                    "healthz_url": "http://127.0.0.1:4174/api/inference/healthz",
+                    "api_key": "harbor-local-model-token",
+                    "api_key_configured": true,
+                }),
+            }],
+            route_policies: default_model_route_policies(),
+            model_store_root: default_model_store_root(),
+            capability_bindings: Vec::new(),
+            runtimes: Vec::new(),
+        };
+
+        let sanitized = sanitize_model_center_state(state);
+        if let Some(value) = previous {
+            std::env::set_var("HARBOR_MODEL_API_TOKEN", value);
+        } else {
+            std::env::remove_var("HARBOR_MODEL_API_TOKEN");
+        }
+        let endpoint = sanitized
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "llm-local-openai-compatible")
+            .expect("llm endpoint");
+        assert_eq!(endpoint.metadata["api_key"], json!(current_token));
+        assert_eq!(endpoint.metadata["api_key_configured"], json!(true));
+        assert_eq!(endpoint.metadata["api_key_required"], json!(true));
     }
 
     #[test]

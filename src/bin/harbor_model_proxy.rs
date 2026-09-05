@@ -1,6 +1,11 @@
 use std::io::Cursor;
 use std::time::Duration;
 
+use harborbeacon_local_agent::runtime::ai_resource_scheduler::{
+    acquire_ai_resource_lease, AiLeaseQuarantineReason, AiWorkload,
+};
+use harborbeacon_local_agent::runtime::fixed_models;
+use harborbeacon_local_agent::service_auth::VerifierTokens;
 use reqwest::blocking::Client;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::Url;
@@ -14,19 +19,58 @@ const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 pub struct ModelApiProxy {
     client: Client,
     upstream: Url,
+    verifier: VerifierTokens,
 }
 
 impl ModelApiProxy {
-    pub fn from_env() -> Result<Self, String> {
-        let raw = std::env::var("HARBOR_MODEL_API_UPSTREAM_BASE_URL")
-            .unwrap_or_else(|_| DEFAULT_UPSTREAM.to_string());
+    pub fn warm_fixed_model(&self) {
+        if !fixed_models::FIXED {
+            return;
+        }
+        let proxy = self.clone();
+        std::thread::spawn(move || {
+            for _ in 0..30 {
+                if proxy
+                    .client
+                    .get("http://127.0.0.1:8792/healthz")
+                    .timeout(Duration::from_secs(1))
+                    .send()
+                    .is_ok_and(|value| value.status().is_success())
+                {
+                    let body = serde_json::to_vec(&json!({
+                        "model": fixed_models::CHAT_MODEL,
+                        "messages": [{"role": "user", "content": "Ready."}],
+                        "max_tokens": 1, "temperature": 0
+                    }))
+                    .unwrap();
+                    let response = proxy.forward(Method::Post, "/v1/chat/completions", &body);
+                    eprintln!("fixed model warmup completed: {}", response.status_code().0);
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            eprintln!("fixed model warmup failed: runtime unavailable");
+        });
+    }
+
+    pub fn from_env(verifier: VerifierTokens) -> Result<Self, String> {
+        let raw = if fixed_models::FIXED {
+            DEFAULT_UPSTREAM.to_string()
+        } else {
+            std::env::var("HARBOR_MODEL_API_UPSTREAM_BASE_URL")
+                .unwrap_or_else(|_| DEFAULT_UPSTREAM.to_string())
+        };
         let upstream = validate_loopback_upstream(&raw)?;
-        let timeout_ms = std::env::var("HARBOR_MODEL_API_REQUEST_TIMEOUT_MS")
-            .ok()
-            .map(|value| value.parse::<u64>())
-            .transpose()
-            .map_err(|error| format!("invalid request timeout: {error}"))?
-            .unwrap_or(DEFAULT_TIMEOUT_MS);
+        let timeout_ms = if fixed_models::FIXED {
+            110_000
+        } else {
+            std::env::var("HARBOR_MODEL_API_REQUEST_TIMEOUT_MS")
+                .ok()
+                .map(|value| value.parse::<u64>())
+                .transpose()
+                .map_err(|error| format!("invalid request timeout: {error}"))?
+                .unwrap_or(DEFAULT_TIMEOUT_MS)
+        };
         if timeout_ms == 0 {
             return Err("request timeout must be greater than zero".to_string());
         }
@@ -34,10 +78,33 @@ impl ModelApiProxy {
             .timeout(Duration::from_millis(timeout_ms))
             .build()
             .map_err(|error| format!("failed to create model proxy client: {error}"))?;
-        Ok(Self { client, upstream })
+        Ok(Self {
+            client,
+            upstream,
+            verifier,
+        })
     }
 
-    pub fn route(&self, method: Method, path: &str, body: &[u8]) -> Response<Cursor<Vec<u8>>> {
+    pub fn route(
+        &self,
+        method: Method,
+        path: &str,
+        headers: &[Header],
+        body: &[u8],
+    ) -> Response<Cursor<Vec<u8>>> {
+        if method == Method::Post
+            && !headers
+                .iter()
+                .find(|header| header.field.equiv("Authorization"))
+                .and_then(|header| header.value.as_str().strip_prefix("Bearer "))
+                .is_some_and(|token| self.verifier.matches(token))
+        {
+            return proxy_error(
+                StatusCode(401),
+                "UNAUTHORIZED",
+                "model authentication required",
+            );
+        }
         match (&method, path) {
             (Method::Get, "/healthz") => self.forward(method, path, body),
             (Method::Post, "/v1/chat/completions" | "/v1/embeddings") => {
@@ -55,6 +122,17 @@ impl ModelApiProxy {
     }
 
     fn forward(&self, method: Method, path: &str, body: &[u8]) -> Response<Cursor<Vec<u8>>> {
+        let lease =
+            if fixed_models::FIXED && method == Method::Post && path == "/v1/chat/completions" {
+                match acquire_ai_resource_lease(AiWorkload::Llm) {
+                    Ok(lease) => Some(lease),
+                    Err(error) => {
+                        return proxy_error(StatusCode(503), error.code(), &error.to_string())
+                    }
+                }
+            } else {
+                None
+            };
         let url = match self.upstream.join(path.trim_start_matches('/')) {
             Ok(url) => url,
             Err(_) => {
@@ -70,6 +148,7 @@ impl ModelApiProxy {
             Method::Post => self
                 .client
                 .post(url)
+                .bearer_auth(&self.verifier.current)
                 .header(CONTENT_TYPE, "application/json")
                 .body(body.to_vec()),
             _ => {
@@ -82,15 +161,24 @@ impl ModelApiProxy {
         };
         let upstream = match request.send() {
             Ok(response) => response,
-            Err(_) => {
+            Err(error) => {
+                if let Some(lease) = lease {
+                    if !error.is_connect() {
+                        lease.quarantine(AiLeaseQuarantineReason::ProcessExitUnconfirmed);
+                    }
+                }
                 return proxy_error(
                     StatusCode(503),
                     "MODEL_RUNTIME_UNAVAILABLE",
                     "local model runtime is unavailable",
-                )
+                );
             }
         };
         let status = StatusCode(upstream.status().as_u16());
+        let stopped = upstream
+            .headers()
+            .get("X-Harbor-Execution-Stopped")
+            .is_some_and(|value| value == "true");
         let content_type = upstream
             .headers()
             .get(CONTENT_TYPE)
@@ -100,13 +188,21 @@ impl ModelApiProxy {
         let response_body = match upstream.bytes() {
             Ok(value) => value.to_vec(),
             Err(_) => {
+                if let Some(lease) = lease {
+                    lease.quarantine(AiLeaseQuarantineReason::ProcessExitUnconfirmed);
+                }
                 return proxy_error(
                     StatusCode(502),
                     "MODEL_RUNTIME_READ_ERROR",
                     "local model runtime response could not be read",
-                )
+                );
             }
         };
+        if let Some(lease) = lease {
+            if !stopped {
+                lease.quarantine(AiLeaseQuarantineReason::ProcessExitUnconfirmed);
+            }
+        }
         let mut response = Response::from_data(response_body).with_status_code(status);
         response.add_header(
             Header::from_bytes("Content-Type", content_type)
@@ -155,6 +251,105 @@ fn json_response(status: StatusCode, payload: serde_json::Value) -> Response<Cur
 mod tests {
     use super::*;
 
+    #[cfg(feature = "fixed-local-models")]
+    #[test]
+    fn fixed_inference_owns_one_lease_and_quarantines_uncertain_exit() {
+        use harborbeacon_local_agent::runtime::ai_resource_scheduler::{
+            ai_resource_workload_snapshot, AiLeaseErrorKind,
+        };
+        use std::process::{Command, Stdio};
+        use std::time::Instant;
+        // Quarantine is deliberately permanent for a scheduler process.
+        if std::env::var_os("HARBOR_PROXY_QUARANTINE_FIXTURE").is_none() {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "harbor_model_proxy::tests::fixed_inference_owns_one_lease_and_quarantines_uncertain_exit", "--nocapture"])
+                .env("HARBOR_PROXY_QUARANTINE_FIXTURE", "1")
+                .stdin(Stdio::null()).spawn().unwrap();
+            let until = Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    return;
+                }
+                if Instant::now() >= until {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("proxy scheduling fixture timed out");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let token = "test_model_token_0123456789abcdef0123456789abcdef";
+        let proxy = ModelApiProxy {
+            client: Client::builder()
+                .timeout(Duration::from_secs(3))
+                .build()
+                .unwrap(),
+            upstream: Url::parse(&format!("http://{}/", server.server_addr())).unwrap(),
+            verifier: VerifierTokens::current_only(token).unwrap(),
+        };
+        let cat = acquire_ai_resource_lease(AiWorkload::CatRecordingVerifier).unwrap();
+        let inference_proxy = proxy.clone();
+        let inference = std::thread::spawn(move || {
+            inference_proxy.route(
+                Method::Post,
+                "/v1/chat/completions",
+                &[Header::from_bytes("Authorization", format!("Bearer {token}")).unwrap()],
+                b"{}",
+            )
+        });
+        let until = Instant::now() + Duration::from_secs(2);
+        while ai_resource_workload_snapshot(AiWorkload::Llm)["queue_depth"] != 1 {
+            assert!(Instant::now() < until, "chat must wait for the cat lease");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(server
+            .recv_timeout(Duration::from_millis(30))
+            .unwrap()
+            .is_none());
+        let health_proxy = proxy.clone();
+        let health =
+            std::thread::spawn(move || health_proxy.route(Method::Get, "/healthz", &[], &[]));
+        let request = server
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.url(), "/healthz");
+        request.respond(Response::from_string("{}")).unwrap();
+        assert_eq!(health.join().unwrap().status_code(), StatusCode(200));
+        drop(cat);
+        let request = server
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.url(), "/v1/chat/completions");
+        assert_eq!(
+            ai_resource_workload_snapshot(AiWorkload::Llm)["holder_workload"],
+            "llm"
+        );
+        request
+            .respond(
+                Response::from_string("{}")
+                    .with_header(Header::from_bytes("X-Harbor-Execution-Stopped", "true").unwrap()),
+            )
+            .unwrap();
+        assert_eq!(inference.join().unwrap().status_code(), StatusCode(200));
+        drop(acquire_ai_resource_lease(AiWorkload::CatRecordingVerifier).unwrap());
+
+        let uncertain =
+            std::thread::spawn(move || proxy.forward(Method::Post, "/v1/chat/completions", b"{}"));
+        server
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap()
+            .respond(Response::from_string("{}").with_status_code(503))
+            .unwrap();
+        assert_eq!(uncertain.join().unwrap().status_code(), StatusCode(503));
+        let failure = acquire_ai_resource_lease(AiWorkload::CatRecordingVerifier).unwrap_err();
+        assert_eq!(failure.kind(), AiLeaseErrorKind::Quarantined);
+    }
+
     #[test]
     fn external_model_runtime_must_be_loopback_http() {
         assert!(validate_loopback_upstream("http://127.0.0.1:8792").is_ok());
@@ -166,10 +361,14 @@ mod tests {
 
     #[test]
     fn external_model_runtime_exposes_only_required_routes() {
-        let proxy = ModelApiProxy::from_env().expect("default proxy");
-        let response = proxy.route(Method::Get, "/v1/models", &[]);
+        let proxy = ModelApiProxy::from_env(
+            VerifierTokens::current_only("test_model_token_0123456789abcdef0123456789abcdef")
+                .unwrap(),
+        )
+        .expect("default proxy");
+        let response = proxy.route(Method::Get, "/v1/models", &[], &[]);
         assert_eq!(response.status_code(), StatusCode(404));
-        let response = proxy.route(Method::Options, "/v1/chat/completions", &[]);
+        let response = proxy.route(Method::Options, "/v1/chat/completions", &[], &[]);
         assert_eq!(response.status_code(), StatusCode(204));
     }
 }

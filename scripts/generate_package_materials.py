@@ -1078,7 +1078,11 @@ def runtime_license_review(
                 "copyright_file": copyright_file,
                 "declared_license": declared,
                 "name": name,
-                "purl": f"pkg:deb/ubuntu/{name}@{version}?arch={architecture}",
+                "purl": (
+                    f"pkg:generic/spacemit-com/{name}@{version}?arch={architecture}"
+                    if name in {"spacemit-llama.cpp", "spine-runtime"}
+                    else f"pkg:deb/ubuntu/{name}@{version}?arch={architecture}"
+                ),
                 "review_status": "approved" if approved else "blocked",
                 "version": version,
             }

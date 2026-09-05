@@ -1,7 +1,40 @@
 {
   "architecture": "riscv64",
-  "packages": [],
-  "repository": "https://github.com/Bean-Harbor/HarborBeacon",
+  "packages": [
+    {
+      "artifact": {
+        "filename": "spacemit-llama.cpp.riscv64.0.1.8.tar.gz",
+        "sha256": "7cbe228b305f712400df35cc3a7888a4e226723034f1ebb5a2ba8ca878e24a6f"
+      },
+      "blocking_reason": "vendor_transitive_notice_review_pending",
+      "concluded_license": "MIT",
+      "copyright_file": {
+        "installed_path": "/usr/share/doc/harboros-model-runtime/vendor-licenses/spacemit-llama.cpp/LICENSE",
+        "sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d"
+      },
+      "declared_license": "MIT",
+      "name": "spacemit-llama.cpp",
+      "review_status": "blocked",
+      "version": "0.1.8"
+    },
+    {
+      "artifact": {
+        "filename": "spine-runtime.riscv64.0.6.1.tar.gz",
+        "sha256": "9b2060b0e17c352d859b761bd8bc839ab9b248e1c964dd9a633ba3a0b9932155"
+      },
+      "blocking_reason": "vendor_transitive_notice_review_pending",
+      "concluded_license": "MIT",
+      "copyright_file": {
+        "installed_path": "/usr/share/doc/harboros-model-runtime/vendor-licenses/spine-runtime/LICENSE",
+        "sha256": "15ff61d10e7354ef9448b24b7e3cb5c4d2e6cda9288f6bbd87bad9573ace430a"
+      },
+      "declared_license": "MIT",
+      "name": "spine-runtime",
+      "review_status": "blocked",
+      "version": "0.6.1"
+    }
+  ],
+  "repository": "https://github.com/spacemit-com",
   "schema_version": 1,
-  "suite": "source"
+  "suite": "vendor-release"
 }

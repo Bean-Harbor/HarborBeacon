@@ -63,18 +63,18 @@ EXPECTED_MODEL_EVIDENCE = {
     "semantic-router-bootstrap-llm": [
         {
             "filename": "LICENSE",
-            "id": "model-license-qwen2.5-0.5b-instruct",
+            "id": "model-license-qwen2.5-1.5b-instruct-gguf",
             "installed_path": (
                 "/usr/share/doc/harboros-model-runtime/model-licenses/"
-                "qwen2.5-0.5b-instruct/LICENSE"
+                "qwen2.5-1.5b-instruct-gguf/LICENSE"
             ),
-            "kind": "model-license-qwen2.5-0.5b-instruct",
+            "kind": "model-license-qwen2.5-1.5b-instruct-gguf",
             "purpose": "distribution-license",
-            "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+            "revision": "91cad51170dc346986eccefdc2dd33a9da36ead9",
             "sha256": "832dd9e00a68dd83b3c3fb9f5588dad7dcf337a0db50f7d9483f310cd292e92e",
             "source": (
-                "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/"
-                "7ae557604adf67be50417f59c2c2f167def9a775/LICENSE"
+                "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/"
+                "91cad51170dc346986eccefdc2dd33a9da36ead9/LICENSE"
             ),
         }
     ],
@@ -113,10 +113,10 @@ EXPECTED_MODEL_EVIDENCE = {
 EXPECTED_NOTICE_REVIEWS = {
     "semantic-router-bootstrap-llm": {
         "license_paths": ["LICENSE"],
-        "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+        "revision": "91cad51170dc346986eccefdc2dd33a9da36ead9",
         "source": (
-            "https://huggingface.co/api/models/Qwen/Qwen2.5-0.5B-Instruct/tree/"
-            "7ae557604adf67be50417f59c2c2f167def9a775?recursive=true&expand=false"
+            "https://huggingface.co/api/models/Qwen/Qwen2.5-1.5B-Instruct-GGUF/tree/"
+            "91cad51170dc346986eccefdc2dd33a9da36ead9?recursive=true&expand=false"
         ),
     },
     "rag-embedding-model": {

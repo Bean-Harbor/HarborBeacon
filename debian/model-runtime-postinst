@@ -140,6 +140,8 @@ if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
 fi
 
 /usr/lib/harboros-model-runtime/ensure-data-layout /data/models
+HARBORBEACON_RUNTIME_ENV_FILE=/etc/default/harboros-fixed-models \
+  /usr/lib/harboros-model-runtime/ensure-model-token
 if [ -e /data/models/current.new ] || [ -L /data/models/current.new ]; then
   echo "error: stale or unsafe /data/models/current.new exists" >&2
   exit 1

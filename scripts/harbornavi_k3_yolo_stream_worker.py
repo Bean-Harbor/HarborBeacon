@@ -264,6 +264,11 @@ def build_session(args: argparse.Namespace) -> tuple[ort.InferenceSession, int, 
         raise ValueError("target label is not present in the label file")
     if args.provider != "cpu":
         raise ValueError("EVT.1 YOLO provider must be cpu")
+    if hasattr(os, "sched_getaffinity"):
+        cpu_cores = os.sched_getaffinity(0) & set(range(8))
+        if not cpu_cores:
+            raise RuntimeError("no K3 CPU cores available")
+        os.sched_setaffinity(0, cpu_cores)
     providers = provider_list("cpu")
     options = ort.SessionOptions()
     cpu_threads = int(os.environ.get("HARBOR_K3_YOLO_CPU_THREADS", "1"))

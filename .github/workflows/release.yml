@@ -1,17 +1,121 @@
-name: legacy-release-disabled
+name: release
 
 on:
   workflow_dispatch:
-
-permissions:
-  contents: read
+    inputs:
+      tag:
+        description: "Tag to release"
+        required: true
+        default: "1.0.0"
 
 jobs:
-  legacy-amd64-release-disabled:
+  build-deb:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    timeout-minutes: 90
+
     steps:
-      - name: Reject the obsolete public release path
+      - name: Checkout HarborBeacon
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
         run: |
-          echo "The legacy amd64 packager cannot satisfy the HarborOS K3 component contract."
-          echo "Use k3-evt-package.yml and the central signed HarborOS APT snapshot."
-          exit 1
+          rustup target add x86_64-unknown-linux-gnu
+
+      - name: Cache cargo builds
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binary
+        run: cargo build --release --bin harboros-beacon --target x86_64-unknown-linux-gnu
+
+      - name: Download bootstrap LLM
+        run: |
+          python3 scripts/fetch_hf_bootstrap_model.py \
+            --model-id Qwen/Qwen2.5-0.5B-Instruct \
+            --revision 7ae557604adf67be50417f59c2c2f167def9a775 \
+            --output ./dist/bootstrap-models/qwen2.5-0.5b-instruct
+
+      - name: Create deb package
+        run: |
+          VERSION="${{ inputs.tag }}"
+          PKG_NAME="harboros-beacon_${VERSION}_linux_amd64"
+          PKG_DIR="./deb-package/${PKG_NAME}"
+          BOOTSTRAP_MODEL_DIR="./dist/bootstrap-models/qwen2.5-0.5b-instruct"
+          BOOTSTRAP_MODEL_PKG_DIR="${PKG_DIR}/mnt/software/harborbeacon-agent-ci/model-store/runtimes/harbor-candle/bootstrap-llm"
+
+          mkdir -p ${PKG_DIR}/DEBIAN
+          mkdir -p ${PKG_DIR}/usr/bin
+          mkdir -p ${PKG_DIR}/usr/lib/harboros-beacon
+          mkdir -p ${PKG_DIR}/etc/systemd/system
+
+          cp ./target/x86_64-unknown-linux-gnu/release/harboros-beacon ${PKG_DIR}/usr/bin/harboros-beacon
+          chmod 0755 ${PKG_DIR}/usr/bin/harboros-beacon
+
+          cp ./debian/reconcile-legacy-semantic-router ${PKG_DIR}/usr/lib/harboros-beacon/
+          chmod 0755 ${PKG_DIR}/usr/lib/harboros-beacon/reconcile-legacy-semantic-router
+
+          test -f "${BOOTSTRAP_MODEL_DIR}/model.safetensors"
+          mkdir -p "${BOOTSTRAP_MODEL_PKG_DIR}"
+          cp -a "${BOOTSTRAP_MODEL_DIR}/." "${BOOTSTRAP_MODEL_PKG_DIR}/"
+
+          cp ./debian/harboros-beacon.service ${PKG_DIR}/etc/systemd/system/
+          chmod 0644 ${PKG_DIR}/etc/systemd/system/harboros-beacon.service
+
+          mkdir -p ${PKG_DIR}/usr/lib/harboros-beacon
+          cp ./debian/validate-harborbeacon-service-auth ${PKG_DIR}/usr/lib/harboros-beacon/
+          chmod 0755 ${PKG_DIR}/usr/lib/harboros-beacon/validate-harborbeacon-service-auth
+          cp ./debian/ensure-harborbeacon-model-token ${PKG_DIR}/usr/lib/harboros-beacon/
+          chmod 0755 ${PKG_DIR}/usr/lib/harboros-beacon/ensure-harborbeacon-model-token
+
+          cp ./debian/control ${PKG_DIR}/DEBIAN/control
+          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g" ${PKG_DIR}/DEBIAN/control
+          sed -i "s/ARCH_PLACEHOLDER/amd64/g" ${PKG_DIR}/DEBIAN/control
+
+          cp ./debian/postinst ${PKG_DIR}/DEBIAN/postinst
+          chmod 0755 ${PKG_DIR}/DEBIAN/postinst
+
+          cp ./debian/prerm ${PKG_DIR}/DEBIAN/prerm
+          chmod 0755 ${PKG_DIR}/DEBIAN/prerm
+
+          bash -n \
+            ${PKG_DIR}/DEBIAN/postinst \
+            ${PKG_DIR}/DEBIAN/prerm \
+            ${PKG_DIR}/usr/lib/harboros-beacon/validate-harborbeacon-service-auth \
+            ${PKG_DIR}/usr/lib/harboros-beacon/ensure-harborbeacon-model-token \
+            ${PKG_DIR}/usr/lib/harboros-beacon/reconcile-legacy-semantic-router
+          find "${PKG_DIR}" -type d -exec chmod a-s,u=rwx,go=rx {} +
+          dpkg-deb --root-owner-group --build ${PKG_DIR}
+          DEB_PATH="./deb-package/${PKG_NAME}.deb"
+          CONTENTS_PATH="./deb-package/${PKG_NAME}.contents"
+          dpkg-deb --contents "${DEB_PATH}" > "${CONTENTS_PATH}"
+          grep -F './usr/bin/harboros-beacon' "${CONTENTS_PATH}"
+          grep -F './etc/systemd/system/harboros-beacon.service' "${CONTENTS_PATH}"
+          grep -F './usr/lib/harboros-beacon/validate-harborbeacon-service-auth' "${CONTENTS_PATH}"
+          grep -F './usr/lib/harboros-beacon/ensure-harborbeacon-model-token' "${CONTENTS_PATH}"
+          grep -F './usr/lib/harboros-beacon/reconcile-legacy-semantic-router' "${CONTENTS_PATH}"
+          if grep -Eq 'harbor-model-api|semantic-router\.service|etc/default/semantic-router' "${CONTENTS_PATH}"; then
+            echo 'error: AMD64 package contains standalone semantic-router lifecycle artifacts' >&2
+            exit 1
+          fi
+          mkdir -p ./artifacts/
+          mv "${DEB_PATH}" ./artifacts/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.tag }}
+          name: v${{ inputs.tag }}
+          generate_release_notes: true
+          files: |
+            ./artifacts/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

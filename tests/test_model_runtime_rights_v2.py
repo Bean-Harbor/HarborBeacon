@@ -45,7 +45,7 @@ class ModelRuntimeRightsV2Tests(unittest.TestCase):
         self.assertEqual(
             [item["id"] for item in evidence],
             [
-                "model-license-qwen2.5-0.5b-instruct",
+                "model-license-qwen2.5-1.5b-instruct-gguf",
                 "model-license-declaration-jina-embeddings-v2-base-zh",
                 "model-distribution-license-jina-embeddings-v2-base-zh",
             ],
@@ -338,17 +338,26 @@ class ModelRuntimeRightsV2Tests(unittest.TestCase):
     def test_model_runtime_dependency_contract_rejects_drift(self):
         expected_dependencies = [
             "libc6",
+            "libstdc++6",
+            "libgcc-s1",
+            "libatomic1",
             "ca-certificates",
             "adduser",
             "curl",
             "init-system-helpers",
+            "python3",
+            "python3-numpy",
+            "python3-spacemit-ort (= 2.0.3+3)",
+            "spacemit-onnxruntime (= 2.0.3+3)",
+            "spacemit-tcm (= 3.0.0+3)",
             "harboros-system (>= 0.1.0~evt.1)",
             "harboros-system (<< 0.2)",
         ]
         contract = self.dependencies.load_dependency_contract(
             self.runtime_manifest_path, self.control_path
         )
-        self.assertEqual(contract["bundled_runtime_dependencies"], [])
+        self.assertEqual(contract["bundled_runtime_dependencies"],
+                         ["spacemit-llama.cpp=0.1.8", "spine-runtime=0.6.1"])
         self.assertEqual(contract["debian_control_dependencies"], expected_dependencies)
 
         manifest = json.loads(self.runtime_manifest_path.read_text(encoding="utf-8"))
@@ -472,7 +481,7 @@ class ModelRuntimeRightsV2Tests(unittest.TestCase):
             "predicate": {
                 "buildDefinition": {
                     "externalParameters": {
-                        "bundled_runtime_dependencies": [],
+                        "bundled_runtime_dependencies": contract["bundled_runtime_dependencies"],
                         "debian_control_dependencies": contract[
                             "debian_control_dependencies"
                         ],

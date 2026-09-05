@@ -14,6 +14,7 @@ const DEFAULT_LEASE_QUEUE_CAPACITY: usize = 8;
 const MAX_LEASE_QUEUE_CAPACITY: usize = 64;
 const DEFAULT_LEASE_WAIT_TIMEOUT_MS: u64 = 60_000;
 const MAX_LEASE_WAIT_TIMEOUT_MS: u64 = 300_000;
+const PRIORITY_AGING_INTERVAL: Duration = Duration::from_secs(1);
 pub const AI_RESOURCE_QUEUE_MODE: &str = "ai_cluster_lease";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,6 +231,14 @@ struct LeaseWaiter {
     priority: u8,
     resource_mask: u8,
     enqueued_at: Instant,
+}
+
+impl LeaseWaiter {
+    fn scheduling_key(&self) -> (u8, u64) {
+        let aging = (self.enqueued_at.elapsed().as_millis() / PRIORITY_AGING_INTERVAL.as_millis())
+            .min(u8::MAX as u128) as u8;
+        (self.priority.saturating_sub(aging), self.ticket)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -507,7 +516,10 @@ impl AiResourceScheduler {
         let state = self.lock_state();
         json!({
             "kind": "k3_ai_resource_scheduler_v2",
-            "mode": "bounded_priority_fifo_lease",
+            "mode": "bounded_aging_priority_fifo_lease",
+            "priority_aging_interval_ms": duration_millis(PRIORITY_AGING_INTERVAL),
+            "model_residency_holds_lease": false,
+            "cluster_1_policy": "request_scoped_shared_llm_cat_verifier_vlm",
             "atomic_multi_resource_leases": true,
             "queue_capacity_per_cluster": self.queue_capacity,
             "queue_capacity_per_resource": self.queue_capacity,
@@ -686,7 +698,7 @@ fn workload_snapshot(
         "required_resource_ids": required_resource_ids,
         "blocked_resource_ids": blocked_resource_ids,
         "atomic_resource_lease": workload.required_resources().len() > 1,
-        "mode": "bounded_priority_fifo_lease",
+        "mode": "bounded_aging_priority_fifo_lease",
         "queue_capacity": scheduler.queue_capacity,
         "wait_timeout_ms": duration_millis(scheduler.wait_timeout),
         "started_total": metrics.acquired_total,
@@ -764,7 +776,7 @@ fn can_grant_new_request(state: &SchedulerState, workload: AiWorkload) -> bool {
         && !state.waiters.iter().any(|waiter| {
             resources_overlap(waiter.resource_mask, resource_mask)
                 && resources_are_free(state, waiter.resource_mask)
-                && (waiter.priority, waiter.ticket) <= (workload.priority(), u64::MAX)
+                && waiter.scheduling_key() <= (workload.priority(), u64::MAX)
         })
 }
 
@@ -777,7 +789,7 @@ fn waiter_can_be_granted(state: &SchedulerState, ticket: u64) -> bool {
             other.ticket != waiter.ticket
                 && resources_overlap(other.resource_mask, waiter.resource_mask)
                 && resources_are_free(state, other.resource_mask)
-                && (other.priority, other.ticket) < (waiter.priority, waiter.ticket)
+                && other.scheduling_key() < waiter.scheduling_key()
         })
 }
 
@@ -1067,6 +1079,30 @@ mod tests {
         assert_eq!(error.kind(), AiLeaseErrorKind::QueueFull);
         drop(holder);
         drop(waiter.join().unwrap().expect("queued VLM lease"));
+    }
+
+    #[test]
+    fn aged_background_work_cannot_be_starved_by_continuous_llm_requests() {
+        let scheduler = Arc::new(AiResourceScheduler::new(4, Duration::from_secs(2)));
+        let holder = scheduler.acquire(AiWorkload::Llm).unwrap();
+        let other = Arc::clone(&scheduler);
+        let (acquired, received) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            let lease = other.acquire(AiWorkload::Vlm).unwrap();
+            acquired.send(()).unwrap();
+            drop(lease);
+        });
+        wait_for_queue_depth(&scheduler, 1);
+        {
+            let mut state = scheduler.lock_state();
+            state.waiters.front_mut().unwrap().enqueued_at =
+                Instant::now() - Duration::from_secs(11);
+        }
+        drop(holder);
+        let llm = scheduler.acquire(AiWorkload::Llm).unwrap();
+        received.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(llm);
+        waiter.join().unwrap();
     }
 
     #[test]

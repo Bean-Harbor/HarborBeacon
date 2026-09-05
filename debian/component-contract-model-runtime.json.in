@@ -2,11 +2,13 @@
   "contracts": [
     {
       "capabilities": [
-        "candle-only",
-        "jina-embeddings-v2",
+        "fixed-local-models",
+        "jina-onnx-fp32-cpu-768-mean-l2-v1",
         "lazy-model-loading",
-        "loopback-8792-only",
-        "qwen2.5-0.5b-instruct",
+        "loopback-8792-facade",
+        "loopback-8793-managed-child",
+        "spacemit-llama.cpp-0.1.8-spine-0.6.1",
+        "qwen2.5-1.5b-instruct-q4-k-m",
         "signed-model-materials"
       ],
       "id": "harboros.k3.model-runtime",

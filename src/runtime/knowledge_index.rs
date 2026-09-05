@@ -512,7 +512,7 @@ impl KnowledgeIndexService {
         snapshot: &KnowledgeIndexSnapshot,
         model_center_state: &AdminModelCenterState,
     ) -> KnowledgeEmbeddingWarmupStats {
-        self.warm_embedding_cache_inner(snapshot, model_center_state, None, None)
+        self.warm_embedding_cache_inner(snapshot, model_center_state, None, None, None)
     }
 
     pub fn warm_embedding_cache_with_deadline(
@@ -522,7 +522,30 @@ impl KnowledgeIndexService {
         deadline: Instant,
         timeout: Duration,
     ) -> KnowledgeEmbeddingWarmupStats {
-        self.warm_embedding_cache_inner(snapshot, model_center_state, Some(deadline), Some(timeout))
+        self.warm_embedding_cache_inner(
+            snapshot,
+            model_center_state,
+            Some(deadline),
+            Some(timeout),
+            None,
+        )
+    }
+
+    pub fn warm_embedding_cache_with_progress(
+        &self,
+        snapshot: &KnowledgeIndexSnapshot,
+        model_center_state: &AdminModelCenterState,
+        deadline: Instant,
+        timeout: Duration,
+        progress: &mut dyn FnMut(&KnowledgeEmbeddingWarmupStats),
+    ) -> KnowledgeEmbeddingWarmupStats {
+        self.warm_embedding_cache_inner(
+            snapshot,
+            model_center_state,
+            Some(deadline),
+            Some(timeout),
+            Some(progress),
+        )
     }
 
     fn warm_embedding_cache_inner(
@@ -531,6 +554,7 @@ impl KnowledgeIndexService {
         model_center_state: &AdminModelCenterState,
         deadline: Option<Instant>,
         timeout: Option<Duration>,
+        mut progress: Option<&mut dyn FnMut(&KnowledgeEmbeddingWarmupStats)>,
     ) -> KnowledgeEmbeddingWarmupStats {
         let candidate_count = self.embedding_warmup_candidate_count(snapshot);
         if embedding_deadline_expired(deadline) {
@@ -591,6 +615,19 @@ impl KnowledgeIndexService {
             model_center::embedding_endpoint_identity_with_state(model_center_state)
         {
             let identity_matches = embedding_store_matches_identity(&store, &identity);
+            if crate::runtime::fixed_models::FIXED && !identity_matches && !store.entries.is_empty()
+            {
+                if let Err(error) = preserve_embedding_generation(&embedding_store_path, &store) {
+                    stats.degraded = true;
+                    stats.last_error = Some(error);
+                    return stats;
+                }
+                store.entries.clear();
+                store.hnsw_entry_count = None;
+                store.vector_dimensions = None;
+                incremental_ready = false;
+                dirty = true;
+            }
             if store.entries.is_empty() && !identity_matches {
                 store.provider_key = Some(identity.provider_key);
                 store.model_endpoint_id = Some(identity.model_endpoint_id);
@@ -663,6 +700,9 @@ impl KnowledgeIndexService {
 
         for entry in &snapshot.manifest.entries {
             for chunk in embedding_chunks_for_entry(entry) {
+                if let Some(progress) = progress.as_mut() {
+                    progress(&stats);
+                }
                 let text = if chunk.indexed_text.trim().is_empty() {
                     chunk.text.trim()
                 } else {
@@ -744,6 +784,9 @@ impl KnowledgeIndexService {
                 dirty = true;
             }
         }
+        if let Some(progress) = progress.as_mut() {
+            progress(&stats);
+        }
 
         if incremental_ready {
             for entry in &mut store.entries {
@@ -820,6 +863,56 @@ fn embedding_store_matches_identity(
     store.provider_key.as_deref() == Some(identity.provider_key.as_str())
         && store.model_endpoint_id.as_deref() == Some(identity.model_endpoint_id.as_str())
         && store.model_name.as_deref() == Some(identity.model_name.as_str())
+}
+
+fn preserve_embedding_generation(
+    path: &Path,
+    store: &KnowledgeEmbeddingStore,
+) -> Result<(), String> {
+    let backup = path.with_extension("pre-fixed-models");
+    let name = path
+        .file_name()
+        .ok_or("embedding manifest has no filename")?;
+    if backup.join(name).is_file() {
+        return Ok(());
+    }
+    if backup.exists() {
+        return Err(format!(
+            "incomplete index backup already exists: {}",
+            backup.display()
+        ));
+    }
+    let temporary = path.with_extension(format!("backup-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&temporary).map_err(|error| format!("cannot create index backup: {error}"))?;
+    let result = (|| -> Result<(), String> {
+        let mut files = vec![path.to_path_buf()];
+        for candidate in [
+            embedding_vector_path(path, store),
+            embedding_hnsw_path(path, store),
+        ] {
+            if let Ok(file) = candidate {
+                if file.is_file() {
+                    files.push(file);
+                }
+            }
+        }
+        for file in files {
+            let destination = temporary.join(file.file_name().ok_or("invalid index filename")?);
+            fs::copy(&file, &destination)
+                .map_err(|error| format!("cannot preserve old index: {error}"))?;
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&destination)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| format!("cannot sync old index backup: {error}"))?;
+        }
+        fs::rename(&temporary, &backup)
+            .map_err(|error| format!("cannot commit index backup: {error}"))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&temporary);
+    }
+    result
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -3795,6 +3888,64 @@ mod tests {
         if path.exists() {
             let _ = fs::remove_dir_all(path);
         }
+    }
+
+    #[test]
+    fn embedding_generation_backup_restores_vectors_after_rebuild() {
+        let root = unique_dir("harborbeacon-embedding-backup");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("store.embeddings.json");
+        let previous = KnowledgeEmbeddingStore {
+            schema_version: EMBEDDING_STORE_SCHEMA_VERSION,
+            model_name: Some("old-candle-execution".into()),
+            vector_dimensions: Some(3),
+            entries: vec![KnowledgeEmbeddingEntry {
+                key: "note.md".into(),
+                path: "note.md".into(),
+                text_hash: "original".into(),
+                vector: vec![1.0, 0.0, 0.0],
+                ..KnowledgeEmbeddingEntry::default()
+            }],
+            ..KnowledgeEmbeddingStore::default()
+        };
+        save_embedding_store(&path, &previous).unwrap();
+        let compact = load_embedding_store(&path).unwrap();
+        let before = fs::read(&path).unwrap();
+        super::preserve_embedding_generation(&path, &compact).unwrap();
+        save_embedding_store(&path, &KnowledgeEmbeddingStore::default()).unwrap();
+        // A later rebuild must not replace the original rollback generation.
+        super::preserve_embedding_generation(&path, &KnowledgeEmbeddingStore::default()).unwrap();
+        let backup_path = path
+            .with_extension("pre-fixed-models")
+            .join(path.file_name().unwrap());
+        assert_eq!(fs::read(&backup_path).unwrap(), before);
+        let restored = load_embedding_store_with_vectors(&backup_path).unwrap();
+        assert_eq!(restored.model_name, previous.model_name);
+        assert_eq!(restored.entries[0].vector, vec![1.0, 0.0, 0.0]);
+        assert!(super::embedding_hnsw_path(&backup_path, &restored)
+            .unwrap()
+            .is_file());
+        cleanup_dir(&root);
+    }
+
+    #[test]
+    fn incomplete_embedding_backup_does_not_replace_source() {
+        let root = unique_dir("harborbeacon-embedding-backup-failure");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("store.embeddings.json");
+        fs::write(&path, b"original generation").unwrap();
+        fs::write(
+            path.with_extension("pre-fixed-models"),
+            b"occupied backup path",
+        )
+        .unwrap();
+        assert!(
+            super::preserve_embedding_generation(&path, &KnowledgeEmbeddingStore::default())
+                .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"original generation");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+        cleanup_dir(&root);
     }
 
     #[test]

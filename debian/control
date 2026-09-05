@@ -3,8 +3,7 @@ Version: VERSION_PLACEHOLDER
 Section: utils
 Priority: optional
 Architecture: ARCH_PLACEHOLDER
-Depends: libc6, openssl, ca-certificates, ffmpeg, harboros-system (>= 0.1.0~evt.1), harboros-system (<< 0.2), harborlink (>= 0.1.0~evt.1), harborlink (<< 0.2), harboros-model-runtime (= VERSION_PLACEHOLDER), harboros-cat-vision-runtime (= VERSION_PLACEHOLDER)
-Breaks: harboros-model-runtime (<< VERSION_PLACEHOLDER), harboros-cat-vision-runtime (<< VERSION_PLACEHOLDER)
+Depends: libc6, openssl, ca-certificates, harborlink (>= 0.1.0), harboros-im-gate, harboros-service-auth-abi (>= 1)
 Maintainer: Harborinno Ltd.
 Description: HarborNAS Beacon Service
   Background service for the HarborNAS Beacon feature.

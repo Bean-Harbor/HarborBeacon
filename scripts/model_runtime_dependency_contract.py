@@ -30,6 +30,12 @@ EXPECTED_SERVICES = [
         "unit": "harboros-model-runtime.service",
     }
 ]
+FIXED_BUNDLED_DEPENDENCIES = ["spacemit-llama.cpp=0.1.8", "spine-runtime=0.6.1"]
+FIXED_SERVICES = EXPECTED_SERVICES + [{
+    "bind": "127.0.0.1:8793",
+    "health": "http://127.0.0.1:8793/health",
+    "unit": "harboros-model-runtime.service",
+}]
 DEPENDENCY_RE = re.compile(
     r"^[a-z0-9][a-z0-9+.-]*(?::[a-z0-9][a-z0-9-]*)?"
     r"(?: \((?:<<|<=|=|>=|>>) [0-9A-Za-z.+:~_-]+\))?$"
@@ -172,20 +178,28 @@ def load_dependency_contract_bytes(
             raise ValueError("model runtime manifest source commit is invalid")
     elif manifest_source != source_commit or SOURCE_COMMIT_RE.fullmatch(source_commit) is None:
         raise ValueError("model runtime manifest source commit changed")
+    fixed = manifest.get("schema_version") == 3
+    bundled = FIXED_BUNDLED_DEPENDENCIES if fixed else []
     if (
-        manifest.get("schema_version") != 2
+        manifest.get("schema_version") not in (2, 3)
         or manifest.get("package") != PACKAGE
-        or manifest.get("services") != EXPECTED_SERVICES
-        or manifest.get("bundled_runtime_dependencies") != []
+        or manifest.get("services") != (FIXED_SERVICES if fixed else EXPECTED_SERVICES)
+        or manifest.get("bundled_runtime_dependencies") != bundled
     ):
         raise ValueError("model runtime manifest contract changed")
     _fields, control_dependencies = parse_debian_control(control_bytes)
     if manifest.get("debian_control_dependencies") != control_dependencies:
         raise ValueError("model runtime manifest differs from generated Debian Depends")
-    if any("spacemit" in value or "llama" in value for value in control_dependencies):
+    if not fixed and any("spacemit" in value or "llama" in value for value in control_dependencies):
         raise ValueError("model runtime Debian Depends includes a forbidden runtime")
+    if fixed:
+        pinned = {"python3-spacemit-ort (= 2.0.3+3)", "spacemit-onnxruntime (= 2.0.3+3)", "spacemit-tcm (= 3.0.0+3)"}
+        if {value for value in control_dependencies if "spacemit" in value} != pinned:
+            raise ValueError("fixed runtime must preserve the qualified vision runtime versions")
+        if any("llama" in value or "candle" in value for value in control_dependencies):
+            raise ValueError("native chat dependencies must remain package-private")
     return {
-        "bundled_runtime_dependencies": [],
+        "bundled_runtime_dependencies": bundled,
         "control_sha256": hashlib.sha256(control_bytes).hexdigest(),
         "debian_control_dependencies": control_dependencies,
     }

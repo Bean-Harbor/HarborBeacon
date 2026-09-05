@@ -1,0 +1,6 @@
+[
+  {"id": "chinese", "text": "\u95e8\u53e3\u7684\u732b\u4eca\u5929\u5403\u4e86\u591a\u5c11\u732b\u7cae\uff1f"},
+  {"id": "english", "text": "The delivery arrived at the front door yesterday afternoon."},
+  {"id": "mixed", "text": "HarborBeacon \u8bbe\u5907\u5728 K3 \u4e0a\u8fd0\u884c local inference\uff0c\u4fdd\u7559\u539f\u59cb\u8d44\u6599\u548c\u5f15\u7528\u3002"},
+  {"id": "long", "text": "\u8fd9\u662f\u5173\u4e8e\u5bb6\u5ead\u8d44\u6599\u68c0\u7d22\u7684\u957f\u6587\u672c\u3002", "repeat": 32}
+]

@@ -52,21 +52,21 @@ cargo_target_dir="$(cd "$cargo_target_dir" && pwd -P)"
 export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }--remap-path-prefix=${cargo_target_dir}=./target --remap-path-prefix=${repo_root}=."
 
 cargo build --locked --release --target "$target" \
-  --no-default-features --features external-model-runtime \
+  --no-default-features --features fixed-local-models \
   --bin harboros-beacon \
   --bin cat-sampling-plan \
   --bin harbornavi-k3-local-vision-smoke \
   --bin harbornavi-k3-multi-vision-smoke \
   --bin harbornavi-ha-mqtt-event-contract-smoke
 if cargo tree --locked --target "$target" \
-  --no-default-features --features external-model-runtime \
+  --no-default-features --features fixed-local-models \
   | grep -Eq '(^| )candle-(core|nn|transformers) '; then
   echo "error: K3 Beacon dependency tree still contains the embedded model runtime" >&2
   exit 2
 fi
 cargo metadata --locked --offline --format-version 1 \
   --filter-platform "$target" \
-  --no-default-features --features external-model-runtime \
+  --no-default-features --features fixed-local-models \
   > "$build_root/cargo-metadata.json"
 
 model_source_dir="config/harbornavi-k3/vision-models/mobilenetv2-cat-binary-v2-20260806"
@@ -103,7 +103,7 @@ install -m 0755 debian/migrate-cat-activity-state \
   "$pkg_dir/usr/lib/harborbeacon/migrate-cat-activity-state"
 install -m 0755 debian/verify-beacon-k3-generation \
   "$pkg_dir/usr/lib/harborbeacon/verify-k3-generation"
-install -m 0644 debian/harboros-beacon.service \
+install -m 0644 debian/n2/harboros-beacon.service \
   "$pkg_dir/usr/lib/systemd/system/harboros-beacon.service"
 install -m 0644 \
   "$model_source_dir/mobilenetv2_cat_binary_int8.onnx" \
@@ -122,11 +122,11 @@ python3 scripts/generate_cargo_license_sidecar.py \
   --cargo-metadata "$build_root/cargo-metadata.json" \
   --output "$pkg_dir/usr/share/doc/harboros-beacon/third-party-licenses.json"
 sed -e "s/VERSION_PLACEHOLDER/${DEBIAN_VERSION}/g" \
-  -e "s/ARCH_PLACEHOLDER/${deb_arch}/g" debian/control \
+  -e "s/ARCH_PLACEHOLDER/${deb_arch}/g" debian/n2/control \
   | sed "s/^Depends: .*/Depends: libc6, openssl, ca-certificates, adduser, init-system-helpers, harboros-system (>= 0.1.0~evt.1), harboros-system (<< 0.2), harborlink (>= 0.1.0~evt.1), harborlink (<< 0.2), harboros-model-runtime (= ${DEBIAN_VERSION}), harboros-cat-vision-runtime (= ${DEBIAN_VERSION}), ffmpeg, python3, python3-numpy, python3-pil, python3-opencv/" \
   > "$pkg_dir/DEBIAN/control"
-sed 's/\r$//' debian/postinst > "$pkg_dir/DEBIAN/postinst"
-sed 's/\r$//' debian/prerm > "$pkg_dir/DEBIAN/prerm"
+sed 's/\r$//' debian/n2/postinst > "$pkg_dir/DEBIAN/postinst"
+sed 's/\r$//' debian/n2/prerm > "$pkg_dir/DEBIAN/prerm"
 chmod 0755 "$pkg_dir/DEBIAN/postinst" "$pkg_dir/DEBIAN/prerm"
 sed "s/SOURCE_COMMIT_PLACEHOLDER/${source_commit}/g" \
   debian/component-contract-beacon.json.in \

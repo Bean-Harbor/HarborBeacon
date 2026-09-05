@@ -16,6 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+#[cfg(feature = "local-model-management")]
 use hf_hub::{
     api::{sync::ApiBuilder as HfApiBuilder, Progress as HfProgress},
     Cache as HfCache, Repo, RepoType,
@@ -180,8 +181,35 @@ use harborbeacon_local_agent::runtime::vision_event::{
     local_vision_event_store_stats_default, LocalVisionEvent, StoredLocalVisionEvent,
     MAX_LOCAL_VISION_EVENT_JSON_BYTES,
 };
+use harborbeacon_local_agent::service_auth::{
+    beacon_to_gate_sender_token, gate_to_beacon_verifier_tokens, validate_required_service_auth,
+    VerifierTokens, GATE_TO_BEACON_TOKEN_ENV,
+};
 
 const DEFAULT_HF_ENDPOINT: &str = "https://hf-mirror.com";
+
+#[cfg(not(feature = "local-model-management"))]
+#[path = "fixed_model_admin.rs"]
+mod fixed_model_admin;
+#[cfg(not(feature = "local-model-management"))]
+use fixed_model_admin::build_model_capabilities_response;
+
+fn fixed_model_error() -> Response<std::io::Cursor<Vec<u8>>> {
+    let mut response = ok_json(&json!({
+        "ok": false,
+        "error": {"code": "LOCAL_MODELS_FIXED", "message": "Local models are managed by the product."}
+    }));
+    response = response.with_status_code(StatusCode(403));
+    response
+}
+
+fn model_management_error(error: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    if error == harborbeacon_local_agent::runtime::fixed_models::LOCAL_MODELS_FIXED {
+        fixed_model_error()
+    } else {
+        error_json(StatusCode(422), error)
+    }
+}
 const HARBORBEACON_WEB_API_TOKEN_ENV: &str = "HARBORBEACON_WEB_API_TOKEN";
 const HARBOR_EDGE_ASSERTION_KEY_FILE_ENV: &str = "HARBOR_EDGE_ASSERTION_KEY_FILE";
 const EDGE_ASSERTION_VERSION: &str = "v1";
@@ -1960,6 +1988,7 @@ struct LocalModelCatalogItem {
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 struct ModelCapabilitiesResponse {
+    local_model_policy: &'static str,
     generated_at: String,
     checked_at: String,
     status: String,
@@ -4221,9 +4250,10 @@ impl AdminApi {
         raw_url: &str,
         headers: &[Header],
     ) -> Result<GateAuthenticatedPrincipal, GatePrincipalAuthError> {
-        let configured_token = env::var(HARBORBEACON_WEB_API_TOKEN_ENV).ok();
-        authenticate_gate_principal_with_workspace_loader(
-            configured_token.as_deref(),
+        let configured_tokens = gate_to_beacon_verifier_tokens()
+            .map_err(|error| GatePrincipalAuthError::new(StatusCode(503), error))?;
+        authenticate_gate_principal_with_workspace_loader_tokens(
+            Some(&configured_tokens),
             raw_url,
             headers,
             || self.load_active_workspace_id(),
@@ -7793,13 +7823,21 @@ impl AdminApi {
             prune_detection_job_history(&mut jobs);
         }
 
-        let ai_lease = acquire_ai_resource_lease(AiWorkload::Yolo).map_err(|error| {
-            let status = match error.kind() {
-                AiLeaseErrorKind::QueueFull => StatusCode(429),
-                AiLeaseErrorKind::WaitTimeout | AiLeaseErrorKind::Quarantined => StatusCode(503),
-            };
-            (status, format!("YOLO A100 resource is busy: {error}"))
-        })?;
+        let ai_lease = if provider == "cpu" {
+            None
+        } else {
+            Some(
+                acquire_ai_resource_lease(AiWorkload::Yolo).map_err(|error| {
+                    let status = match error.kind() {
+                        AiLeaseErrorKind::QueueFull => StatusCode(429),
+                        AiLeaseErrorKind::WaitTimeout | AiLeaseErrorKind::Quarantined => {
+                            StatusCode(503)
+                        }
+                    };
+                    (status, format!("YOLO A100 resource is busy: {error}"))
+                })?,
+            )
+        };
 
         let mut jobs = self.detection_jobs.lock().map_err(|_| {
             (
@@ -7945,7 +7983,7 @@ impl AdminApi {
                 projection: projection.clone(),
                 output_dir,
                 child: Some(child),
-                ai_lease: Some(ai_lease),
+                ai_lease,
             },
         );
         Ok(DetectionJobStartResponse {
@@ -9734,7 +9772,7 @@ impl AdminApi {
         };
         match self.admin_store.save_model_endpoint(endpoint) {
             Ok(state) => ok_json(&redact_model_endpoint_response(&state.models.endpoints)),
-            Err(error) => error_json(StatusCode(422), &error),
+            Err(error) => model_management_error(&error),
         }
     }
 
@@ -9757,7 +9795,7 @@ impl AdminApi {
         };
         match self.admin_store.patch_model_endpoint(&endpoint_id, patch) {
             Ok(state) => ok_json(&redact_model_endpoint_response(&state.models.endpoints)),
-            Err(error) => error_json(StatusCode(422), &error),
+            Err(error) => model_management_error(&error),
         }
     }
 
@@ -9812,6 +9850,19 @@ impl AdminApi {
         ok_json(&result)
     }
 
+    #[cfg(not(feature = "local-model-management"))]
+    fn handle_create_model_download(
+        &self,
+        _request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        fixed_model_error()
+    }
+
+    #[cfg(feature = "local-model-management")]
     fn handle_create_model_download(
         &self,
         request: &mut Request,
@@ -9909,6 +9960,19 @@ impl AdminApi {
         }
     }
 
+    #[cfg(not(feature = "local-model-management"))]
+    fn handle_update_model_store(
+        &self,
+        _request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        fixed_model_error()
+    }
+
+    #[cfg(feature = "local-model-management")]
     fn handle_update_model_store(
         &self,
         request: &mut Request,
@@ -9927,6 +9991,19 @@ impl AdminApi {
         }
     }
 
+    #[cfg(not(feature = "local-model-management"))]
+    fn handle_install_model_runtime(
+        &self,
+        _path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        fixed_model_error()
+    }
+
+    #[cfg(feature = "local-model-management")]
     fn handle_install_model_runtime(
         &self,
         path: &str,
@@ -9965,6 +10042,20 @@ impl AdminApi {
         })
     }
 
+    #[cfg(not(feature = "local-model-management"))]
+    fn handle_select_model_capability(
+        &self,
+        _path: &str,
+        _request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        fixed_model_error()
+    }
+
+    #[cfg(feature = "local-model-management")]
     fn handle_select_model_capability(
         &self,
         path: &str,
@@ -10046,6 +10137,7 @@ impl AdminApi {
         self.handle_model_capabilities(hints)
     }
 
+    #[cfg(feature = "local-model-management")]
     fn activate_selected_model_capability(
         &self,
         capability_id: &str,
@@ -10145,6 +10237,7 @@ impl AdminApi {
         Ok(result)
     }
 
+    #[cfg(feature = "local-model-management")]
     fn record_model_runtime_activation(
         &self,
         model_kind: ModelKind,
@@ -10190,6 +10283,19 @@ impl AdminApi {
         Ok(())
     }
 
+    #[cfg(not(feature = "local-model-management"))]
+    fn handle_cancel_model_download(
+        &self,
+        _path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        fixed_model_error()
+    }
+
+    #[cfg(feature = "local-model-management")]
     fn handle_cancel_model_download(
         &self,
         path: &str,
@@ -10243,7 +10349,7 @@ impl AdminApi {
                     route_policies: state.models.route_policies,
                 })
             }
-            Err(error) => error_json(StatusCode(422), &error),
+            Err(error) => model_management_error(&error),
         }
     }
 
@@ -12496,6 +12602,10 @@ fn principal_skips_manual_camera_connect_approval(principal: &AccessPrincipal) -
 
 fn main() {
     let cli = Cli::parse();
+    if let Err(error) = validate_required_service_auth() {
+        eprintln!("service authentication configuration failed: {error}");
+        std::process::exit(1);
+    }
     let device_registry_path = resolve_state_path(&cli.device_registry);
     let admin_state_path = resolve_state_path(&cli.admin_state);
     std::env::set_var(ADMIN_STATE_PATH_ENV, &admin_state_path);
@@ -12769,22 +12879,39 @@ fn authenticate_gate_principal_with_workspace_loader(
     headers: &[Header],
     load_active_workspace: impl FnOnce() -> Result<String, GatePrincipalAuthError>,
 ) -> Result<GateAuthenticatedPrincipal, GatePrincipalAuthError> {
-    validate_gate_service_bearer(configured_token, headers)?;
+    let configured_tokens = configured_token.map(|current| VerifierTokens {
+        current: current.to_string(),
+        previous: None,
+    });
+    authenticate_gate_principal_with_workspace_loader_tokens(
+        configured_tokens.as_ref(),
+        raw_url,
+        headers,
+        load_active_workspace,
+    )
+}
+
+fn authenticate_gate_principal_with_workspace_loader_tokens(
+    configured_tokens: Option<&VerifierTokens>,
+    raw_url: &str,
+    headers: &[Header],
+    load_active_workspace: impl FnOnce() -> Result<String, GatePrincipalAuthError>,
+) -> Result<GateAuthenticatedPrincipal, GatePrincipalAuthError> {
+    validate_gate_service_bearer(configured_tokens, headers)?;
     let active_workspace_id = load_active_workspace()?;
     authenticate_gate_principal_identity(raw_url, headers, &active_workspace_id)
 }
 
 fn validate_gate_service_bearer(
-    configured_token: Option<&str>,
+    configured_tokens: Option<&VerifierTokens>,
     headers: &[Header],
 ) -> Result<(), GatePrincipalAuthError> {
-    let expected_token = configured_token
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+    let configured_tokens = configured_tokens
+        .filter(|tokens| !tokens.current.trim().is_empty())
         .ok_or_else(|| {
             GatePrincipalAuthError::new(
                 StatusCode(503),
-                format!("{HARBORBEACON_WEB_API_TOKEN_ENV} is not configured"),
+                format!("{GATE_TO_BEACON_TOKEN_ENV} is not configured"),
             )
         })?;
     let actual_token = header_value(headers, "Authorization")
@@ -12792,7 +12919,7 @@ fn validate_gate_service_bearer(
         .ok_or_else(|| {
             GatePrincipalAuthError::new(StatusCode(401), "missing or invalid bearer token")
         })?;
-    if actual_token != expected_token {
+    if !configured_tokens.matches(&actual_token) {
         return Err(GatePrincipalAuthError::new(
             StatusCode(401),
             "missing or invalid bearer token",
@@ -15764,16 +15891,11 @@ fn deprecated_im_binding_response_html(manage_url: &str) -> Response<std::io::Cu
 }
 
 fn authorize_gateway_service_request(headers: &[Header]) -> Result<(), String> {
-    let expected =
-        env_var_with_legacy_alias("HARBORGATE_BEARER_TOKEN", "HARBOR_IM_GATEWAY_BEARER_TOKEN")
-            .or_else(|| env::var("IM_AGENT_SERVICE_TOKEN").ok())
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| "gateway service token is not configured".to_string())?;
+    let expected = gate_to_beacon_verifier_tokens()?;
     let actual = header_value(headers, "Authorization")
         .and_then(|value| parse_bearer_token(&value))
         .ok_or_else(|| "missing or invalid bearer token".to_string())?;
-    if actual != expected {
+    if !expected.matches(&actual) {
         return Err("missing or invalid bearer token".to_string());
     }
     Ok(())
@@ -17254,13 +17376,15 @@ fn run_knowledge_embedding_warmup_with_timeout(
     service: &KnowledgeIndexService,
     snapshot: &KnowledgeIndexSnapshot,
     model_center_state: &AdminModelCenterState,
+    progress: &mut dyn FnMut(&KnowledgeEmbeddingWarmupStats),
 ) -> KnowledgeEmbeddingWarmupStats {
     let timeout = knowledge_embedding_warmup_timeout();
-    service.warm_embedding_cache_with_deadline(
+    service.warm_embedding_cache_with_progress(
         snapshot,
         model_center_state,
         Instant::now() + timeout,
         timeout,
+        progress,
     )
 }
 
@@ -17320,7 +17444,34 @@ fn run_knowledge_index_job(
             }
             let embedding_warmup = if embedding_warmup_enabled {
                 let model_center_state = load_model_center_state();
-                run_knowledge_embedding_warmup_with_timeout(service, &snapshot, &model_center_state)
+                let total = service.embedding_warmup_candidate_count(&snapshot);
+                let mut last_progress = Instant::now();
+                let mut progress = |stats: &KnowledgeEmbeddingWarmupStats| {
+                    let processed = stats.completed + stats.skipped + stats.failed;
+                    if processed < total && last_progress.elapsed() < Duration::from_secs(1) {
+                        return;
+                    }
+                    // Preserve an asynchronous cancellation request while publishing progress.
+                    if knowledge_index_job_cancel_requested(store, &job.job_id) {
+                        return;
+                    }
+                    job.progress_percent =
+                        Some(85 + ((processed * 14 / total.max(1)).min(14) as u8));
+                    job.checkpoint["embedding_total"] = json!(total);
+                    job.checkpoint["embedding_completed"] = json!(stats.completed);
+                    job.checkpoint["embedding_skipped"] = json!(stats.skipped);
+                    job.checkpoint["embedding_failed"] = json!(stats.failed);
+                    if let Err(error) = store.save_knowledge_index_job(job.clone()) {
+                        eprintln!("knowledge embedding progress write failed: {error}");
+                    }
+                    last_progress = Instant::now();
+                };
+                run_knowledge_embedding_warmup_with_timeout(
+                    service,
+                    &snapshot,
+                    &model_center_state,
+                    &mut progress,
+                )
             } else {
                 let total = service.embedding_warmup_candidate_count(&snapshot);
                 KnowledgeEmbeddingWarmupStats {
@@ -20636,6 +20787,24 @@ fn build_local_model_catalog(
     build_local_model_catalog_for_roots(local_model_cache_roots(), download_jobs)
 }
 
+#[cfg(not(feature = "local-model-management"))]
+fn build_local_model_catalog_for_roots(
+    _cache_roots: Vec<String>,
+    _download_jobs: Vec<ModelDownloadJobRecord>,
+) -> LocalModelCatalogResponse {
+    LocalModelCatalogResponse {
+        generated_at: now_unix_string(),
+        checked_at: now_unix_string(),
+        status: "fixed".to_string(),
+        cache_roots: Vec::new(),
+        models: Vec::new(),
+        download_jobs: Vec::new(),
+        downloads: Vec::new(),
+        blockers: Vec::new(),
+        warnings: Vec::new(),
+    }
+}
+
 fn build_local_model_catalog_for_model_state(
     model_state: &AdminModelCenterState,
     download_jobs: Vec<ModelDownloadJobRecord>,
@@ -20646,6 +20815,7 @@ fn build_local_model_catalog_for_model_state(
     )
 }
 
+#[cfg(feature = "local-model-management")]
 fn build_local_model_catalog_for_roots(
     cache_roots: Vec<String>,
     download_jobs: Vec<ModelDownloadJobRecord>,
@@ -20682,6 +20852,7 @@ fn build_local_model_catalog_for_roots(
     }
 }
 
+#[cfg(feature = "local-model-management")]
 fn build_model_capabilities_response(
     model_state: &AdminModelCenterState,
     endpoints: &[ModelEndpoint],
@@ -20805,6 +20976,7 @@ fn build_model_capabilities_response(
     .to_string();
 
     ModelCapabilitiesResponse {
+        local_model_policy: harborbeacon_local_agent::runtime::fixed_models::policy(),
         generated_at: generated_at.clone(),
         checked_at: generated_at,
         status,
@@ -20821,6 +20993,16 @@ fn build_model_runtime_manager_response(
     runtime: &LocalModelRuntimeProjection,
 ) -> ModelRuntimeManagerResponse {
     let generated_at = now_unix_string();
+    if harborbeacon_local_agent::runtime::fixed_models::FIXED {
+        return ModelRuntimeManagerResponse {
+            generated_at: generated_at.clone(),
+            checked_at: generated_at,
+            status: if runtime.ready { "ready" } else { "degraded" }.to_string(),
+            runtimes: Vec::new(),
+            blockers: Vec::new(),
+            warnings: Vec::new(),
+        };
+    }
     let runtimes = model_runtime_records_for_state(model_state)
         .into_iter()
         .map(|record| model_runtime_status(record, runtime))
@@ -21005,6 +21187,7 @@ fn runtime_profile_is_external(profile: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "local-model-management")]
 fn build_model_capability_status(
     model_state: &AdminModelCenterState,
     capability_id: &str,
@@ -21273,6 +21456,7 @@ struct LocalModelCatalogSpec {
     acceptance_note: Option<&'static str>,
 }
 
+#[cfg(feature = "local-model-management")]
 fn local_model_catalog_specs() -> Vec<LocalModelCatalogSpec> {
     vec![
         LocalModelCatalogSpec {
@@ -21437,6 +21621,7 @@ fn local_model_catalog_specs() -> Vec<LocalModelCatalogSpec> {
     ]
 }
 
+#[cfg(feature = "local-model-management")]
 fn local_model_catalog_item(
     cache_roots: &[String],
     download_jobs: &[ModelDownloadJobRecord],
@@ -21446,6 +21631,7 @@ fn local_model_catalog_item(
     local_model_catalog_item_with_hardware(cache_roots, download_jobs, spec, &hardware)
 }
 
+#[cfg(feature = "local-model-management")]
 fn local_model_catalog_item_with_hardware(
     cache_roots: &[String],
     download_jobs: &[ModelDownloadJobRecord],
@@ -21572,6 +21758,7 @@ fn local_model_catalog_item_with_hardware(
     }
 }
 
+#[cfg(feature = "local-model-management")]
 fn local_model_catalog_spec_is_installable(spec: &LocalModelCatalogSpec) -> bool {
     spec.source_kind == "huggingface" && spec.repo_id.is_some()
 }
@@ -21583,6 +21770,7 @@ struct ModelHardwareRecommendation {
     recommendation_group: String,
 }
 
+#[cfg(feature = "local-model-management")]
 fn model_hardware_recommendation(
     spec: &LocalModelCatalogSpec,
     hardware: &HardwareReadinessResponse,
@@ -21660,6 +21848,7 @@ fn model_hardware_recommendation(
     )
 }
 
+#[cfg(feature = "local-model-management")]
 fn catalog_model_matches_kind(model: &LocalModelCatalogItem, kind: ModelKind) -> bool {
     let model_kind = model.model_kind.trim().to_ascii_lowercase();
     match kind {
@@ -21695,6 +21884,7 @@ fn catalog_model_matches_kind(model: &LocalModelCatalogItem, kind: ModelKind) ->
     }
 }
 
+#[cfg(feature = "local-model-management")]
 fn catalog_model_matches_kind_or_capability(
     model: &LocalModelCatalogItem,
     kind: ModelKind,
@@ -21707,6 +21897,7 @@ fn catalog_model_matches_kind_or_capability(
             .any(|capability| capability.eq_ignore_ascii_case(capability_id))
 }
 
+#[cfg(feature = "local-model-management")]
 fn model_capability_assignment<'a>(
     model_state: &'a AdminModelCenterState,
     capability_id: &str,
@@ -21717,6 +21908,7 @@ fn model_capability_assignment<'a>(
         .find(|binding| binding.capability_id == capability_id)
 }
 
+#[cfg(feature = "local-model-management")]
 fn canonical_catalog_model_id(
     runtime_identity: &str,
     catalog_models: &[LocalModelCatalogItem],
@@ -21735,6 +21927,7 @@ fn canonical_catalog_model_id(
         .or_else(|| non_empty_string(identity))
 }
 
+#[cfg(feature = "local-model-management")]
 fn configured_external_runtime_model_id(
     endpoints: &[ModelEndpoint],
     catalog_models: &[LocalModelCatalogItem],
@@ -21885,6 +22078,7 @@ fn probe_local_endpoint_runtime_model(
     Some(ProbedEndpointRuntimeModel { model_id, loaded })
 }
 
+#[cfg(feature = "local-model-management")]
 fn model_capability_installable_model(
     model: &LocalModelCatalogItem,
 ) -> ModelCapabilityInstallableModel {
@@ -22010,6 +22204,7 @@ fn latest_model_download_jobs(jobs: &[ModelDownloadJobRecord]) -> Vec<ModelDownl
     latest_jobs
 }
 
+#[cfg(feature = "local-model-management")]
 fn enrich_model_download_metadata(metadata: &mut Value, item: &LocalModelCatalogItem) {
     if !metadata.is_object() {
         *metadata = json!({});
@@ -22090,6 +22285,7 @@ fn model_download_job_timestamp(value: &str) -> u64 {
     value.trim().parse::<u64>().unwrap_or(0)
 }
 
+#[cfg(feature = "local-model-management")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ModelDownloadTransferStats {
     bytes_written: u64,
@@ -22099,8 +22295,10 @@ struct ModelDownloadTransferStats {
     message: String,
 }
 
+#[cfg(feature = "local-model-management")]
 const MODEL_DOWNLOAD_CANCELED: &str = "model download canceled";
 
+#[cfg(feature = "local-model-management")]
 fn spawn_model_download_worker(
     store: AdminConsoleStore,
     job: ModelDownloadJobRecord,
@@ -22112,6 +22310,7 @@ fn spawn_model_download_worker(
         .map_err(|error| format!("failed to spawn model download worker: {error}"))
 }
 
+#[cfg(feature = "local-model-management")]
 fn mark_model_download_spawn_failed(
     store: &AdminConsoleStore,
     mut job: ModelDownloadJobRecord,
@@ -22127,6 +22326,7 @@ fn mark_model_download_spawn_failed(
     store.save_model_download_job(job.clone()).unwrap_or(job)
 }
 
+#[cfg(feature = "local-model-management")]
 fn run_model_download_job(store: AdminConsoleStore, mut job: ModelDownloadJobRecord) {
     if model_download_job_cancel_requested(&store, &job.job_id) {
         mark_model_download_canceled(&store, job, "canceled_before_start");
@@ -22178,6 +22378,7 @@ fn run_model_download_job(store: AdminConsoleStore, mut job: ModelDownloadJobRec
     }
 }
 
+#[cfg(feature = "local-model-management")]
 fn mark_model_download_failed(
     store: &AdminConsoleStore,
     mut job: ModelDownloadJobRecord,
@@ -22194,6 +22395,7 @@ fn mark_model_download_failed(
     let _ = store.save_model_download_job(job);
 }
 
+#[cfg(feature = "local-model-management")]
 fn mark_model_download_canceled(
     store: &AdminConsoleStore,
     mut job: ModelDownloadJobRecord,
@@ -22209,6 +22411,7 @@ fn mark_model_download_canceled(
     let _ = store.save_model_download_job(job);
 }
 
+#[cfg(feature = "local-model-management")]
 fn model_download_job_cancel_requested(store: &AdminConsoleStore, job_id: &str) -> bool {
     matches!(
         store
@@ -22220,6 +22423,7 @@ fn model_download_job_cancel_requested(store: &AdminConsoleStore, job_id: &str) 
     )
 }
 
+#[cfg(feature = "local-model-management")]
 fn save_model_download_checkpoint(
     store: Option<&AdminConsoleStore>,
     job_id: &str,
@@ -22251,6 +22455,7 @@ fn save_model_download_checkpoint(
     let _ = store.save_model_download_job(job);
 }
 
+#[cfg(feature = "local-model-management")]
 fn run_model_download_transfer(
     job: &ModelDownloadJobRecord,
 ) -> Result<ModelDownloadTransferStats, String> {
@@ -22258,6 +22463,7 @@ fn run_model_download_transfer(
     run_model_download_transfer_with_progress(&mut job, None)
 }
 
+#[cfg(feature = "local-model-management")]
 fn run_model_download_transfer_with_progress(
     job: &mut ModelDownloadJobRecord,
     store: Option<&AdminConsoleStore>,
@@ -22380,6 +22586,7 @@ fn run_model_download_transfer_with_progress(
     })
 }
 
+#[cfg(feature = "local-model-management")]
 fn run_huggingface_snapshot_download(
     job: &mut ModelDownloadJobRecord,
     store: Option<&AdminConsoleStore>,
@@ -22660,12 +22867,14 @@ fn run_huggingface_snapshot_download(
     })
 }
 
+#[cfg(feature = "local-model-management")]
 fn huggingface_download_should_fallback_to_plain_http(error_message: &str) -> bool {
     let normalized = error_message.to_ascii_lowercase();
     normalized.contains("header content-range is missing")
         || normalized.contains("header etag is missing")
 }
 
+#[cfg(feature = "local-model-management")]
 fn huggingface_download_should_try_endpoint_fallback(error_message: &str) -> bool {
     let normalized = error_message.to_ascii_lowercase();
     normalized.contains("status code 404")
@@ -22676,6 +22885,7 @@ fn huggingface_download_should_try_endpoint_fallback(error_message: &str) -> boo
         || normalized.contains("connection")
 }
 
+#[cfg(feature = "local-model-management")]
 fn download_huggingface_file_via_plain_http(
     endpoint: &str,
     repo_id: &str,
@@ -22745,6 +22955,7 @@ fn download_huggingface_file_via_plain_http(
     Ok(())
 }
 
+#[cfg(feature = "local-model-management")]
 fn huggingface_resolve_url(
     endpoint: &str,
     repo_id: &str,
@@ -22770,6 +22981,7 @@ fn huggingface_resolve_url(
     Ok(url)
 }
 
+#[cfg(feature = "local-model-management")]
 fn partial_snapshot_download_path(destination: &Path) -> PathBuf {
     let mut partial = destination.to_path_buf();
     let file_name = destination
@@ -22780,6 +22992,7 @@ fn partial_snapshot_download_path(destination: &Path) -> PathBuf {
     partial
 }
 
+#[cfg(feature = "local-model-management")]
 #[derive(Debug, Clone)]
 struct HfModelDownloadProgress {
     store: Option<AdminConsoleStore>,
@@ -22794,6 +23007,7 @@ struct HfModelDownloadProgress {
     last_saved_percent: u8,
 }
 
+#[cfg(feature = "local-model-management")]
 impl HfModelDownloadProgress {
     fn new(
         store: Option<AdminConsoleStore>,
@@ -22855,6 +23069,7 @@ impl HfModelDownloadProgress {
     }
 }
 
+#[cfg(feature = "local-model-management")]
 impl HfProgress for HfModelDownloadProgress {
     fn init(&mut self, size: usize, filename: &str) {
         self.current_file_size = size as u64;
@@ -22876,6 +23091,7 @@ impl HfProgress for HfModelDownloadProgress {
     }
 }
 
+#[cfg(feature = "local-model-management")]
 fn model_download_huggingface_repo_id(job: &ModelDownloadJobRecord) -> Option<String> {
     model_download_metadata_string(&job.metadata, "repo_id").or_else(|| {
         let source_kind = model_download_metadata_string(&job.metadata, "source_kind")
@@ -22885,6 +23101,7 @@ fn model_download_huggingface_repo_id(job: &ModelDownloadJobRecord) -> Option<St
     })
 }
 
+#[cfg(feature = "local-model-management")]
 fn model_download_huggingface_endpoint(metadata: &Value) -> String {
     model_download_huggingface_endpoints(metadata)
         .into_iter()
@@ -22892,6 +23109,7 @@ fn model_download_huggingface_endpoint(metadata: &Value) -> String {
         .unwrap_or_else(|| DEFAULT_HF_ENDPOINT.to_string())
 }
 
+#[cfg(feature = "local-model-management")]
 fn model_download_huggingface_endpoints(metadata: &Value) -> Vec<String> {
     let mut endpoints = Vec::new();
     if let Some(items) = metadata.get("hf_endpoints").and_then(Value::as_array) {
@@ -22917,11 +23135,13 @@ fn model_download_huggingface_endpoints(metadata: &Value) -> Vec<String> {
     endpoints
 }
 
+#[cfg(feature = "local-model-management")]
 fn normalize_huggingface_endpoint(value: &str) -> Option<String> {
     let normalized = value.trim().trim_end_matches('/').to_string();
     (!normalized.is_empty()).then_some(normalized)
 }
 
+#[cfg(feature = "local-model-management")]
 fn push_normalized_huggingface_endpoint(endpoints: &mut Vec<String>, value: &str) {
     let Some(endpoint) = normalize_huggingface_endpoint(value) else {
         return;
@@ -22931,6 +23151,7 @@ fn push_normalized_huggingface_endpoint(endpoints: &mut Vec<String>, value: &str
     }
 }
 
+#[cfg(feature = "local-model-management")]
 fn model_download_metadata_string(metadata: &Value, key: &str) -> Option<String> {
     metadata
         .get(key)
@@ -22938,6 +23159,7 @@ fn model_download_metadata_string(metadata: &Value, key: &str) -> Option<String>
         .and_then(non_empty_string)
 }
 
+#[cfg(feature = "local-model-management")]
 fn model_download_allow_patterns(metadata: &Value) -> Vec<String> {
     let configured = metadata
         .get("allow_patterns")
@@ -22981,6 +23203,7 @@ fn model_download_allow_patterns(metadata: &Value) -> Vec<String> {
     .collect()
 }
 
+#[cfg(feature = "local-model-management")]
 fn model_snapshot_file_allowed(filename: &str, allow_patterns: &[String]) -> bool {
     if safe_snapshot_relative_path(filename).is_err() {
         return false;
@@ -23004,6 +23227,7 @@ fn model_snapshot_file_allowed(filename: &str, allow_patterns: &[String]) -> boo
         .any(|pattern| wildcard_match(pattern, &normalized))
 }
 
+#[cfg(feature = "local-model-management")]
 fn wildcard_match(pattern: &str, value: &str) -> bool {
     let pattern = pattern.as_bytes();
     let value = value.as_bytes();
@@ -23036,6 +23260,7 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
     pattern_index == pattern.len()
 }
 
+#[cfg(feature = "local-model-management")]
 fn safe_snapshot_relative_path(filename: &str) -> Result<PathBuf, String> {
     let trimmed = filename.trim();
     if trimmed.is_empty() {
@@ -23053,6 +23278,7 @@ fn safe_snapshot_relative_path(filename: &str) -> Result<PathBuf, String> {
     Ok(path.to_path_buf())
 }
 
+#[cfg(feature = "local-model-management")]
 fn huggingface_token_from_env() -> Option<String> {
     ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"]
         .into_iter()
@@ -23063,6 +23289,7 @@ fn huggingface_token_from_env() -> Option<String> {
         })
 }
 
+#[cfg(feature = "local-model-management")]
 fn merge_model_download_metadata(metadata: &mut Value, patch: Value) {
     if !metadata.is_object() {
         *metadata = json!({});
@@ -23079,6 +23306,7 @@ fn merge_model_download_metadata(metadata: &mut Value, patch: Value) {
     }
 }
 
+#[cfg(feature = "local-model-management")]
 fn model_path_size(path: &Path) -> Result<u64, String> {
     let metadata = path
         .metadata()
@@ -23107,6 +23335,7 @@ fn model_path_size(path: &Path) -> Result<u64, String> {
     Ok(total)
 }
 
+#[cfg(feature = "local-model-management")]
 fn model_download_source_url(metadata: &Value) -> Option<String> {
     metadata
         .get("source_url")
@@ -23120,6 +23349,7 @@ fn model_download_source_url(metadata: &Value) -> Option<String> {
         })
 }
 
+#[cfg(feature = "local-model-management")]
 fn model_download_source_file_path(source: &str) -> Option<PathBuf> {
     let path = PathBuf::from(source);
     if path.exists() {
@@ -23134,10 +23364,12 @@ fn model_download_source_file_path(source: &str) -> Option<PathBuf> {
     None
 }
 
+#[cfg(feature = "local-model-management")]
 fn default_model_download_target_path(model_id: &str) -> String {
     default_model_download_target_path_in_root(&default_model_store_root(), model_id)
 }
 
+#[cfg(feature = "local-model-management")]
 fn default_model_download_target_path_for_model_state(
     model_state: &AdminModelCenterState,
     model_id: &str,
@@ -23145,6 +23377,7 @@ fn default_model_download_target_path_for_model_state(
     default_model_download_target_path_in_root(&model_store_root(model_state), model_id)
 }
 
+#[cfg(feature = "local-model-management")]
 fn default_model_download_target_path_in_root(root: &str, model_id: &str) -> String {
     if model_id.trim() == "Qwen/Qwen2.5-0.5B-Instruct" {
         return Path::new(root)
@@ -23215,6 +23448,17 @@ fn model_store_root(model_state: &AdminModelCenterState) -> String {
 }
 
 fn build_model_store_status(model_state: &AdminModelCenterState) -> ModelStoreStatusResponse {
+    if harborbeacon_local_agent::runtime::fixed_models::FIXED {
+        return ModelStoreStatusResponse {
+            path: "/data/models/current".to_string(),
+            status: "fixed".to_string(),
+            writable: false,
+            runtime_readable: true,
+            next_action: String::new(),
+            blockers: Vec::new(),
+            warnings: Vec::new(),
+        };
+    }
     let path = model_store_root(model_state);
     let store_path = Path::new(&path);
     let writable = path_can_accept_write(store_path);
@@ -23265,6 +23509,7 @@ fn push_unique_root(roots: &mut Vec<String>, root: String) {
     }
 }
 
+#[cfg(feature = "local-model-management")]
 fn find_cached_model_path(cache_roots: &[String], model_id: &str) -> Option<String> {
     let slug = model_id.replace('/', "-").to_ascii_lowercase();
     for root in cache_roots {
@@ -23605,8 +23850,6 @@ fn live_bridge_provider_from_setup_status(payload: &Value) -> Option<BridgeProvi
 fn fetch_remote_gateway_status() -> Result<Value, String> {
     const PRIMARY_BASE_URL: &str = "HARBORGATE_BASE_URL";
     const LEGACY_BASE_URL: &str = "HARBOR_IM_GATEWAY_BASE_URL";
-    const PRIMARY_TOKEN: &str = "HARBORGATE_BEARER_TOKEN";
-    const LEGACY_TOKEN: &str = "HARBOR_IM_GATEWAY_BEARER_TOKEN";
 
     let base_url = env_var_with_legacy_alias(PRIMARY_BASE_URL, LEGACY_BASE_URL)
         .ok_or_else(|| format!("missing required env var {PRIMARY_BASE_URL}"))?;
@@ -23616,10 +23859,11 @@ fn fetch_remote_gateway_status() -> Result<Value, String> {
         .build()
         .map_err(|error| format!("failed to build HarborGate status client: {error}"))?;
 
-    let mut request = client.get(endpoint).header("X-Contract-Version", "2.0");
-    if let Some(token) = env_var_with_legacy_alias(PRIMARY_TOKEN, LEGACY_TOKEN) {
-        request = request.header("Authorization", format!("Bearer {token}"));
-    }
+    let token = beacon_to_gate_sender_token()?;
+    let request = client
+        .get(endpoint)
+        .header("X-Contract-Version", "2.0")
+        .header("Authorization", format!("Bearer {token}"));
 
     let response = request
         .send()
@@ -25729,22 +25973,17 @@ mod tests {
         cat_auto_recording_epoch_ms, cat_auto_recording_transition,
         cat_recording_validation_retry_delay, cat_recording_validation_status_for_decision,
         cat_validation_error_invalidates_readiness, cat_validation_readiness_for_pending,
-        cleanup_detection_job_output_dir, current_epoch_secs, default_model_download_target_path,
-        default_model_download_target_path_in_root, default_model_endpoints,
+        cleanup_detection_job_output_dir, current_epoch_secs, default_model_endpoints,
         detection_job_matches_stream_profile, dvr_timeline_segment_from_harborlink,
         ensure_local_admin_access, ensure_local_camera_access,
         harbor_assistant_build_missing_response, harbor_assistant_search_session_id,
-        hardware_class_for_probe, has_forwarding_headers,
-        huggingface_download_should_fallback_to_plain_http, huggingface_resolve_url,
-        identity_query_suffix, is_admin_surface_path, is_cat_activity_managed_detection_job,
-        is_gate_principal_endpoint, is_gate_principal_knowledge_endpoint,
-        is_harbor_assistant_client_route, is_harbor_assistant_surface_path,
-        is_new_cat_detection_sequence, knowledge_preview_mime_supported,
-        latest_model_download_jobs, live_bridge_provider_from_setup_status,
-        local_model_catalog_item, local_model_catalog_specs, mime_type_for_path,
-        model_download_huggingface_endpoint, model_download_huggingface_endpoints,
-        model_download_jobs_status, model_endpoint_uses_external_runtime,
-        model_hardware_recommendation, model_snapshot_file_allowed, normalize_detection_job_start,
+        hardware_class_for_probe, has_forwarding_headers, identity_query_suffix,
+        is_admin_surface_path, is_cat_activity_managed_detection_job, is_gate_principal_endpoint,
+        is_gate_principal_knowledge_endpoint, is_harbor_assistant_client_route,
+        is_harbor_assistant_surface_path, is_new_cat_detection_sequence,
+        knowledge_preview_mime_supported, latest_model_download_jobs,
+        live_bridge_provider_from_setup_status, mime_type_for_path, model_download_jobs_status,
+        model_endpoint_uses_external_runtime, normalize_detection_job_start,
         normalize_detection_provider, normalize_harbor_assistant_conversation_id,
         normalize_unified_admin_path, normalize_unified_admin_url,
         notification_delivery_error_to_harbor_app_error,
@@ -25777,11 +26016,10 @@ mod tests {
         redacted_home_assistant_task_api_event_summary, release_item, request_identity_hints,
         resolve_admin_search_source_scope, resolve_harbor_assistant_asset_path,
         resolve_knowledge_preview_path, reusable_cat_event_recording,
-        reusable_detection_job_projection, run_knowledge_index_jobs, run_model_download_job,
-        run_model_download_transfer, sanitize_cat_recording_validation_error,
-        sanitized_outreach_delivery_request_audit, select_cat_recording_classifier_sample_targets,
-        service_overloaded_response, snapshot_artifact_from_task_response,
-        summarize_media_tool_stderr, url_encode_path_segment,
+        reusable_detection_job_projection, run_knowledge_index_jobs,
+        sanitize_cat_recording_validation_error, sanitized_outreach_delivery_request_audit,
+        select_cat_recording_classifier_sample_targets, service_overloaded_response,
+        snapshot_artifact_from_task_response, summarize_media_tool_stderr, url_encode_path_segment,
         validate_home_assistant_service_fields, validate_home_assistant_service_smoke,
         validate_outreach_delivery_request, AdminApi, CameraLiveSessionProjection,
         CameraStreamProfile, CatActivityCameraState, CatActivityCameraStatus,
@@ -25795,9 +26033,17 @@ mod tests {
         HomeGuardianEvaluationQueue, KnowledgeSearchApiRequest, LocalModelRuntimeProjection,
         ManualAddRequest, ModelRuntimeActivationRequest, ModelRuntimeActivationResult,
         OutreachDeliveryRecipientRequest, OutreachDeliveryRequest, VisionIngestLimiter,
-        DEFAULT_HF_ENDPOINT, HARBORBEACON_WEB_API_TOKEN_ENV, HARBOR_ASSISTANT_SEARCH_SURFACE,
+        DEFAULT_HF_ENDPOINT, GATE_TO_BEACON_TOKEN_ENV, HARBOR_ASSISTANT_SEARCH_SURFACE,
         HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS, HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS,
         MAX_DETECTION_JOB_HISTORY, MAX_VISION_EVENT_INGEST_INFLIGHT, PRIVACY_GATEWAY_AUDIT_ACTION,
+    };
+    #[cfg(feature = "local-model-management")]
+    use super::{
+        default_model_download_target_path, default_model_download_target_path_in_root,
+        huggingface_download_should_fallback_to_plain_http, huggingface_resolve_url,
+        local_model_catalog_item, local_model_catalog_specs, model_download_huggingface_endpoint,
+        model_download_huggingface_endpoints, model_hardware_recommendation,
+        model_snapshot_file_allowed, run_model_download_job, run_model_download_transfer,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use harborbeacon_local_agent::connectors::notifications::{
@@ -25887,6 +26133,12 @@ mod tests {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
+
+    fn model_api_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
     use tiny_http::{Header, Method, Server, StatusCode};
 
     const EDGE_TEST_KEY: [u8; 32] = [0x2a; 32];
@@ -26263,6 +26515,7 @@ mod tests {
         .expect("Gate v2 bearer fallback");
         assert_eq!(principal.0.role_kind, RoleKind::Admin);
     }
+    const VALID_GATE_SERVICE_TOKEN: &str = "gate_service_0123456789abcdef0123456789abcdef";
 
     #[test]
     fn parse_json_body_limited_blocks_oversized_payload() {
@@ -26323,6 +26576,117 @@ mod tests {
             "http://harborbeacon.local:4174".to_string(),
         );
         (api, vec![admin_path, registry_path, conversation_path])
+    }
+
+    #[test]
+    #[cfg(feature = "fixed-local-models")]
+    fn fixed_model_http_boundaries_preserve_cloud_answer_configuration() {
+        use harborbeacon_local_agent::runtime::fixed_models;
+        let (api, paths) = build_test_admin_api("fixed-model-http");
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", server.server_addr());
+        let call = |method: &str, path: &str, body: Value| {
+            let endpoint = format!("{url}{path}");
+            let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
+            let client = thread::spawn(move || {
+                let response = reqwest::blocking::Client::new()
+                    .request(method, endpoint)
+                    .timeout(Duration::from_secs(10))
+                    .json(&body)
+                    .send()
+                    .unwrap();
+                (
+                    response.status().as_u16(),
+                    response.json::<Value>().unwrap(),
+                )
+            });
+            api.handle(
+                server
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap()
+                    .unwrap(),
+            );
+            client.join().unwrap()
+        };
+        for (method, path) in [
+            ("POST", "/api/models/local-downloads"),
+            ("POST", "/api/models/local-downloads/legacy/cancel"),
+            ("POST", "/api/models/runtimes/harbor-candle/install"),
+            ("PUT", "/api/models/store"),
+            ("POST", "/api/models/capabilities/semantic_router/selection"),
+            ("PATCH", "/api/models/endpoints/llm-local-openai-compatible"),
+        ] {
+            let (status, body) = call(method, path, json!({"model_name": "replacement"}));
+            assert_eq!(status, 403, "{path}: {body}");
+            assert_eq!(
+                body["error"]["code"], "LOCAL_MODELS_FIXED",
+                "{path}: {body}"
+            );
+        }
+        let state = api.admin_store.load_state().unwrap();
+        let local = state
+            .models
+            .endpoints
+            .iter()
+            .find(|item| item.model_endpoint_id == fixed_models::CHAT_ENDPOINT)
+            .unwrap();
+        let mut cloud = serde_json::to_value(local).unwrap();
+        cloud["model_endpoint_id"] = json!("qualified-cloud");
+        cloud["endpoint_kind"] = json!("cloud");
+        cloud["model_name"] = json!("answer-model");
+        cloud["metadata"] =
+            json!({"base_url": "https://api.example.com/v1", "api_key": "test-only"});
+        let (status, body) = call("POST", "/api/models/endpoints", cloud);
+        assert_eq!(status, 200, "cloud save: {body}");
+        let (status, body) = call(
+            "PATCH",
+            "/api/models/endpoints/qualified-cloud",
+            json!({"endpoint_kind": "local"}),
+        );
+        assert_eq!(status, 403, "cloud type conversion: {body}");
+        let mut policies = state.models.route_policies;
+        let answer = policies
+            .iter_mut()
+            .find(|item| item.route_policy_id == "retrieval.answer")
+            .unwrap();
+        answer.privacy_level =
+            harborbeacon_local_agent::control_plane::models::PrivacyLevel::AllowRedactedCloud;
+        answer.fallback_order = vec!["local".into(), "sidecar".into(), "cloud".into()];
+        let (status, body) = call(
+            "PUT",
+            "/api/models/policies",
+            json!({"route_policies": policies}),
+        );
+        assert_eq!(status, 200, "answer policy save: {body}");
+        let answer = policies
+            .iter_mut()
+            .find(|item| item.route_policy_id == "retrieval.answer")
+            .unwrap();
+        answer.local_preferred = false;
+        answer.fallback_order = vec!["cloud".into()];
+        let (status, body) = call(
+            "PUT",
+            "/api/models/policies",
+            json!({"route_policies": policies}),
+        );
+        assert_eq!(status, 403, "cloud-only policy: {body}");
+        assert_eq!(body["error"]["code"], "LOCAL_MODELS_FIXED");
+        let saved = api.admin_store.load_state().unwrap();
+        assert_eq!(
+            saved
+                .models
+                .endpoints
+                .iter()
+                .find(|item| item.model_endpoint_id == fixed_models::CHAT_ENDPOINT)
+                .unwrap()
+                .model_name,
+            fixed_models::CHAT_MODEL
+        );
+        drop(api);
+        for path in paths {
+            let _ = std::fs::remove_file(path.with_extension("pre-fixed-models.json"));
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     fn detection_gate_principal(role_kind: RoleKind) -> GateAuthenticatedPrincipal {
@@ -32569,6 +32933,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "local-model-management")]
     fn model_download_retry_reuses_failed_job_record() {
         let admin_path = unique_store_path("harborbeacon-model-download-reuse-admin");
         let registry_path = unique_store_path("harborbeacon-model-download-reuse-registry");
@@ -32617,6 +32982,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "local-model-management")]
     fn local_model_catalog_ignores_failed_huggingface_cache_only_directory() {
         let root = unique_store_path("model-cache-root").with_extension("");
         let target = root.join("qwen-qwen3.5-4b");
@@ -32667,6 +33033,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "local-model-management")]
     fn local_model_catalog_marks_nonempty_cache_directory_installed() {
         let root = unique_store_path("model-cache-root").with_extension("");
         let target = root.join("qwen-qwen3.5-4b");
@@ -32689,6 +33056,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "local-model-management")]
     fn local_model_catalog_marks_completed_download_target_installed() {
         let root = unique_store_path("model-cache-root").with_extension("");
         let target = root.join("qwen-completed-download");
@@ -32737,6 +33105,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "local-model-management")]
     fn bootstrap_model_download_target_uses_candle_runtime_store() {
         let root = unique_store_path("bootstrap-model-store").with_extension("");
         let target = default_model_download_target_path_in_root(
@@ -32878,6 +33247,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "local-model-management")]
     fn hardware_profile_keeps_4b_models_out_of_tiny_cpu_recommendations() {
         assert_eq!(
             hardware_class_for_probe(4, Some(12_000), false, None),
@@ -32928,6 +33298,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "local-model-management")]
     fn model_capabilities_hide_manual_only_models_from_installable_choices() {
         let runtime = LocalModelRuntimeProjection {
             error: Some("runtime offline".to_string()),
@@ -32966,6 +33337,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "local-model-management")]
     fn model_capabilities_surface_default_candle_runtime_and_missing_model() {
         let runtime = LocalModelRuntimeProjection {
             error: Some("runtime offline".to_string()),
@@ -33066,6 +33438,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "local-model-management")]
     fn model_capabilities_do_not_treat_persisted_assignment_as_runtime_truth() {
         let runtime = LocalModelRuntimeProjection {
             error: Some("runtime offline".to_string()),
@@ -33106,6 +33479,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "local-model-management")]
     fn model_capabilities_use_external_runtime_evidence_for_ready_status() {
         let runtime = LocalModelRuntimeProjection::default();
         let mut endpoints = default_model_endpoints();
@@ -33143,6 +33517,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "local-model-management")]
     fn huggingface_snapshot_allow_patterns_keep_runtime_files_only() {
         let patterns = vec![
             "*.json".to_string(),
@@ -33161,6 +33536,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "local-model-management")]
     fn huggingface_plain_http_fallback_handles_mirror_header_gaps() {
         assert!(huggingface_download_should_fallback_to_plain_http(
             "Header Content-Range is missing"
@@ -33174,6 +33550,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "local-model-management")]
     fn huggingface_endpoint_fallback_covers_common_mirror_failures() {
         assert!(super::huggingface_download_should_try_endpoint_fallback(
             "status code 404"
@@ -33187,6 +33564,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "local-model-management")]
     fn huggingface_resolve_url_uses_endpoint_repo_revision_and_file_path() {
         let url = huggingface_resolve_url(
             "https://hf-mirror.com/",
@@ -33203,6 +33581,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "local-model-management")]
     fn huggingface_endpoint_prefers_job_metadata_then_env_then_default_mirror() {
         let _guard = hf_endpoint_env_lock()
             .lock()
@@ -33230,6 +33609,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "local-model-management")]
     fn huggingface_endpoint_candidates_dedupe_metadata_env_and_builtin_fallbacks() {
         let _guard = hf_endpoint_env_lock()
             .lock()
@@ -33257,6 +33637,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "local-model-management")]
     fn huggingface_endpoint_does_not_generate_double_slash_repo_info_base() {
         let endpoint = model_download_huggingface_endpoint(&json!({
             "hf_endpoint": "https://hf-mirror.com/"
@@ -33274,6 +33655,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "local-model-management")]
     fn default_model_download_target_path_is_snapshot_directory() {
         let target = default_model_download_target_path("Qwen/Qwen3.5-4B");
 
@@ -33282,6 +33664,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "local-model-management")]
     fn model_download_transfer_copies_explicit_source_to_target() {
         let source_path = unique_store_path("harborbeacon-model-source");
         let target_path = unique_store_path("harborbeacon-model-target");
@@ -33319,6 +33702,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "local-model-management")]
     fn model_download_failed_job_preserves_last_progress() {
         let admin_path = unique_store_path("harborbeacon-model-download-failed-admin");
         let registry_path = unique_store_path("harborbeacon-model-download-failed-registry");
@@ -33360,6 +33744,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "local-model-management")]
     fn concurrent_model_download_workers_preserve_job_records() {
         let admin_path = unique_store_path("harborbeacon-model-download-concurrent-admin");
         let registry_path = unique_store_path("harborbeacon-model-download-concurrent-registry");
@@ -34573,6 +34958,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "local-model-management")]
     fn installed_model_selection_activates_runtime_and_updates_endpoint() {
         let registry_path = unique_store_path("harborbeacon-model-select-registry");
         let admin_path = unique_store_path("harborbeacon-model-select-state");
@@ -34757,6 +35143,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "local-model-management")]
     fn external_openai_compatible_catalog_model_is_not_auto_started() {
         let registry_path = unique_store_path("harborbeacon-model-external-registry");
         let admin_path = unique_store_path("harborbeacon-model-external-state");
@@ -34810,6 +35197,11 @@ mod tests {
 
     #[test]
     fn runtime_overlay_promotes_llm_and_embedder_without_recreating_builtin_vlm() {
+        let _env_lock = model_api_env_lock().lock().expect("model API env lock");
+        let _model_token = EnvGuard::set(
+            "HARBOR_MODEL_API_TOKEN",
+            "test_model_api_token_0123456789abcdef0123456789abcdef",
+        );
         let mut endpoints =
             harborbeacon_local_agent::runtime::admin_console::default_model_endpoints();
         for endpoint in &mut endpoints {
@@ -34875,6 +35267,11 @@ mod tests {
 
     #[test]
     fn runtime_probe_falls_back_to_builtin_local_endpoint_urls() {
+        let _env_lock = model_api_env_lock().lock().expect("model API env lock");
+        let _model_token = EnvGuard::set(
+            "HARBOR_MODEL_API_TOKEN",
+            "test_model_api_token_0123456789abcdef0123456789abcdef",
+        );
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let addr = listener.local_addr().expect("local addr");
         let server = thread::spawn(move || {
@@ -35642,7 +36039,7 @@ mod tests {
         let _env_lock = gate_principal_env_lock()
             .lock()
             .expect("gate principal env lock");
-        let _token = EnvGuard::set(HARBORBEACON_WEB_API_TOKEN_ENV, "service-token");
+        let _token = EnvGuard::set(GATE_TO_BEACON_TOKEN_ENV, VALID_GATE_SERVICE_TOKEN);
         let job_id = "yolo-gate-auth-http";
         let (api, paths) = build_test_admin_api("detection-gate-auth-http");
         api.detection_jobs.lock().expect("detection jobs").insert(
@@ -35664,7 +36061,7 @@ mod tests {
         let gate_request = |method: reqwest::Method, path: &str| {
             client
                 .request(method, format!("{base_url}{path}"))
-                .bearer_auth("service-token")
+                .bearer_auth(VALID_GATE_SERVICE_TOKEN)
                 .header("X-Harbor-Principal-Source", "harboros")
                 .header("X-Harbor-Principal-Id", "harboros:uid:1000")
                 .header("X-Harbor-Principal-Roles", "FULL_ADMIN")
@@ -35693,12 +36090,12 @@ mod tests {
         .expect("unknown method response");
         let missing_principal = client
             .get(format!("{base_url}/api/vision/detection-jobs/{job_id}"))
-            .bearer_auth("service-token")
+            .bearer_auth(VALID_GATE_SERVICE_TOKEN)
             .send()
             .expect("missing principal response");
         let legacy_header = client
             .get(format!("{base_url}/api/vision/detection-jobs/{job_id}"))
-            .bearer_auth("service-token")
+            .bearer_auth(VALID_GATE_SERVICE_TOKEN)
             .header("X-Harbor-User-Id", "local-owner")
             .send()
             .expect("legacy header response");
@@ -35728,7 +36125,7 @@ mod tests {
         let _env_lock = gate_principal_env_lock()
             .lock()
             .expect("gate principal env lock");
-        let _token = EnvGuard::set(HARBORBEACON_WEB_API_TOKEN_ENV, "service-token");
+        let _token = EnvGuard::set(GATE_TO_BEACON_TOKEN_ENV, VALID_GATE_SERVICE_TOKEN);
         let job_id = "yolo-direct-observation";
         let (api, paths) = build_test_admin_api("detection-direct-observation");
         let mut runtime = sample_running_detection_job(job_id, "camera.252", false, None);
@@ -35814,12 +36211,12 @@ mod tests {
 
         let missing_principal = client
             .get(&observation_url)
-            .bearer_auth("service-token")
+            .bearer_auth(VALID_GATE_SERVICE_TOKEN)
             .send()
             .expect("missing principal response");
         let observation = client
             .get(&observation_url)
-            .bearer_auth("service-token")
+            .bearer_auth(VALID_GATE_SERVICE_TOKEN)
             .header("X-Harbor-Principal-Source", "harboros")
             .header("X-Harbor-Principal-Id", "harboros:uid:1000")
             .header("X-Harbor-Principal-Roles", "FULL_ADMIN")
@@ -35832,7 +36229,7 @@ mod tests {
             .get(format!(
                 "{base_url}/api/cameras/camera.252/cat-detection/observation?stream_profile=main"
             ))
-            .bearer_auth("service-token")
+            .bearer_auth(VALID_GATE_SERVICE_TOKEN)
             .header("X-Harbor-Principal-Source", "harboros")
             .header("X-Harbor-Principal-Id", "harboros:uid:1000")
             .header("X-Harbor-Principal-Roles", "FULL_ADMIN")
@@ -35934,14 +36331,23 @@ mod tests {
 
     #[test]
     fn gateway_service_request_requires_matching_bearer_token() {
-        let headers = vec![Header::from_bytes(
+        let current = "gate_current_0123456789abcdef0123456789abcdef";
+        let previous = "gate_previous_0123456789abcdef0123456789abcdef";
+        let current_headers = vec![Header::from_bytes(
             b"Authorization".as_slice(),
-            b"Bearer shared-token".as_slice(),
+            format!("Bearer {current}").as_bytes(),
         )
         .expect("header")];
-        let _guard = EnvGuard::set("HARBORGATE_BEARER_TOKEN", "shared-token");
+        let previous_headers = vec![Header::from_bytes(
+            b"Authorization".as_slice(),
+            format!("Bearer {previous}").as_bytes(),
+        )
+        .expect("header")];
+        let _current = EnvGuard::set(GATE_TO_BEACON_TOKEN_ENV, current);
+        let _previous = EnvGuard::set("HARBOR_GATE_TO_BEACON_TOKEN_PREVIOUS", previous);
 
-        assert!(authorize_gateway_service_request(&headers).is_ok());
+        assert!(authorize_gateway_service_request(&current_headers).is_ok());
+        assert!(authorize_gateway_service_request(&previous_headers).is_ok());
         assert!(authorize_gateway_service_request(&[]).is_err());
     }
 

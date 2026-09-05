@@ -1,0 +1,78 @@
+#!/bin/sh
+set -eu
+
+generation_state_dir="/run/harboros-k3-generation"
+beacon_active_state="$generation_state_dir/beacon-was-active"
+beacon_state_tmp=""
+
+cleanup() {
+  [ -z "$beacon_state_tmp" ] || rm -f -- "$beacon_state_tmp"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+validate_generation_state_dir() {
+  [ ! -L "$generation_state_dir" ] \
+    && [ -d "$generation_state_dir" ] \
+    && [ "$(stat -c %u "$generation_state_dir")" = 0 ] \
+    && [ "$(stat -c %a "$generation_state_dir")" = 700 ] || {
+    echo "error: unsafe Beacon generation state directory" >&2
+    exit 1
+  }
+}
+
+validate_beacon_active_state() {
+  validate_generation_state_dir
+  [ ! -L "$beacon_active_state" ] \
+    && [ -f "$beacon_active_state" ] \
+    && [ "$(stat -c %u "$beacon_active_state")" = 0 ] \
+    && [ "$(stat -c %a "$beacon_active_state")" = 600 ] \
+    && [ "$(stat -c %s "$beacon_active_state")" = 24 ] \
+    && [ "$(cat "$beacon_active_state")" = harboros-beacon.service ] || {
+    echo "error: unsafe Beacon generation active state: $beacon_active_state" >&2
+    exit 1
+  }
+}
+
+case "${1:-}" in
+  upgrade|deconfigure)
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+      if [ -e "$generation_state_dir" ] || [ -L "$generation_state_dir" ]; then
+        validate_generation_state_dir
+      else
+        install -d -o root -g root -m 0700 "$generation_state_dir"
+      fi
+      if [ -e "$beacon_active_state" ] || [ -L "$beacon_active_state" ]; then
+        validate_beacon_active_state
+      elif systemctl is-active --quiet harboros-beacon.service; then
+        beacon_state_tmp="$(mktemp "$generation_state_dir/.beacon-was-active.XXXXXXXX")"
+        printf '%s\n' harboros-beacon.service > "$beacon_state_tmp"
+        chown root:root "$beacon_state_tmp"
+        chmod 0600 "$beacon_state_tmp"
+        mv -f -- "$beacon_state_tmp" "$beacon_active_state"
+        beacon_state_tmp=""
+      fi
+      systemctl stop harboros-beacon.service >/dev/null 2>&1 || true
+      if systemctl is-active --quiet harboros-beacon.service; then
+        echo "error: Beacon must stop before package generation upgrade" >&2
+        exit 1
+      fi
+    fi
+    ;;
+  remove)
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+      systemctl stop harboros-beacon.service >/dev/null 2>&1 || true
+    fi
+    if [ -e "$generation_state_dir" ] || [ -L "$generation_state_dir" ]; then
+      validate_generation_state_dir
+      if [ -e "$beacon_active_state" ] || [ -L "$beacon_active_state" ]; then
+        validate_beacon_active_state
+        rm -f -- "$beacon_active_state"
+      fi
+      rmdir "$generation_state_dir" 2>/dev/null || true
+    fi
+    ;;
+esac
+
+trap - EXIT HUP INT TERM
+exit 0

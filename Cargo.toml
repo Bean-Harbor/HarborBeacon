@@ -54,6 +54,11 @@ path = "src/bin/harbor-model-api.rs"
 required-features = ["embedded-model-runtime"]
 
 [[bin]]
+name = "harbor-fixed-model-api"
+path = "src/bin/harbor_fixed_model_api.rs"
+required-features = ["fixed-local-models"]
+
+[[bin]]
 name = "harborbeacon-service"
 path = "src/bin/harborbeacon_service.rs"
 
@@ -91,6 +96,7 @@ path = "src/bin/build_knowledge_hnsw.rs"
 
 [dependencies]
 anyhow = "1.0"
+constant_time_eq = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
@@ -114,7 +120,7 @@ fast-hnsw = "1.0.1"
 candle = { package = "candle-core", version = "0.10.2", optional = true }
 candle-nn = { version = "0.10.2", optional = true }
 candle-transformers = { version = "0.10.2", default-features = false, optional = true }
-hf-hub = { version = "0.4.1", default-features = false, features = ["ureq"] }
+hf-hub = { version = "0.4.1", default-features = false, features = ["ureq"], optional = true }
 tokenizers = { version = "0.22.0", default-features = false, features = ["fancy-regex"] }
 tantivy = "0.22"
 time = { version = "0.3.41", features = ["parsing"] }
@@ -128,9 +134,11 @@ cap-fs-ext = "=4.0.2"
 rustix = { version = "=1.1.4", features = ["fs"] }
 
 [features]
-default = ["embedded-model-runtime"]
-embedded-model-runtime = ["dep:candle", "dep:candle-nn", "dep:candle-transformers"]
+default = ["embedded-model-runtime", "local-model-management"]
+embedded-model-runtime = ["dep:candle", "dep:candle-nn", "dep:candle-transformers", "dep:hf-hub"]
 external-model-runtime = []
+local-model-management = ["dep:hf-hub"]
+fixed-local-models = ["external-model-runtime"]
 
 [patch.crates-io]
 rig-core = { path = "vendor/rig-core-0.8.0" }

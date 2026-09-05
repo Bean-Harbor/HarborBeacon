@@ -16,6 +16,7 @@ deb_arch="${DEB_ARCH:-riscv64}"
 : "${HARBORBEACON_DEBIAN_SNAPSHOT:?HARBORBEACON_DEBIAN_SNAPSHOT is required}"
 : "${MODEL_BUNDLE_ROOT:?MODEL_BUNDLE_ROOT is required}"
 : "${MODEL_LICENSE_EVIDENCE_ROOT:?MODEL_LICENSE_EVIDENCE_ROOT is required}"
+: "${N2_VENDOR_ARCHIVE_ROOT:?N2_VENDOR_ARCHIVE_ROOT is required}"
 dpkg --validate-version "$DEBIAN_VERSION"
 [[ "$HARBORBEACON_BUILD_CONTAINER_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || {
   echo "error: HARBORBEACON_BUILD_CONTAINER_DIGEST must be a sha256 digest" >&2
@@ -64,10 +65,10 @@ python3 scripts/validate_k3_model_materials.py \
   --license-stage-root "$pkg_dir" \
   --manifest-stage "$pkg_dir/usr/share/harboros-model-runtime/model-materials.json"
 cargo build --locked --release --target "$target" \
-  --no-default-features --features embedded-model-runtime --bin harbor-model-api
+  --no-default-features --features fixed-local-models --bin harbor-fixed-model-api
 cargo metadata --locked --offline --format-version 1 \
   --filter-platform "$target" \
-  --no-default-features --features embedded-model-runtime \
+  --no-default-features --features fixed-local-models \
   > "$build_root/cargo-metadata.json"
 
 install -d \
@@ -77,8 +78,14 @@ install -d \
   "$pkg_dir/usr/lib/systemd/system" \
   "$pkg_dir/usr/share/doc/harboros-model-runtime" \
   "$pkg_dir/usr/share/harboros/component-contracts"
-install -m 0755 "$cargo_target_dir/$target/release/harbor-model-api" \
+install -m 0755 "$cargo_target_dir/$target/release/harbor-fixed-model-api" \
   "$pkg_dir/usr/bin/harbor-model-api"
+python3 scripts/stage_n2_vendor_runtime.py \
+  --lock models/n2-vendor-runtime.json --source "$N2_VENDOR_ARCHIVE_ROOT" --package "$pkg_dir"
+install -m 0644 scripts/n2_embedding_worker.py \
+  "$pkg_dir/usr/lib/harboros-model-runtime/n2_embedding_worker.py"
+install -m 0755 debian/ensure-harborbeacon-model-token \
+  "$pkg_dir/usr/lib/harboros-model-runtime/ensure-model-token"
 install -m 0755 debian/ensure-model-runtime-data-layout \
   "$pkg_dir/usr/lib/harboros-model-runtime/ensure-data-layout"
 install -m 0755 scripts/verify_k3_model_release.py \
@@ -114,7 +121,12 @@ python3 scripts/generate_cargo_license_sidecar.py \
   --cargo-metadata "$build_root/cargo-metadata.json" \
   --output "$pkg_dir/usr/share/doc/harboros-model-runtime/third-party-licenses.json"
 
+vendor_binary_args=()
+while IFS= read -r -d '' vendor_binary; do
+  vendor_binary_args+=(--binary "$vendor_binary")
+done < <(find "$pkg_dir/usr/lib/harboros-model-runtime/vendor" -type f -print0 | sort -z)
 python3 scripts/generate_k3_supply_chain.py \
+  "${vendor_binary_args[@]}" \
   --package harboros-model-runtime \
   --cargo-lock "$repo_root/Cargo.lock" \
   --cargo-metadata "$build_root/cargo-metadata.json" \
@@ -124,6 +136,12 @@ python3 scripts/generate_k3_supply_chain.py \
   --model-license-sidecar-prefix "$material_prefix" \
   --runtime-manifest "$pkg_dir/usr/share/doc/harboros-model-runtime/runtime-manifest.json" \
   --debian-control "$pkg_dir/DEBIAN/control" \
+  --runtime-dependency spacemit-llama.cpp=0.1.8 \
+  --runtime-dependency spine-runtime=0.6.1 \
+  --input-file "$repo_root/models/n2-vendor-runtime.json" \
+  --input-file "$repo_root/scripts/stage_n2_vendor_runtime.py" \
+  --input-file "$repo_root/scripts/n2_embedding_worker.py" \
+  --input-file "$repo_root/debian/ensure-harborbeacon-model-token" \
   --input-file "$repo_root/debian/model-runtime-control.in" \
   --input-file "$repo_root/debian/model-runtime-postinst" \
   --input-file "$repo_root/debian/model-runtime-prerm" \

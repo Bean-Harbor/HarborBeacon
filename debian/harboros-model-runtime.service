@@ -9,17 +9,12 @@ Type=simple
 User=harbormodel
 Group=harbormodel
 UMask=0077
-Environment=HARBOR_MODEL_API_BIND=127.0.0.1:8792
-Environment=HARBOR_MODEL_API_BACKEND=candle
-Environment=HARBOR_MODEL_API_CHAT_MODEL=Qwen/Qwen2.5-0.5B-Instruct
-Environment=HARBOR_MODEL_API_CANDLE_CHAT_MODEL_ID=/data/models/current/semantic-router/qwen2.5-0.5b-instruct
-Environment=HARBOR_MODEL_API_CANDLE_EMBEDDING_MODEL_ID=/data/models/current/embedding/jina-embeddings-v2-base-zh
-Environment=HARBOR_MODEL_API_CANDLE_CACHE_DIR=/data/models/cache
-Environment=HARBOR_MODEL_API_CANDLE_MAX_NEW_TOKENS=128
-Environment=HARBOR_MODEL_API_CANDLE_TEMPERATURE=0.1
+EnvironmentFile=/etc/default/harboros-fixed-models
 ExecStart=/usr/bin/harbor-model-api
 ExecStartPost=/usr/lib/harboros-model-runtime/wait-health http://127.0.0.1:8792/healthz 60
 TimeoutStartSec=75
+TimeoutStopSec=15
+KillMode=control-group
 Restart=on-failure
 RestartSec=5s
 MemoryAccounting=true
@@ -29,7 +24,6 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/data/models/cache
 ReadOnlyPaths=/data/models
 
 [Install]

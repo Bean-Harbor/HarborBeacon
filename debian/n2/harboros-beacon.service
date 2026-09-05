@@ -1,0 +1,62 @@
+[Unit]
+Description=HarborOS Beacon API Service
+Wants=network-online.target harborlink.target harboros-model-runtime.service
+Requires=harboros-bootstrap.service
+After=network-online.target harboros-bootstrap.service harborlink.target harboros-model-runtime.service
+RequiresMountsFor=/data
+
+[Service]
+Type=simple
+User=harborbeacon
+Group=harborbeacon
+UMask=0077
+Environment=HARBOR_FFMPEG_BIN=/usr/bin/ffmpeg
+Environment=HARBOR_FFPROBE_BIN=/usr/bin/ffprobe
+Environment=HARBORLINK_MEDIA_API_URL=http://127.0.0.1:8790
+Environment=HARBORBEACON_SOUTHBOUND_MODE=harborlink
+Environment=HARBOR_K3_CAT_AUTO_RECORD_ENABLED=true
+Environment=HARBOR_K3_CAT_ACTIVITY_POLICY_PATH=/data/harborbeacon/cat-activity/policy.json
+Environment=HARBOR_K3_CAT_RECORDING_RECONCILIATION_PATH=/data/harborbeacon/cat-activity/reconciliation.json
+Environment=HARBOR_K3_CAT_RECORDING_VALIDATION_MODE=enforce
+Environment=HARBOR_K3_CAT_RECORDING_VALIDATION_STORE_PATH=/data/harborbeacon/cat-activity/validations.jsonl
+Environment=HARBOR_K3_CAT_RECORDING_VALIDATION_TEMP_ROOT=/run/harboros-beacon/cat-recording-validation
+Environment=HARBOR_K3_CAT_RECORDING_VALIDATOR=mobilenet_v2_int8
+Environment=HARBOR_K3_CAT_RECORDING_CLASSIFIER_BIN=/usr/lib/harboros-beacon/harbornavi_k3_cat_recording_classifier.py
+Environment=HARBOR_K3_CAT_RECORDING_CLASSIFIER_MODEL=/usr/share/harboros-beacon/vision-models/mobilenetv2-cat-binary-v2-20260806/mobilenetv2_cat_binary_int8.onnx
+Environment=HARBOR_K3_CAT_RECORDING_CLASSIFIER_MODEL_SHA256=d0c1bdcf973ca7f6efc6e62af764ff59300e0d27abbc75c20c7f86515769d825
+Environment=HARBOR_K3_CAT_RECORDING_CLASSIFIER_THRESHOLD=0.62
+Environment=HARBOR_K3_CAT_RECORDING_CLASSIFIER_AI_THREADS=4
+Environment="HARBOR_K3_CAT_RECORDING_CLASSIFIER_AFFINITY=12;13;14;15"
+Environment=HARBOR_AI_RESOURCE_LEASE_QUEUE_CAPACITY=8
+Environment=HARBOR_AI_RESOURCE_LEASE_WAIT_TIMEOUT_MS=60000
+LoadCredential=harborlink-local-api-token:/data/harborlink/secrets/local-api.token
+Environment=HARBORLINK_LOCAL_API_TOKEN_FILE=%d/harborlink-local-api-token
+LoadCredential=harbor-edge-assertion-key:/data/harboros/secrets/edge-assertion.key
+Environment=HARBOR_HARBOROS_WRITABLE_ROOT=/data/harborbeacon
+Environment=HARBOR_VISION_EVENT_STORE_PATH=/data/harborbeacon/events/vision-events.jsonl
+Environment=HARBOR_K3_YOLO_MODEL=/data/vision-models/current/detection/yolov8n_192x320.q.onnx
+Environment=HARBOR_K3_YOLO_LABELS=/data/vision-models/current/detection/label.txt
+Environment=HARBOR_K3_YOLO_PROVIDER=cpu
+Environment=HARBOR_MODEL_API_BASE_URL=http://127.0.0.1:8792/v1
+Environment=HARBOR_MODEL_API_BACKEND=openai_proxy
+Environment=HARBOR_MODEL_API_UPSTREAM_BASE_URL=http://127.0.0.1:8792
+EnvironmentFile=/data/harboros/secrets/beacon-gate.env
+EnvironmentFile=/etc/default/harboros-fixed-models
+Environment=HARBOR_EDGE_ASSERTION_KEY_FILE=%d/harbor-edge-assertion-key
+ExecStartPre=+/usr/lib/harborbeacon/verify-k3-generation
+ExecStartPre=+/usr/bin/systemctl restart harboros-model-runtime.service
+ExecStart=/usr/bin/harboros-beacon --bind 127.0.0.1:4174 --admin-state /data/harborbeacon/admin-console.json --device-registry /data/harborbeacon/device-registry.json --conversations /data/harborbeacon/task-api-conversations.json --harbor-assistant-dist /usr/share/harboros/webui --public-origin http://127.0.0.1:4174
+Restart=on-failure
+RestartSec=5s
+MemoryAccounting=true
+MemoryHigh=8G
+MemoryMax=12G
+RuntimeDirectory=harboros-beacon
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/data/harborbeacon /run/harboros-beacon
+
+[Install]
+WantedBy=multi-user.target

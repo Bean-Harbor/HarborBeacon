@@ -13,6 +13,7 @@ use harborbeacon_local_agent::runtime::task_api::{
     TaskApiService, TaskTurnEnvelope, TaskTurnRequestAcceptance,
 };
 use harborbeacon_local_agent::runtime::task_session::TaskConversationStore;
+use harborbeacon_local_agent::service_auth::{gate_to_beacon_file_verifier_tokens, VerifierTokens};
 
 const CONTRACT_VERSION: &str = "2.0";
 const SERVICE_TOKEN_ENV: &str = "HARBOR_TASK_API_BEARER_TOKEN";
@@ -119,14 +120,14 @@ struct SharedHttpErrorEnvelope {
 #[derive(Debug, Clone)]
 pub struct TaskApiHttpServer {
     service: TaskApiService,
-    service_token: String,
+    service_tokens: VerifierTokens,
 }
 
 impl TaskApiHttpServer {
-    pub fn new(service: TaskApiService, service_token: String) -> Self {
+    pub fn new(service: TaskApiService, service_tokens: VerifierTokens) -> Self {
         Self {
             service,
-            service_token,
+            service_tokens,
         }
     }
 
@@ -223,7 +224,7 @@ impl TaskApiHttpServer {
     fn is_service_authorized(&self, headers: &[Header]) -> bool {
         header_value(headers, HEADER_AUTHORIZATION)
             .and_then(|value| parse_bearer_token(&value))
-            .is_some_and(|value| value == self.service_token)
+            .is_some_and(|value| self.service_tokens.matches(&value))
     }
 }
 
@@ -236,7 +237,9 @@ pub(crate) fn is_turn_api_path(path: &str) -> bool {
 
 fn main() {
     let cli = Cli::parse();
-    let service_token = resolve_service_token(cli.service_token);
+    let service_tokens = resolve_service_tokens(cli.service_token).unwrap_or_else(|error| {
+        fail(&error);
+    });
     let device_registry_path = resolve_state_path(&cli.device_registry);
     let admin_state_path = resolve_state_path(&cli.admin_state);
     std::env::set_var(ADMIN_STATE_PATH_ENV, &admin_state_path);
@@ -246,7 +249,7 @@ fn main() {
     let admin_store = AdminConsoleStore::new(admin_state_path, registry_store);
     let conversation_store = TaskConversationStore::new(conversation_path);
     let service = TaskApiService::new(admin_store, conversation_store);
-    let api = TaskApiHttpServer::new(service, service_token);
+    let api = TaskApiHttpServer::new(service, service_tokens);
 
     let server = Server::http(&cli.bind).unwrap_or_else(|error| {
         panic!("failed to bind assistant task api on {}: {error}", cli.bind);
@@ -261,17 +264,18 @@ fn main() {
     }
 }
 
-fn resolve_service_token(cli_token: Option<String>) -> String {
-    cli_token
-        .or_else(|| env::var(SERVICE_TOKEN_ENV).ok())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| {
-            eprintln!(
-                "assistant-task-api requires a bearer token via --service-token or {SERVICE_TOKEN_ENV}"
-            );
-            std::process::exit(2);
-        })
+fn resolve_service_tokens(cli_token: Option<String>) -> Result<VerifierTokens, String> {
+    match cli_token {
+        Some(token) => VerifierTokens::current_only(token),
+        None => match env::var(SERVICE_TOKEN_ENV)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            Some(token) => VerifierTokens::current_only(token),
+            None => gate_to_beacon_file_verifier_tokens(),
+        },
+    }
 }
 
 fn read_request_body(request: &mut Request) -> Result<Vec<u8>, String> {
@@ -482,6 +486,7 @@ mod tests {
     use harborbeacon_local_agent::runtime::registry::DeviceRegistryStore;
     use harborbeacon_local_agent::runtime::task_api::TaskApiService;
     use harborbeacon_local_agent::runtime::task_session::TaskConversationStore;
+    use harborbeacon_local_agent::service_auth::VerifierTokens;
 
     static HARBOROS_HTTP_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -494,6 +499,13 @@ mod tests {
     }
 
     fn build_server(token: &str) -> (TaskApiHttpServer, Vec<std::path::PathBuf>) {
+        build_server_with_tokens(token, None)
+    }
+
+    fn build_server_with_tokens(
+        current: &str,
+        previous: Option<&str>,
+    ) -> (TaskApiHttpServer, Vec<std::path::PathBuf>) {
         let admin_path = unique_path("assistant-task-api-admin");
         let registry_path = unique_path("assistant-task-api-registry");
         let conversation_path = unique_path("assistant-task-api-conversations");
@@ -505,7 +517,13 @@ mod tests {
             TaskConversationStore::new(conversation_path.clone()),
         );
         (
-            TaskApiHttpServer::new(service, token.to_string()),
+            TaskApiHttpServer::new(
+                service,
+                VerifierTokens {
+                    current: current.to_string(),
+                    previous: previous.map(str::to_string),
+                },
+            ),
             vec![admin_path, registry_path, conversation_path],
         )
     }
@@ -673,6 +691,26 @@ mod tests {
             header_value(&headers, "WWW-Authenticate"),
             Some("Bearer".to_string())
         );
+        cleanup(paths);
+    }
+
+    #[test]
+    fn task_endpoint_accepts_current_and_previous_but_rejects_wrong_domain() {
+        let (server, paths) =
+            build_server_with_tokens("gate-to-beacon-current", Some("gate-to-beacon-previous"));
+
+        assert!(server.is_service_authorized(&[header(
+            HEADER_AUTHORIZATION,
+            "Bearer gate-to-beacon-current",
+        )]));
+        assert!(server.is_service_authorized(&[header(
+            HEADER_AUTHORIZATION,
+            "Bearer gate-to-beacon-previous",
+        )]));
+        assert!(!server.is_service_authorized(&[header(
+            HEADER_AUTHORIZATION,
+            "Bearer beacon-to-gate-current",
+        )]));
         cleanup(paths);
     }
 

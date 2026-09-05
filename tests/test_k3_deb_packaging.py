@@ -7,6 +7,7 @@ from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
 BUILD_SCRIPT = REPOSITORY_ROOT / "scripts" / "build_harbornavi_k3_deb.sh"
+K3_DEBIAN_DIRECTORY = REPOSITORY_ROOT / "debian" / "n2"
 
 
 class K3DebPackagingTests(unittest.TestCase):
@@ -32,7 +33,7 @@ class K3DebPackagingTests(unittest.TestCase):
             REPOSITORY_ROOT / "src" / "runtime" / "cat_recording_classifier.rs"
         ).read_text(encoding="utf-8")
         systemd_unit = (
-            REPOSITORY_ROOT / "debian" / "harboros-beacon.service"
+            K3_DEBIAN_DIRECTORY / "harboros-beacon.service"
         ).read_text(encoding="utf-8")
         build_script = BUILD_SCRIPT.read_text(encoding="utf-8")
 
@@ -82,7 +83,7 @@ class K3DebPackagingTests(unittest.TestCase):
         self.assertEqual(runtime_contract["runtime"]["affinity"], "12;13;14;15")
 
     def test_cat_recording_reconciliation_uses_the_state_directory(self):
-        unit = (REPOSITORY_ROOT / "debian" / "harboros-beacon.service").read_text(
+        unit = (K3_DEBIAN_DIRECTORY / "harboros-beacon.service").read_text(
             encoding="utf-8"
         )
         self.assertIn(
@@ -94,7 +95,7 @@ class K3DebPackagingTests(unittest.TestCase):
     def test_beacon_systemd_unit_is_packaged_read_only(self):
         script = BUILD_SCRIPT.read_text(encoding="utf-8")
         self.assertIn(
-            "install -m 0644 debian/harboros-beacon.service \\\n"
+            "install -m 0644 debian/n2/harboros-beacon.service \\\n"
             '  "$pkg_dir/usr/lib/systemd/system/harboros-beacon.service"',
             script,
         )
@@ -103,13 +104,13 @@ class K3DebPackagingTests(unittest.TestCase):
 
     def test_beacon_boot_verifies_exact_package_and_pointer_generation(self):
         script = BUILD_SCRIPT.read_text(encoding="utf-8")
-        unit = (REPOSITORY_ROOT / "debian" / "harboros-beacon.service").read_text(
+        unit = (K3_DEBIAN_DIRECTORY / "harboros-beacon.service").read_text(
             encoding="utf-8"
         )
         verifier = (
             REPOSITORY_ROOT / "debian" / "verify-beacon-k3-generation"
         ).read_text(encoding="utf-8")
-        control = (REPOSITORY_ROOT / "debian" / "control").read_text(
+        control = (K3_DEBIAN_DIRECTORY / "control").read_text(
             encoding="utf-8"
         )
 
@@ -131,6 +132,25 @@ class K3DebPackagingTests(unittest.TestCase):
         self.assertIn("/usr/lib/harboros-model-runtime/verify-release", verifier)
         self.assertIn("/usr/lib/harboros-cat-vision-runtime/verify-release", verifier)
         self.assertIn("/usr/lib/harboros-cat-vision-runtime/verify-evidence", verifier)
+
+    def test_n2_uses_fixed_runtime_and_isolated_lifecycle(self):
+        script = BUILD_SCRIPT.read_text(encoding="utf-8")
+        for source in ("debian/n2/postinst", "debian/n2/prerm", "debian/n2/harboros-beacon.service"):
+            self.assertIn(source, script)
+        self.assertIn("--no-default-features --features fixed-local-models", script)
+        self.assertNotIn("--features embedded-model-runtime", script)
+        self.assertNotIn("semantic-router.service", script)
+        for filename in ("postinst", "prerm"):
+            content = (K3_DEBIAN_DIRECTORY / filename).read_text(encoding="utf-8")
+            self.assertNotIn("systemctl restart semantic-router.service", content)
+        unit = (K3_DEBIAN_DIRECTORY / "harboros-beacon.service").read_text(encoding="utf-8")
+        self.assertIn("EnvironmentFile=/etc/default/harboros-fixed-models", unit)
+        self.assertIn("ExecStartPre=+/usr/bin/systemctl restart harboros-model-runtime.service", unit)
+        self.assertLess(unit.index("verify-k3-generation"), unit.index("systemctl restart harboros-model-runtime.service"))
+        runtime = (REPOSITORY_ROOT / "debian" / "harboros-model-runtime.service").read_text(encoding="utf-8")
+        self.assertIn("EnvironmentFile=/etc/default/harboros-fixed-models", runtime)
+        self.assertIn("KillMode=control-group", runtime)
+        self.assertNotIn("CANDLE", runtime)
 
 
 if __name__ == "__main__":

@@ -1,74 +1,66 @@
-#!/bin/sh
-set -eu
+#!/bin/bash
+set -euo pipefail
 
-generation_state_dir="/run/harboros-k3-generation"
-beacon_active_state="$generation_state_dir/beacon-was-active"
-
-validate_generation_state_dir() {
-  [ ! -L "$generation_state_dir" ] \
-    && [ -d "$generation_state_dir" ] \
-    && [ "$(stat -c %u "$generation_state_dir")" = 0 ] \
-    && [ "$(stat -c %a "$generation_state_dir")" = 700 ] || {
-    echo "error: unsafe Beacon generation state directory" >&2
-    exit 1
-  }
-}
-
-validate_beacon_active_state() {
-  validate_generation_state_dir
-  [ ! -L "$beacon_active_state" ] \
-    && [ -f "$beacon_active_state" ] \
-    && [ "$(stat -c %u "$beacon_active_state")" = 0 ] \
-    && [ "$(stat -c %a "$beacon_active_state")" = 600 ] \
-    && [ "$(stat -c %s "$beacon_active_state")" = 24 ] \
-    && [ "$(cat "$beacon_active_state")" = harboros-beacon.service ] || {
-    echo "error: unsafe Beacon generation active state: $beacon_active_state" >&2
-    exit 1
-  }
-}
+/usr/lib/harboros-beacon/validate-harborbeacon-service-auth
+HARBOR_MODEL_TOKEN_FORBIDDEN_FILES="/etc/harboros/service-auth/gate-to-beacon.accept-current:/etc/harboros/service-auth/gate-to-beacon.accept-previous:/etc/harboros/service-auth/beacon-to-gate.send" \
+  /usr/lib/harboros-beacon/ensure-harborbeacon-model-token
 
 if ! getent group harborbeacon >/dev/null 2>&1; then
   addgroup --system harborbeacon
 fi
 if ! id harborbeacon >/dev/null 2>&1; then
-  adduser --system --ingroup harborbeacon --home /data/harborbeacon --no-create-home harborbeacon
+  adduser --system --ingroup harborbeacon --home /var/lib/harboros-beacon --no-create-home harborbeacon
 fi
 
-/usr/lib/harborbeacon/ensure-data-layout /data/harborbeacon
-/usr/lib/harborbeacon/migrate-cat-activity-state
-
-if command -v deb-systemd-helper >/dev/null 2>&1; then
-  deb-systemd-helper unmask harboros-beacon.service >/dev/null || true
-  deb-systemd-helper enable harboros-beacon.service >/dev/null || true
-fi
-
-if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-  systemctl daemon-reload
-  if [ -e "$beacon_active_state" ] || [ -L "$beacon_active_state" ]; then
-    validate_beacon_active_state
-    beacon_version="$(dpkg-query -W -f='${Version}' harboros-beacon 2>/dev/null || true)"
-    [ -n "$beacon_version" ] || {
-      echo "error: unable to resolve the configuring Beacon generation" >&2
-      exit 1
-    }
-    for package in harboros-model-runtime harboros-cat-vision-runtime; do
-      installed="$(dpkg-query -W -f='${Status} ${Version}' "$package" 2>/dev/null || true)"
-      [ "$installed" = "install ok installed $beacon_version" ] || {
-        echo "error: $package is not the configured Beacon generation $beacon_version" >&2
-        exit 1
-      }
-    done
-    systemctl restart harboros-beacon.service
-    systemctl is-active --quiet harboros-beacon.service || {
-      echo "error: Beacon did not become active after generation upgrade" >&2
-      exit 1
-    }
-    rm -f -- "$beacon_active_state"
-    rmdir "$generation_state_dir" 2>/dev/null || true
-  elif systemctl is-active --quiet harboros-beacon.service; then
-    echo "error: Beacon is active without a generation upgrade marker" >&2
-    exit 1
+append_env_if_missing() {
+  local env_file="$1"
+  local key="$2"
+  local value="$3"
+  if ! grep -q "^${key}=" "$env_file" 2>/dev/null; then
+    printf '%s=%s\n' "$key" "$value" >> "$env_file"
   fi
-fi
+}
+
+upsert_env_value() {
+  local env_file="$1"
+  local key="$2"
+  local value="$3"
+  if grep -q "^${key}=" "$env_file" 2>/dev/null; then
+    sed -i "s|^${key}=.*|${key}=${value}|" "$env_file"
+  else
+    printf '%s=%s\n' "$key" "$value" >> "$env_file"
+  fi
+}
+
+ensure_harborbeacon_runtime_env() {
+  local env_file="/etc/default/harboros-beacon"
+  local writable_root="/mnt/software/harborbeacon-agent-ci"
+  local candle_root="${writable_root}/model-store/runtimes/harbor-candle"
+
+  install -d -m 0755 /etc/default
+  install -d -m 0755 "${candle_root}/cache"
+  install -d -m 0755 "${candle_root}/bootstrap-llm"
+  touch "$env_file"
+  chmod 0600 "$env_file"
+
+  append_env_if_missing "$env_file" "HARBOR_HARBOROS_WRITABLE_ROOT" "$writable_root"
+  upsert_env_value "$env_file" "HARBOR_MODEL_API_BASE_URL" "http://127.0.0.1:4174/api/inference/v1"
+  append_env_if_missing "$env_file" "HARBOR_MODEL_API_BACKEND" "candle"
+  append_env_if_missing "$env_file" "HARBOR_MODEL_API_CHAT_MODEL" "Qwen/Qwen2.5-0.5B-Instruct"
+  append_env_if_missing "$env_file" "HARBOR_MODEL_API_CANDLE_CHAT_MODEL_ID" "${candle_root}/bootstrap-llm"
+  append_env_if_missing "$env_file" "HARBOR_MODEL_API_CANDLE_CACHE_DIR" "${candle_root}/cache"
+  upsert_env_value "$env_file" "HARBOR_SEMANTIC_ROUTER_TOPOLOGY" "embedded"
+  append_env_if_missing "$env_file" "HARBOR_SEMANTIC_ROUTER_LOCAL_ONLY" "1"
+}
+
+ensure_harborbeacon_runtime_env
+install -d -o harborbeacon -g harborbeacon -m 0750 \
+  /var/lib/harboros-beacon /mnt/software/harborbeacon-agent-ci
+chown -R harborbeacon:harborbeacon \
+  /var/lib/harboros-beacon /mnt/software/harborbeacon-agent-ci
+/usr/lib/harboros-beacon/reconcile-legacy-semantic-router
+systemctl daemon-reload
+systemctl enable harboros-beacon.service
+systemctl restart harboros-beacon.service
 
 exit 0
