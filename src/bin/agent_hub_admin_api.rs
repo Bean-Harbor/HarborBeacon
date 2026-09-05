@@ -24,6 +24,10 @@ use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, ResponseBox, Server, StatusCode};
 use uuid::Uuid;
 
+#[path = "rules_admin_api.rs"]
+mod rules_admin_api;
+use harborbeacon_local_agent::runtime::automation::RulesStore;
+
 use harborbeacon_local_agent::adapters::rtsp::{CommandRtspAdapter, RtspProbeAdapter};
 #[cfg(test)]
 use harborbeacon_local_agent::connectors::home_assistant::validate_home_assistant_service_fields as validate_home_assistant_service_fields_shared;
@@ -278,6 +282,8 @@ impl Cli {
 #[derive(Clone)]
 pub struct AdminApi {
     admin_store: AdminConsoleStore,
+    rules_store: RulesStore,
+    rules_worker_lifetime: Arc<()>,
     task_service: TaskApiService,
     dvr_runtime: DvrRuntime,
     hls_live_runtime: HlsLiveRuntime,
@@ -1692,6 +1698,8 @@ impl AdminApi {
         let (guardian_sender, guardian_receiver) =
             sync_channel(HOME_GUARDIAN_EVALUATION_QUEUE_CAPACITY);
         let api = Self {
+            rules_store: RulesStore::new(admin_store.path().with_extension("rules.json")),
+            rules_worker_lifetime: Arc::new(()),
             admin_store,
             task_service,
             dvr_runtime: DvrRuntime::default(),
@@ -1718,6 +1726,7 @@ impl AdminApi {
         };
         api.refresh_home_guardian_rule_cache_best_effort();
         api.start_home_guardian_worker(guardian_receiver);
+        api.start_rules_worker();
         api
     }
 
@@ -1734,7 +1743,9 @@ impl AdminApi {
     }
 
     fn start_home_guardian_worker(&self, receiver: Receiver<StoredLocalVisionEvent>) {
-        let worker = self.clone();
+        let mut worker = self.clone();
+        // This long-lived receiver must not retain the independent Rules worker owner.
+        worker.rules_worker_lifetime = Arc::new(());
         let _ = thread::Builder::new()
             .name("home-guardian-eval".to_string())
             .spawn(move || worker.run_home_guardian_worker(receiver));
@@ -2228,6 +2239,12 @@ impl AdminApi {
                 let _ = request.respond(error_json(StatusCode(403), &error).boxed());
                 return;
             }
+        }
+
+        if rules_admin_api::is_rules_path(&path) {
+            let response = self.handle_rules_request(&mut request, &path, &identity_hints);
+            let _ = request.respond(response);
+            return;
         }
 
         let response = match method {
@@ -9954,6 +9971,7 @@ fn is_admin_surface_path(path: &str) -> bool {
         || (path.starts_with("/api/access/members/") && path.ends_with("/default-delivery-surface"))
         || path == "/api/tasks/approvals"
         || path.starts_with("/api/tasks/approvals/")
+        || rules_admin_api::is_rules_path(path)
         || path == "/api/automation/reviews"
         || path.starts_with("/api/automation/reviews/")
         || path == "/api/discovery/scan"
