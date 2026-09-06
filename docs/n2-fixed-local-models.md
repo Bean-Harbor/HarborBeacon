@@ -5,6 +5,10 @@ Beacon source tree. This is a short integration branch, not a separate product
 mainline. The HarborOS K3 WebUI/product changes live in the matching HarborOS
 integration branch.
 
+Startup isolation is evolving under [Option B](n2-capability-startup.md).
+Its first batch does not remove the model restart or generation protections
+described below, and must not be reported as installed-stack acceptance.
+
 ## Build And Execution Boundaries
 
 | Product | Cargo features | Local model management | Execution |

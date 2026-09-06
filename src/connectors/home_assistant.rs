@@ -8,6 +8,8 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::runtime::startup::StartupProfile;
+
 const DEFAULT_TIMEOUT_SECONDS: u64 = 8;
 const DEFAULT_HARBORLINK_MEDIA_API_URL: &str = "http://127.0.0.1:8790";
 const DEFAULT_HARBORLINK_LOCAL_API_TOKEN_FILE: &str =
@@ -109,7 +111,22 @@ pub struct HomeAssistantServiceActionRequest {
 
 impl HomeAssistantClient {
     pub fn from_harborlink_env() -> Result<Self, String> {
+        match StartupProfile::from_env()? {
+            StartupProfile::N1 => Self::from_harborlink_env_with_auth(false),
+            StartupProfile::N2 => Self::from_authenticated_harborlink_env(),
+        }
+    }
+
+    pub fn from_authenticated_harborlink_env() -> Result<Self, String> {
+        Self::from_harborlink_env_with_auth(true)
+    }
+
+    fn from_harborlink_env_with_auth(require_token: bool) -> Result<Self, String> {
         require_harborlink_cutover()?;
+        let local_api_token = read_local_api_token_from_env()?;
+        if require_token && local_api_token.is_none() {
+            return Err("HarborLink local API credential is unavailable".to_string());
+        }
         let base_url = std::env::var("HARBORLINK_MEDIA_API_URL")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -121,7 +138,7 @@ impl HomeAssistantClient {
             .map_err(|error| format!("failed to build HarborLink client: {error}"))?;
         Ok(Self {
             base_url,
-            local_api_token: read_local_api_token_from_env()?,
+            local_api_token,
             http,
         })
     }
@@ -470,14 +487,23 @@ fn home_assistant_secret_like_value(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
     use serde_json::{json, Value};
+    use tiny_http::{Response, Server};
 
     use super::{
         home_assistant_service_action_is_allowlisted, normalize_base_url,
         normalize_home_assistant_service_action_request, sanitize_service_path_component,
         token_is_redacted, validate_home_assistant_service_action_request,
-        validate_home_assistant_service_fields, HomeAssistantServiceActionRequest,
-        HOME_ASSISTANT_TOKEN_REDACTION,
+        validate_home_assistant_service_fields, HomeAssistantClient,
+        HomeAssistantServiceActionRequest, HOME_ASSISTANT_TOKEN_REDACTION,
     };
 
     #[test]
@@ -563,5 +589,209 @@ mod tests {
             "message": "Bearer abcdef"
         }))
         .is_err());
+    }
+
+    const FACTORY_CHILD: &str = "HARBOR_HA_FACTORY_TEST_CHILD";
+    const LINK_TOKEN: &str = "synthetic_link_token_0123456789abcdef0123456789abcdef";
+
+    struct FactoryFixture(PathBuf);
+
+    impl FactoryFixture {
+        fn new() -> Self {
+            let path = env::temp_dir().join(format!("harbor-ha-auth-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for FactoryFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn assert_factory_scenario(scenario: &str, rejection: Option<&str>) {
+        let fixture = FactoryFixture::new();
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let (stop, stopped) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut requests = Vec::new();
+            while stopped.try_recv().is_err() {
+                let Some(request) = server.recv_timeout(Duration::from_millis(20)).unwrap() else {
+                    continue;
+                };
+                let header = |name: &str| {
+                    request
+                        .headers()
+                        .iter()
+                        .find(|header| header.field.to_string().eq_ignore_ascii_case(name))
+                        .map(|header| header.value.to_string())
+                };
+                requests.push((
+                    request.method().as_str().to_string(),
+                    request.url().to_string(),
+                    header("Authorization"),
+                    header("X-HarborLink-Contract-Version"),
+                    header("X-Request-Id"),
+                ));
+                let body = if request.method().as_str() == "GET" {
+                    json!([])
+                } else {
+                    json!({"domain":"light", "service":"turn_on", "entity_id":"light.fixture", "ok":true})
+                };
+                request
+                    .respond(Response::from_string(body.to_string()))
+                    .unwrap();
+            }
+            requests
+        });
+        // Each child receives synthetic configuration without mutating the test process env.
+        let mut command = Command::new(env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "connectors::home_assistant::tests::harborlink_factory_child",
+            "--nocapture",
+        ]);
+        for key in [
+            "HARBOR_BEACON_STARTUP_PROFILE",
+            "HARBORBEACON_SOUTHBOUND_MODE",
+            "HARBORLINK_MEDIA_API_URL",
+            "HARBORLINK_LOCAL_API_TOKEN",
+            "HARBORLINK_LOCAL_API_TOKEN_FILE",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            command.env_remove(key);
+        }
+        command
+            .env(FACTORY_CHILD, rejection.unwrap_or(""))
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("HARBORBEACON_SOUTHBOUND_MODE", "harborlink")
+            .env("HARBORLINK_MEDIA_API_URL", format!("http://{address}"))
+            .env("HARBORLINK_LOCAL_API_TOKEN_FILE", fixture.0.join("token"));
+        match scenario {
+            "missing-token" => {}
+            "env-token" => {
+                command.env("HARBORLINK_LOCAL_API_TOKEN", LINK_TOKEN);
+            }
+            "file-token" => {
+                fs::write(fixture.0.join("token"), LINK_TOKEN).unwrap();
+            }
+            "empty-token-file" => {
+                fs::write(fixture.0.join("token"), "\n").unwrap();
+            }
+            "invalid-profile" => {
+                command.env("HARBOR_BEACON_STARTUP_PROFILE", "invalid");
+            }
+            "wrong-product-profile" => {
+                command.env(
+                    "HARBOR_BEACON_STARTUP_PROFILE",
+                    if cfg!(feature = "external-model-runtime") {
+                        "n1"
+                    } else {
+                        "n2"
+                    },
+                );
+            }
+            "invalid-cutover" => {
+                command.env("HARBORBEACON_SOUTHBOUND_MODE", "direct");
+            }
+            _ => panic!("unknown factory scenario"),
+        }
+        let output = command.output().unwrap();
+        stop.send(()).unwrap();
+        let requests = worker.join().unwrap();
+        assert!(
+            output.status.success(),
+            "{scenario}: child failed, {} outbound requests:\n{}\n{}",
+            requests.len(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        if rejection.is_some() {
+            assert!(
+                requests.is_empty(),
+                "rejected factory sent an outbound request"
+            );
+        } else {
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].0, "GET");
+            assert_eq!(requests[0].1, "/v1/home-assistant/entities");
+            assert_eq!(requests[1].0, "POST");
+            assert_eq!(requests[1].1, "/v1/home-assistant/services/light/turn_on");
+            for request in &requests {
+                assert_eq!(request.3.as_deref(), Some("1.0"));
+                let expected =
+                    (scenario != "missing-token").then(|| format!("Bearer {LINK_TOKEN}"));
+                assert_eq!(request.2, expected);
+            }
+            assert!(requests[1]
+                .4
+                .as_deref()
+                .is_some_and(|value| value.starts_with("beacon-")));
+        }
+    }
+
+    #[test]
+    fn harborlink_factory_child() {
+        let Ok(rejection) = env::var(FACTORY_CHILD) else {
+            return;
+        };
+        let result = HomeAssistantClient::from_harborlink_env();
+        if rejection.is_empty() {
+            let client = result.unwrap();
+            assert!(client.fetch_entities().unwrap().is_empty());
+            assert!(
+                client
+                    .call_service("light", "turn_on", "light.fixture", None)
+                    .unwrap()
+                    .ok
+            );
+        } else {
+            if let Ok(client) = &result {
+                // A permissive mock exposes an incorrectly enabled client, without relying on 401.
+                let _ = client.fetch_entities();
+            }
+            let error = result.expect_err("factory must reject before network access");
+            assert!(
+                error.contains(&rejection),
+                "unexpected factory error: {error}"
+            );
+            assert!(!error.contains(LINK_TOKEN));
+        }
+    }
+
+    #[test]
+    fn harborlink_factory_requires_token_for_n2_and_preserves_n1_compatibility() {
+        let rejection = cfg!(feature = "external-model-runtime")
+            .then_some("HarborLink local API credential is unavailable");
+        assert_factory_scenario("missing-token", rejection);
+    }
+
+    #[test]
+    fn harborlink_factory_sends_bearer_for_env_and_file_tokens() {
+        assert_factory_scenario("env-token", None);
+        assert_factory_scenario("file-token", None);
+    }
+
+    #[test]
+    fn harborlink_factory_rejects_invalid_profile_before_network() {
+        assert_factory_scenario("invalid-profile", Some("HARBOR_BEACON_STARTUP_PROFILE"));
+        assert_factory_scenario(
+            "wrong-product-profile",
+            Some("HARBOR_BEACON_STARTUP_PROFILE"),
+        );
+    }
+
+    #[test]
+    fn harborlink_factory_rejects_invalid_cutover_and_empty_credentials_before_network() {
+        assert_factory_scenario("invalid-cutover", Some("HARBORBEACON_SOUTHBOUND_MODE"));
+        assert_factory_scenario("empty-token-file", Some("empty"));
     }
 }

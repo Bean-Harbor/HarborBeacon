@@ -2,3 +2,6 @@
 *.py text eol=lf
 debian/postinst text eol=lf
 debian/prerm text eol=lf
+debian/model-runtime-manifest.json.in text eol=lf
+debian/component-contract-beacon.json.in text eol=lf
+debian/component-contract-model-runtime.json.in text eol=lf

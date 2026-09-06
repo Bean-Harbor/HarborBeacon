@@ -35,6 +35,14 @@ pub struct VerifierTokens {
 }
 
 impl VerifierTokens {
+    /// Explicitly disable a protected adapter without accepting anonymous requests.
+    pub fn disabled() -> Self {
+        Self {
+            current: String::new(),
+            previous: None,
+        }
+    }
+
     pub fn current_only(current: impl Into<String>) -> Result<Self, String> {
         let current = validate_configured_token(current.into(), "bearer token")?;
         Ok(Self {
@@ -106,7 +114,12 @@ fn required_token(
     primary_env: &str,
     legacy_envs: &[&str],
 ) -> Result<String, String> {
-    if let Some(value) = token_from_file_env(file_env)? {
+    if let Some(value) = token_from_env_compatible_file(file_env)? {
+        if value.is_empty() {
+            return Err(format!(
+                "service credential configured by {file_env} is empty"
+            ));
+        }
         return validate_configured_token(value, file_env);
     }
     if let Some(value) = token_from_env(primary_env) {
@@ -122,13 +135,7 @@ fn required_token(
 }
 
 fn optional_token(file_env: &str, primary_env: &str) -> Result<Option<String>, String> {
-    if let Some(path) = credential_file_path(file_env) {
-        let value = fs::read_to_string(&path)
-            .map_err(|error| {
-                format!("failed to read service credential configured by {file_env}: {error}")
-            })?
-            .trim()
-            .to_string();
+    if let Some(value) = token_from_env_compatible_file(file_env)? {
         return if value.is_empty() {
             Ok(None)
         } else {
@@ -138,6 +145,33 @@ fn optional_token(file_env: &str, primary_env: &str) -> Result<Option<String>, S
     token_from_env(primary_env)
         .map(|value| validate_configured_token(value, primary_env).map(Some))
         .unwrap_or(Ok(None))
+}
+
+fn token_from_env_compatible_file(file_env: &str) -> Result<Option<String>, String> {
+    let Some(path) = credential_file_path(file_env) else {
+        return Ok(None);
+    };
+    let configured_path = configured_file_path(file_env);
+    let result = match fs::read_to_string(&path) {
+        // Other adapters also use systemd credentials. An absent inferred Gate
+        // file falls through to an explicit file, then env if no file was set.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && configured_path.as_ref() != Some(&path) =>
+        {
+            match configured_path {
+                Some(path) => fs::read_to_string(path),
+                None => return Ok(None),
+            }
+        }
+        result => result,
+    };
+    // Existing systemd files keep precedence; explicit errors never fall back to env.
+    result
+        .map(|value| Some(value.trim().to_string()))
+        .map_err(|error| {
+            format!("failed to read service credential configured by {file_env}: {error}")
+        })
 }
 
 fn required_file_token(file_env: &str) -> Result<String, String> {
@@ -236,6 +270,10 @@ fn validate_configured_token(value: String, source: &str) -> Result<String, Stri
 fn constant_time_token_eq(actual: &str, expected: &str) -> bool {
     constant_time_eq(actual.as_bytes(), expected.as_bytes())
 }
+
+#[cfg(test)]
+#[path = "service_auth_profiles_tests.rs"]
+mod profile_tests;
 
 #[cfg(test)]
 mod tests {

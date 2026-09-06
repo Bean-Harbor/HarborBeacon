@@ -34,6 +34,7 @@ use uuid::Uuid;
 #[path = "rules_admin_api.rs"]
 mod rules_admin_api;
 use harborbeacon_local_agent::runtime::automation::RulesStore;
+use harborbeacon_local_agent::runtime::startup::{StartupCapability, StartupProfile};
 
 use harborbeacon_local_agent::connectors::harborlink_media::{
     harborlink_request_scope, HarborLinkCameraProjection, HarborLinkCredentialStatus,
@@ -756,6 +757,12 @@ pub struct AdminApi {
     admin_store: AdminConsoleStore,
     rules_store: RulesStore,
     rules_worker_lifetime: Arc<()>,
+    background_receiver: Arc<Mutex<Option<Receiver<StoredLocalVisionEvent>>>>,
+    background_start_error: Arc<Mutex<Option<String>>>,
+    startup_profile: Option<StartupProfile>,
+    startup_capabilities: Vec<StartupCapability>,
+    vision_unavailable_reason: Option<&'static str>,
+    service_tokens: Option<Option<VerifierTokens>>,
     task_service: TaskApiService,
     harborlink_media: HarborLinkMediaClient,
     harbor_assistant_dist: PathBuf,
@@ -779,12 +786,12 @@ pub struct AdminApi {
     detection_job_lifecycle_lock: Arc<Mutex<()>>,
     detection_jobs: Arc<Mutex<HashMap<String, DetectionJobRuntime>>>,
     cat_auto_recording: Arc<Mutex<HashMap<String, CatAutoRecordingState>>>,
-    cat_activity_policy_store: CatActivityPolicyStore,
+    cat_activity_policy_store: Option<CatActivityPolicyStore>,
     cat_activity_camera_statuses: Arc<Mutex<BTreeMap<String, CatActivityCameraStatus>>>,
     cat_validation_readiness: Arc<Mutex<CatValidationReadinessCache>>,
-    cat_recording_reconciliation_store: CatRecordingReconciliationStore,
+    cat_recording_reconciliation_store: Option<CatRecordingReconciliationStore>,
     cat_recording_validation_mode: CatRecordingValidationMode,
-    cat_recording_validation_store: CatRecordingValidationStore,
+    cat_recording_validation_store: Option<CatRecordingValidationStore>,
     http_runtime: HttpRuntimeCounters,
     vision_ingest_limiter: VisionIngestLimiter,
 }
@@ -2542,6 +2549,40 @@ fn constructor_cat_recording_validation_store() -> CatRecordingValidationStore {
 }
 
 impl AdminApi {
+    pub fn new_deferred(
+        admin_store: AdminConsoleStore,
+        task_service: TaskApiService,
+        harbor_assistant_dist: PathBuf,
+        public_origin: String,
+        profile: StartupProfile,
+    ) -> Result<Self, String> {
+        use harborbeacon_local_agent::runtime::{
+            cat_activity_policy, cat_recording_reconciliation, cat_recording_validation,
+        };
+        admin_store.load_state()?;
+        let mut api = Self::build_deferred(
+            admin_store,
+            task_service,
+            harbor_assistant_dist,
+            public_origin,
+            if profile.isolate_optional_capabilities() {
+                HarborLinkMediaClient::from_env_authenticated()
+            } else {
+                HarborLinkMediaClient::from_env()
+            },
+            validation_mode_from_env(),
+            CatActivityPolicyStore::try_new(cat_activity_policy::default_policy_path()),
+            CatRecordingReconciliationStore::try_new(
+                cat_recording_reconciliation::default_reconciliation_path(),
+            ),
+            CatRecordingValidationStore::try_new(cat_recording_validation::default_store_path()),
+            Some(profile),
+        )?;
+        // Entrypoints inject their already-resolved verifier before starting workers.
+        api.service_tokens = Some(None);
+        Ok(api)
+    }
+
     pub fn new(
         admin_store: AdminConsoleStore,
         task_service: TaskApiService,
@@ -2594,16 +2635,107 @@ impl AdminApi {
         cat_recording_reconciliation_store: CatRecordingReconciliationStore,
         cat_recording_validation_store: CatRecordingValidationStore,
     ) -> Self {
+        let api = Self::build_deferred(
+            admin_store,
+            task_service,
+            harbor_assistant_dist,
+            public_origin,
+            Ok(harborlink_media),
+            Ok(cat_recording_validation_mode),
+            Ok(cat_activity_policy_store),
+            Ok(cat_recording_reconciliation_store),
+            Ok(cat_recording_validation_store),
+            None,
+        )
+        .unwrap_or_else(|error| fail(&error));
+        api.start_background_workers()
+            .unwrap_or_else(|error| fail(&error));
+        api
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_deferred(
+        admin_store: AdminConsoleStore,
+        task_service: TaskApiService,
+        harbor_assistant_dist: PathBuf,
+        public_origin: String,
+        harborlink_media: Result<HarborLinkMediaClient, String>,
+        cat_recording_validation_mode: Result<CatRecordingValidationMode, String>,
+        cat_activity_policy_store: Result<CatActivityPolicyStore, String>,
+        cat_recording_reconciliation_store: Result<CatRecordingReconciliationStore, String>,
+        cat_recording_validation_store: Result<CatRecordingValidationStore, String>,
+        startup_profile: Option<StartupProfile>,
+    ) -> Result<Self, String> {
+        let profile = startup_profile.unwrap_or(StartupProfile::N1);
+        let harborlink_media = profile
+            .optional(harborlink_media, "HARBORLINK_CONFIG_UNAVAILABLE")?
+            .unwrap_or_else(HarborLinkMediaClient::disabled);
+        let mode = profile.optional(cat_recording_validation_mode, "VISION_MODE_UNAVAILABLE")?;
+        let cat_activity_policy_store = profile.optional(
+            cat_activity_policy_store.and_then(|store| {
+                store.load()?;
+                Ok(store)
+            }),
+            "VISION_POLICY_UNAVAILABLE",
+        )?;
+        let reconciliation = profile.optional(
+            cat_recording_reconciliation_store.and_then(|store| {
+                let state = store.load()?.into_iter().collect::<HashMap<_, _>>();
+                Ok((store, state))
+            }),
+            "VISION_RECONCILIATION_UNAVAILABLE",
+        )?;
+        let cat_recording_validation_store = profile.optional(
+            cat_recording_validation_store.and_then(|store| {
+                if profile.isolate_optional_capabilities() {
+                    store.validate_startup_state()?;
+                } else {
+                    store.list_latest()?;
+                }
+                Ok(store)
+            }),
+            "VISION_VALIDATION_UNAVAILABLE",
+        )?;
+        let vision_unavailable_reason = if mode.is_none() {
+            Some("VISION_MODE_UNAVAILABLE")
+        } else if cat_activity_policy_store.is_none() {
+            Some("VISION_POLICY_UNAVAILABLE")
+        } else if reconciliation.is_none() {
+            Some("VISION_RECONCILIATION_UNAVAILABLE")
+        } else if cat_recording_validation_store.is_none() {
+            Some("VISION_VALIDATION_UNAVAILABLE")
+        } else if !harborlink_media.is_configured() {
+            Some("HARBORLINK_CONFIG_UNAVAILABLE")
+        } else {
+            None
+        };
+        let startup_capabilities = vec![
+            if harborlink_media.is_configured() {
+                StartupCapability::configured("harborlink")
+            } else {
+                StartupCapability::unavailable("harborlink", "HARBORLINK_CONFIG_UNAVAILABLE")
+            },
+            match vision_unavailable_reason {
+                Some(reason) => StartupCapability::unavailable("vision", reason),
+                None => StartupCapability::configured("vision"),
+            },
+        ];
+        // An unavailable store is never replaced or used by a worker or vision route.
+        let (cat_recording_reconciliation_store, cat_auto_recording) = match reconciliation {
+            Some((store, state)) => (Some(store), state),
+            None => (None, HashMap::new()),
+        };
         let (guardian_sender, guardian_receiver) =
             sync_channel(HOME_GUARDIAN_EVALUATION_QUEUE_CAPACITY);
-        let cat_auto_recording = cat_recording_reconciliation_store
-            .load()
-            .unwrap_or_else(|error| fail(&error))
-            .into_iter()
-            .collect::<HashMap<_, _>>();
-        let mut api = Self {
+        let api = Self {
             rules_store: RulesStore::new(admin_store.path().with_extension("rules.json")),
             rules_worker_lifetime: Arc::new(()),
+            background_receiver: Arc::new(Mutex::new(Some(guardian_receiver))),
+            background_start_error: Arc::new(Mutex::new(None)),
+            startup_profile,
+            startup_capabilities,
+            vision_unavailable_reason,
+            service_tokens: None,
             admin_store,
             task_service,
             harborlink_media,
@@ -2632,21 +2764,92 @@ impl AdminApi {
             cat_activity_camera_statuses: Arc::new(Mutex::new(BTreeMap::new())),
             cat_validation_readiness: Arc::new(Mutex::new(CatValidationReadinessCache::default())),
             cat_recording_reconciliation_store,
-            cat_recording_validation_mode,
+            cat_recording_validation_mode: mode.unwrap_or(CatRecordingValidationMode::Off),
             cat_recording_validation_store,
             http_runtime: HttpRuntimeCounters::new(),
             vision_ingest_limiter: VisionIngestLimiter::new(),
         };
-        api.refresh_home_guardian_rule_cache_best_effort();
-        api.start_home_guardian_worker(guardian_receiver);
-        api.start_detection_job_monitor();
-        api.start_cat_activity_supervisor();
-        api.start_cat_auto_recording_worker();
-        api.start_cat_recording_validation_worker();
-        // Existing background clones must not keep the independent Rules worker alive.
-        api.rules_worker_lifetime = Arc::new(());
-        api.start_rules_worker();
-        api
+        Ok(api)
+    }
+
+    pub fn startup_capabilities(&self) -> Vec<StartupCapability> {
+        self.startup_capabilities.clone()
+    }
+
+    pub(crate) fn with_service_tokens(mut self, tokens: Option<VerifierTokens>) -> Self {
+        self.service_tokens = Some(tokens);
+        self
+    }
+
+    /// Call only after core configuration, edge verification and listener binding succeed.
+    pub fn start_background_workers(&self) -> Result<bool, String> {
+        let mut receiver = self
+            .background_receiver
+            .lock()
+            .map_err(|_| "BACKGROUND_STARTUP_STATE_UNAVAILABLE".to_string())?;
+        if receiver.is_none() {
+            if let Some(error) = self
+                .background_start_error
+                .lock()
+                .map_err(|_| "BACKGROUND_STARTUP_STATE_UNAVAILABLE".to_string())?
+                .as_ref()
+            {
+                return Err(error.clone());
+            }
+            return Ok(false);
+        }
+        if self.startup_profile.is_some() {
+            self.admin_store.load_state()?;
+            if self.startup_profile == Some(StartupProfile::N2)
+                && self.edge_assertion_verifier.is_none()
+            {
+                return Err("EDGE_AUTH_UNAVAILABLE".to_string());
+            }
+            reconcile_stale_knowledge_index_jobs(&self.admin_store)?;
+        }
+        let guardian_receiver = receiver.take().expect("checked startup receiver");
+        self.refresh_home_guardian_rule_cache_best_effort();
+        if self.vision_unavailable_reason.is_none() {
+            self.start_home_guardian_worker(guardian_receiver);
+            self.start_detection_job_monitor();
+            self.start_cat_activity_supervisor();
+            self.start_cat_auto_recording_worker();
+            self.start_cat_recording_validation_worker();
+        }
+        if let Err(error) = self.start_rules_worker() {
+            *self
+                .background_start_error
+                .lock()
+                .map_err(|_| "BACKGROUND_STARTUP_STATE_UNAVAILABLE".to_string())? =
+                Some(error.clone());
+            return Err(error);
+        }
+        Ok(true)
+    }
+
+    fn background_clone(&self) -> Self {
+        let mut worker = self.clone();
+        // Vision workers must not keep the independent Rules worker alive.
+        worker.rules_worker_lifetime = Arc::new(());
+        worker
+    }
+
+    fn reconciliation_store(&self) -> Result<&CatRecordingReconciliationStore, String> {
+        self.cat_recording_reconciliation_store
+            .as_ref()
+            .ok_or_else(|| "VISION_RECONCILIATION_UNAVAILABLE".to_string())
+    }
+
+    fn validation_store(&self) -> Result<&CatRecordingValidationStore, String> {
+        self.cat_recording_validation_store
+            .as_ref()
+            .ok_or_else(|| "VISION_VALIDATION_UNAVAILABLE".to_string())
+    }
+
+    fn activity_policy_store(&self) -> Result<&CatActivityPolicyStore, String> {
+        self.cat_activity_policy_store
+            .as_ref()
+            .ok_or_else(|| "VISION_POLICY_UNAVAILABLE".to_string())
     }
 
     #[cfg(test)]
@@ -2691,7 +2894,7 @@ impl AdminApi {
 
     #[cfg(test)]
     fn with_cat_activity_policy_store(mut self, store: CatActivityPolicyStore) -> Self {
-        self.cat_activity_policy_store = store;
+        self.cat_activity_policy_store = Some(store);
         self
     }
 
@@ -2700,14 +2903,14 @@ impl AdminApi {
     }
 
     fn start_home_guardian_worker(&self, receiver: Receiver<StoredLocalVisionEvent>) {
-        let worker = self.clone();
+        let worker = self.background_clone();
         let _ = thread::Builder::new()
             .name("home-guardian-eval".to_string())
             .spawn(move || worker.run_home_guardian_worker(receiver));
     }
 
     fn start_detection_job_monitor(&self) {
-        let worker = self.clone();
+        let worker = self.background_clone();
         let _ = thread::Builder::new()
             .name("detection-job-monitor".to_string())
             .spawn(move || loop {
@@ -2724,7 +2927,7 @@ impl AdminApi {
         if !cat_auto_recording_enabled() {
             return;
         }
-        let worker = self.clone();
+        let worker = self.background_clone();
         thread::Builder::new()
             .name("cat-activity-supervisor".to_string())
             .spawn(move || {
@@ -2755,7 +2958,7 @@ impl AdminApi {
     }
 
     fn reconcile_cat_activity_policy(&self) -> Result<(), String> {
-        let policy = self.cat_activity_policy_store.load()?;
+        let policy = self.activity_policy_store()?.load()?;
         let previous_ids = self
             .cat_activity_camera_statuses
             .lock()
@@ -2914,7 +3117,10 @@ impl AdminApi {
 
     fn mark_cat_activity_dependency_degraded(&self) {
         let updated_at = Some(current_rfc3339_timestamp());
-        let policy = self.cat_activity_policy_store.load().ok();
+        let policy = self
+            .activity_policy_store()
+            .and_then(|store| store.load())
+            .ok();
         if let Ok(mut statuses) = self.cat_activity_camera_statuses.lock() {
             for status in statuses.values_mut() {
                 if policy.as_ref().is_some_and(|policy| {
@@ -2949,7 +3155,7 @@ impl AdminApi {
         if config.is_none() && !has_pending_reconciliation {
             return;
         }
-        let worker = self.clone();
+        let worker = self.background_clone();
         thread::Builder::new()
             .name("cat-auto-recording".to_string())
             .spawn(move || loop {
@@ -2980,7 +3186,7 @@ impl AdminApi {
         if !self.cat_recording_validation_mode.validates_candidates() {
             return;
         }
-        let worker = self.clone();
+        let worker = self.background_clone();
         thread::Builder::new()
             .name("cat-recording-validation".to_string())
             .spawn(move || worker.run_cat_recording_validation_worker())
@@ -2990,23 +3196,26 @@ impl AdminApi {
     }
 
     fn run_cat_recording_validation_worker(self) {
+        let Ok(store) = self.validation_store() else {
+            return;
+        };
         let worker_owner = format!(
             "harborbeacon-{}-{}",
             std::process::id(),
             Uuid::new_v4().simple()
         );
-        if let Err(error) = self.cat_recording_validation_store.recover_expired_claims() {
+        if let Err(error) = store.recover_expired_claims() {
             eprintln!("HarborBeacon cat recording validation recovery failed: {error}");
         }
         self.retry_pending_cat_recording_discards();
         loop {
             self.retry_pending_cat_recording_discards();
-            if let Err(error) = self.cat_recording_validation_store.recover_expired_claims() {
+            if let Err(error) = store.recover_expired_claims() {
                 eprintln!("HarborBeacon cat recording validation recovery failed: {error}");
                 thread::sleep(CAT_RECORDING_VALIDATION_POLL_INTERVAL);
                 continue;
             }
-            let has_pending = match self.cat_recording_validation_store.next_pending() {
+            let has_pending = match store.next_pending() {
                 Ok(pending) => pending.is_some(),
                 Err(error) => {
                     eprintln!("HarborBeacon cat recording validation queue failed: {error}");
@@ -3028,7 +3237,7 @@ impl AdminApi {
                     continue;
                 }
             }
-            match self.cat_recording_validation_store.claim_next_pending(
+            match store.claim_next_pending(
                 &worker_owner,
                 CAT_RECORDING_VALIDATION_CLAIM_LEASE_DURATION.as_millis(),
             ) {
@@ -3043,6 +3252,9 @@ impl AdminApi {
     }
 
     fn process_cat_recording_validation(&self, claimed: CatRecordingValidationRecord) {
+        let Ok(store) = self.validation_store() else {
+            return;
+        };
         let Some(claim_token) = claimed.claim_token.as_deref() else {
             eprintln!("HarborBeacon cat recording validation claim is missing its fencing token");
             return;
@@ -3058,7 +3270,7 @@ impl AdminApi {
             _ => {}
         }
         let completion = match result {
-            Ok((status, decision, error)) => self.cat_recording_validation_store.complete(
+            Ok((status, decision, error)) => store.complete(
                 &claimed.artifact_id,
                 claim_token,
                 status,
@@ -3077,7 +3289,7 @@ impl AdminApi {
                         CAT_RECORDING_AI_RESOURCE_RETRY_DELAY.as_secs(),
                         diagnostic
                     );
-                    self.cat_recording_validation_store
+                    store
                         .defer_resource_contention(
                             &claimed.artifact_id,
                             claim_token,
@@ -3097,7 +3309,7 @@ impl AdminApi {
                             delay.as_secs(),
                             diagnostic
                         );
-                            self.cat_recording_validation_store.schedule_retry(
+                            store.schedule_retry(
                                 &claimed.artifact_id,
                                 claim_token,
                                 retry_at,
@@ -3112,7 +3324,7 @@ impl AdminApi {
                             claimed.attempt_count,
                             diagnostic
                         );
-                            self.cat_recording_validation_store.complete(
+                            store.complete(
                                 &claimed.artifact_id,
                                 claim_token,
                                 CatRecordingValidationStatus::ReviewRequired,
@@ -3139,8 +3351,8 @@ impl AdminApi {
 
     fn retry_pending_cat_recording_discards(&self) {
         match self
-            .cat_recording_validation_store
-            .pending_discards(self.cat_recording_validation_mode)
+            .validation_store()
+            .and_then(|store| store.pending_discards(self.cat_recording_validation_mode))
         {
             Ok(records) => {
                 for record in records {
@@ -3154,10 +3366,13 @@ impl AdminApi {
     }
 
     fn discard_cat_recording_artifact(&self, record: &CatRecordingValidationRecord) {
+        let Ok(store) = self.validation_store() else {
+            return;
+        };
         if !record.is_physical_discard_eligible(self.cat_recording_validation_mode) {
             return;
         }
-        let pending = match self.cat_recording_validation_store.claim_artifact_discard(
+        let pending = match store.claim_artifact_discard(
             &record.artifact_id,
             self.cat_recording_validation_mode,
             CAT_RECORDING_DISCARD_CLAIM_LEASE_MS,
@@ -3186,7 +3401,7 @@ impl AdminApi {
                     .get("alreadyAbsent")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                if let Err(error) = self.cat_recording_validation_store.mark_artifact_discarded(
+                if let Err(error) = store.mark_artifact_discarded(
                     &pending.artifact_id,
                     discard_attempt_token,
                     provider_deleted,
@@ -3196,8 +3411,7 @@ impl AdminApi {
                     eprintln!(
                         "HarborBeacon could not persist cat recording discard tombstone: {error}"
                     );
-                    if let Err(store_error) = self
-                        .cat_recording_validation_store
+                    if let Err(store_error) = store
                         .mark_artifact_discard_failed(
                             &pending.artifact_id,
                             discard_attempt_token,
@@ -3212,8 +3426,7 @@ impl AdminApi {
             }
             Err(error) => {
                 let diagnostic = sanitize_cat_recording_validation_error(&error);
-                if let Err(store_error) = self
-                    .cat_recording_validation_store
+                if let Err(store_error) = store
                     .mark_artifact_discard_failed(
                         &pending.artifact_id,
                         discard_attempt_token,
@@ -3344,7 +3557,7 @@ impl AdminApi {
                     .is_some_and(|source| source == "yolo_cat_activity")
                 && artifact.labels.iter().any(|label| label == "cat")
         }) {
-            self.cat_recording_validation_store
+            self.validation_store()?
                 .register_candidate_with_evidence(artifact, detection_evidence)?;
             registered += 1;
         }
@@ -3403,7 +3616,7 @@ impl AdminApi {
                 recovered.phase = CatRecordingReconciliationPhase::Active;
                 recovered.lease_id = Some(lease.lease_id.clone());
                 recovered.stream_profile = Some(lease.stream_profile.clone());
-                self.cat_recording_reconciliation_store
+                self.reconciliation_store()?
                     .upsert(recovered.clone())?;
                 self.cat_auto_recording
                     .lock()
@@ -3435,7 +3648,7 @@ impl AdminApi {
                 && cat_auto_recording_epoch_ms().saturating_sub(state.created_at_epoch_ms)
                     >= CAT_RECORDING_PENDING_START_TIMEOUT_MS;
             if lease_not_found && pending_start_expired {
-                self.cat_recording_reconciliation_store
+                self.reconciliation_store()?
                     .remove(&state.camera_id)?;
                 self.cat_auto_recording
                     .lock()
@@ -3448,7 +3661,7 @@ impl AdminApi {
             ));
         }
         self.register_cat_recording_validation_artifacts(&artifacts, &state.detection_evidence)?;
-        self.cat_recording_reconciliation_store
+        self.reconciliation_store()?
             .remove(&state.camera_id)?;
         self.cat_auto_recording
             .lock()
@@ -3638,7 +3851,7 @@ impl AdminApi {
                     &stopped.artifacts,
                     &state.detection_evidence,
                 )?;
-                self.cat_recording_reconciliation_store.remove(camera_id)?;
+                self.reconciliation_store()?.remove(camera_id)?;
             }
             *state = CatAutoRecordingState::default();
             state.camera_id = camera_id.to_string();
@@ -3675,7 +3888,7 @@ impl AdminApi {
                 if let Some(sample) = new_sample.filter(|sample| sample.detection_count > 0) {
                     record_cat_detection_evidence(&mut state.detection_evidence, &sample);
                 }
-                self.cat_recording_reconciliation_store
+                self.reconciliation_store()?
                     .upsert(state.clone())?;
                 self.harborlink_media.start_event_recording(
                     camera_id,
@@ -3702,7 +3915,7 @@ impl AdminApi {
             state.event_id = Some(lease.event_id);
             state.lease_id = Some(lease.lease_id);
             state.last_renewed_epoch_ms = now;
-            self.cat_recording_reconciliation_store
+            self.reconciliation_store()?
                 .upsert(state.clone())?;
         }
 
@@ -3714,7 +3927,7 @@ impl AdminApi {
                     .any(|evidence| evidence.sequence == sample.sequence)
                 {
                     record_cat_detection_evidence(&mut state.detection_evidence, &sample);
-                    self.cat_recording_reconciliation_store
+                    self.reconciliation_store()?
                         .upsert(state.clone())?;
                 }
             }
@@ -3740,7 +3953,7 @@ impl AdminApi {
                     &stopped.artifacts,
                     &state.detection_evidence,
                 )?;
-                self.cat_recording_reconciliation_store.remove(camera_id)?;
+                self.reconciliation_store()?.remove(camera_id)?;
                 *state = CatAutoRecordingState::default();
                 state.camera_id = camera_id.to_string();
             } else if sample.is_some()
@@ -3757,7 +3970,7 @@ impl AdminApi {
                         state.event_id = Some(renewed.event_id);
                         state.lease_id = Some(renewed.lease_id);
                         state.last_renewed_epoch_ms = now;
-                        self.cat_recording_reconciliation_store
+                        self.reconciliation_store()?
                             .upsert(state.clone())?;
                     }
                     Err(error) => {
@@ -3812,7 +4025,7 @@ impl AdminApi {
                     }
                 }?;
             }
-            self.cat_recording_reconciliation_store.remove(camera_id)?;
+            self.reconciliation_store()?.remove(camera_id)?;
             completed.push(camera_id.clone());
         }
         for camera_id in completed {
@@ -4261,6 +4474,14 @@ impl AdminApi {
         raw_url: &str,
         headers: &[Header],
     ) -> Result<GateAuthenticatedPrincipal, GatePrincipalAuthError> {
+        if let Some(configured_tokens) = &self.service_tokens {
+            return authenticate_gate_principal_with_workspace_loader_tokens(
+                configured_tokens.as_ref(),
+                raw_url,
+                headers,
+                || self.load_active_workspace_id(),
+            );
+        }
         let configured_tokens = gate_to_beacon_verifier_tokens()
             .map_err(|error| GatePrincipalAuthError::new(StatusCode(503), error))?;
         authenticate_gate_principal_with_workspace_loader_tokens(
@@ -4447,8 +4668,21 @@ impl AdminApi {
             return;
         }
 
+        if path.starts_with("/api/vision/") {
+            if let Some(reason) = self.vision_unavailable_reason {
+                let _ = request.respond(json_response(StatusCode(503), &json!({
+                    "error": "vision capability unavailable",
+                    "status": "unavailable",
+                    "reason_code": reason,
+                })).boxed());
+                return;
+            }
+        }
+
         let response = match method {
-            Method::Get if path == "/healthz" => ok_json(&json!({"status":"ok"})).boxed(),
+            Method::Get if path == "/healthz" => ok_json(&json!({
+                "status":"ok", "startup_capabilities": self.startup_capabilities(),
+            })).boxed(),
             Method::Get if path == "/api/state" => self.handle_state(&identity_hints).boxed(),
             Method::Get if path == "/api/account-management" => {
                 self.handle_account_management(&identity_hints).boxed()
@@ -7690,9 +7924,13 @@ impl AdminApi {
             disabled_camera_ids: update.disabled_camera_ids,
             updated_at: Some(current_rfc3339_timestamp()),
         };
+        let store = match self.activity_policy_store() {
+            Ok(store) => store,
+            Err(error) => return error_json(StatusCode(503), &error),
+        };
         if let Err(error) = persist_cat_activity_policy_with_audit(
             &self.admin_store,
-            &self.cat_activity_policy_store,
+            store,
             &principal,
             policy,
         ) {
@@ -7734,7 +7972,7 @@ impl AdminApi {
     }
 
     fn cat_activity_settings_response(&self) -> Result<CatActivitySettingsResponse, String> {
-        let policy = self.cat_activity_policy_store.load()?;
+        let policy = self.activity_policy_store()?.load()?;
         let cameras = self
             .cat_activity_camera_statuses
             .lock()
@@ -7847,7 +8085,9 @@ impl AdminApi {
                 acquire_ai_resource_lease(AiWorkload::Yolo).map_err(|error| {
                     let status = match error.kind() {
                         AiLeaseErrorKind::QueueFull => StatusCode(429),
-                        AiLeaseErrorKind::WaitTimeout | AiLeaseErrorKind::Quarantined => {
+                        AiLeaseErrorKind::WaitTimeout
+                        | AiLeaseErrorKind::Cancelled
+                        | AiLeaseErrorKind::Quarantined => {
                             StatusCode(503)
                         }
                     };
@@ -8653,7 +8893,7 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        match self.cat_recording_validation_store.list_latest() {
+        match self.validation_store().and_then(|store| store.list_latest()) {
             Ok(mut records) => {
                 let mut counts = BTreeMap::<String, usize>::new();
                 for record in &records {
@@ -12619,32 +12859,45 @@ fn principal_skips_manual_camera_connect_approval(principal: &AccessPrincipal) -
 
 fn main() {
     let cli = Cli::parse();
-    if let Err(error) = validate_required_service_auth() {
-        eprintln!("service authentication configuration failed: {error}");
-        std::process::exit(1);
-    }
+    let profile = StartupProfile::from_env().unwrap_or_else(|error| fail(&error));
+    let service_tokens = if profile == StartupProfile::N1 {
+        // Preserve the standalone tool's legacy inbound/outbound credential sources.
+        validate_required_service_auth().unwrap_or_else(|error| fail(&error));
+        Some(gate_to_beacon_verifier_tokens().unwrap_or_else(|error| fail(&error)))
+    } else {
+        profile.gate_verifier(None).unwrap_or_else(|error| fail(&error))
+    };
     let device_registry_path = resolve_state_path(&cli.device_registry);
     let admin_state_path = resolve_state_path(&cli.admin_state);
     std::env::set_var(ADMIN_STATE_PATH_ENV, &admin_state_path);
     let conversation_path = resolve_state_path(&cli.conversations);
     let registry_store = DeviceRegistryStore::new(device_registry_path);
     let admin_store = AdminConsoleStore::new(admin_state_path, registry_store);
-    let server = Server::http(&cli.bind).unwrap_or_else(|error| {
-        eprintln!("failed to start admin api on {}: {}", cli.bind, error);
-        std::process::exit(1);
-    });
-    if let Err(error) = reconcile_stale_knowledge_index_jobs(&admin_store) {
-        eprintln!("failed to reconcile interrupted knowledge index jobs: {error}");
-        std::process::exit(1);
-    }
     let conversation_store = TaskConversationStore::new(conversation_path);
     let task_service = TaskApiService::new(admin_store.clone(), conversation_store);
-    let api = AdminApi::new(
+    let api = AdminApi::new_deferred(
         admin_store,
         task_service,
         cli.harbor_assistant_dist,
         cli.public_origin,
-    );
+        profile,
+    )
+    .unwrap_or_else(|error| fail(&error))
+    .with_service_tokens(service_tokens);
+    let api = if profile == StartupProfile::N2 {
+        api.with_edge_assertion_verifier(
+            EdgeAssertionVerifier::from_credential_env()
+                .unwrap_or_else(|_| fail("EDGE_AUTH_UNAVAILABLE")),
+        )
+    } else {
+        api
+    };
+    let server = Server::http(&cli.bind).unwrap_or_else(|error| {
+        eprintln!("failed to start admin api on {}: {}", cli.bind, error);
+        std::process::exit(1);
+    });
+    api.start_background_workers()
+        .unwrap_or_else(|error| fail(&error));
 
     println!("HarborBeacon admin API listening on http://{}", cli.bind);
     let (request_sender, request_receiver) =
@@ -12674,7 +12927,9 @@ fn main() {
 
     for request in server.incoming_requests() {
         if is_healthz_request(&request) {
-            let _ = request.respond(ok_json(&json!({"status":"ok"})).boxed());
+            let _ = request.respond(ok_json(&json!({
+                "status":"ok", "startup_capabilities": api.startup_capabilities(),
+            })).boxed());
             continue;
         }
         match request_sender.try_send(request) {
@@ -13549,6 +13804,15 @@ fn cat_recording_validation_temp_root() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("harborbeacon-cat-recording-validation"))
 }
 
+#[cfg(feature = "fixed-local-models")]
+fn cat_recording_validation_runtime_ready() -> Result<bool, String> {
+    validator_backend_from_env()?;
+    let config = classifier_config_from_env()?;
+    harborbeacon_local_agent::runtime::classifier_rpc::probe_classifier_rpc(&config)?;
+    Ok(true)
+}
+
+#[cfg(not(feature = "fixed-local-models"))]
 fn cat_recording_validation_runtime_ready() -> Result<bool, String> {
     validator_backend_from_env()?;
     let config = classifier_config_from_env()?;
@@ -13673,6 +13937,15 @@ fn quarantine_ai_resource_lease(lease: AiResourceLease) {
     lease.quarantine(AiLeaseQuarantineReason::ProcessExitUnconfirmed);
 }
 
+#[cfg(feature = "fixed-local-models")]
+fn run_cat_recording_classifier(
+    sample_frames: &[(u8, PathBuf)],
+    config: &CatRecordingClassifierConfig,
+) -> Result<CatRecordingClassifierOutput, String> {
+    harborbeacon_local_agent::runtime::classifier_rpc::classify_frames_rpc(sample_frames, config)
+}
+
+#[cfg(not(feature = "fixed-local-models"))]
 fn run_cat_recording_classifier(
     sample_frames: &[(u8, PathBuf)],
     config: &CatRecordingClassifierConfig,
@@ -26596,6 +26869,141 @@ mod tests {
         (api, vec![admin_path, registry_path, conversation_path])
     }
 
+    fn deferred_startup_fixture(
+        profile: super::StartupProfile,
+        failure: Option<&str>,
+    ) -> (Result<AdminApi, String>, Vec<PathBuf>) {
+        let paths = [
+            "admin",
+            "registry",
+            "conversations",
+            "policy",
+            "reconciliation",
+            "validation",
+        ]
+        .map(|name| unique_store_path(&format!("deferred-startup-{name}")))
+        .to_vec();
+        let admin =
+            AdminConsoleStore::new(paths[0].clone(), DeviceRegistryStore::new(paths[1].clone()));
+        let tasks =
+            TaskApiService::new(admin.clone(), TaskConversationStore::new(paths[2].clone()));
+        for (name, index) in [("policy", 3), ("reconciliation", 4), ("validation", 5)] {
+            if failure == Some(name) {
+                fs::write(&paths[index], b"preserve invalid durable state\n").unwrap();
+            }
+        }
+        let link = if failure == Some("link") {
+            Err("private invalid Link configuration".to_string())
+        } else {
+            HarborLinkMediaClient::new("http://127.0.0.1:9")
+        };
+        let mode = if failure == Some("mode") {
+            Err("private invalid vision mode".to_string())
+        } else {
+            Ok(CatRecordingValidationMode::Off)
+        };
+        let api = AdminApi::build_deferred(
+            admin,
+            tasks,
+            PathBuf::from("unused-ui"),
+            "http://localhost".to_string(),
+            link,
+            mode,
+            CatActivityPolicyStore::try_new(paths[3].clone()),
+            CatRecordingReconciliationStore::try_new(paths[4].clone()),
+            CatRecordingValidationStore::try_new(paths[5].clone()),
+            Some(profile),
+        );
+        (api, paths)
+    }
+
+    #[test]
+    fn deferred_startup_constructs_without_workers_and_requires_edge_before_start() {
+        let (api, paths) = deferred_startup_fixture(super::StartupProfile::N2, Some("link"));
+        let api = api.unwrap();
+        assert!(api.background_receiver.lock().unwrap().is_some());
+        assert!(!paths[0].with_extension("rules.json").exists());
+        assert_eq!(
+            api.start_background_workers().unwrap_err(),
+            "EDGE_AUTH_UNAVAILABLE"
+        );
+        assert!(api.background_receiver.lock().unwrap().is_some());
+        assert!(!paths[0].with_extension("rules.json").exists());
+        drop(api);
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn deferred_startup_is_once_only_across_clones_after_bind_and_edge_injection() {
+        let (api, paths) = deferred_startup_fixture(super::StartupProfile::N2, Some("link"));
+        let api = api
+            .unwrap()
+            .with_edge_assertion_verifier(EdgeAssertionVerifier::new(EDGE_TEST_KEY));
+        let listener = Server::http("127.0.0.1:0").unwrap();
+        assert!(api.start_background_workers().unwrap());
+        assert!(!api.clone().start_background_workers().unwrap());
+        assert!(api.background_receiver.lock().unwrap().is_none());
+        assert_eq!(Arc::strong_count(&api.rules_worker_lifetime), 1);
+        drop(listener);
+        drop(api);
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn deferred_startup_rejects_corrupt_core_without_starting_workers() {
+        let (api, paths) = deferred_startup_fixture(super::StartupProfile::N2, Some("link"));
+        let api = api
+            .unwrap()
+            .with_edge_assertion_verifier(EdgeAssertionVerifier::new(EDGE_TEST_KEY));
+        fs::write(&paths[0], b"invalid core state").unwrap();
+        assert!(api.start_background_workers().is_err());
+        assert!(api.background_receiver.lock().unwrap().is_some());
+        assert_eq!(fs::read(&paths[0]).unwrap(), b"invalid core state");
+        drop(api);
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn deferred_startup_n2_isolates_optional_failures_without_replacing_durable_state() {
+        for failure in ["link", "mode", "policy", "reconciliation", "validation"] {
+            let (api, paths) = deferred_startup_fixture(super::StartupProfile::N2, Some(failure));
+            let api = api.unwrap();
+            assert!(api.vision_unavailable_reason.is_some(), "{failure}");
+            let status = serde_json::to_string(&api.startup_capabilities()).unwrap();
+            assert!(status.contains("unavailable"));
+            assert!(!status.contains("private"));
+            assert!(api.background_receiver.lock().unwrap().is_some());
+            for (name, index) in [("policy", 3), ("reconciliation", 4), ("validation", 5)] {
+                if failure == name {
+                    assert_eq!(
+                        fs::read(&paths[index]).unwrap(),
+                        b"preserve invalid durable state\n"
+                    );
+                }
+            }
+            drop(api);
+            cleanup_test_paths(&paths);
+        }
+    }
+
+    #[test]
+    fn deferred_startup_n1_keeps_optional_configuration_failures_strict() {
+        for failure in ["link", "mode", "policy", "reconciliation"] {
+            let (api, paths) = deferred_startup_fixture(super::StartupProfile::N1, Some(failure));
+            assert!(api.is_err(), "{failure}");
+            cleanup_test_paths(&paths);
+        }
+        let (api, paths) = deferred_startup_fixture(super::StartupProfile::N1, Some("validation"));
+        let api = api.unwrap();
+        assert!(api.vision_unavailable_reason.is_none());
+        assert_eq!(
+            fs::read(&paths[5]).unwrap(),
+            b"preserve invalid durable state\n"
+        );
+        drop(api);
+        cleanup_test_paths(&paths);
+    }
+
     #[test]
     fn rules_worker_lifetime_tracks_http_owners_not_background_clones() {
         let (api, paths) = build_test_admin_api("rules-worker-lifetime");
@@ -28225,8 +28633,7 @@ mod tests {
         });
         let (mut api, mut paths) = build_test_admin_api("auto-renew-detection");
         let reconciliation_path = unique_store_path("auto-renew-detection-reconciliation");
-        api.cat_recording_reconciliation_store =
-            CatRecordingReconciliationStore::new(reconciliation_path.clone());
+        api.cat_recording_reconciliation_store = Some(CatRecordingReconciliationStore::new(reconciliation_path.clone()));
         api.cat_auto_recording = Arc::new(Mutex::new(HashMap::new()));
         paths.push(reconciliation_path);
         let _enabled = EnvGuard::set("HARBOR_K3_CAT_AUTO_RECORD_ENABLED", "true");
@@ -28576,7 +28983,7 @@ mod tests {
             })
             .expect("save off policy");
         let (mut api, paths) = build_test_admin_api("cat-policy-cleanup-retry");
-        api.cat_activity_policy_store = policy_store;
+        api.cat_activity_policy_store = Some(policy_store);
         api.harborlink_media = HarborLinkMediaClient::new("http://127.0.0.1:9")
             .expect("unavailable HarborLink client");
         api.detection_jobs.lock().expect("detection jobs").insert(
@@ -29547,8 +29954,8 @@ mod tests {
         let (mut api, paths) = build_test_admin_api("cat-recording-failed-start-api");
         api.harborlink_media = HarborLinkMediaClient::new(format!("http://{harborlink_addr}"))
             .expect("HarborLink client");
-        api.cat_recording_reconciliation_store = reconciliation_store.clone();
-        api.cat_recording_validation_store = validation_store;
+        api.cat_recording_reconciliation_store = Some(reconciliation_store.clone());
+        api.cat_recording_validation_store = Some(validation_store);
         api.cat_auto_recording = Arc::new(Mutex::new(HashMap::new()));
         let sample_epoch_ms = cat_auto_recording_epoch_ms() as u64;
         let sample = json!({
@@ -29629,7 +30036,7 @@ mod tests {
             .upsert(pending.clone())
             .expect("persist pending start");
         let (mut api, paths) = build_test_admin_api("cat-recording-pending-start-orphan-api");
-        api.cat_recording_reconciliation_store = reconciliation_store.clone();
+        api.cat_recording_reconciliation_store = Some(reconciliation_store.clone());
         api.cat_auto_recording = Arc::new(Mutex::new(HashMap::from([(
             pending.camera_id.clone(),
             pending.clone(),
@@ -29723,7 +30130,7 @@ mod tests {
         let (mut api, paths) = build_test_admin_api("cat-recording-pending-start-retry-api");
         api.harborlink_media = HarborLinkMediaClient::new(format!("http://{harborlink_addr}"))
             .expect("HarborLink client");
-        api.cat_recording_reconciliation_store = reconciliation_store.clone();
+        api.cat_recording_reconciliation_store = Some(reconciliation_store.clone());
         api.cat_auto_recording = Arc::new(Mutex::new(HashMap::from([(
             pending.camera_id.clone(),
             pending.clone(),
@@ -29830,8 +30237,8 @@ mod tests {
         let (mut api, paths) = build_test_admin_api("cat-recording-pending-timeline-retry-api");
         api.harborlink_media = HarborLinkMediaClient::new(format!("http://{harborlink_addr}"))
             .expect("HarborLink client");
-        api.cat_recording_reconciliation_store = reconciliation_store.clone();
-        api.cat_recording_validation_store = validation_store.clone();
+        api.cat_recording_reconciliation_store = Some(reconciliation_store.clone());
+        api.cat_recording_validation_store = Some(validation_store.clone());
         api.cat_recording_validation_mode = CatRecordingValidationMode::Enforce;
         api.cat_auto_recording = Arc::new(Mutex::new(HashMap::from([(
             pending.camera_id.clone(),
@@ -29934,7 +30341,7 @@ mod tests {
         let (mut api, paths) = build_test_admin_api("cat-recording-lost-start-api");
         api.harborlink_media = HarborLinkMediaClient::new(format!("http://{harborlink_addr}"))
             .expect("HarborLink client");
-        api.cat_recording_reconciliation_store = reconciliation_store.clone();
+        api.cat_recording_reconciliation_store = Some(reconciliation_store.clone());
         api.cat_auto_recording = Arc::new(Mutex::new(HashMap::new()));
         let sample_epoch_ms = cat_auto_recording_epoch_ms() as u64;
         let sample = json!({
@@ -30106,7 +30513,7 @@ mod tests {
         let (mut api, paths) = build_test_admin_api("cat-recording-isolated-reconcile-api");
         api.harborlink_media = HarborLinkMediaClient::new(format!("http://{harborlink_addr}"))
             .expect("HarborLink client");
-        api.cat_recording_reconciliation_store = reconciliation_store;
+        api.cat_recording_reconciliation_store = Some(reconciliation_store);
         api.cat_auto_recording = Arc::new(Mutex::new(states));
         let now = cat_auto_recording_epoch_ms() as u64;
         let good_runtime =
@@ -30267,8 +30674,8 @@ mod tests {
         let (mut api, _) = build_test_admin_api("cat-recording-lost-stop-api");
         api.harborlink_media = HarborLinkMediaClient::new(format!("http://{harborlink_addr}"))
             .expect("HarborLink client");
-        api.cat_recording_reconciliation_store = reconciliation_store.clone();
-        api.cat_recording_validation_store = validation_store.clone();
+        api.cat_recording_reconciliation_store = Some(reconciliation_store.clone());
+        api.cat_recording_validation_store = Some(validation_store.clone());
         api.cat_recording_validation_mode = CatRecordingValidationMode::Enforce;
         api.cat_auto_recording = Arc::new(Mutex::new(
             reconciliation_store
@@ -30381,8 +30788,8 @@ mod tests {
         let (mut api, _) = build_test_admin_api("cat-recording-renew-api");
         api.harborlink_media = HarborLinkMediaClient::new(format!("http://{harborlink_addr}"))
             .expect("HarborLink client");
-        api.cat_recording_reconciliation_store = reconciliation_store.clone();
-        api.cat_recording_validation_store = validation_store.clone();
+        api.cat_recording_reconciliation_store = Some(reconciliation_store.clone());
+        api.cat_recording_validation_store = Some(validation_store.clone());
         api.cat_recording_validation_mode = CatRecordingValidationMode::Enforce;
         api.cat_auto_recording = Arc::new(Mutex::new(
             reconciliation_store
@@ -30499,8 +30906,8 @@ mod tests {
         let (mut api, _) = build_test_admin_api("cat-recording-404-api");
         api.harborlink_media = HarborLinkMediaClient::new(format!("http://{harborlink_addr}"))
             .expect("HarborLink client");
-        api.cat_recording_reconciliation_store = reconciliation_store.clone();
-        api.cat_recording_validation_store = validation_store.clone();
+        api.cat_recording_reconciliation_store = Some(reconciliation_store.clone());
+        api.cat_recording_validation_store = Some(validation_store.clone());
         api.cat_recording_validation_mode = CatRecordingValidationMode::Enforce;
         api.cat_auto_recording = Arc::new(Mutex::new(
             reconciliation_store
@@ -30616,7 +31023,7 @@ mod tests {
         let (mut api, _) = build_test_admin_api("cat-recording-nondestructive-api");
         api.harborlink_media = HarborLinkMediaClient::new(format!("http://{harborlink_addr}"))
             .expect("HarborLink client");
-        api.cat_recording_validation_store = validation_store.clone();
+        api.cat_recording_validation_store = Some(validation_store.clone());
 
         api.cat_recording_validation_mode = CatRecordingValidationMode::Enforce;
         let review = validation_store
@@ -30715,11 +31122,11 @@ mod tests {
             .expect("HarborLink client");
         let (mut api_a, paths_a) = build_test_admin_api("cat-discard-concurrent-a");
         api_a.harborlink_media = client.clone();
-        api_a.cat_recording_validation_store = store_a.clone();
+        api_a.cat_recording_validation_store = Some(store_a.clone());
         api_a.cat_recording_validation_mode = CatRecordingValidationMode::Enforce;
         let (mut api_b, paths_b) = build_test_admin_api("cat-discard-concurrent-b");
         api_b.harborlink_media = client;
-        api_b.cat_recording_validation_store = store_b;
+        api_b.cat_recording_validation_store = Some(store_b);
         api_b.cat_recording_validation_mode = CatRecordingValidationMode::Enforce;
         let barrier = Arc::new(std::sync::Barrier::new(3));
         let worker_a_barrier = barrier.clone();
@@ -30823,7 +31230,7 @@ mod tests {
             .expect("HarborLink client");
         let (mut api, _) = build_test_admin_api("cat-recording-discard-intent-api");
         api.harborlink_media = client.clone();
-        api.cat_recording_validation_store = validation_store.clone();
+        api.cat_recording_validation_store = Some(validation_store.clone());
         api.cat_recording_validation_mode = CatRecordingValidationMode::Enforce;
         api.discard_cat_recording_artifact(&rejected);
 
@@ -30850,7 +31257,7 @@ mod tests {
         let restarted_store = CatRecordingValidationStore::new(validation_path);
         let (mut restarted_api, _) = build_test_admin_api("cat-recording-discard-restart-api");
         restarted_api.harborlink_media = client;
-        restarted_api.cat_recording_validation_store = restarted_store.clone();
+        restarted_api.cat_recording_validation_store = Some(restarted_store.clone());
         restarted_api.cat_recording_validation_mode = CatRecordingValidationMode::Enforce;
         restarted_api.retry_pending_cat_recording_discards();
         harborlink_server.join().expect("HarborLink server");

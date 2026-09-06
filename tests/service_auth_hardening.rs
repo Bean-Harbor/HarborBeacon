@@ -126,6 +126,7 @@ fn runtime_has_no_predictable_model_token_fallback() {
     let admin_console = fs::read_to_string(root.join("src/runtime/admin_console.rs")).unwrap();
     let service = fs::read_to_string(root.join("src/bin/harborbeacon_service.rs")).unwrap();
     let service_auth = fs::read_to_string(root.join("src/service_auth.rs")).unwrap();
+    let startup = fs::read_to_string(root.join("src/runtime/startup.rs")).unwrap();
     let standalone = fs::read_to_string(root.join("src/bin/harbor-model-api.rs")).unwrap();
     let production_admin_console = admin_console
         .split("#[cfg(test)]")
@@ -133,7 +134,8 @@ fn runtime_has_no_predictable_model_token_fallback() {
         .expect("production admin console source");
 
     assert!(!production_admin_console.contains("harbor-local-model-token"));
-    assert!(service.contains("model_api_verifier_token().unwrap_or_else"));
+    assert!(service.contains("startup_profile.model_verifier()"));
+    assert!(startup.contains("self.optional(model_api_verifier_token(), \"MODEL_AUTH_UNAVAILABLE\")"));
     assert!(service_auth.contains("{MODEL_API_TOKEN_ENV} is not configured"));
     assert!(standalone.contains("ModelApiService::from_env_and_args().unwrap_or_else"));
 }

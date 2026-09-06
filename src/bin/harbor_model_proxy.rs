@@ -1,8 +1,8 @@
 use std::io::Cursor;
 use std::time::Duration;
 
-use harborbeacon_local_agent::runtime::ai_resource_scheduler::{
-    acquire_ai_resource_lease, AiLeaseQuarantineReason, AiWorkload,
+use harborbeacon_local_agent::runtime::ai_execution::{
+    request_execution_cancel, EXECUTION_ID_HEADER,
 };
 use harborbeacon_local_agent::runtime::fixed_models;
 use harborbeacon_local_agent::service_auth::VerifierTokens;
@@ -74,8 +74,13 @@ impl ModelApiProxy {
         if timeout_ms == 0 {
             return Err("request timeout must be greater than zero".to_string());
         }
-        let client = Client::builder()
-            .timeout(Duration::from_millis(timeout_ms))
+        let client = Client::builder().timeout(Duration::from_millis(timeout_ms));
+        let client = if fixed_models::FIXED {
+            client.no_proxy().redirect(reqwest::redirect::Policy::none())
+        } else {
+            client
+        };
+        let client = client
             .build()
             .map_err(|error| format!("failed to create model proxy client: {error}"))?;
         Ok(Self {
@@ -122,17 +127,8 @@ impl ModelApiProxy {
     }
 
     fn forward(&self, method: Method, path: &str, body: &[u8]) -> Response<Cursor<Vec<u8>>> {
-        let lease =
-            if fixed_models::FIXED && method == Method::Post && path == "/v1/chat/completions" {
-                match acquire_ai_resource_lease(AiWorkload::Llm) {
-                    Ok(lease) => Some(lease),
-                    Err(error) => {
-                        return proxy_error(StatusCode(503), error.code(), &error.to_string())
-                    }
-                }
-            } else {
-                None
-            };
+        let execution_id = (fixed_models::FIXED && method == Method::Post)
+            .then(|| uuid::Uuid::new_v4().to_string());
         let url = match self.upstream.join(path.trim_start_matches('/')) {
             Ok(url) => url,
             Err(_) => {
@@ -143,7 +139,7 @@ impl ModelApiProxy {
                 )
             }
         };
-        let request = match method {
+        let mut request = match method {
             Method::Get => self.client.get(url),
             Method::Post => self
                 .client
@@ -159,13 +155,14 @@ impl ModelApiProxy {
                 )
             }
         };
+        if let Some(id) = &execution_id {
+            request = request.header(EXECUTION_ID_HEADER, id);
+        }
         let upstream = match request.send() {
             Ok(response) => response,
             Err(error) => {
-                if let Some(lease) = lease {
-                    if !error.is_connect() {
-                        lease.quarantine(AiLeaseQuarantineReason::ProcessExitUnconfirmed);
-                    }
+                if !error.is_connect() {
+                    self.cancel_execution(execution_id.as_deref());
                 }
                 return proxy_error(
                     StatusCode(503),
@@ -175,10 +172,6 @@ impl ModelApiProxy {
             }
         };
         let status = StatusCode(upstream.status().as_u16());
-        let stopped = upstream
-            .headers()
-            .get("X-Harbor-Execution-Stopped")
-            .is_some_and(|value| value == "true");
         let content_type = upstream
             .headers()
             .get(CONTENT_TYPE)
@@ -188,9 +181,7 @@ impl ModelApiProxy {
         let response_body = match upstream.bytes() {
             Ok(value) => value.to_vec(),
             Err(_) => {
-                if let Some(lease) = lease {
-                    lease.quarantine(AiLeaseQuarantineReason::ProcessExitUnconfirmed);
-                }
+                self.cancel_execution(execution_id.as_deref());
                 return proxy_error(
                     StatusCode(502),
                     "MODEL_RUNTIME_READ_ERROR",
@@ -198,17 +189,19 @@ impl ModelApiProxy {
                 );
             }
         };
-        if let Some(lease) = lease {
-            if !stopped {
-                lease.quarantine(AiLeaseQuarantineReason::ProcessExitUnconfirmed);
-            }
-        }
         let mut response = Response::from_data(response_body).with_status_code(status);
         response.add_header(
             Header::from_bytes("Content-Type", content_type)
                 .expect("static content-type header must be valid"),
         );
         response
+    }
+
+    fn cancel_execution(&self, execution_id: Option<&str>) {
+        if let Some(id) = execution_id {
+            // Runtime owns termination and the lease even if cancellation delivery fails.
+            request_execution_cancel(&self.client, &self.upstream, &self.verifier.current, id);
+        }
     }
 }
 
@@ -253,17 +246,16 @@ mod tests {
 
     #[cfg(feature = "fixed-local-models")]
     #[test]
-    fn fixed_inference_owns_one_lease_and_quarantines_uncertain_exit() {
+    fn fixed_proxy_delegates_execution_ownership_and_cancels_transport_timeout() {
         use harborbeacon_local_agent::runtime::ai_resource_scheduler::{
-            ai_resource_workload_snapshot, AiLeaseErrorKind,
+            acquire_ai_resource_lease, ai_resource_workload_snapshot, AiWorkload,
         };
         use std::process::{Command, Stdio};
         use std::time::Instant;
-        // Quarantine is deliberately permanent for a scheduler process.
-        if std::env::var_os("HARBOR_PROXY_QUARANTINE_FIXTURE").is_none() {
+        if std::env::var_os("HARBOR_PROXY_EXECUTION_FIXTURE").is_none() {
             let mut child = Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "harbor_model_proxy::tests::fixed_inference_owns_one_lease_and_quarantines_uncertain_exit", "--nocapture"])
-                .env("HARBOR_PROXY_QUARANTINE_FIXTURE", "1")
+                .args(["--exact", "harbor_model_proxy::tests::fixed_proxy_delegates_execution_ownership_and_cancels_transport_timeout", "--nocapture"])
+                .env("HARBOR_PROXY_EXECUTION_FIXTURE", "1")
                 .stdin(Stdio::null()).spawn().unwrap();
             let until = Instant::now() + Duration::from_secs(15);
             loop {
@@ -274,7 +266,7 @@ mod tests {
                 if Instant::now() >= until {
                     child.kill().unwrap();
                     child.wait().unwrap();
-                    panic!("proxy scheduling fixture timed out");
+                    panic!("proxy execution fixture timed out");
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -299,15 +291,30 @@ mod tests {
                 b"{}",
             )
         });
-        let until = Instant::now() + Duration::from_secs(2);
-        while ai_resource_workload_snapshot(AiWorkload::Llm)["queue_depth"] != 1 {
-            assert!(Instant::now() < until, "chat must wait for the cat lease");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(server
-            .recv_timeout(Duration::from_millis(30))
+        let request = server
+            .recv_timeout(Duration::from_secs(1))
             .unwrap()
-            .is_none());
+            .expect("proxy must not acquire the caller's scheduler lease");
+        assert_eq!(request.url(), "/v1/chat/completions");
+        let execution_id = request
+            .headers()
+            .iter()
+            .find(|header| header.field.equiv(EXECUTION_ID_HEADER))
+            .unwrap()
+            .value
+            .to_string();
+        assert!(uuid::Uuid::parse_str(&execution_id).is_ok());
+        assert_eq!(
+            ai_resource_workload_snapshot(AiWorkload::Llm)["started_total"],
+            0
+        );
+        request
+            .respond(
+                Response::from_string("{}")
+                    .with_header(Header::from_bytes("X-Harbor-Execution-Stopped", "true").unwrap()),
+            )
+            .unwrap();
+        assert_eq!(inference.join().unwrap().status_code(), StatusCode(200));
         let health_proxy = proxy.clone();
         let health =
             std::thread::spawn(move || health_proxy.route(Method::Get, "/healthz", &[], &[]));
@@ -319,35 +326,48 @@ mod tests {
         request.respond(Response::from_string("{}")).unwrap();
         assert_eq!(health.join().unwrap().status_code(), StatusCode(200));
         drop(cat);
-        let request = server
+        let mut timeout_proxy = proxy;
+        timeout_proxy.client = Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let uncertain = std::thread::spawn(move || {
+            timeout_proxy.forward(Method::Post, "/v1/chat/completions", b"{}")
+        });
+        let running = server
             .recv_timeout(Duration::from_secs(2))
             .unwrap()
             .unwrap();
-        assert_eq!(request.url(), "/v1/chat/completions");
+        let id = running
+            .headers()
+            .iter()
+            .find(|header| header.field.equiv(EXECUTION_ID_HEADER))
+            .unwrap()
+            .value
+            .to_string();
+        let cancellation = server
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            ai_resource_workload_snapshot(AiWorkload::Llm)["holder_workload"],
-            "llm"
+            cancellation.url(),
+            format!("/internal/ai/executions/{id}/cancel")
         );
-        request
-            .respond(
-                Response::from_string("{}")
-                    .with_header(Header::from_bytes("X-Harbor-Execution-Stopped", "true").unwrap()),
-            )
-            .unwrap();
-        assert_eq!(inference.join().unwrap().status_code(), StatusCode(200));
-        drop(acquire_ai_resource_lease(AiWorkload::CatRecordingVerifier).unwrap());
-
-        let uncertain =
-            std::thread::spawn(move || proxy.forward(Method::Post, "/v1/chat/completions", b"{}"));
-        server
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap()
-            .unwrap()
-            .respond(Response::from_string("{}").with_status_code(503))
+        assert!(cancellation
+            .headers()
+            .iter()
+            .any(|header| header.field.equiv("Authorization")
+                && header.value.as_str() == format!("Bearer {token}")));
+        cancellation
+            .respond(Response::from_string("{\"execution_stopped\":false}").with_status_code(202))
             .unwrap();
         assert_eq!(uncertain.join().unwrap().status_code(), StatusCode(503));
-        let failure = acquire_ai_resource_lease(AiWorkload::CatRecordingVerifier).unwrap_err();
-        assert_eq!(failure.kind(), AiLeaseErrorKind::Quarantined);
+        let _ = running.respond(Response::from_string("{}"));
+        assert_eq!(
+            ai_resource_workload_snapshot(AiWorkload::Llm)["started_total"],
+            0
+        );
+        drop(acquire_ai_resource_lease(AiWorkload::CatRecordingVerifier).unwrap());
     }
 
     #[test]

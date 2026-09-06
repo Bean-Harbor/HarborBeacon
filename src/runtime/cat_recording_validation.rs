@@ -402,6 +402,26 @@ impl CatRecordingValidationStore {
         &self.path
     }
 
+    /// Startup must distinguish an empty log from records skipped by tail recovery.
+    pub fn validate_startup_state(&self) -> Result<(), String> {
+        self.with_locked_index(|_| {
+            let Some(opened) = self.secure_path.open_data_read()? else {
+                return Ok(());
+            };
+            if opened.len > MAX_STORE_BYTES {
+                return Err("cat recording validation store exceeds its size limit".to_string());
+            }
+            let mut bytes = Vec::with_capacity(opened.len as usize);
+            BufReader::new(opened.file)
+                .read_to_end(&mut bytes)
+                .map_err(|_| "cat recording validation store cannot be read".to_string())?;
+            if bytes.is_empty() {
+                return Ok(());
+            }
+            apply_strict_archive_records(&self.path, &bytes, &mut HashMap::new())
+        })
+    }
+
     pub fn register_candidate(
         &self,
         artifact: &HarborLinkRecordingArtifact,

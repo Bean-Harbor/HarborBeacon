@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 use std::env;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -90,6 +91,7 @@ pub enum AiLeaseErrorKind {
     QueueFull,
     WaitTimeout,
     Quarantined,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +111,7 @@ impl AiLeaseError {
             AiLeaseErrorKind::QueueFull => "ai_resource_queue_full",
             AiLeaseErrorKind::WaitTimeout => "ai_resource_wait_timeout",
             AiLeaseErrorKind::Quarantined => "ai_resource_quarantined",
+            AiLeaseErrorKind::Cancelled => "ai_resource_cancelled",
         }
     }
 }
@@ -263,6 +266,7 @@ struct WorkloadMetrics {
     queued_total: u64,
     queue_full_total: u64,
     timed_out_total: u64,
+    cancelled_total: u64,
     total_wait_ms: u64,
     max_wait_ms: u64,
 }
@@ -318,11 +322,31 @@ impl AiResourceScheduler {
     }
 
     fn acquire(self: &Arc<Self>, workload: AiWorkload) -> Result<AiResourceLease, AiLeaseError> {
+        self.acquire_with_control(workload, None)
+    }
+
+    fn acquire_with_control(
+        self: &Arc<Self>,
+        workload: AiWorkload,
+        control: Option<(Instant, &AtomicBool)>,
+    ) -> Result<AiResourceLease, AiLeaseError> {
         let cluster = workload.cluster();
         let resource_mask = workload.resource_mask();
         let workload_index = workload.index();
+        let mut deadline = control
+            .map(|(deadline, _)| deadline.min(Instant::now() + self.wait_timeout))
+            .unwrap_or_else(|| Instant::now() + self.wait_timeout);
         let mut state = self.lock_state();
         state.workloads[workload_index].requested_total += 1;
+
+        if let Some(kind) = interrupted_lease_wait(control, deadline) {
+            record_interrupted_wait(&mut state, workload, kind);
+            return Err(AiLeaseError {
+                kind,
+                workload,
+                cluster,
+            });
+        }
 
         if required_resources_are_quarantined(&state, workload) {
             state.workloads[workload_index].quarantine_rejected_total += 1;
@@ -364,9 +388,20 @@ impl AiResourceScheduler {
             state.resources[resource.index()].metrics.queued_total += 1;
         }
         state.workloads[workload_index].queued_total += 1;
-        let deadline = Instant::now() + self.wait_timeout;
-
+        if control.is_none() {
+            deadline = Instant::now() + self.wait_timeout;
+        }
         loop {
+            if let Some(kind) = interrupted_lease_wait(control, deadline) {
+                remove_waiter(&mut state.waiters, ticket);
+                record_interrupted_wait(&mut state, workload, kind);
+                self.changed.notify_all();
+                return Err(AiLeaseError {
+                    kind,
+                    workload,
+                    cluster,
+                });
+            }
             if required_resources_are_quarantined(&state, workload) {
                 remove_waiter(&mut state.waiters, ticket);
                 state.workloads[workload_index].quarantine_rejected_total += 1;
@@ -405,6 +440,11 @@ impl AiResourceScheduler {
             }
 
             let remaining = deadline.saturating_duration_since(now);
+            let remaining = if control.is_some() {
+                remaining.min(Duration::from_millis(20))
+            } else {
+                remaining
+            };
             let wait_result = self.changed.wait_timeout(state, remaining);
             let (next_state, _) = wait_result.unwrap_or_else(|poisoned| poisoned.into_inner());
             state = next_state;
@@ -598,6 +638,44 @@ pub fn acquire_ai_resource_lease(workload: AiWorkload) -> Result<AiResourceLease
     global_scheduler().acquire(workload)
 }
 
+pub fn acquire_ai_resource_lease_until(
+    workload: AiWorkload,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> Result<AiResourceLease, AiLeaseError> {
+    global_scheduler().acquire_with_control(workload, Some((deadline, cancelled)))
+}
+
+fn interrupted_lease_wait(
+    control: Option<(Instant, &AtomicBool)>,
+    deadline: Instant,
+) -> Option<AiLeaseErrorKind> {
+    control.and_then(|(_, cancelled)| {
+        if cancelled.load(Ordering::Acquire) {
+            Some(AiLeaseErrorKind::Cancelled)
+        } else if Instant::now() >= deadline {
+            Some(AiLeaseErrorKind::WaitTimeout)
+        } else {
+            None
+        }
+    })
+}
+
+fn record_interrupted_wait(
+    state: &mut SchedulerState,
+    workload: AiWorkload,
+    kind: AiLeaseErrorKind,
+) {
+    if kind == AiLeaseErrorKind::Cancelled {
+        state.workloads[workload.index()].cancelled_total += 1;
+    } else {
+        state.workloads[workload.index()].timed_out_total += 1;
+        for resource in workload.required_resources() {
+            state.resources[resource.index()].metrics.timed_out_total += 1;
+        }
+    }
+}
+
 pub fn ai_resource_scheduler_snapshot() -> Value {
     global_scheduler().snapshot()
 }
@@ -705,6 +783,7 @@ fn workload_snapshot(
         "completed_total": metrics.released_total,
         "busy_total": metrics.queued_total + metrics.queue_full_total + metrics.quarantine_rejected_total,
         "failed_total": metrics.queue_full_total + metrics.timed_out_total + metrics.quarantine_rejected_total,
+        "cancelled_total": metrics.cancelled_total,
         "requested_total": metrics.requested_total,
         "cross_cluster_parallel_acquired_total": metrics.cross_cluster_parallel_acquired_total,
         "quarantine_rejected_total": metrics.quarantine_rejected_total,
@@ -1116,5 +1195,117 @@ mod tests {
         assert_eq!(error.kind(), AiLeaseErrorKind::WaitTimeout);
         assert_eq!(scheduler.snapshot()["clusters"][1]["queue_depth"], 0);
         drop(holder);
+    }
+
+    #[test]
+    fn cancelled_execution_leaves_queue_without_granting_resources() {
+        let scheduler = Arc::new(AiResourceScheduler::new(4, Duration::from_secs(2)));
+        let holder = scheduler.acquire(AiWorkload::Llm).unwrap();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let flag = cancellation.clone();
+        let other = scheduler.clone();
+        let waiter = thread::spawn(move || {
+            other.acquire_with_control(
+                AiWorkload::CatRecordingVerifier,
+                Some((Instant::now() + Duration::from_secs(2), &flag)),
+            )
+        });
+        wait_for_queue_depth(&scheduler, 1);
+        cancellation.store(true, Ordering::Release);
+        assert_eq!(
+            waiter.join().unwrap().unwrap_err().kind(),
+            AiLeaseErrorKind::Cancelled
+        );
+        assert_eq!(scheduler.snapshot()["clusters"][1]["queue_depth"], 0);
+        assert_eq!(
+            scheduler.snapshot()["workloads"]["cat_recording_verifier"]["started_total"],
+            0
+        );
+        assert_eq!(
+            scheduler.snapshot()["workloads"]["cat_recording_verifier"]["cancelled_total"],
+            1
+        );
+        drop(holder);
+        drop(scheduler.acquire(AiWorkload::CatRecordingVerifier).unwrap());
+    }
+
+    #[test]
+    fn expired_or_cancelled_execution_cannot_take_even_a_free_resource() {
+        let scheduler = Arc::new(AiResourceScheduler::new(4, Duration::from_secs(2)));
+        let flag = AtomicBool::new(false);
+        let deadline = Instant::now() - Duration::from_millis(1);
+        assert_eq!(
+            scheduler
+                .acquire_with_control(AiWorkload::Llm, Some((deadline, &flag)))
+                .unwrap_err()
+                .kind(),
+            AiLeaseErrorKind::WaitTimeout
+        );
+        flag.store(true, Ordering::Release);
+        assert_eq!(
+            scheduler
+                .acquire_with_control(
+                    AiWorkload::Llm,
+                    Some((Instant::now() + Duration::from_secs(1), &flag))
+                )
+                .unwrap_err()
+                .kind(),
+            AiLeaseErrorKind::Cancelled
+        );
+        assert_eq!(scheduler.snapshot()["clusters"][1]["busy"], false);
+    }
+
+    #[test]
+    fn execution_owner_must_confirm_stopped_before_lease_release() {
+        use crate::runtime::ai_execution::ExecutionLease;
+        let scheduler = Arc::new(AiResourceScheduler::new(4, Duration::from_millis(5)));
+        let execution = ExecutionLease::new(scheduler.acquire(AiWorkload::Llm).unwrap());
+        assert_eq!(
+            scheduler
+                .acquire(AiWorkload::CatRecordingVerifier)
+                .unwrap_err()
+                .kind(),
+            AiLeaseErrorKind::WaitTimeout
+        );
+        execution.confirm_stopped();
+        drop(scheduler.acquire(AiWorkload::CatRecordingVerifier).unwrap());
+        assert_eq!(scheduler.snapshot()["clusters"][1]["quarantined"], false);
+    }
+
+    #[test]
+    fn unexpected_execution_owner_drop_quarantines_the_shared_cluster() {
+        use crate::runtime::ai_execution::ExecutionLease;
+        let scheduler = Arc::new(AiResourceScheduler::new(4, Duration::from_millis(5)));
+        drop(ExecutionLease::new(
+            scheduler.acquire(AiWorkload::Llm).unwrap(),
+        ));
+        assert_eq!(
+            scheduler
+                .acquire(AiWorkload::CatRecordingVerifier)
+                .unwrap_err()
+                .kind(),
+            AiLeaseErrorKind::Quarantined
+        );
+        assert_eq!(
+            scheduler.snapshot()["clusters"][1]["quarantine_reason"],
+            "process_exit_unconfirmed"
+        );
+        drop(scheduler.acquire(AiWorkload::Yolo).unwrap());
+    }
+
+    #[test]
+    fn confirmed_process_exit_does_not_clear_runtime_failure_quarantine() {
+        use crate::runtime::ai_execution::ExecutionLease;
+        let scheduler = Arc::new(AiResourceScheduler::new(4, Duration::from_millis(5)));
+        ExecutionLease::new(scheduler.acquire(AiWorkload::CatRecordingVerifier).unwrap())
+            .quarantine(AiLeaseQuarantineReason::RuntimeFailure);
+        assert_eq!(
+            scheduler.acquire(AiWorkload::Llm).unwrap_err().kind(),
+            AiLeaseErrorKind::Quarantined
+        );
+        assert_eq!(
+            scheduler.snapshot()["clusters"][1]["quarantine_reason"],
+            "runtime_failure"
+        );
     }
 }

@@ -9,6 +9,7 @@ RequiresMountsFor=/data
 Type=simple
 User=harborbeacon
 Group=harborbeacon
+Environment=HARBOR_BEACON_STARTUP_PROFILE=n2
 UMask=0077
 Environment=HARBOR_FFMPEG_BIN=/usr/bin/ffmpeg
 Environment=HARBOR_FFPROBE_BIN=/usr/bin/ffprobe

@@ -13,6 +13,13 @@
       ],
       "id": "harboros.k3.model-runtime",
       "version": 1
+    },
+    {
+      "capabilities": [
+        "runtime-owned-ai-execution-v1"
+      ],
+      "id": "harboros.n2.ai-execution",
+      "version": 1
     }
   ],
   "package": "harboros-model-runtime",

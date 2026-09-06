@@ -277,11 +277,11 @@ impl AdminApi {
         }
     }
 
-    pub(super) fn start_rules_worker(&self) {
+    pub(super) fn start_rules_worker(&self) -> Result<(), String> {
         let lifetime = Arc::downgrade(&self.rules_worker_lifetime);
         let rules = self.rules_store.clone();
         let admin = self.admin_store.clone();
-        let _ = thread::Builder::new()
+        thread::Builder::new()
             .name("harbor-rules".into())
             .spawn(move || {
                 let mut previous_states = BTreeMap::new();
@@ -300,7 +300,9 @@ impl AdminApi {
                     }
                     thread::sleep(Duration::from_secs(2));
                 }
-            });
+            })
+            .map(|_| ())
+            .map_err(|_| "RULES_WORKER_START_FAILED".to_string())
     }
 }
 

@@ -30,13 +30,12 @@ use harborbeacon_local_agent::runtime::model_center::{
     semantic_router_topology, SemanticRouterTopology, ADMIN_STATE_PATH_ENV,
 };
 use harborbeacon_local_agent::runtime::registry::DeviceRegistryStore;
+use harborbeacon_local_agent::runtime::startup::{StartupCapability, StartupProfile};
 use harborbeacon_local_agent::runtime::task_api::TaskApiService;
 use harborbeacon_local_agent::runtime::task_session::TaskConversationStore;
 #[cfg(test)]
-use harborbeacon_local_agent::service_auth::MODEL_API_TOKEN_ENV;
-use harborbeacon_local_agent::service_auth::{
-    gate_to_beacon_file_verifier_tokens, model_api_verifier_token, VerifierTokens,
-};
+use harborbeacon_local_agent::service_auth::{model_api_verifier_token, MODEL_API_TOKEN_ENV};
+use harborbeacon_local_agent::service_auth::VerifierTokens;
 
 #[derive(Debug, Clone)]
 struct Cli {
@@ -141,18 +140,28 @@ struct HarborBeaconService {
     #[cfg(not(feature = "external-model-runtime"))]
     model_api: Arc<RwLock<ModelApiService>>,
     #[cfg(feature = "external-model-runtime")]
-    model_api: ModelApiProxy,
+    model_api: Option<ModelApiProxy>,
+    #[cfg(feature = "external-model-runtime")]
+    model_auth_verifier: Option<VerifierTokens>,
     semantic_router_topology: SemanticRouterTopology,
+    startup_profile: StartupProfile,
+    startup_capabilities: Vec<StartupCapability>,
 }
 
 impl HarborBeaconService {
     fn new(
         cli: &Cli,
-        service_tokens: VerifierTokens,
-        model_auth_verifier: VerifierTokens,
+        startup_profile: StartupProfile,
+        service_tokens: Option<VerifierTokens>,
+        model_auth_verifier: Option<VerifierTokens>,
         semantic_router_topology: SemanticRouterTopology,
-    ) -> Self {
+    ) -> Result<Self, String> {
         env::set_var(ADMIN_STATE_PATH_ENV, &cli.admin_state);
+        let mut startup_capabilities = vec![if service_tokens.is_some() {
+            StartupCapability::configured("gate_turns")
+        } else {
+            StartupCapability::unavailable("gate_turns", "GATE_AUTH_UNAVAILABLE")
+        }];
         let registry_store = DeviceRegistryStore::new(cli.device_registry.clone());
         let admin_store = AdminConsoleStore::new(cli.admin_state.clone(), registry_store);
         let conversation_store = TaskConversationStore::new(cli.conversations.clone());
@@ -164,39 +173,63 @@ impl HarborBeaconService {
             apply_persisted_model_runtime_selection(&mut model_config, &admin_store);
             Arc::new(RwLock::new(ModelApiService::new(
                 model_config,
-                model_auth_verifier,
+                model_auth_verifier.ok_or("model authentication is required for N1")?,
             )))
         };
         #[cfg(feature = "external-model-runtime")]
-        let model_api = ModelApiProxy::from_env(model_auth_verifier).unwrap_or_else(|error| {
-            eprintln!("invalid external model runtime configuration: {error}");
-            std::process::exit(2);
-        });
-        let admin_api = agent_hub_admin_api::AdminApi::new(
+        let (model_api, model_status) = match model_auth_verifier.clone() {
+            Some(verifier) => {
+                let proxy = startup_profile.optional(
+                    ModelApiProxy::from_env(verifier),
+                    "MODEL_CONFIGURATION_UNAVAILABLE",
+                )?;
+                let status = if proxy.is_some() {
+                    StartupCapability::configured("local_inference")
+                } else {
+                    StartupCapability::unavailable("local_inference", "MODEL_CONFIGURATION_UNAVAILABLE")
+                };
+                (proxy, status)
+            }
+            None => (
+                None,
+                StartupCapability::unavailable("local_inference", "MODEL_AUTH_UNAVAILABLE"),
+            ),
+        };
+        #[cfg(feature = "external-model-runtime")]
+        startup_capabilities.push(model_status);
+        #[cfg(not(feature = "external-model-runtime"))]
+        startup_capabilities.push(StartupCapability::configured("local_inference"));
+        let admin_api = agent_hub_admin_api::AdminApi::new_deferred(
             admin_store,
             task_service.clone(),
             cli.harbor_assistant_dist.clone(),
             cli.public_origin.clone(),
-        );
+            startup_profile,
+        )?
+        .with_service_tokens(service_tokens.clone());
         #[cfg(feature = "external-model-runtime")]
         let admin_api = admin_api.with_edge_assertion_verifier(
-            agent_hub_admin_api::EdgeAssertionVerifier::from_credential_env().unwrap_or_else(
-                |error| {
-                    eprintln!("invalid HarborOS edge assertion credential: {error}");
-                    std::process::exit(2);
-                },
-            ),
+            agent_hub_admin_api::EdgeAssertionVerifier::from_credential_env()
+                .map_err(|_| "invalid HarborOS edge assertion credential".to_string())?,
         );
         #[cfg(not(feature = "external-model-runtime"))]
         let admin_api = admin_api.with_model_runtime_activation_handler(
             build_model_runtime_activation_handler(model_api.clone()),
         );
-        Self {
+        startup_capabilities.extend(admin_api.startup_capabilities());
+        Ok(Self {
             admin_api,
-            task_api: assistant_task_api::TaskApiHttpServer::new(task_service, service_tokens),
+            task_api: assistant_task_api::TaskApiHttpServer::new(
+                task_service,
+                service_tokens.unwrap_or_else(VerifierTokens::disabled),
+            ),
             model_api,
+            #[cfg(feature = "external-model-runtime")]
+            model_auth_verifier,
             semantic_router_topology,
-        }
+            startup_profile,
+            startup_capabilities,
+        })
     }
 
     fn handle(&self, request: Request) {
@@ -226,6 +259,10 @@ impl HarborBeaconService {
                 "semantic_router": {
                     "topology": self.semantic_router_topology.as_str(),
                     "local_only": true,
+                },
+                "startup": {
+                    "profile": self.startup_profile.as_str(),
+                    "capabilities": self.startup_capabilities,
                 }
             })));
             return;
@@ -271,7 +308,15 @@ impl HarborBeaconService {
             ),
         };
         #[cfg(feature = "external-model-runtime")]
-        let response = self.model_api.route(method, &model_path, &headers, &body);
+        let response = match &self.model_api {
+            Some(model_api) => model_api.route(method, &model_path, &headers, &body),
+            None => unavailable_inference_response(
+                method,
+                &model_path,
+                &headers,
+                self.model_auth_verifier.as_ref(),
+            ),
+        };
         let _ = request.respond(response);
     }
 }
@@ -472,30 +517,40 @@ fn model_backend_env_is_explicit() -> bool {
 
 fn main() {
     let cli = Cli::parse();
+    let startup_profile = StartupProfile::from_env().unwrap_or_else(|error| fail(&error));
     let semantic_router_topology = semantic_router_topology()
         .unwrap_or_else(|error| fail(&format!("invalid semantic-router topology: {error}")));
-    let model_auth_verifier = model_api_verifier_token().unwrap_or_else(|error| fail(&error));
-    let service_tokens =
-        resolve_service_tokens(cli.service_token.clone()).unwrap_or_else(|error| fail(&error));
+    let model_auth_verifier = startup_profile.model_verifier().unwrap_or_else(|error| fail(&error));
+    let service_tokens = startup_profile
+        .gate_verifier(cli.service_token.clone())
+        .unwrap_or_else(|error| fail(&error));
     let service = HarborBeaconService::new(
         &cli,
+        startup_profile,
         service_tokens,
         model_auth_verifier,
         semantic_router_topology,
-    );
+    )
+    .unwrap_or_else(|error| fail(&error));
     let server = Server::http(&cli.bind).unwrap_or_else(|error| {
         panic!(
             "failed to bind harborbeacon service on {}: {error}",
             cli.bind
         );
     });
+    service
+        .admin_api
+        .start_background_workers()
+        .unwrap_or_else(|error| fail(&error));
     println!(
         "harborbeacon-service listening on http://{} (admin/web/inference single-port)",
         cli.bind
     );
 
     #[cfg(feature = "fixed-local-models")]
-    service.model_api.warm_fixed_model();
+    if let Some(model_api) = &service.model_api {
+        model_api.warm_fixed_model();
+    }
     for request in server.incoming_requests() {
         let service = service.clone();
         thread::spawn(move || service.handle(request));
@@ -529,13 +584,35 @@ fn is_inference_api_path(path: &str) -> bool {
         || path.starts_with("/api/harbor-beacon/inference/")
 }
 
-fn resolve_service_tokens(cli_token: Option<String>) -> Result<VerifierTokens, String> {
-    match cli_token {
-        Some(token) => VerifierTokens::current_only(token),
-        #[cfg(not(feature = "external-model-runtime"))]
-        None => gate_to_beacon_file_verifier_tokens(),
-        #[cfg(feature = "external-model-runtime")]
-        None => harborbeacon_local_agent::service_auth::gate_to_beacon_verifier_tokens(),
+#[cfg(feature = "external-model-runtime")]
+fn unavailable_inference_response(
+    method: Method,
+    path: &str,
+    headers: &[Header],
+    verifier: Option<&VerifierTokens>,
+) -> Response<Cursor<Vec<u8>>> {
+    if method == Method::Post
+        && !headers
+            .iter()
+            .find(|header| header.field.equiv("Authorization"))
+            .and_then(|header| header.value.as_str().strip_prefix("Bearer "))
+            .is_some_and(|token| verifier.is_some_and(|verifier| verifier.matches(token)))
+    {
+        return error_json(
+            StatusCode(401),
+            "UNAUTHORIZED",
+            "model authentication required",
+        );
+    }
+    match (method, path) {
+        (Method::Get, "/healthz")
+        | (Method::Post, "/v1/chat/completions" | "/v1/embeddings") => error_json(
+            StatusCode(503),
+            "MODEL_RUNTIME_UNAVAILABLE",
+            "local inference is not configured",
+        ),
+        (Method::Options, _) => Response::from_data(Vec::new()).with_status_code(204),
+        _ => error_json(StatusCode(404), "ROUTE_NOT_FOUND", "model route not found"),
     }
 }
 
@@ -736,10 +813,50 @@ mod tests {
     #[test]
     fn explicit_cli_task_token_is_current_only_and_strict() {
         let current = "dev_task_token_0123456789abcdef0123456789abcdef";
-        let verifier = resolve_service_tokens(Some(current.to_string())).unwrap();
+        let verifier = StartupProfile::N1
+            .gate_verifier(Some(current.to_string()))
+            .unwrap()
+            .unwrap();
         assert!(verifier.matches(current));
         assert!(verifier.previous.is_none());
-        assert!(resolve_service_tokens(Some("short".to_string())).is_err());
+        assert!(StartupProfile::N1
+            .gate_verifier(Some("short".to_string()))
+            .is_err());
+        assert!(StartupProfile::N2
+            .gate_verifier(Some("short".to_string()))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "external-model-runtime")]
+    fn missing_model_auth_never_turns_inference_into_anonymous_access() {
+        for path in ["/v1/embeddings", "/v1/chat/completions"] {
+            let response = unavailable_inference_response(Method::Post, path, &[], None);
+            assert_eq!(response.status_code().0, 401);
+        }
+        let health = unavailable_inference_response(Method::Get, "/healthz", &[], None);
+        assert_eq!(health.status_code().0, 503);
+        let unknown = unavailable_inference_response(Method::Get, "/unknown", &[], None);
+        assert_eq!(unknown.status_code().0, 404);
+    }
+
+    #[test]
+    #[cfg(feature = "external-model-runtime")]
+    fn configured_model_auth_survives_proxy_configuration_failure() {
+        let token = "model_token_0123456789abcdef0123456789abcdef";
+        let verifier = VerifierTokens::current_only(token).unwrap();
+        let valid = [Header::from_bytes("Authorization", format!("Bearer {token}")).unwrap()];
+        let wrong = [Header::from_bytes("Authorization", "Bearer wrong").unwrap()];
+        for (headers, verifier, expected) in [
+            (valid.as_slice(), Some(&verifier), 503),
+            (wrong.as_slice(), Some(&verifier), 401),
+            (valid.as_slice(), None, 401),
+        ] {
+            let response =
+                unavailable_inference_response(Method::Post, "/v1/embeddings", headers, verifier);
+            assert_eq!(response.status_code().0, expected);
+        }
     }
 
     #[test]

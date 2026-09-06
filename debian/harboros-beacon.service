@@ -8,6 +8,7 @@ After=network.target harborlink.target harboros-service-auth-recovery.service
 Type=simple
 User=harborbeacon
 Group=harborbeacon
+Environment=HARBOR_BEACON_STARTUP_PROFILE=n1
 Environment=HARBOR_FFMPEG_BIN=/usr/bin/ffmpeg
 Environment=HARBOR_FFPROBE_BIN=/usr/bin/ffprobe
 Environment=HARBORLINK_MEDIA_API_URL=http://127.0.0.1:8790

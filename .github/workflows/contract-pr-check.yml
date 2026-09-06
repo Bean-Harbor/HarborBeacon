@@ -39,12 +39,16 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - run: python3 -m unittest discover -s tests -p 'test_n2_fixed_feature_isolation.py' -v
+      - run: python3 -m unittest discover -s tests -p 'test_n2_execution_component_contract.py' -v
       - run: cargo check --locked --no-default-features --features fixed-local-models --bin harboros-beacon --bin harbor-fixed-model-api
       - run: cargo test --locked --no-default-features --features fixed-local-models --bin harbor-fixed-model-api -- --test-threads=1
       - run: cargo test --locked --no-default-features --features fixed-local-models --bin harboros-beacon fixed_model_http_boundaries -- --test-threads=1
       - run: cargo test --locked --no-default-features --features fixed-local-models --bin harboros-beacon harbor_model_proxy::tests -- --test-threads=1
       - run: cargo test --locked --no-default-features --features fixed-local-models --lib runtime::fixed_models -- --test-threads=1
       - run: cargo test --locked --no-default-features --features fixed-local-models --lib runtime::ai_resource_scheduler -- --test-threads=1
+      - run: cargo test --locked --no-default-features --features fixed-local-models --lib runtime::ai_execution -- --test-threads=1
+      - run: cargo test --locked --no-default-features --features fixed-local-models --lib runtime::owned_ai_process -- --test-threads=1
+      - run: cargo test --locked --no-default-features --features fixed-local-models --lib runtime::classifier_rpc -- --test-threads=1
       - run: cargo test --locked --no-default-features --features fixed-local-models --lib runtime::knowledge_index -- --test-threads=1
 
   harborlink_package_contract:

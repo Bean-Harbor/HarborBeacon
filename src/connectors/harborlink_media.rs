@@ -13,6 +13,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::runtime::registry::CameraCapabilities;
+use crate::runtime::startup::StartupProfile;
 
 const DEFAULT_HARBORLINK_MEDIA_API_URL: &str = "http://127.0.0.1:8790";
 const DEFAULT_HARBORLINK_LOCAL_API_TOKEN_FILE: &str =
@@ -59,7 +60,7 @@ pub struct HarborLinkContractError {
 pub struct HarborLinkMediaClient {
     base_url: String,
     local_api_token: Option<String>,
-    http: Client,
+    http: Option<Client>,
 }
 
 trait HarborLinkRequestBuilderExt {
@@ -335,14 +336,41 @@ impl Read for HarborLinkMjpegStream {
 }
 
 impl HarborLinkMediaClient {
+    pub fn disabled() -> Self {
+        Self {
+            base_url: String::new(),
+            local_api_token: None,
+            http: None,
+        }
+    }
+
+    pub fn is_configured(&self) -> bool {
+        self.http.is_some()
+    }
+
     pub fn from_env() -> Result<Self, String> {
+        match StartupProfile::from_env()? {
+            StartupProfile::N1 => Self::from_env_with_auth(false),
+            StartupProfile::N2 => Self::from_env_authenticated(),
+        }
+    }
+
+    pub fn from_env_authenticated() -> Result<Self, String> {
+        Self::from_env_with_auth(true)
+    }
+
+    fn from_env_with_auth(require_token: bool) -> Result<Self, String> {
         require_harborlink_cutover()?;
+        let local_api_token = read_local_api_token_from_env()?;
+        if require_token && local_api_token.is_none() {
+            return Err("HarborLink local API credential is unavailable".to_string());
+        }
         let base_url = std::env::var("HARBORLINK_MEDIA_API_URL")
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_HARBORLINK_MEDIA_API_URL.to_string());
         let mut client = Self::new(base_url)?;
-        client.local_api_token = read_local_api_token_from_env()?;
+        client.local_api_token = local_api_token;
         Ok(client)
     }
 
@@ -352,7 +380,7 @@ impl HarborLinkMediaClient {
                 reqwest::Method::GET,
                 format!("{}/v1/cameras", self.base_url),
                 false,
-            )
+            )?
             .timeout(Duration::from_secs(4))
             .send_harborlink()
             .map_err(unavailable_error)?;
@@ -372,7 +400,7 @@ impl HarborLinkMediaClient {
         Ok(Self {
             base_url,
             local_api_token: None,
-            http,
+            http: Some(http),
         })
     }
 
@@ -382,7 +410,7 @@ impl HarborLinkMediaClient {
                 reqwest::Method::GET,
                 format!("{}/readyz", self.base_url),
                 false,
-            )
+            )?
             .timeout(Duration::from_secs(3))
             .send_harborlink()
             .map_err(unavailable_error)?;
@@ -395,7 +423,7 @@ impl HarborLinkMediaClient {
                 reqwest::Method::GET,
                 format!("{}/v1/capabilities", self.base_url),
                 false,
-            )
+            )?
             .timeout(Duration::from_secs(3))
             .send_harborlink()
             .map_err(unavailable_error)?;
@@ -410,7 +438,7 @@ impl HarborLinkMediaClient {
     ) -> Result<HarborLinkLiveSession, String> {
         let endpoint = self.live_session_collection_endpoint(camera_id);
         let response = self
-            .request(reqwest::Method::POST, endpoint, true)
+            .request(reqwest::Method::POST, endpoint, true)?
             .timeout(Duration::from_secs(4))
             .json(&StartLiveSessionRequest {
                 stream_profile,
@@ -431,7 +459,7 @@ impl HarborLinkMediaClient {
                 reqwest::Method::GET,
                 self.live_session_endpoint(camera_id, session_id),
                 false,
-            )
+            )?
             .timeout(Duration::from_secs(4))
             .send_harborlink()
             .map_err(unavailable_error)?;
@@ -451,7 +479,7 @@ impl HarborLinkMediaClient {
                 reqwest::Method::DELETE,
                 self.live_session_endpoint(camera_id, session_id),
                 true,
-            )
+            )?
             .timeout(Duration::from_secs(4))
             .send_harborlink()
             .map_err(unavailable_error)?;
@@ -473,7 +501,7 @@ impl HarborLinkMediaClient {
                     encode_path_segment(session_id)
                 ),
                 true,
-            )
+            )?
             .timeout(Duration::from_secs(4))
             .json(&json!({ "ttl_seconds": ttl_seconds }))
             .send_harborlink()
@@ -493,7 +521,7 @@ impl HarborLinkMediaClient {
                 reqwest::Method::POST,
                 self.detection_lease_collection_endpoint(camera_id),
                 true,
-            )
+            )?
             .timeout(Duration::from_secs(12))
             .json(&StartDetectionLeaseRequest {
                 stream_profile,
@@ -521,7 +549,7 @@ impl HarborLinkMediaClient {
                 reqwest::Method::GET,
                 self.detection_lease_endpoint(camera_id, lease_id),
                 false,
-            )
+            )?
             .timeout(Duration::from_secs(4))
             .send_harborlink()
             .map_err(unavailable_error)?;
@@ -542,7 +570,7 @@ impl HarborLinkMediaClient {
                     self.detection_lease_endpoint(camera_id, lease_id)
                 ),
                 true,
-            )
+            )?
             .timeout(Duration::from_secs(4))
             .json(&json!({ "ttl_seconds": ttl_seconds }))
             .send_harborlink()
@@ -560,7 +588,7 @@ impl HarborLinkMediaClient {
                 reqwest::Method::DELETE,
                 self.detection_lease_endpoint(camera_id, lease_id),
                 true,
-            )
+            )?
             .timeout(Duration::from_secs(4))
             .send_harborlink()
             .map_err(unavailable_error)?;
@@ -577,7 +605,7 @@ impl HarborLinkMediaClient {
                     encode_path_segment(camera_id)
                 ),
                 false,
-            )
+            )?
             .timeout(Duration::from_secs(20))
             .send_harborlink()
             .map_err(unavailable_error)?;
@@ -603,7 +631,7 @@ impl HarborLinkMediaClient {
                     encode_path_segment(camera_id)
                 ),
                 true,
-            )
+            )?
             .timeout(Duration::from_secs(20))
             .send_harborlink()
             .map_err(unavailable_error)?;
@@ -620,7 +648,7 @@ impl HarborLinkMediaClient {
                     encode_path_segment(camera_id)
                 ),
                 false,
-            )
+            )?
             .send_harborlink()
             .map_err(unavailable_error)?;
         if !response.status().is_success() {
@@ -662,7 +690,7 @@ impl HarborLinkMediaClient {
                 reqwest::Method::POST,
                 self.event_recording_endpoint(camera_id, "current"),
                 true,
-            )
+            )?
             .timeout(Duration::from_secs(10))
             .json(&StartEventRecordingRequest {
                 event_id,
@@ -695,7 +723,7 @@ impl HarborLinkMediaClient {
                 reqwest::Method::GET,
                 self.event_recording_endpoint(camera_id, "current"),
                 false,
-            )
+            )?
             .timeout(Duration::from_secs(4))
             .send_harborlink()
             .map_err(unavailable_error)?;
@@ -712,7 +740,7 @@ impl HarborLinkMediaClient {
                 reqwest::Method::GET,
                 self.event_recording_endpoint(camera_id, lease_id),
                 false,
-            )
+            )?
             .timeout(Duration::from_secs(4))
             .send_harborlink()
             .map_err(unavailable_error)?;
@@ -733,7 +761,7 @@ impl HarborLinkMediaClient {
                     self.event_recording_endpoint(camera_id, lease_id)
                 ),
                 true,
-            )
+            )?
             .timeout(Duration::from_secs(4))
             .json(&json!({ "ttl_seconds": ttl_seconds }))
             .send_harborlink()
@@ -751,7 +779,7 @@ impl HarborLinkMediaClient {
                 reqwest::Method::DELETE,
                 self.event_recording_endpoint(camera_id, lease_id),
                 true,
-            )
+            )?
             .timeout(Duration::from_secs(10))
             .send_harborlink()
             .map_err(unavailable_error)?;
@@ -774,7 +802,7 @@ impl HarborLinkMediaClient {
                     encode_path_segment(camera_id)
                 ),
                 true,
-            )
+            )?
             .timeout(Duration::from_secs(
                 u64::from(clip_length_seconds.clamp(3, 300)) + 45,
             ))
@@ -803,7 +831,7 @@ impl HarborLinkMediaClient {
                     encode_path_segment(camera_id)
                 ),
                 method != reqwest::Method::GET,
-            )
+            )?
             .timeout(Duration::from_secs(10));
         let request = if method == reqwest::Method::POST {
             request.json(&StartRecordingRequest { stream_profile })
@@ -840,7 +868,7 @@ impl HarborLinkMediaClient {
                     encode_path_segment(camera_id)
                 ),
                 false,
-            )
+            )?
             .timeout(Duration::from_secs(4))
             .send_harborlink()
             .map_err(unavailable_error)?;
@@ -864,7 +892,7 @@ impl HarborLinkMediaClient {
                     encode_path_segment(camera_id)
                 ),
                 true,
-            )
+            )?
             .timeout(Duration::from_secs(4))
             .json(&json!({
                 "username": username,
@@ -894,7 +922,7 @@ impl HarborLinkMediaClient {
                     encode_path_segment(camera_id)
                 ),
                 true,
-            )
+            )?
             .timeout(Duration::from_secs(10))
             .json(&json!({
                 "username": username,
@@ -921,7 +949,7 @@ impl HarborLinkMediaClient {
                     encode_path_segment(camera_id)
                 ),
                 true,
-            )
+            )?
             .timeout(Duration::from_secs(20))
             .json(registration)
             .send_harborlink()
@@ -943,7 +971,7 @@ impl HarborLinkMediaClient {
                 reqwest::Method::POST,
                 format!("{}/v1/cameras/discover", self.base_url),
                 true,
-            )
+            )?
             .timeout(Duration::from_secs(90))
             .json(&json!({
                 "networkCidr": network_cidr,
@@ -964,7 +992,7 @@ impl HarborLinkMediaClient {
                 reqwest::Method::GET,
                 format!("{}/v1/discovery-settings", self.base_url),
                 false,
-            )
+            )?
             .timeout(Duration::from_secs(4))
             .send_harborlink()
             .map_err(unavailable_error)?;
@@ -985,7 +1013,7 @@ impl HarborLinkMediaClient {
                 reqwest::Method::PUT,
                 format!("{}/v1/discovery-settings", self.base_url),
                 true,
-            )
+            )?
             .timeout(Duration::from_secs(4))
             .json(&json!({
                 "networkCidr": network_cidr,
@@ -1006,7 +1034,7 @@ impl HarborLinkMediaClient {
                 reqwest::Method::PUT,
                 format!("{}/v1/dvr-settings", self.base_url),
                 true,
-            )
+            )?
             .timeout(Duration::from_secs(4))
             .json(settings)
             .send_harborlink()
@@ -1020,7 +1048,7 @@ impl HarborLinkMediaClient {
                 reqwest::Method::GET,
                 format!("{}/v1/dvr-settings", self.base_url),
                 false,
-            )
+            )?
             .timeout(Duration::from_secs(4))
             .send_harborlink()
             .map_err(unavailable_error)?;
@@ -1040,7 +1068,7 @@ impl HarborLinkMediaClient {
                     encode_path_segment(camera_id)
                 ),
                 false,
-            )
+            )?
             .timeout(Duration::from_secs(10))
             .send_harborlink()
             .map_err(unavailable_error)?;
@@ -1057,7 +1085,7 @@ impl HarborLinkMediaClient {
                     encode_path_segment(artifact_id)
                 ),
                 true,
-            )
+            )?
             .timeout(Duration::from_secs(10))
             .send_harborlink()
             .map_err(unavailable_error)?;
@@ -1085,7 +1113,7 @@ impl HarborLinkMediaClient {
                     encode_path_segment(artifact_id)
                 ),
                 false,
-            )
+            )?
             .timeout(Duration::from_secs(30));
         if let Some(range) = range {
             request = request.header(reqwest::header::RANGE, range);
@@ -1167,7 +1195,7 @@ impl HarborLinkMediaClient {
                     encode_path_segment(camera_id)
                 ),
                 true,
-            )
+            )?
             .timeout(Duration::from_secs(4))
             .json(camera)
             .send_harborlink()
@@ -1185,7 +1213,7 @@ impl HarborLinkMediaClient {
                     encode_path_segment(camera_id)
                 ),
                 true,
-            )
+            )?
             .timeout(Duration::from_secs(4))
             .json(update)
             .send_harborlink()
@@ -1203,7 +1231,7 @@ impl HarborLinkMediaClient {
                     encode_path_segment(camera_id)
                 ),
                 true,
-            )
+            )?
             .timeout(Duration::from_secs(4))
             .send_harborlink()
             .map_err(unavailable_error)?;
@@ -1216,7 +1244,7 @@ impl HarborLinkMediaClient {
                 reqwest::Method::GET,
                 format!("{}/v1/home-assistant", self.base_url),
                 false,
-            )
+            )?
             .timeout(Duration::from_secs(4))
             .send_harborlink()
             .map_err(unavailable_error)?;
@@ -1239,7 +1267,7 @@ impl HarborLinkMediaClient {
                 reqwest::Method::PUT,
                 format!("{}/v1/home-assistant", self.base_url),
                 true,
-            )
+            )?
             .timeout(Duration::from_secs(4))
             .json(&json!({
                 "enabled": enabled,
@@ -1256,10 +1284,24 @@ impl HarborLinkMediaClient {
         decode_json_response(response, "Home Assistant configuration")
     }
 
-    fn request(&self, method: reqwest::Method, url: String, mutation: bool) -> RequestBuilder {
+    fn request(
+        &self,
+        method: reqwest::Method,
+        url: String,
+        mutation: bool,
+    ) -> Result<RequestBuilder, String> {
+        let http = self.http.as_ref().ok_or_else(|| {
+            encode_contract_error(HarborLinkContractError {
+                status_code: 503,
+                code: "HARBORLINK_UNAVAILABLE".to_string(),
+                message: "HarborLink configuration is unavailable".to_string(),
+                retryable: false,
+                dependency: "harborlink".to_string(),
+                request_id: None,
+            })
+        })?;
         let request_id = mutation.then(|| operation_request_id(&method, &url));
-        let mut request = self
-            .http
+        let mut request = http
             .request(method, url)
             .header("X-HarborLink-Contract-Version", HARBORLINK_CONTRACT_VERSION);
         if let Some(token) = self.local_api_token.as_deref() {
@@ -1268,7 +1310,7 @@ impl HarborLinkMediaClient {
         if let Some(request_id) = request_id {
             request = request.header("X-Request-Id", request_id);
         }
-        request
+        Ok(request)
     }
 
     fn live_session_collection_endpoint(&self, camera_id: &str) -> String {
@@ -1515,6 +1557,9 @@ mod tests {
         HarborLinkContractError, HarborLinkMediaClient, StartDetectionLeaseRequest,
         StartEventRecordingRequest, StartLiveSessionRequest, StartRecordingRequest,
     };
+    use serde_json::json;
+    use std::{env, fs, path::PathBuf, process::Command, sync::mpsc, thread, time::Duration};
+    use tiny_http::{Response, Server};
 
     #[test]
     fn camera_projection_uses_registry_id_without_exposing_credentials() {
@@ -1636,7 +1681,7 @@ mod tests {
             reqwest::Method::POST,
             "http://127.0.0.1:8790/v1/cameras/cam-1/recordings/current".to_string(),
             true,
-        );
+        ).expect("configured client");
         let first = request
             .try_clone()
             .expect("clone first attempt")
@@ -1661,6 +1706,7 @@ mod tests {
         let build_request_id = |method, url: &str| {
             client
                 .request(method, url.to_string(), true)
+                .expect("configured client")
                 .build()
                 .expect("build request")
                 .headers()
@@ -1702,5 +1748,226 @@ mod tests {
         let error = HarborLinkMediaClient::new("file:///tmp/harborlink.sock")
             .expect_err("file URL must be rejected");
         assert!(error.contains("http or https"));
+    }
+
+    #[test]
+    fn disabled_client_rejects_reads_and_mutations_before_building_a_request() {
+        let client = HarborLinkMediaClient::disabled();
+        assert!(!client.is_configured());
+        for error in [
+            client.list_cameras().unwrap_err(),
+            client.readyz().unwrap_err(),
+            client.start_live_session("camera-test", "sub", 30).unwrap_err(),
+            client.delete_dvr_artifact("artifact-test").unwrap_err(),
+        ] {
+            assert!(error.contains("HARBORLINK_UNAVAILABLE"));
+            assert!(!error.contains("127.0.0.1"));
+        }
+        assert!(client.request(
+            reqwest::Method::POST, "http://must-not-be-contacted.invalid".to_string(), true,
+        ).is_err());
+    }
+
+    const FACTORY_CHILD: &str = "HARBOR_MEDIA_FACTORY_TEST_CHILD";
+    const LINK_TOKEN: &str = "synthetic_media_token_0123456789abcdef0123456789abcdef";
+
+    struct FactoryFixture(PathBuf);
+
+    impl FactoryFixture {
+        fn new() -> Self {
+            let path = env::temp_dir().join(format!("harbor-media-auth-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for FactoryFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn assert_factory_scenario(scenario: &str, rejection: Option<&str>) {
+        let fixture = FactoryFixture::new();
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let (stop, stopped) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut requests = Vec::new();
+            while stopped.try_recv().is_err() {
+                let Some(request) = server.recv_timeout(Duration::from_millis(20)).unwrap() else {
+                    continue;
+                };
+                let header = |name: &str| {
+                    request
+                        .headers()
+                        .iter()
+                        .find(|header| header.field.to_string().eq_ignore_ascii_case(name))
+                        .map(|header| header.value.to_string())
+                };
+                requests.push((
+                    request.method().as_str().to_string(),
+                    request.url().to_string(),
+                    header("Authorization"),
+                    header("X-HarborLink-Contract-Version"),
+                    header("X-Request-Id"),
+                ));
+                let body = if request.method().as_str() == "GET" {
+                    json!([])
+                } else {
+                    json!({"artifactId": "fixture-artifact", "deleted": true})
+                };
+                request
+                    .respond(Response::from_string(body.to_string()))
+                    .unwrap();
+            }
+            requests
+        });
+        // Isolate environment changes in a child and use only synthetic loopback credentials.
+        let mut command = Command::new(env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "connectors::harborlink_media::tests::harborlink_factory_child",
+            "--nocapture",
+        ]);
+        for key in [
+            "HARBOR_BEACON_STARTUP_PROFILE",
+            "HARBORBEACON_SOUTHBOUND_MODE",
+            "HARBORLINK_MEDIA_API_URL",
+            "HARBORLINK_LOCAL_API_TOKEN",
+            "HARBORLINK_LOCAL_API_TOKEN_FILE",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            command.env_remove(key);
+        }
+        command
+            .env(FACTORY_CHILD, rejection.unwrap_or(""))
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("HARBORBEACON_SOUTHBOUND_MODE", "harborlink")
+            .env("HARBORLINK_MEDIA_API_URL", format!("http://{address}"))
+            .env("HARBORLINK_LOCAL_API_TOKEN_FILE", fixture.0.join("token"));
+        match scenario {
+            "missing-token" => {}
+            "env-token" => {
+                command.env("HARBORLINK_LOCAL_API_TOKEN", LINK_TOKEN);
+            }
+            "file-token" => {
+                fs::write(fixture.0.join("token"), LINK_TOKEN).unwrap();
+            }
+            "empty-token-file" => {
+                fs::write(fixture.0.join("token"), "\n").unwrap();
+            }
+            "invalid-profile" => {
+                command.env("HARBOR_BEACON_STARTUP_PROFILE", "invalid");
+            }
+            "wrong-product-profile" => {
+                command.env(
+                    "HARBOR_BEACON_STARTUP_PROFILE",
+                    if cfg!(feature = "external-model-runtime") {
+                        "n1"
+                    } else {
+                        "n2"
+                    },
+                );
+            }
+            "invalid-cutover" => {
+                command.env("HARBORBEACON_SOUTHBOUND_MODE", "direct");
+            }
+            _ => panic!("unknown factory scenario"),
+        }
+        let output = command.output().unwrap();
+        stop.send(()).unwrap();
+        let requests = worker.join().unwrap();
+        assert!(
+            output.status.success(),
+            "{scenario}: child failed, {} outbound requests:\n{}\n{}",
+            requests.len(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        if rejection.is_some() {
+            assert!(
+                requests.is_empty(),
+                "rejected factory sent an outbound request"
+            );
+        } else {
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].0, "GET");
+            assert_eq!(requests[0].1, "/v1/cameras");
+            assert_eq!(requests[1].0, "DELETE");
+            assert_eq!(requests[1].1, "/v1/dvr/artifacts/fixture-artifact");
+            for request in &requests {
+                assert_eq!(request.3.as_deref(), Some("1.0"));
+                let expected =
+                    (scenario != "missing-token").then(|| format!("Bearer {LINK_TOKEN}"));
+                assert_eq!(request.2, expected);
+            }
+            assert!(requests[1]
+                .4
+                .as_deref()
+                .is_some_and(|value| value.starts_with("beacon-")));
+        }
+    }
+
+    #[test]
+    fn harborlink_factory_child() {
+        let Ok(rejection) = env::var(FACTORY_CHILD) else {
+            return;
+        };
+        let result = HarborLinkMediaClient::from_env();
+        if rejection.is_empty() {
+            let client = result.unwrap();
+            assert!(client.list_cameras().unwrap().is_empty());
+            assert_eq!(
+                client.delete_dvr_artifact("fixture-artifact").unwrap()["deleted"],
+                true
+            );
+        } else {
+            if let Ok(client) = &result {
+                // A permissive mock catches incorrectly enabled clients without relying on 401.
+                let _ = client.list_cameras();
+                let _ = client.delete_dvr_artifact("fixture-artifact");
+            }
+            let error = result.expect_err("factory must reject before network access");
+            assert!(
+                error.contains(&rejection),
+                "unexpected factory error: {error}"
+            );
+            assert!(!error.contains(LINK_TOKEN));
+        }
+    }
+
+    #[test]
+    fn harborlink_factory_requires_token_for_n2_and_preserves_n1_compatibility() {
+        let rejection = cfg!(feature = "external-model-runtime")
+            .then_some("HarborLink local API credential is unavailable");
+        assert_factory_scenario("missing-token", rejection);
+    }
+
+    #[test]
+    fn harborlink_factory_sends_bearer_for_env_and_file_tokens() {
+        assert_factory_scenario("env-token", None);
+        assert_factory_scenario("file-token", None);
+    }
+
+    #[test]
+    fn harborlink_factory_rejects_invalid_profile_before_network() {
+        assert_factory_scenario("invalid-profile", Some("HARBOR_BEACON_STARTUP_PROFILE"));
+        assert_factory_scenario(
+            "wrong-product-profile",
+            Some("HARBOR_BEACON_STARTUP_PROFILE"),
+        );
+    }
+
+    #[test]
+    fn harborlink_factory_rejects_invalid_cutover_and_empty_credentials_before_network() {
+        assert_factory_scenario("invalid-cutover", Some("HARBORBEACON_SOUTHBOUND_MODE"));
+        assert_factory_scenario("empty-token-file", Some("empty"));
     }
 }

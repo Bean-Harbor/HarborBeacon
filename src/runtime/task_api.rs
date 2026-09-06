@@ -16970,15 +16970,39 @@ mod tests {
             .expect("save HA config");
     }
 
+    static HARBORLINK_TASK_API_TEST_LOCK: Mutex<()> = Mutex::new(());
+    const MOCK_HARBORLINK_TOKEN: &str = "task-api-fixture-link-token-0123456789abcdef";
+
     struct MockHarborLinkEnvironment {
         previous_url: Option<std::ffi::OsString>,
         previous_mode: Option<std::ffi::OsString>,
+        previous_token: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl MockHarborLinkEnvironment {
+        fn new(base_url: &str) -> Self {
+            let lock = HARBORLINK_TASK_API_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let environment = Self {
+                previous_url: std::env::var_os("HARBORLINK_MEDIA_API_URL"),
+                previous_mode: std::env::var_os("HARBORBEACON_SOUTHBOUND_MODE"),
+                previous_token: std::env::var_os("HARBORLINK_LOCAL_API_TOKEN"),
+                _lock: lock,
+            };
+            std::env::set_var("HARBORLINK_MEDIA_API_URL", base_url);
+            std::env::set_var("HARBORBEACON_SOUTHBOUND_MODE", "harborlink");
+            std::env::set_var("HARBORLINK_LOCAL_API_TOKEN", MOCK_HARBORLINK_TOKEN);
+            environment
+        }
     }
 
     impl Drop for MockHarborLinkEnvironment {
         fn drop(&mut self) {
             restore_env_var("HARBORLINK_MEDIA_API_URL", self.previous_url.take());
             restore_env_var("HARBORBEACON_SOUTHBOUND_MODE", self.previous_mode.take());
+            restore_env_var("HARBORLINK_LOCAL_API_TOKEN", self.previous_token.take());
         }
     }
 
@@ -16992,12 +17016,7 @@ mod tests {
     ) {
         let server = Server::http("127.0.0.1:0").expect("HarborLink mock server");
         let base_url = format!("http://{}", server.server_addr());
-        let environment = MockHarborLinkEnvironment {
-            previous_url: std::env::var_os("HARBORLINK_MEDIA_API_URL"),
-            previous_mode: std::env::var_os("HARBORBEACON_SOUTHBOUND_MODE"),
-        };
-        std::env::set_var("HARBORLINK_MEDIA_API_URL", &base_url);
-        std::env::set_var("HARBORBEACON_SOUTHBOUND_MODE", "harborlink");
+        let environment = MockHarborLinkEnvironment::new(&base_url);
         let posts = Arc::new(Mutex::new(Vec::new()));
         let post_records = posts.clone();
         let json_header =
@@ -17005,7 +17024,29 @@ mod tests {
         let server_thread = thread::spawn(move || {
             let mut state_index = 0usize;
             for _ in 0..expected_requests {
-                let mut request = server.recv().expect("HA request");
+                let mut request = server
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("HA mock receive")
+                    .expect("HA request");
+                let header = |name: &str| {
+                    request
+                        .headers()
+                        .iter()
+                        .find(|header| header.field.to_string().eq_ignore_ascii_case(name))
+                        .map(|header| header.value.to_string())
+                };
+                assert_eq!(
+                    header("Authorization"),
+                    Some(format!("Bearer {MOCK_HARBORLINK_TOKEN}")),
+                );
+                assert_eq!(
+                    header("X-HarborLink-Contract-Version").as_deref(),
+                    Some("1.0"),
+                );
+                if request.method() == &Method::Post {
+                    assert!(header("X-Request-Id")
+                        .is_some_and(|value| value.starts_with("beacon-")));
+                }
                 let method = request.method().clone();
                 let url = request.url().to_string();
                 match (method, url.as_str()) {
@@ -17070,12 +17111,7 @@ mod tests {
     ) {
         let server = Server::http("127.0.0.1:0").expect("HarborLink camera mock server");
         let base_url = format!("http://{}", server.server_addr());
-        let environment = MockHarborLinkEnvironment {
-            previous_url: std::env::var_os("HARBORLINK_MEDIA_API_URL"),
-            previous_mode: std::env::var_os("HARBORBEACON_SOUTHBOUND_MODE"),
-        };
-        std::env::set_var("HARBORLINK_MEDIA_API_URL", &base_url);
-        std::env::set_var("HARBORBEACON_SOUTHBOUND_MODE", "harborlink");
+        let environment = MockHarborLinkEnvironment::new(&base_url);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let request_records = requests.clone();
         let json_header =
