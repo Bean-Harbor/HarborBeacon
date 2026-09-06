@@ -31,6 +31,7 @@ pub mod model_center;
 pub mod node_runtime;
 pub mod owned_ai_process;
 pub mod privacy_gateway;
+pub mod product_jobs;
 pub mod registry;
 pub mod remote_view;
 mod secure_store_path;

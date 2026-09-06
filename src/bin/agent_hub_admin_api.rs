@@ -33,7 +33,10 @@ use uuid::Uuid;
 
 #[path = "rules_admin_api.rs"]
 mod rules_admin_api;
+#[path = "product_jobs_admin_api.rs"]
+mod product_jobs_admin_api;
 use harborbeacon_local_agent::runtime::automation::RulesStore;
+use harborbeacon_local_agent::runtime::product_jobs::ProductJobStore;
 use harborbeacon_local_agent::runtime::startup::{StartupCapability, StartupProfile};
 
 use harborbeacon_local_agent::connectors::harborlink_media::{
@@ -756,6 +759,7 @@ impl Cli {
 pub struct AdminApi {
     admin_store: AdminConsoleStore,
     rules_store: RulesStore,
+    product_jobs: ProductJobStore,
     rules_worker_lifetime: Arc<()>,
     background_receiver: Arc<Mutex<Option<Receiver<StoredLocalVisionEvent>>>>,
     background_start_error: Arc<Mutex<Option<String>>>,
@@ -2729,6 +2733,7 @@ impl AdminApi {
             sync_channel(HOME_GUARDIAN_EVALUATION_QUEUE_CAPACITY);
         let api = Self {
             rules_store: RulesStore::new(admin_store.path().with_extension("rules.json")),
+            product_jobs: ProductJobStore::new(admin_store.path().with_extension("product-jobs")),
             rules_worker_lifetime: Arc::new(()),
             background_receiver: Arc::new(Mutex::new(Some(guardian_receiver))),
             background_start_error: Arc::new(Mutex::new(None)),
@@ -4661,6 +4666,16 @@ impl AdminApi {
         } else {
             None
         };
+
+        if product_jobs_admin_api::is_product_jobs_path(&path) {
+            let response = self.handle_product_jobs_request(
+                &mut request,
+                &path,
+                gate_principal.as_ref().expect("authenticated product route"),
+            );
+            let _ = request.respond(response);
+            return;
+        }
 
         if rules_admin_api::is_rules_path(&path) {
             let response = self.handle_rules_request(&mut request, &path, &identity_hints);
@@ -13123,7 +13138,8 @@ fn is_gate_principal_knowledge_endpoint(method: &Method, path: &str) -> bool {
 }
 
 fn is_gate_principal_endpoint(method: &Method, path: &str) -> bool {
-    is_gate_principal_knowledge_endpoint(method, path)
+    product_jobs_admin_api::is_product_jobs_path(path)
+        || is_gate_principal_knowledge_endpoint(method, path)
         || (method == &Method::Get && is_cat_detection_observation_path(path))
         || path == "/api/vision/detection-jobs"
         || path.starts_with("/api/vision/detection-jobs/")
@@ -16236,7 +16252,8 @@ fn add_common_headers<R: Read>(response: &mut Response<R>) {
 }
 
 fn is_admin_surface_path(path: &str) -> bool {
-    path == "/api/state"
+    product_jobs_admin_api::is_product_jobs_path(path)
+        || path == "/api/state"
         || path == "/api/account-management"
         || path == "/api/gateway/status"
         || path == "/api/release/readiness"

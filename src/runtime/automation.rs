@@ -494,6 +494,11 @@ impl RulesStore {
         Ok(result)
     }
 
+    pub fn history_snapshot(&self) -> Result<Vec<RuleRun>, String> {
+        let _guard = self.acquire()?;
+        Ok(self.load()?.runs)
+    }
+
     pub fn history(&self, id: &str) -> Result<Vec<RuleRun>, String> {
         let _guard = self.acquire()?;
         let state = self.load()?;
