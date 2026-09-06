@@ -2,8 +2,7 @@
 
 use super::{
     error_json, filter_home_assistant_entities, home_assistant_client_from_state, ok_json,
-    read_json_body, AccessAction, AccessIdentityHints, AdminApi, AdminConsoleStore,
-    HomeAssistantServiceActionRequest,
+    read_json_body, AdminApi, AdminConsoleStore, HomeAssistantServiceActionRequest,
 };
 use harborbeacon_local_agent::connectors::home_assistant::{
     validate_home_assistant_service_action_request, HomeAssistantEntity,
@@ -91,17 +90,8 @@ impl AdminApi {
         &self,
         request: &mut Request,
         path: &str,
-        hints: &AccessIdentityHints,
+        principal: &super::AccessPrincipal,
     ) -> Response<Cursor<Vec<u8>>> {
-        let action = if request.method() == &Method::Get {
-            AccessAction::AdminReadState
-        } else {
-            AccessAction::AdminManage
-        };
-        let principal = match self.authorize_admin_action(hints, action) {
-            Ok(principal) => principal,
-            Err(error) => return error_json(StatusCode(403), &error),
-        };
         let now = now_seconds();
         if path == RULES_PREFIX {
             return match request.method() {
@@ -239,20 +229,11 @@ impl AdminApi {
                 Err(error) => return rule_error(&error),
             };
             let context = condition_context(&self.admin_store, std::slice::from_ref(&rule));
+            if let Err(error) = check_rule_actions(&self.admin_store, &rule) {
+                return rule_error(&format!("VALIDATION: {error}"));
+            }
             return match self.rules_store.preview(id, body.revision, &context, now) {
-                Ok(mut preview) => {
-                    if rule
-                        .definition
-                        .actions
-                        .iter()
-                        .any(|action| matches!(action, RuleAction::HomeAssistant { .. }))
-                    {
-                        if let Err(error) = load_entities(&self.admin_store) {
-                            preview.warnings.push(error);
-                        }
-                    }
-                    ok_json(&preview)
-                }
+                Ok(preview) => ok_json(&preview),
                 Err(error) => rule_error(&error),
             };
         }
@@ -261,6 +242,15 @@ impl AdminApi {
             Some("pause") => "paused",
             _ => "deleted",
         };
+        if status == "enabled" {
+            let rule = match find_rule(&self.rules_store, id, now) {
+                Ok(rule) => rule,
+                Err(error) => return rule_error(&error),
+            };
+            if let Err(error) = check_rule_actions(&self.admin_store, &rule) {
+                return rule_error(&format!("VALIDATION: {error}"));
+            }
+        }
         match self.rules_store.set_status(id, body.revision, status, now) {
             Ok(rule) => {
                 self.record_admin_audit(
@@ -377,26 +367,43 @@ fn execute_action(store: &AdminConsoleStore, action: &RuleAction) -> Result<Stri
     )?;
     let client = home_assistant_client_from_state(&state)
         .map_err(|_| "Home Assistant is not configured or enabled".to_string())?;
-    let entities = client
-        .fetch_entities()
-        .map_err(|_| "Home Assistant entities are unavailable".to_string())?;
-    let entity = entities
-        .iter()
-        .find(|entity| &entity.entity_id == entity_id)
-        .ok_or_else(|| "Home Assistant entity does not exist".to_string())?;
-    if matches!(entity.state.as_str(), "unavailable" | "unknown") {
-        return Err("Home Assistant entity is unavailable".into());
+    let outcome = client.execute_checked_action(&request);
+    match outcome.status {
+        "succeeded" => Ok(outcome.message),
+        "unknown" => Err(format!("UNKNOWN: {}", outcome.message)),
+        _ => Err(outcome.message),
     }
-    let result = client
-        .call_service(domain, service, entity_id, Some(fields))
-        .map_err(|_| {
-            "UNKNOWN: Home Assistant action outcome is unknown; automatic retry is disabled"
-                .to_string()
-        })?;
-    if !result.ok {
-        return Err("Home Assistant did not confirm the service action".into());
+}
+
+fn check_rule_actions(store: &AdminConsoleStore, rule: &RuleRecord) -> Result<(), String> {
+    for action in &rule.definition.actions {
+        if let RuleAction::HomeAssistant {
+            entity_id,
+            domain,
+            service,
+            fields,
+        } = action
+        {
+            let state = store
+                .home_assistant_state()
+                .map_err(|_| "Home Assistant configuration is unavailable".to_string())?;
+            let request = HomeAssistantServiceActionRequest {
+                entity_id: entity_id.clone(),
+                domain: domain.clone(),
+                service: service.clone(),
+                fields: fields.clone(),
+            };
+            validate_home_assistant_service_action_request(
+                &request,
+                state.enabled,
+                &state.exposed_domains,
+            )?;
+            let client = home_assistant_client_from_state(&state)
+                .map_err(|_| "Home Assistant is not configured or enabled".to_string())?;
+            client.check_service_action(&request)?;
+        }
     }
-    Ok("Home Assistant accepted the service action".into())
+    Ok(())
 }
 
 fn dispatch_event(
@@ -638,7 +645,11 @@ mod tests {
             );
             let server = Server::http("127.0.0.1:0").unwrap();
             let base = format!("http://{}", server.server_addr());
-            let api = AdminApi::new_for_test(admin, tasks, root.join("webui"), base.clone());
+            let api = AdminApi::new_for_test(admin, tasks, root.join("webui"), base.clone())
+                .with_service_tokens(Some(super::super::VerifierTokens {
+                    current: "rules-http-fixture-token".into(),
+                    previous: None,
+                }));
             let worker = thread::spawn(move || {
                 for request in server.incoming_requests() {
                     if request.url() == "/__test_stop" {
@@ -658,6 +669,11 @@ mod tests {
         fn request(&self, method: reqwest::Method, path: &str, body: Value) -> (u16, Value) {
             let response = reqwest::blocking::Client::new()
                 .request(method, format!("{}{path}", self.base))
+                .bearer_auth("rules-http-fixture-token")
+                .header("X-Harbor-Principal-Source", "harboros")
+                .header("X-Harbor-Principal-Id", "harboros:uid:1000")
+                .header("X-Harbor-Principal-Roles", "FULL_ADMIN")
+                .header("X-Harbor-Workspace-Id", "home-1")
                 .timeout(Duration::from_secs(10))
                 .json(&body)
                 .send()
@@ -827,7 +843,7 @@ mod tests {
             .header("X-Harbor-User-Id", "not-a-member")
             .send()
             .unwrap();
-        assert_eq!(response.status().as_u16(), 403);
+        assert_eq!(response.status().as_u16(), 401);
     }
 
     #[test]
@@ -918,6 +934,19 @@ mod tests {
             assert_harborlink_request(&states, Method::Get, "/v1/home-assistant/entities");
             states
                 .respond(Response::from_string(harborlink_entities("off", None)))
+                .unwrap();
+            let services = server
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            assert_harborlink_request(&services, Method::Get, "/v1/home-assistant/services");
+            services
+                .respond(Response::from_string(
+                    json!([{
+                        "domain":"light", "services":[{"service":"turn_on", "fields":{}}]
+                    }])
+                    .to_string(),
+                ))
                 .unwrap();
             let mut action = server
                 .recv_timeout(Duration::from_secs(10))

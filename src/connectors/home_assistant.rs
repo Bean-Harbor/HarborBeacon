@@ -98,6 +98,7 @@ pub struct HomeAssistantServiceCallResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct HomeAssistantServiceActionRequest {
     #[serde(default)]
     pub entity_id: String,
@@ -107,6 +108,27 @@ pub struct HomeAssistantServiceActionRequest {
     pub service: String,
     #[serde(default)]
     pub fields: Value,
+}
+
+#[derive(Debug)]
+pub struct HomeAssistantActionOutcome {
+    pub status: &'static str,
+    pub allowed: bool,
+    pub executed: bool,
+    pub message: String,
+    pub result: Option<HomeAssistantServiceCallResponse>,
+}
+
+impl HomeAssistantActionOutcome {
+    pub fn blocked(message: String) -> Self {
+        Self {
+            status: "blocked",
+            allowed: false,
+            executed: false,
+            message,
+            result: None,
+        }
+    }
 }
 
 impl HomeAssistantClient {
@@ -162,6 +184,68 @@ impl HomeAssistantClient {
 
     pub fn fetch_services(&self) -> Result<Vec<HomeAssistantServiceDomain>, String> {
         self.get_json("/v1/home-assistant/services")
+    }
+
+    pub fn check_service_action(
+        &self,
+        request: &HomeAssistantServiceActionRequest,
+    ) -> Result<(), String> {
+        let entities = self.fetch_entities().map_err(|_| {
+            "Home Assistant entities are unavailable; no action was sent".to_string()
+        })?;
+        let services = self.fetch_services().map_err(|_| {
+            "Home Assistant actions are unavailable; no action was sent".to_string()
+        })?;
+        validate_home_assistant_action_capability(request, &entities, &services)
+    }
+
+    pub fn execute_checked_action(
+        &self,
+        request: &HomeAssistantServiceActionRequest,
+    ) -> HomeAssistantActionOutcome {
+        if let Err(message) = self.check_service_action(request) {
+            return HomeAssistantActionOutcome::blocked(message);
+        }
+        // Once dispatched, an unreadable response cannot prove that no action occurred.
+        let result = self.call_service(
+            &request.domain,
+            &request.service,
+            &request.entity_id,
+            Some(&request.fields),
+        );
+        let (status, message, result) = match result {
+            Ok(result)
+                if result.domain == request.domain
+                    && result.service == request.service
+                    && result.entity_id == request.entity_id =>
+            {
+                if result.ok {
+                    (
+                        "succeeded",
+                        "Home Assistant accepted the action; device state is not yet confirmed",
+                        Some(result),
+                    )
+                } else {
+                    (
+                        "failed",
+                        "Home Assistant did not accept the action",
+                        Some(result),
+                    )
+                }
+            }
+            _ => (
+                "unknown",
+                "Home Assistant action outcome is unknown; check the device before trying again",
+                None,
+            ),
+        };
+        HomeAssistantActionOutcome {
+            status,
+            allowed: true,
+            executed: true,
+            message: message.into(),
+            result,
+        }
     }
 
     pub fn call_service(
@@ -327,6 +411,44 @@ pub fn home_assistant_service_action_is_allowlisted(domain: &str, service: &str)
     }
 }
 
+pub fn validate_home_assistant_action_capability(
+    request: &HomeAssistantServiceActionRequest,
+    entities: &[HomeAssistantEntity],
+    services: &[HomeAssistantServiceDomain],
+) -> Result<(), String> {
+    validate_home_assistant_service_action_request(request, true, &[])?;
+    let entity = entities
+        .iter()
+        .find(|entity| entity.entity_id == request.entity_id)
+        .ok_or_else(|| {
+            "Home Assistant entity no longer exists or is outside the allowed scope".to_string()
+        })?;
+    if entity.domain != request.domain || matches!(entity.state.as_str(), "unavailable" | "unknown")
+    {
+        return Err("Home Assistant entity is unavailable or its capability changed".into());
+    }
+    let service = services
+        .iter()
+        .filter(|domain| domain.domain == request.domain)
+        .flat_map(|domain| &domain.services)
+        .find(|service| service.service == request.service)
+        .ok_or_else(|| {
+            "Home Assistant action is no longer available; review the device action".to_string()
+        })?;
+    if let Some(fields) = request.fields.as_object() {
+        for key in fields.keys() {
+            if !service
+                .fields
+                .as_object()
+                .is_some_and(|schema| schema.contains_key(key))
+            {
+                return Err("Home Assistant action contains an unsupported parameter".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn normalize_home_assistant_service_fields(fields: &Value) -> Value {
     if fields.is_null() {
         return json!({});
@@ -342,6 +464,14 @@ pub fn validate_home_assistant_service_fields(fields: &Value) -> Result<(), Stri
         return Err("Home Assistant service fields must be a JSON object".to_string());
     };
     for (key, value) in object {
+        if matches!(
+            key.as_str(),
+            "entity_id" | "device_id" | "area_id" | "target" | "floor_id" | "label_id"
+        ) {
+            return Err(
+                "Home Assistant action parameters cannot override the selected entity".into(),
+            );
+        }
         if home_assistant_secret_like_key(key) {
             return Err(
                 "Home Assistant service fields cannot include secret-like keys".to_string(),
@@ -589,6 +719,69 @@ mod tests {
             "message": "Bearer abcdef"
         }))
         .is_err());
+    }
+
+    #[test]
+    fn action_preflight_uses_current_inventory_and_service_schema() {
+        let request = HomeAssistantServiceActionRequest {
+            entity_id: "light.desk".into(),
+            domain: "light".into(),
+            service: "turn_on".into(),
+            fields: json!({}),
+        };
+        let mut entities: Vec<super::HomeAssistantEntity> = serde_json::from_value(json!([{
+            "entity_id":"light.desk", "domain":"light", "state":"off", "display_name":"Desk"
+        }]))
+        .unwrap();
+        let services: Vec<super::HomeAssistantServiceDomain> = serde_json::from_value(json!([{
+            "domain":"light", "services":[{"service":"turn_on", "fields":{}}]
+        }]))
+        .unwrap();
+        assert!(
+            super::validate_home_assistant_action_capability(&request, &entities, &services)
+                .is_ok()
+        );
+        assert!(
+            super::validate_home_assistant_action_capability(&request, &[], &services).is_err()
+        );
+        assert!(
+            super::validate_home_assistant_action_capability(&request, &entities, &[]).is_err()
+        );
+        entities[0].state = "unavailable".into();
+        assert!(
+            super::validate_home_assistant_action_capability(&request, &entities, &services)
+                .is_err()
+        );
+        entities[0].state = "off".into();
+        let mut unsupported = request;
+        unsupported.fields = json!({"invented_parameter": true});
+        assert!(super::validate_home_assistant_action_capability(
+            &unsupported,
+            &entities,
+            &services
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn action_parameters_cannot_widen_the_selected_target() {
+        for key in [
+            "entity_id",
+            "device_id",
+            "area_id",
+            "target",
+            "floor_id",
+            "label_id",
+        ] {
+            let fields = json!({key: "all"});
+            assert!(
+                validate_home_assistant_service_fields(&fields).is_err(),
+                "{key}"
+            );
+        }
+        assert!(serde_json::from_value::<HomeAssistantServiceActionRequest>(json!({
+            "entity_id":"light.desk", "domain":"light", "service":"turn_on", "target":{"area_id":"all"}
+        })).is_err());
     }
 
     const FACTORY_CHILD: &str = "HARBOR_HA_FACTORY_TEST_CHILD";

@@ -4667,6 +4667,42 @@ impl AdminApi {
             None
         };
 
+        let control_principal = if is_home_assistant_control_path(&path)
+            || rules_admin_api::is_rules_path(&path)
+        {
+            let principal = gate_principal
+                .as_ref()
+                .expect("authenticated control route")
+                .access_principal();
+            let state = match self.admin_store.load_state() {
+                Ok(state) => state,
+                Err(_) => {
+                    let _ = request.respond(error_json(
+                        StatusCode(503), "Control settings are unavailable",
+                    ));
+                    return;
+                }
+            };
+            let action = if method == Method::Get {
+                AccessAction::AdminReadState
+            } else {
+                AccessAction::AdminManage
+            };
+            match authorize_authenticated_principal(
+                &state, principal, action, &format!("workspace:{}", principal.workspace_id),
+            ) {
+                Ok(principal) => Some(principal),
+                Err(_) => {
+                    let _ = request.respond(error_json(
+                        StatusCode(403), "Device and rule access is not permitted",
+                    ));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
         if product_jobs_admin_api::is_product_jobs_path(&path) {
             let response = self.handle_product_jobs_request(
                 &mut request,
@@ -4678,7 +4714,9 @@ impl AdminApi {
         }
 
         if rules_admin_api::is_rules_path(&path) {
-            let response = self.handle_rules_request(&mut request, &path, &identity_hints);
+            let response = self.handle_rules_request(
+                &mut request, &path, control_principal.as_ref().expect("authorized rule route"),
+            );
             let _ = request.respond(response);
             return;
         }
@@ -7476,32 +7514,21 @@ impl AdminApi {
             Ok(client) => client,
             Err(error) => return error_json(StatusCode(422), &error),
         };
-        match client.call_service(
-            &normalized.domain,
-            &normalized.service,
-            &normalized.entity_id,
-            Some(&normalized.fields),
-        ) {
-            Ok(result) => ok_json(&HomeAssistantServiceSmokeResponse {
-                status: "succeeded".to_string(),
-                allowed: true,
-                executed: true,
-                domain: normalized.domain,
-                service: normalized.service,
-                entity_id: normalized.entity_id,
-                message: "Home Assistant allowlisted service call completed.".to_string(),
-                result: Some(result),
-                audit_record: build_home_assistant_operator_audit(
-                    "home_assistant.service_smoke_executed",
-                    "succeeded",
-                    true,
-                    true,
-                    "Home Assistant allowlisted service call completed.",
-                    &body,
-                ),
-            }),
-            Err(error) => error_json(StatusCode(422), &redact_admin_string(&error)),
-        }
+        let outcome = client.execute_checked_action(&normalized);
+        ok_json(&HomeAssistantServiceSmokeResponse {
+            status: outcome.status.into(),
+            allowed: outcome.allowed,
+            executed: outcome.executed,
+            domain: normalized.domain,
+            service: normalized.service,
+            entity_id: normalized.entity_id,
+            message: outcome.message.clone(),
+            result: outcome.result,
+            audit_record: build_home_assistant_operator_audit(
+                "home_assistant.service_smoke_result", outcome.status,
+                outcome.allowed, outcome.executed, &outcome.message, &body,
+            ),
+        })
     }
 
     fn handle_home_assistant_service_action(
@@ -7549,60 +7576,24 @@ impl AdminApi {
             Ok(client) => client,
             Err(error) => return error_json(StatusCode(422), &error),
         };
-        match client.call_service(
-            &normalized.domain,
-            &normalized.service,
-            &normalized.entity_id,
-            Some(&normalized.fields),
-        ) {
-            Ok(result) => {
-                let response = HomeAssistantServiceActionResponse {
-                    action_id,
-                    status: "succeeded".to_string(),
-                    allowed: true,
-                    executed: true,
-                    domain: normalized.domain,
-                    service: normalized.service,
-                    entity_id: normalized.entity_id,
-                    message: "Home Assistant low-risk service action completed.".to_string(),
-                    result: Some(result),
-                    audit_record: build_home_assistant_operator_audit(
-                        "home_assistant.service_action_executed",
-                        "succeeded",
-                        true,
-                        true,
-                        "Home Assistant low-risk service action completed.",
-                        &body,
-                    ),
-                };
-                self.record_last_home_assistant_service_action(&response);
-                ok_json(&response)
-            }
-            Err(error) => {
-                let message = redact_admin_string(&error);
-                let response = HomeAssistantServiceActionResponse {
-                    action_id,
-                    status: "failed".to_string(),
-                    allowed: true,
-                    executed: false,
-                    domain: normalized.domain,
-                    service: normalized.service,
-                    entity_id: normalized.entity_id,
-                    message: message.clone(),
-                    result: None,
-                    audit_record: build_home_assistant_operator_audit(
-                        "home_assistant.service_action_failed",
-                        "failed",
-                        true,
-                        false,
-                        &message,
-                        &body,
-                    ),
-                };
-                self.record_last_home_assistant_service_action(&response);
-                ok_json(&response)
-            }
-        }
+        let outcome = client.execute_checked_action(&normalized);
+        let response = HomeAssistantServiceActionResponse {
+            action_id,
+            status: outcome.status.into(),
+            allowed: outcome.allowed,
+            executed: outcome.executed,
+            domain: normalized.domain,
+            service: normalized.service,
+            entity_id: normalized.entity_id,
+            message: outcome.message.clone(),
+            result: outcome.result,
+            audit_record: build_home_assistant_operator_audit(
+                "home_assistant.service_action_result", outcome.status,
+                outcome.allowed, outcome.executed, &outcome.message, &body,
+            ),
+        };
+        self.record_last_home_assistant_service_action(&response);
+        ok_json(&response)
     }
 
     fn handle_home_assistant_install_status(
@@ -13139,10 +13130,16 @@ fn is_gate_principal_knowledge_endpoint(method: &Method, path: &str) -> bool {
 
 fn is_gate_principal_endpoint(method: &Method, path: &str) -> bool {
     product_jobs_admin_api::is_product_jobs_path(path)
+        || rules_admin_api::is_rules_path(path)
+        || is_home_assistant_control_path(path)
         || is_gate_principal_knowledge_endpoint(method, path)
         || (method == &Method::Get && is_cat_detection_observation_path(path))
         || path == "/api/vision/detection-jobs"
         || path.starts_with("/api/vision/detection-jobs/")
+}
+
+fn is_home_assistant_control_path(path: &str) -> bool {
+    path.starts_with("/api/home-assistant/") || path.starts_with("/api/harboros/apps/home-assistant/")
 }
 
 fn is_knowledge_conversation_detail_path(path: &str) -> bool {
